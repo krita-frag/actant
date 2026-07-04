@@ -1,4 +1,5 @@
 pub mod actor;
+pub mod capability;
 pub mod common;
 pub mod event_bus;
 pub mod metrics;

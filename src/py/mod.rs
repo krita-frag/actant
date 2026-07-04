@@ -3,6 +3,7 @@ pub mod actor_ops;
 pub mod awaitable;
 pub mod bootstrap;
 pub mod cancel;
+pub mod capability;
 pub mod config;
 pub mod error;
 pub mod event;
@@ -34,6 +35,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     actor_ops::register(m)?;
     awaitable::register(m)?;
     cancel::register(m)?;
+    capability::register(m)?;
     error::register_exceptions(m)?;
     Ok(())
 }
