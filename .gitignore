@@ -1,0 +1,42 @@
+# Rust build
+target/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+*.so
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.*
+
+# Coverage
+htmlcov/
+.coverage
+coverage.xml
+
+# Benchmarks
+.benchmarks/
+
+# Python cache
+.mypy_cache/
+.rust_cache/
+.pytest_cache/
+**/__pycache__/
+
+
+/docs

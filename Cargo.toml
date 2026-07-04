@@ -1,0 +1,110 @@
+[package]
+name = "actant"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "基于 Actor 模型的跨平台通用分布式任务编排引擎 — 0.1.0"
+
+[dependencies]
+async-trait = "0.1"
+crossbeam-channel = "0.5"
+dashmap = { version = "6.1", features = ["serde"] }
+heed = "0.22.1"
+num_cpus = "1.17"
+parking_lot = "0.12"
+postcard = { version = "1.1", features = ["use-std"] }
+rkyv = { version = "0.8", features = ["std", "uuid-1"] }
+serde = { version = "1.0", features = ["derive", "rc"] }
+thiserror = "2.0.18"
+tokio = { version = "1", features = ["full", "rt-multi-thread", "macros", "time", "fs", "io-util"] }
+tracing = { version = "0.1", features = ["log"] }
+uuid = { version = "1.0", features = ["v4", "serde"] }
+xxhash-rust = { version = "0.8", features = ["xxh3", "const_xxh3", "xxh32"] }
+fs-err = "3.3.0"
+futures = "0.3"
+iroh = { version = "1.0", default-features = false, features = ["tls-ring"] }
+iroh-gossip = { version = "0.101", default-features = false, features = ["net"] }
+blake3 = "1.8.5"
+subtle = "2"
+data-encoding = "2.11.0"
+bytes = "1.12.0"
+pyo3 = { version = "0.29", optional = true }
+pyo3-log = { version = "0.13", optional = true }
+log = "0.4"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "registry", "json"] }
+opentelemetry = { version = "0.32", features = ["metrics"] }
+opentelemetry_sdk = { version = "0.32", features = ["metrics"] }
+opentelemetry-prometheus = "0.32"
+opentelemetry-appender-tracing = "0.32"
+opentelemetry-semantic-conventions = "0.32"
+prometheus = "0.14"
+dhat = { version = "0.3.3", optional = true }
+pprof = { version = "0.14", optional = true, features = ["flamegraph"] }
+console-subscriber = { version = "0.4", optional = true }
+
+
+[dev-dependencies]
+tempfile = "3.24.0"
+criterion = { version = "0.5", features = ["html_reports"] }
+serde_json = "1.0"
+
+[features]
+dhat-heap = ["dep:dhat"]
+python = ["dep:pyo3", "dep:pyo3-log"]
+# tokio-console 支持（ACTANT_TOKIO_CONSOLE=1 激活）
+tokio-console = ["dep:console-subscriber"]
+# pprof CPU 火焰图（ACTANT_PPROF=<path> 激活）
+pprof = ["dep:pprof"]
+default = ["python"]
+
+[lib]
+name = "actant"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+# 必须 unwind：worker/dispatcher.rs 的 catch_unwind 依赖 unwind 语义
+# 来隔离 Python task handler 的 panic，避免单个任务崩溃终止整个 worker。
+panic = "unwind"
+
+[profile.bench]
+inherits = "release"
+lto = false
+strip = false
+debug = true
+
+# ---------------------------------------------------------------------------
+# Criterion 基准测试目标
+# ---------------------------------------------------------------------------
+# 每个目标聚焦一个热点路径，便于独立运行与回归对比：
+#   cargo bench --bench scheduler       # 调度器 enqueue/dequeue/enqueue_batch
+#   cargo bench --bench serialization  # rkyv 序列化/反序列化
+#   cargo bench --bench store           # LMDB 读写
+# 全量运行：cargo bench
+# 基准测试不依赖 Python（关闭 default features），避免拉入 pyo3。
+
+[[bench]]
+name = "scheduler"
+harness = false
+required-features = []
+
+[[bench]]
+name = "serialization"
+harness = false
+required-features = []
+
+[[bench]]
+name = "store"
+harness = false
+required-features = []
+
+# 内存分配跟踪测试 — 通过 dhat 测量热点路径的堆分配。
+# 运行：cargo test --bench mem_profile --features dhat-heap -- --nocapture
+[[bench]]
+name = "mem_profile"
+harness = false
+required-features = ["dhat-heap"]

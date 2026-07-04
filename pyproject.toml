@@ -1,0 +1,189 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "actant"
+version = "0.1.0"
+description = "基于 Actor 模型的跨平台通用分布式任务编排引擎"
+readme = "README.md"
+authors = [{ name = "Actant Team" }]
+license = { file = "LICENSE" }
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "cloudpickle>=3.1.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-benchmark>=5.2.3",
+    "pytest-xdist>=3.5",
+    "maturin>=1.14.1",
+    "ruff>=0.15.18",
+    "mypy>=1.10",
+    "memory-profiler>=0.61.0",
+    "objgraph>=3.6.2",
+    "pytest-timeout>=2.3",
+    "pytest-cov>=4.1",
+    "coverage[toml]>=7.4",
+]
+# 可观测性工具：通过环境变量激活，无需代码改动
+#   ACTANT_VIZTRACER=/tmp/actant.json  → Python 调用追踪
+#   ACTANT_TRACING=1                   → Rust 结构化日志
+#   ACTANT_TOKIO_CONSOLE=1             → Rust 异步运行时可视化（需 cargo --features tokio-console）
+#   ACTANT_PPROF=/tmp/actant.svg       → Rust CPU 火焰图（需 cargo --features pprof）
+observability = [
+    "viztracer>=0.16",
+]
+
+[project.urls]
+Repository = "https://github.com/actant/actant"
+Issues = "https://github.com/actant/actant/issues"
+
+[project.scripts]
+actant = "actant.cli:main"
+
+[tool.maturin]
+manifest-path = "Cargo.toml"
+python-source = "."
+module-name = "actant.actant"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "SIM",  # flake8-simplify
+    "RUF",  # ruff-specific rules
+]
+ignore = [
+    "E501",    # line too long (handled by formatter)
+    "RUF001",  # ambiguous unicode in strings (Chinese fullwidth punctuation is intentional)
+    "RUF002",  # ambiguous unicode in docstrings (Chinese fullwidth punctuation is intentional)
+    "RUF003",  # ambiguous unicode in comments (Chinese fullwidth punctuation is intentional)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["actant"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+timeout = 60
+timeout_method = "thread"
+markers = [
+    "unit: 纯单元测试，无网络无 I/O",
+    "integration: 单进程集成测试，真实 Rust 运行时",
+    "e2e: 多节点真实分布式端到端测试",
+    "regression: 针对已发现 bug 的回归测试",
+    "slow: 执行时间 >5s 的测试",
+]
+
+# ---------------------------------------------------------------------------
+# 覆盖率门禁
+# ---------------------------------------------------------------------------
+# 设计原则：
+#   - Rust 核心（src/）由 cargo-tarpaulin/llvm-cov 覆盖，目标 90%+
+#   - Python 公共 API（actant/__init__.py 导出）目标 85%+
+#   - 关键路径（序列化 / DAG / 调度）目标 95%+
+#   - CLI / _pidfile / _logging 等周边模块目标 70%+（难以自动化测试）
+# CI 应在 `pytest --cov` 后运行 `coverage report --fail-under` 强制门禁。
+# 本地无 pytest-cov 时正常跳过覆盖率收集，测试仍可运行。
+
+[tool.coverage.run]
+source = ["actant"]
+branch = true
+parallel = true  # 配合 pytest-xdist
+# 排除难以测试或非业务关键模块
+omit = [
+    "actant/cli/*",          # CLI 入口，手动测试
+    "actant/_pidfile.py",    # 守护进程 PID 文件，需 fork 进程
+    "actant/_logging.py",    # 日志配置，副作用为主
+    "actant/actant.pyi",     # 类型存根
+    "actant/py.typed",       # PEP 561 标记
+    # Rust 扩展模块（PyO3 生成）：
+    # actant.actant 是 Rust 编译产物，覆盖率由 cargo 工具链负责
+]
+
+[tool.coverage.paths]
+# 跨 worker 进程合并路径
+source = [
+    "actant/",
+    "*/actant/",
+]
+
+[tool.coverage.report]
+# 整体门禁：所有模块平均
+fail_under = 75
+show_missing = true
+skip_covered = false
+skip_empty = true
+precision = 1
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+    # 不可达防御分支
+    "\\.\\.\\.$",  # Protocol / stub body
+]
+
+# 分模块门禁：精确控制关键路径覆盖率
+# 通过 `coverage report --include=<glob> --fail-under=N` 在 CI 中分阶段执行
+[tool.coverage.thresholds]
+# 此节为自定义文档，coverage 工具不解析；CI 脚本读取并强制执行。
+# 详见 .github/workflows/ci.yml 或 scripts/check-coverage-thresholds.sh
+public_api = 85           # actant/__init__.py 导出的公共 API
+serialization = 95        # _serialization.py
+flow_dag = 95             # flow.py + task.py（DAG 构建）
+router = 90               # router.py
+config = 90               # config.py
+exceptions = 95           # exceptions.py
+annotations = 90          # _annotations.py
+result = 85               # result.py
+node_runtime = 70         # _node.py（含网络/线程，部分难测）
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_any_generics = true
+check_untyped_defs = true
+show_error_codes = true
+show_column_numbers = true
+pretty = true
+
+# PyO3-generated module — no stubs, ignore internals
+[[tool.mypy.overrides]]
+module = "actant.actant"
+ignore_missing_imports = true
+
+# Third-party libs without stubs
+[[tool.mypy.overrides]]
+module = ["cloudpickle.*", "tomli.*", "tomllib.*", "yaml.*", "viztracer.*"]
+ignore_missing_imports = true
