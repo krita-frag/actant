@@ -5,8 +5,8 @@
 
 # 设计
 
-- `ask(name, request)`：在 handler 链上依次调用，第一个返回非 `None` 的决定结果。
-- `perform(name, request)`：调用单 handler，结果直接返回。
+- `ask(name, request)`：在 handler 链上逆序调用（后注册=高优先级），第一个返回非 `None` 的决定结果。
+- `perform(name, request)`：调用最后注册的 handler（高优先级），结果直接返回。
 - `emit(name, request)`：所有 handler 顺序执行，无返回值。
 
 Handler 通过 `Runtime.layer(name, kind).chain(handler)` 注册。
@@ -17,7 +17,16 @@ from __future__ import annotations
 from typing import Any, NoReturn, Optional
 
 from actant._runtime import get_current_runtime
-from actant.capabilities import get_capability_meta
+
+
+def _resolve_meta(name: str):
+    """从当前 Runtime 解析 capability 元数据。"""
+    runtime = get_current_runtime()
+    if runtime is None:
+        raise RuntimeError(
+            f"effect {name!r}: no active Runtime; wrap your code in `with actant.Runtime() as rt:`"
+        )
+    return runtime, runtime.capability_meta(name)
 
 
 def ask(name: str, request: Any) -> Optional[Any]:
@@ -32,13 +41,9 @@ def ask(name: str, request: Any) -> Optional[Any]:
 
     Raises:
         RuntimeError: 当前未在 Runtime 上下文中，或 capability 未注册。
+        KeyError: capability 未注册。
     """
-    runtime = get_current_runtime()
-    if runtime is None:
-        raise RuntimeError(
-            "ask: no active Runtime; wrap your code in `with actant.Runtime() as rt:`"
-        )
-    meta = get_capability_meta(name)
+    runtime, meta = _resolve_meta(name)
     if meta.kind != "ask":
         raise RuntimeError(
             f"ask: capability {name!r} is {meta.kind!r}, not 'ask'"
@@ -58,13 +63,9 @@ def perform(name: str, request: Any) -> Any:
 
     Raises:
         RuntimeError: 当前未在 Runtime 上下文中，或 capability 未注册。
+        KeyError: capability 未注册。
     """
-    runtime = get_current_runtime()
-    if runtime is None:
-        raise RuntimeError(
-            "perform: no active Runtime; wrap your code in `with actant.Runtime() as rt:`"
-        )
-    meta = get_capability_meta(name)
+    runtime, meta = _resolve_meta(name)
     if meta.kind != "perform":
         raise RuntimeError(
             f"perform: capability {name!r} is {meta.kind!r}, not 'perform'"
@@ -81,13 +82,9 @@ def emit(name: str, request: Any) -> None:
 
     Raises:
         RuntimeError: 当前未在 Runtime 上下文中，或 capability 未注册。
+        KeyError: capability 未注册。
     """
-    runtime = get_current_runtime()
-    if runtime is None:
-        raise RuntimeError(
-            "emit: no active Runtime; wrap your code in `with actant.Runtime() as rt:`"
-        )
-    meta = get_capability_meta(name)
+    runtime, meta = _resolve_meta(name)
     if meta.kind != "emit":
         raise RuntimeError(
             f"emit: capability {name!r} is {meta.kind!r}, not 'emit'"
@@ -100,7 +97,7 @@ def effect(name: str, kind: str, request: Any) -> Any:
 
     Args:
         name: capability 名称。
-        kind: `"ask"` / `"perform"` / `"emit"`。若为 `None` 则用 capability 默认 kind。
+        kind: `"ask"` / `"perform"` / `"emit"`。
         request: 请求 payload。
 
     Returns:

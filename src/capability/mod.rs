@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use crate::common::ActantError;
 
 pub mod builtins;
+pub mod default_handlers;
 pub mod handler;
 pub mod layer;
 pub mod runtime;

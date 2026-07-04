@@ -78,8 +78,9 @@ impl Runtime {
         Ok(())
     }
 
-    /// 决策型 effect（ask）：在 handler 链上依次调用，第一个返回 `Some` 的决定结果。
+    /// 决策型 effect（ask）：逆序调用 handler 链（后注册=高优先级），第一个返回 `Some` 的决定结果。
     ///
+    /// 语义：后注册的 handler 优先决策，使其能覆盖默认 handler。
     /// 若所有 handler 都返回 `None`，返回 `Ok(None)`。
     /// 若 capability 未注册，返回 `Err`。
     pub async fn ask<C: Capability>(&self, req: C::Request) -> Result<Option<C::Response>, ActantError>
@@ -98,7 +99,8 @@ impl Runtime {
         drop(entry);
 
         let shared_req: Arc<dyn Any + Send + Sync> = Arc::new(req);
-        for handler in &handlers {
+        // 逆序：后注册的 handler 优先决策（用户自定义覆盖默认）
+        for handler in handlers.iter().rev() {
             if let Some(resp) = handler.ask(Arc::clone(&shared_req)).await {
                 let resp = resp
                     .downcast::<C::Response>()
@@ -109,9 +111,9 @@ impl Runtime {
         Ok(None)
     }
 
-    /// 副作用型 effect（perform）：调用单 handler，结果直接返回。
+    /// 副作用型 effect（perform）：调用最后注册的 handler（高优先级），结果直接返回。
     ///
-    /// 若 capability 未注册或 handler 返回 `None`，返回 `Err`。
+    /// 语义：后注册的 handler 覆盖默认。若 capability 未注册或 handler 返回 `None`，返回 `Err`。
     pub async fn perform<C: Capability>(
         &self,
         req: C::Request,
@@ -137,8 +139,9 @@ impl Runtime {
             )));
         }
         let shared_req: Arc<dyn Any + Send + Sync> = Arc::new(req);
-        // 取第一个 handler 执行（perform 是单 handler 语义）
-        let resp = handlers[0].perform(Arc::clone(&shared_req)).await?;
+        // 取最后一个 handler（后注册=高优先级，覆盖默认）
+        let last = handlers.last().unwrap();
+        let resp = last.perform(Arc::clone(&shared_req)).await?;
         let resp = resp
             .downcast::<C::Response>()
             .map_err(|_| ActantError::Internal("perform: response type mismatch".into()))?;

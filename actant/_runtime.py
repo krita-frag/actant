@@ -119,6 +119,18 @@ class Runtime:
             self._metas[name] = meta
             self._layers[name] = []
 
+    @classmethod
+    def with_defaults(cls) -> "Runtime":
+        """创建 Runtime 并注册所有内置默认 handler。
+
+        等价于 `rt = Runtime(); _register_default_handlers(rt)`。
+        用户随后可通过 `rt.layer("Routing").chain(custom)` 追加自定义 handler，
+        自定义 handler 优先级更高（chain 顺序决定 ask 的决策顺序）。
+        """
+        rt = cls()
+        _register_default_handlers(rt)
+        return rt
+
     # ------------------------------------------------------------------
     # Layer 注册
     # ------------------------------------------------------------------
@@ -177,25 +189,27 @@ class Runtime:
     # ------------------------------------------------------------------
 
     def _dispatch_ask(self, name: str, request: Any) -> Optional[Any]:
-        """决策型：依次调用 handler，第一个返回非 None 的决定结果。"""
+        """决策型：逆序调用 handler（后注册=高优先级），第一个返回非 None 的决定结果。"""
         with self._lock:
             handlers = list(self._layers.get(name, []))
-        for handler in handlers:
+        # 逆序：后注册的 handler 优先决策（用户自定义覆盖默认）
+        for handler in reversed(handlers):
             result = handler(request)
             if result is not None:
                 return result
         return None
 
     def _dispatch_perform(self, name: str, request: Any) -> Any:
-        """副作用型：调用第一个 handler，结果直接返回。"""
+        """副作用型：调用最后注册的 handler（高优先级），结果直接返回。"""
         with self._lock:
             handlers = list(self._layers.get(name, []))
         if not handlers:
             raise RuntimeError(f"perform: capability {name!r} has no handlers")
-        return handlers[0](request)
+        # 取最后一个 handler（后注册=高优先级，覆盖默认）
+        return handlers[-1](request)
 
     def _dispatch_emit(self, name: str, request: Any) -> None:
-        """反应型：所有 handler 顺序执行，无返回值。"""
+        """反应型：所有 handler 顺序执行（注册顺序），无返回值。"""
         with self._lock:
             handlers = list(self._layers.get(name, []))
         for handler in handlers:
@@ -270,6 +284,93 @@ def use_runtime(rt: Runtime):
         yield
     finally:
         _runtime_local.runtime = prev
+
+
+# ============================================================================
+# 内置默认 handler
+# ============================================================================
+
+
+def _register_default_handlers(rt: Runtime) -> None:
+    """注册所有内置 capability 的默认 Python handler。
+
+    这些 handler 提供开箱即用的最小可行实现，与 Rust 侧 `default_handlers.rs` 语义一致。
+    用户可通过 `rt.layer(name).chain(custom)` 追加自定义 handler 覆盖。
+    """
+    from actant.capabilities import (
+        ExecuteCtx,
+        ExecuteOutcome,
+        NodeEvent,
+        RetryCtx,
+        RouteCtx,
+        ScheduleCtx,
+        SerializationReq,
+        StoreReq,
+        TaskEvent,
+        TransportReq,
+        WorkflowEvent,
+    )
+
+    # Routing: 默认返回本地节点
+    def _local_router(ctx: RouteCtx) -> Optional[str]:
+        return ctx.local_node or None
+
+    # Scheduling: FIFO，返回 pending 第一个
+    def _fifo_scheduler(ctx: ScheduleCtx) -> Optional[str]:
+        return ctx.pending[0] if ctx.pending else None
+
+    # RetryPolicy: attempt < max_retries 时重试
+    def _default_retry(ctx: RetryCtx) -> Optional[bool]:
+        return ctx.attempt < ctx.max_retries
+
+    # Serialization: 透传 bytes（实际 cloudpickle 在调用方）
+    def _passthrough_serialize(req: SerializationReq) -> bytes:
+        return req.data
+
+    # Transport: 单节点模式空操作
+    def _noop_transport(req: TransportReq) -> None:
+        return None
+
+    # Store: 内存 dict
+    _memory_store: dict[bytes, bytes] = {}
+
+    def _memory_store_handler(req: StoreReq) -> Optional[bytes]:
+        if req.op == "put":
+            _memory_store[req.key] = req.value
+            return None
+        if req.op == "get":
+            return _memory_store.get(req.key)
+        if req.op == "delete":
+            _memory_store.pop(req.key, None)
+            return None
+        return None
+
+    # Execute: 透传 payload（占位；真实执行由 Python 侧 worker 注册的 handler 完成）
+    def _passthrough_execute(ctx: ExecuteCtx) -> ExecuteOutcome:
+        return ExecuteOutcome(task_id=ctx.task_id, result_payload=ctx.payload)
+
+    # Lifecycle: 默认打印日志
+    def _task_lifecycle_log(event: TaskEvent) -> None:
+        # 避免循环导入，用 print 替代 logging
+        # 真实场景下用户应注册自己的 handler 接入 logging/metrics
+        pass
+
+    def _workflow_lifecycle_log(event: WorkflowEvent) -> None:
+        pass
+
+    def _node_lifecycle_log(event: NodeEvent) -> None:
+        pass
+
+    rt.layer("Routing").chain(_local_router)
+    rt.layer("Scheduling").chain(_fifo_scheduler)
+    rt.layer("RetryPolicy").chain(_default_retry)
+    rt.layer("Serialization").chain(_passthrough_serialize)
+    rt.layer("Transport").chain(_noop_transport)
+    rt.layer("Store").chain(_memory_store_handler)
+    rt.layer("Execute").chain(_passthrough_execute)
+    rt.layer("TaskLifecycle").chain(_task_lifecycle_log)
+    rt.layer("WorkflowLifecycle").chain(_workflow_lifecycle_log)
+    rt.layer("NodeLifecycle").chain(_node_lifecycle_log)
 
 
 __all__ = [
