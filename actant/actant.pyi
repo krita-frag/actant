@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Coroutine
 from typing import Any
 
 def get_version() -> str: ...
@@ -58,6 +57,8 @@ class _NetworkConfig:
         direct_request_timeout_ms: int = 30000,
         listen_port: int = 0,
         listen_ip: str = "",
+        capability_gossip_interval_ms: int = 5000,
+        event_channel_capacity: int = 256,
     ) -> None: ...
     @property
     def preset(self) -> str: ...
@@ -79,6 +80,10 @@ class _NetworkConfig:
     def listen_port(self) -> int: ...
     @property
     def listen_ip(self) -> str: ...
+    @property
+    def capability_gossip_interval_ms(self) -> int: ...
+    @property
+    def event_channel_capacity(self) -> int: ...
 
 class _FailoverConfig:
     def __init__(
@@ -86,6 +91,7 @@ class _FailoverConfig:
         heartbeat_interval_ms: int | None = None,
         failure_timeout_ms: int | None = None,
         lease_expiry_check_interval_secs: int | None = None,
+        lease_duration_ms: int | None = None,
     ) -> None: ...
     @property
     def heartbeat_interval_ms(self) -> int: ...
@@ -93,6 +99,8 @@ class _FailoverConfig:
     def failure_timeout_ms(self) -> int: ...
     @property
     def lease_expiry_check_interval_secs(self) -> int: ...
+    @property
+    def lease_duration_ms(self) -> int: ...
 
 class _GossipConfig:
     def __init__(
@@ -101,6 +109,7 @@ class _GossipConfig:
         dedup_ttl_secs: int = 300,
         retry_attempts: int = 3,
         retry_base_delay_ms: int = 100,
+        heads_broadcast_interval_ms: int = 30000,
     ) -> None: ...
     @property
     def dedup_window_size(self) -> int: ...
@@ -110,6 +119,8 @@ class _GossipConfig:
     def retry_attempts(self) -> int: ...
     @property
     def retry_base_delay_ms(self) -> int: ...
+    @property
+    def heads_broadcast_interval_ms(self) -> int: ...
 
 class _ActantConfig:
     def __init__(
@@ -194,14 +205,6 @@ class _OrchestrationEvent:
     @property
     def max_capacity(self) -> int | None: ...
 
-class _RetryInfo:
-    @property
-    def current_retry_count(self) -> int: ...
-    @property
-    def max_retries(self) -> int: ...
-    @property
-    def next_delay_ms(self) -> int: ...
-
 class _DagNode:
     """DAG 节点定义，由 Python 层构造后通过 `submit_dag` 提交。
 
@@ -256,18 +259,22 @@ class _TaskDef:
         retry_policy: _RetryPolicy | None = None,
     ) -> None: ...
 
-class _PeerCapacity:
-    """Peer 节点容量快照：可用槽位、最大槽位、endpoint 地址。"""
-    available: int
-    max: int
-    endpoint_addr: str | None
+class _CapabilityRuntime:
+    """Rust `capability::Runtime` 的 PyO3 包装。
 
-    def __init__(
-        self,
-        available: int,
-        max: int,
-        endpoint_addr: str | None = None,
-    ) -> None: ...
+    Python `Runtime` 在内部延迟创建此对象，用于执行 Rust 内置 capability
+    handler。普通用户直接使用 `actant.Runtime()` 即可。
+    """
+
+    def __init__(self) -> None: ...
+    def builtin_capabilities(self) -> list[tuple[str, str]]: ...
+    @property
+    def capability_count(self) -> int: ...
+    def registered_capabilities(self) -> list[str]: ...
+    def handler_count(self, name: str) -> int: ...
+    def ask(self, name: str, request: Any) -> Any | None: ...
+    def perform(self, name: str, request: Any) -> Any: ...
+    def emit(self, name: str, request: Any) -> None: ...
 
 class _SupervisionEventData:
     @property
@@ -276,196 +283,6 @@ class _SupervisionEventData:
     def actor_id(self) -> str: ...
     @property
     def error(self) -> str | None: ...
-
-class _RuntimeCore:
-    """Rust 核心运行时入口，由 Python 编排循环驱动。
-
-    API 分层：
-      - 公共方法（无 `_` 前缀）：稳定高层接口，面向典型使用场景。
-      - 内部原语（`_` 前缀）：暴露 Rust 编排器/故障转移/gossip 的底层操作，
-        供 Python 编排循环（`actant._orchestration`）或自定义编排实现直接驱动状态机。
-        这些方法语义可能随 Rust 核心演进而调整，自定义实现需自行承担兼容成本。
-    """
-
-    @staticmethod
-    def start(
-        name: str,
-        config: _ActantConfig | None = None,
-        node_id: str | None = None,
-        tasks: dict[str, Any] | None = None,
-    ) -> _RuntimeCore: ...
-
-    # ------------------------------------------------------------------
-    # 身份与状态
-    # ------------------------------------------------------------------
-    def node_id(self) -> str: ...
-    def peer_id(self) -> str: ...
-    def running_task_count(self) -> int: ...
-    def max_concurrent_tasks(self) -> int: ...
-    def available_capacity(self) -> int: ...
-    def max_capacity(self) -> int: ...
-    def get_health_info(self) -> tuple[str, int]: ...
-    def get_metrics_snapshot(self) -> dict[str, int]: ...
-
-    # ------------------------------------------------------------------
-    # Peer 容量
-    # ------------------------------------------------------------------
-    def get_peer_capacities(self) -> dict[str, _PeerCapacity]: ...
-    def _update_peer_capacity(self, peer_id: str, available: int, max: int) -> None: ...
-
-    # ------------------------------------------------------------------
-    # 指标
-    # ------------------------------------------------------------------
-    def prometheus_text(self) -> str: ...
-
-    # ------------------------------------------------------------------
-    # 事件桥（Python 注册回调，Rust 通过 call_soon_threadsafe 上调）
-    # ------------------------------------------------------------------
-    def set_event_callback(self, callback: Any) -> None: ...
-
-    # ------------------------------------------------------------------
-    # DAG 提交与任务入队
-    # ------------------------------------------------------------------
-    def submit_dag(
-        self,
-        nodes: list[_DagNode],
-        edges: list[tuple[int, int, str | None]],
-        #                     ^from  ^to    ^condition_tag
-        workflow_timeout_ms: int | None = None,
-        default_retry_policy: _RetryPolicy | None = None,
-        target_nodes: dict[int, str] | None = None,
-        target_endpoint_addrs: dict[int, str] | None = None,
-        failure_strategy: str | None = None,
-    ) -> _AsyncResultCore: ...
-    def enqueue_tasks(self, tasks: list[_TaskDef]) -> None: ...
-    def _drain_unrouted_tasks(self) -> list[_TaskDef]: ...
-    def scheduler_stats(self) -> int: ...
-
-    # ------------------------------------------------------------------
-    # 编排器原语：供 Python 编排循环驱动 DAG 状态机
-    # ------------------------------------------------------------------
-    def _mark_failed_and_get_retry_info(
-        self,
-        workflow_id: str,
-        task_id: str,
-        error: str,
-    ) -> _RetryInfo | None: ...
-    def _complete_task_and_broadcast(
-        self,
-        workflow_id: str,
-        task_id: str,
-        result: bytes,
-        task_name: str = "",
-    ) -> tuple[list[_TaskDef], list[tuple[str, str]]]: ...
-    def _activate_conditional_successor(
-        self,
-        workflow_id: str,
-        task_id: str,
-    ) -> _TaskDef | None: ...
-    def _skip_conditional_branch(
-        self,
-        workflow_id: str,
-        task_id: str,
-    ) -> list[_TaskDef]: ...
-    def _broadcast_failure(
-        self,
-        workflow_id: str,
-        task_id: str,
-        error: str,
-        task_name: str = "",
-    ) -> None: ...
-    def cancel_workflow(self, workflow_id: str) -> None:
-        """Raises NotFoundError if workflow_id does not exist."""
-        ...
-    def cancel_task(self, workflow_id: str, task_id: str) -> bool:
-        """Raises NotFoundError if workflow_id does not exist."""
-        ...
-    def _mark_workflow_failed(
-        self,
-        workflow_id: str,
-        error: str,
-    ) -> None: ...
-    def _build_ready_tasks(
-        self,
-        workflow_id: str,
-        task_ids: list[str],
-    ) -> list[_TaskDef]: ...
-    def _get_retry_info(
-        self,
-        workflow_id: str,
-        task_id: str,
-    ) -> _RetryInfo | None: ...
-    def _prepare_retry(
-        self,
-        workflow_id: str,
-        task_id: str,
-    ) -> _TaskDef | None: ...
-    def _mark_task_running(
-        self,
-        workflow_id: str,
-        task_id: str,
-    ) -> None: ...
-    def _apply_dag_state_update(
-        self,
-        workflow_id: str,
-        task_id: str,
-        state: str,
-        data: bytes,
-    ) -> None: ...
-    def _handle_heads_exchange(self, data: bytes) -> None: ...
-    def get_stored_results(self, workflow_id: str) -> list[list[bytes]] | None: ...
-    def gossip_stats(self) -> tuple[int, int, int, int]: ...
-    def _recoverable_workflows_with_pending(self) -> list[tuple[str, list[str]]]: ...
-
-    # ------------------------------------------------------------------
-    # 故障转移原语：用于自定义 lease/claim 策略
-    # ------------------------------------------------------------------
-    def get_peer_infos(self) -> list[tuple[str, int, list[str]]]: ...
-    def _detect_failed_nodes(self) -> Coroutine[Any, Any, list[tuple[str, list[str]]]]: ...
-    def _should_claim_workflow(self, workflow_ids: list[str]) -> Coroutine[Any, Any, bool]: ...
-    def _active_leases(self) -> list[tuple[str, str, int, int]]: ...
-
-    # ------------------------------------------------------------------
-    # 网络操作
-    # ------------------------------------------------------------------
-    def listen_addresses(self) -> Coroutine[Any, Any, dict[str, Any]]: ...
-    def dial(self, addr: str) -> Coroutine[Any, Any, None]: ...
-    def discover_peers(self) -> Coroutine[Any, Any, None]: ...
-    def _add_gossip_peer(self, peer_id: str) -> Coroutine[Any, Any, None]: ...
-
-    # ------------------------------------------------------------------
-    # Actor 操作
-    # ------------------------------------------------------------------
-    def create_actor(self, name: str, dispatcher: Any) -> str: ...
-    def create_actor_with_id(self, name: str, actor_id: str, dispatcher: Any) -> str: ...
-    def actor_core(self) -> _ActorCore: ...
-
-    # ------------------------------------------------------------------
-    # 状态枚举辅助
-    # ------------------------------------------------------------------
-    def workflow_state_completed(self) -> _WorkflowState: ...
-    def workflow_state_failed(self) -> _WorkflowState: ...
-
-    # ------------------------------------------------------------------
-    # 工作流与任务状态查询
-    # ------------------------------------------------------------------
-    def list_workflows(self) -> list[tuple[str, str]]: ...
-    def workflow_state(self, workflow_id: str) -> str | None: ...
-    def task_states(self, workflow_id: str) -> list[tuple[str, str]] | None: ...
-
-    # ------------------------------------------------------------------
-    # 生命周期
-    # ------------------------------------------------------------------
-    def shutdown(self, timeout_ms: int | None = None) -> None: ...
-    def drain(self) -> None: ...
-
-class _AsyncResultCore:
-    @property
-    def workflow_id(self) -> str: ...
-    def ready(self) -> bool: ...
-    def state(self) -> str: ...
-    async def get(self, timeout_ms: int | None = None) -> dict[str, Any]: ...
-    async def wait_for_completion(self, timeout_ms: int | None = None) -> dict[str, Any]: ...
 
 class _ActorCore:
     async def call_method(
@@ -479,3 +296,21 @@ class _ActorCore:
     def restart_actor(self, actor_id: str, actor_type: str) -> None: ...
     def actor_status(self, actor_id: str) -> str: ...
     def list_actors(self) -> list[str]: ...
+
+class _RuntimeCore:
+    """Rust 统一运行时核心的 PyO3 包装。
+
+    由 `Runtime.start()` 创建，聚合网络、存储、Actor 系统、Worker 等子系统。
+    `serve()` 在 tokio 后台 spawn worker 守护循环（非阻塞），`shutdown()`
+    优雅关闭所有子系统并关闭 iroh endpoint。
+    """
+    def __init__(
+        self,
+        name: str | None = None,
+        data_dir: str | None = None,
+        config: _ActantConfig | None = None,
+    ) -> None: ...
+    def capability_runtime(self) -> _CapabilityRuntime: ...
+    def serve(self) -> None: ...
+    def shutdown(self, timeout_ms: int = 5000) -> None: ...
+    def node_id(self) -> str: ...

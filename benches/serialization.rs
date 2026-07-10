@@ -11,7 +11,7 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use actant::common::{
     deserialize_rkyv_value, serialize_rkyv, RetryPolicy, TaskDefinition, TaskId, WorkflowId,
 };
-use actant::orchestrator::{Dag, DagNode};
+use actant::runtime::workflow::{Dag, DagNode};
 
 fn make_task(idx: usize) -> TaskDefinition {
     TaskDefinition {

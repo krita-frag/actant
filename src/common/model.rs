@@ -88,6 +88,33 @@ impl_id_type!(ActorId);
 impl_id_type!(NodeId);
 impl_id_type!(MessageId);
 
+impl ActorId {
+    /// Workflow orchestrator actor for a node.
+    pub fn workflow(node_id: &NodeId) -> Self {
+        Self::from(format!("workflow-{}", node_id.as_str()))
+    }
+
+    /// Scheduler actor for a node.
+    pub fn scheduler(node_id: &NodeId) -> Self {
+        Self::from(format!("scheduler-{}", node_id.as_str()))
+    }
+
+    /// Failover manager actor for a node.
+    pub fn failover(node_id: &NodeId) -> Self {
+        Self::from(format!("failover-{}", node_id.as_str()))
+    }
+
+    /// DAG gossip actor for a node.
+    pub fn dag_gossip(node_id: &NodeId) -> Self {
+        Self::from(format!("dag-gossip-{}", node_id.as_str()))
+    }
+
+    /// Capability handler actor for a capability name.
+    pub fn capability(name: impl AsRef<str>) -> Self {
+        Self::from(format!("capability-{}", name.as_ref()))
+    }
+}
+
 #[derive(
     Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Archive, rkyv::Serialize, rkyv::Deserialize,
 )]

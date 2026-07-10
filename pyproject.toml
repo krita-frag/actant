@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "actant"
-version = "0.1.0"
+version = "0.2.0-alpha.1"
 description = "基于 Actor 模型的跨平台通用分布式任务编排引擎"
 readme = "README.md"
 authors = [{ name = "Actant Team" }]

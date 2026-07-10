@@ -4,7 +4,7 @@ use pyo3::types::PyType;
 use crate::common::{
     ActantConfig, DiscoveryMode, FailoverConfig, GossipConfig, NetworkConfig, RetryPolicy,
 };
-use crate::orchestrator::Phase;
+use crate::runtime::workflow::Phase;
 
 #[pyclass(name = "_WorkflowState", from_py_object)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -194,13 +194,17 @@ pub struct PyNetworkConfig {
     pub listen_port: u16,
     #[pyo3(get)]
     pub listen_ip: String,
+    #[pyo3(get)]
+    pub capability_gossip_interval_ms: u64,
+    #[pyo3(get)]
+    pub event_channel_capacity: usize,
 }
 
 #[pymethods]
 impl PyNetworkConfig {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (preset=None, bootstrap_nodes=None, hlc_max_drift_ms=crate::common::NetworkConfig::DEFAULT_HLC_MAX_DRIFT_MS, max_pending_direct_requests=crate::common::NetworkConfig::DEFAULT_MAX_PENDING_DIRECT_REQUESTS, gossip_bootstrap_peers=None, max_message_size=crate::common::NetworkConfig::DEFAULT_MAX_MESSAGE_SIZE, allowed_peer_ids=None, direct_request_timeout_ms=crate::common::NetworkConfig::DEFAULT_DIRECT_REQUEST_TIMEOUT_MS, listen_port=0, listen_ip=""))]
+    #[pyo3(signature = (preset=None, bootstrap_nodes=None, hlc_max_drift_ms=crate::common::NetworkConfig::DEFAULT_HLC_MAX_DRIFT_MS, max_pending_direct_requests=crate::common::NetworkConfig::DEFAULT_MAX_PENDING_DIRECT_REQUESTS, gossip_bootstrap_peers=None, max_message_size=crate::common::NetworkConfig::DEFAULT_MAX_MESSAGE_SIZE, allowed_peer_ids=None, direct_request_timeout_ms=crate::common::NetworkConfig::DEFAULT_DIRECT_REQUEST_TIMEOUT_MS, listen_port=0, listen_ip="", capability_gossip_interval_ms=crate::common::NetworkConfig::DEFAULT_CAPABILITY_GOSSIP_INTERVAL_MS, event_channel_capacity=crate::common::NetworkConfig::DEFAULT_EVENT_CHANNEL_CAPACITY))]
     fn new(
         preset: Option<String>,
         bootstrap_nodes: Option<Vec<String>>,
@@ -212,6 +216,8 @@ impl PyNetworkConfig {
         direct_request_timeout_ms: u64,
         listen_port: u16,
         listen_ip: &str,
+        capability_gossip_interval_ms: u64,
+        event_channel_capacity: usize,
     ) -> Self {
         Self {
             preset: preset.unwrap_or_else(|| "local".to_string()),
@@ -224,6 +230,8 @@ impl PyNetworkConfig {
             direct_request_timeout_ms,
             listen_port,
             listen_ip: listen_ip.to_string(),
+            capability_gossip_interval_ms,
+            event_channel_capacity,
         }
     }
 }
@@ -243,6 +251,9 @@ impl Default for PyNetworkConfig {
                 crate::common::NetworkConfig::DEFAULT_DIRECT_REQUEST_TIMEOUT_MS,
             listen_port: 0,
             listen_ip: String::new(),
+            capability_gossip_interval_ms:
+                crate::common::NetworkConfig::DEFAULT_CAPABILITY_GOSSIP_INTERVAL_MS,
+            event_channel_capacity: crate::common::NetworkConfig::DEFAULT_EVENT_CHANNEL_CAPACITY,
         }
     }
 }
@@ -262,6 +273,8 @@ impl TryFrom<&PyNetworkConfig> for NetworkConfig {
             direct_request_timeout_ms: c.direct_request_timeout_ms,
             listen_port: c.listen_port,
             listen_ip: c.listen_ip.clone(),
+            capability_gossip_interval_ms: c.capability_gossip_interval_ms,
+            event_channel_capacity: c.event_channel_capacity,
         })
     }
 }
@@ -275,16 +288,19 @@ pub struct PyFailoverConfig {
     pub failure_timeout_ms: u64,
     #[pyo3(get)]
     pub lease_expiry_check_interval_secs: u64,
+    #[pyo3(get)]
+    pub lease_duration_ms: u64,
 }
 
 #[pymethods]
 impl PyFailoverConfig {
     #[new]
-    #[pyo3(signature = (heartbeat_interval_ms=None, failure_timeout_ms=None, lease_expiry_check_interval_secs=None))]
+    #[pyo3(signature = (heartbeat_interval_ms=None, failure_timeout_ms=None, lease_expiry_check_interval_secs=None, lease_duration_ms=None))]
     fn new(
         heartbeat_interval_ms: Option<u64>,
         failure_timeout_ms: Option<u64>,
         lease_expiry_check_interval_secs: Option<u64>,
+        lease_duration_ms: Option<u64>,
     ) -> Self {
         let default = FailoverConfig::default();
         Self {
@@ -292,16 +308,19 @@ impl PyFailoverConfig {
             failure_timeout_ms: failure_timeout_ms.unwrap_or(default.failure_timeout_ms),
             lease_expiry_check_interval_secs: lease_expiry_check_interval_secs
                 .unwrap_or(default.lease_expiry_check_interval_secs),
+            lease_duration_ms: lease_duration_ms.unwrap_or(default.lease_duration_ms),
         }
     }
 }
 
 impl Default for PyFailoverConfig {
     fn default() -> Self {
+        let default = FailoverConfig::default();
         Self {
-            heartbeat_interval_ms: 2000,
-            failure_timeout_ms: 8000,
-            lease_expiry_check_interval_secs: 30,
+            heartbeat_interval_ms: default.heartbeat_interval_ms,
+            failure_timeout_ms: default.failure_timeout_ms,
+            lease_expiry_check_interval_secs: default.lease_expiry_check_interval_secs,
+            lease_duration_ms: default.lease_duration_ms,
         }
     }
 }
@@ -312,6 +331,7 @@ impl From<PyFailoverConfig> for FailoverConfig {
             heartbeat_interval_ms: c.heartbeat_interval_ms,
             failure_timeout_ms: c.failure_timeout_ms,
             lease_expiry_check_interval_secs: c.lease_expiry_check_interval_secs,
+            lease_duration_ms: c.lease_duration_ms,
         }
     }
 }
@@ -327,23 +347,27 @@ pub struct PyGossipConfig {
     pub retry_attempts: usize,
     #[pyo3(get)]
     pub retry_base_delay_ms: u64,
+    #[pyo3(get)]
+    pub heads_broadcast_interval_ms: u64,
 }
 
 #[pymethods]
 impl PyGossipConfig {
     #[new]
-    #[pyo3(signature = (dedup_window_size=1024, dedup_ttl_secs=300, retry_attempts=3, retry_base_delay_ms=100))]
+    #[pyo3(signature = (dedup_window_size=1024, dedup_ttl_secs=300, retry_attempts=3, retry_base_delay_ms=100, heads_broadcast_interval_ms=30_000))]
     fn new(
         dedup_window_size: usize,
         dedup_ttl_secs: u64,
         retry_attempts: usize,
         retry_base_delay_ms: u64,
+        heads_broadcast_interval_ms: u64,
     ) -> Self {
         Self {
             dedup_window_size,
             dedup_ttl_secs,
             retry_attempts,
             retry_base_delay_ms,
+            heads_broadcast_interval_ms,
         }
     }
 }
@@ -355,6 +379,7 @@ impl Default for PyGossipConfig {
             dedup_ttl_secs: 300,
             retry_attempts: 3,
             retry_base_delay_ms: 100,
+            heads_broadcast_interval_ms: 30_000,
         }
     }
 }
@@ -366,6 +391,7 @@ impl From<PyGossipConfig> for GossipConfig {
             dedup_ttl_secs: c.dedup_ttl_secs,
             retry_attempts: c.retry_attempts,
             retry_base_delay_ms: c.retry_base_delay_ms,
+            heads_broadcast_interval_ms: c.heads_broadcast_interval_ms,
         }
     }
 }

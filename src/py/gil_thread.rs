@@ -13,29 +13,6 @@ pub(crate) struct GilThread {
 }
 
 impl GilThread {
-    /// 派生新的 GIL worker 线程并返回句柄。
-    pub fn spawn() -> Self {
-        let (tx, rx) = channel::unbounded::<Task>();
-        std::thread::spawn(move || {
-            Python::attach(|py| {
-                // py.detach 在 recv() 阻塞时释放 GIL，
-                // 任务可用时重新获取。
-                while let Ok(task) = py.detach(|| rx.recv()) {
-                    let t0 = std::time::Instant::now();
-                    task(py);
-                    let elapsed = t0.elapsed();
-                    if elapsed > std::time::Duration::from_millis(1) {
-                        tracing::trace!("gil_thread: task executed in {:?} (>1ms, slow)", elapsed);
-                    } else {
-                        tracing::trace!("gil_thread: task executed in {:?}", elapsed);
-                    }
-                }
-                tracing::debug!("gil_thread: channel closed, exiting");
-            });
-        });
-        Self { tx: Arc::new(tx) }
-    }
-
     /// 向 GIL worker 发送闭包。worker 在已持有 GIL 的状态下调用它。
     pub fn send<F>(&self, task: F) -> Result<(), channel::SendError<Task>>
     where

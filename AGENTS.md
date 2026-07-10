@@ -8,13 +8,13 @@ Actant 采用 **Rust + iroh** 构建核心运行时，通过 **PyO3** 暴露给 
 
 ## 架构
 
-三层架构：Rust 核心原语（第 1 层）→ PyO3 边界（`src/py/`）→ Python 轻量封装（第 2 层）。用户可直接调用 PyO3 导出接口，或完全绕过第 2 层自行扩展（第 3 层）。
+四盒（Actor、State、Effect/Capability、Iroh）+ ERH（Effect-Resource-Handler）扩展层。
 
 | 层级 | 位置 | 职责 | 边界约束 |
 |------|------|------|----------|
-| **第 1 层** Rust 核心 | `src/`（除 `src/py/`） | DAG 协议、调度、持久化、网络、Actor、事件总线；载荷为不透明 `Vec<u8>` | **不感知任何 Python 概念** |
+| **第 1 层** Rust 核心 | `src/`（除 `src/py/`） | Actor 运行时、DAG 协议、调度、持久化、网络、Capability/Effect、事件总线；载荷为不透明 `Vec<u8>` | **不感知任何 Python 概念** |
 | **PyO3 边界** | `src/py/` | Rust 与 Python 的唯一通道 | 封装 Rust 原语为 Python 对象 |
-| **第 2 层** Python 封装 | `actant/` | `@task` / `@flow`、顶层 API、异常镜像、Python 侧编排循环、CLI | 通过 `cloudpickle` 序列化 Python 可调用对象为字节后交给 Rust，Rust 不解析其语义 |
+| **第 2 层** Python 封装 | `actant/` | `Runtime` / `Layer` / effect 原语（`ask`/`perform`/`emit`）、capability 声明、异常镜像 | 通过 `cloudpickle` 序列化任务 payload 为字节后交给 Rust，Rust 不解析其语义 |
 | **第 3 层** 用户扩展 | 仓库外 | 业务路由、定时任务、资源管理、监控面板、DSL 风格变体、工作流模板 | 由用户自行实现 |
 
 **核心原则**：简单是可靠的前提。新功能引入前必须能回答"为什么放这一层"。
@@ -26,41 +26,89 @@ Actant 采用 **Rust + iroh** 构建核心运行时，通过 **PyO3** 暴露给 
 ```
 actant/
 ├── src/                          # Rust 核心（第 1 层）
-│   ├── common/                   # 共享类型：TaskId、WorkflowId、RetryPolicy 等
-│   ├── orchestrator/             # DAG 编排、调度器、故障转移、gossip
-│   ├── worker/                   # Worker 运行时、任务分发器
-│   ├── actor/                    # Actor 系统、邮箱、监督
-│   ├── network/                  # iroh 网络、发现、协议
-│   ├── store/                    # LMDB/Heed 持久化、WAL、检查点、HLC
-│   ├── event_bus.rs              # 内部异步事件总线
+│   ├── common/                   # 共享类型与协议：config、error、model、payload、serialization、wire
+│   ├── runtime/                  # 运行时四盒
+│   │   ├── actor.rs              # Actor 模型统一执行引擎：Actor trait、ActorSystem、监督、邮箱、持久化
+│   │   ├── capability.rs         # ERH 核心：Capability、Handler、Layer、Runtime、capability_registry!
+│   │   ├── capability/           # Capability 子模块
+│   │   │   ├── actor.rs          # Actor 相关 capability（ActorMessaging/Supervision/Lifecycle）codec
+│   │   │   ├── builtins.rs       # 内置 capability 注册：register_defaults、StoreHandler、ExecuteHandler
+│   │   │   └── gossip.rs         # Capability 元信息 Gossip 同步：CapabilityGossipActor
+│   │   ├── context.rs            # ActantRuntime 上下文：CapabilityRuntime + ActorSystem + State + Iroh
+│   │   ├── event_bus.rs          # 内部异步事件总线（同文件测试）
+│   │   ├── builder.rs            # RuntimeBuilder：组装四盒
+│   │   ├── network.rs            # iroh 网络、发现、直连协议
+│   │   ├── dispatcher.rs         # TaskDispatcher / TaskRegistry / CancelFlag
+│   │   ├── state.rs              # 统一持久化：Store、HLC、Checkpoint、WAL
+│   │   ├── state/                # State 子模块
+│   │   │   ├── crdt.rs           # CRDT 状态合并
+│   │   │   └── event_log.rs      # 事件日志与序号恢复
+│   │   └── workflow/             # 工作流运行时
+│   │       ├── actor.rs          # WorkflowActor / SchedulerActor / FailoverActor / DagGossipActor
+│   │       ├── dag.rs            # DAG 数据结构与拓扑计算
+│   │       ├── failover.rs       # 故障转移：心跳、租约、任务回收
+│   │       ├── gossip.rs         # DAG 状态 Gossip 同步
+│   │       ├── messaging.rs      # 工作流消息类型与 Actor 间协议
+│   │       ├── orchestrator.rs   # 编排器：DAG 提交、任务就绪计算、完成处理
+│   │       ├── runtime.rs        # WorkflowRuntime：装配 Actor 与调度循环
+│   │       └── scheduler.rs      # 任务调度器抽象与 priority/fifo 实现
+│   ├── py/                       # PyO3 绑定（唯一边界）
+│   │   ├── runtime.rs            # _RuntimeCore / _CapabilityRuntime
+│   │   ├── capability.rs         # capability PyO3 桥
+│   │   ├── actor.rs / actor_ops.rs  # Actor 系统绑定
+│   │   ├── handler.rs            # chain_python_handler：Python handler → Rust
+│   │   ├── config.rs             # NetworkConfig / RetryPolicy / ActantConfig
+│   │   ├── types.rs              # awaitable/cancel/event/registry 合并模块
+│   │   ├── error.rs              # ActantError 镜像
+│   │   ├── gil_thread.rs         # GIL 管理
+│   │   └── mod.rs
 │   ├── metrics.rs                # Rust 侧指标
-│   ├── observability.rs          # Rust 侧 tracing/pprof/console 观测
-│   └── py/                       # PyO3 绑定（唯一边界）
-├── actant/                       # Python 轻量封装（第 2 层）
-│   ├── __init__.py               # 公共 API 导出
-│   ├── _api.py                   # 模块级 API
-│   ├── _node.py                  # 内部 P2P 节点运行时
-│   ├── task.py / flow.py         # Task / Flow / @flow / parallel()
-│   ├── result.py                 # AsyncResult / 工作流结果查询
-│   ├── _serialization.py         # 载荷编码、Rust 枚举编解码
-│   ├── _orchestration.py         # Python 侧编排循环
-│   ├── _annotations.py           # Task 注解上下文（批量选项注入）
-│   ├── _components.py            # 可组合内部组件接口（扩展点）
-│   ├── _dag.py                   # DAG 工具：循环检测与路径格式化
-│   ├── _events.py                # 全局事件订阅系统
-│   ├── _observability.py         # viztracer 集成
-│   ├── router.py / actor.py / supervision.py
-│   ├── config.py / exceptions.py / _logging.py
-│   ├── cli/                      # CLI 子命令
-│   ├── _task_context.py          # 协作式取消
-│   ├── actant.pyi                # PyO3 类型存根
-│   └── py.typed                  # PEP 561 标记
+│   ├── observability.rs          # tracing 初始化与日志回调桥
+│   ├── test_support.rs           # 测试辅助（仅 cfg(test)）
+│   └── lib.rs
+├── actant/                       # Python 封装（第 2 层）
+│   ├── __init__.py               # 顶层 re-export：Runtime / Layer / ask/perform/emit / capability / ctx 类型
+│   ├── _runtime.py               # Runtime + Layer + effect dispatcher + 默认 handler（LocalRouter/FifoScheduler/NoRetryPolicy）
+│   ├── _effects.py               # ask / perform / emit / effect / impossible
+│   ├── capabilities.py           # 内置 13 capability 声明、ctx dataclass、Handler Protocol
+│   ├── exceptions.py             # ActantError 层级，kind 镜像 Rust
+│   ├── cli.py                    # `actant worker` CLI 入口
+│   ├── actant.pyi                # PyO3 模块类型存根
+│   └── py.typed
+├── examples/                     # 可运行示例
+│   ├── quickstart.py             # ERH 全流程：Runtime/ask/perform/emit/impossible
+│   ├── custom_capability.py      # 自定义 capability、handler 链组合、Protocol 约定
+│   └── github_analyzer/          # 大型示例：真实 GitHub issues/PRs 分析流水线
+│       ├── __init__.py / __main__.py
+│       ├── github_client.py      # urllib 真实 HTTP + 本地缓存
+│       ├── models.py             # IssueRecord / RepoStats / AnalysisReport
+│       ├── handlers.py           # 10 个 capability handler（路由/调度/重试/限流/拉取/聚合/存储/指标/审计）
+│       └── pipeline.py           # 编排：限流→重试拉取→路由→优先级调度→聚合→持久化
 ├── benches/                      # Rust 基准测试（criterion）
-├── tests/                        # 测试套件
-├── examples/                     # 用法示例
+├── tests/                        # 测试套件（unit / integration / e2e）
 ├── Cargo.toml                    # Rust 依赖
 └── pyproject.toml                # Python 项目配置
 ```
+
+## Worker 运行模型
+
+Actant 是 P2P 对等混合架构：每个节点同时是编排器与执行器，启动一个 `Runtime` 即在该节点上自动启动一个 `Worker`（含 `SchedulerActor`，负责并发槽位、任务超时、优雅 drain）。与 ray/prefect/celery 等中心化系统不同，**无需连接中心服务器**——节点通过 iroh P2P 自动发现对端。
+
+`Runtime.with_defaults()` 注册内置 handler（本地路由 / FIFO 调度 / 无重试）并以默认配置构造 `_RuntimeCore`，Worker 随之启动。`rt.serve()` 在 tokio 后台 spawn worker 守护循环（订阅 P2P topic + 任务执行循环），非阻塞——调用方线程可继续执行编排逻辑。开发期 P2P 发现默认走 `local` preset（本地网络自动发现对端节点），无需手动配置 bootstrap。
+
+### Worker 可调参数
+
+Worker 行为由 `actant.actant._ActantConfig` 控制。当前高层 `Runtime` 使用默认值；需要调优时通过 PyO3 直建路径传入自定义 config（高层 API 暂未暴露 config 入口，属 P7 待同步项）：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `max_concurrent_tasks` | CPU 核数 | 单节点最大并发任务数 |
+| `default_task_timeout_ms` | 30000 | 任务默认超时（毫秒） |
+| `drain_timeout_secs` | 30 | 退出时等待在途任务的最长时间 |
+| `remote_fallback_delay_ms` | 500 | 本地无法执行的任务重新入队前的延迟 |
+| `scheduler` | `"priority"` | 调度器类型（`"priority"` / `"fifo"`） |
+
+任务超时、重试、远程回退由 Worker 与 `FailoverActor`、`SchedulerActor` 协同处理；Python 层通过 `Execute` capability 覆盖执行行为，通过 `RetryPolicy` 覆盖重试决策。`WorkerError` 异常镜像 Rust 侧 Worker 运行时错误。
 
 ## 技术栈
 
@@ -83,10 +131,6 @@ mypy actant                               # Python 类型检查
 
 cargo bench --bench scheduler              # Rust 基准测试
 cargo audit                               # 依赖漏洞扫描
-
-actant worker start                       # 启动 worker 节点
-actant worker start --daemon              # 后台守护进程
-actant status workflows                   # 列出活跃工作流
 ```
 
 ## 工作准则
@@ -103,6 +147,7 @@ actant status workflows                   # 列出活跃工作流
 - 遵循 `cargo clippy` 与 `cargo fmt`，不抑制告警。
 - 所有日志使用 `tracing`（不使用 `println!`）。
 - 错误处理：使用 `Result<T, ActantError>` + `thiserror` 派生枚举。库代码不 panic。
+- **生产代码禁止 `unwrap()`/`expect()`**：用 `?` 传播错误；Mutex 优先使用 `parking_lot::Mutex`（无 poison）；PyO3 `#[new]` 和 fallible 方法返回 `PyResult`。
 - 异步测试用 `#[tokio::test]`，单元测试放在同文件 `#[cfg(test)] mod tests` 中。
 
 ### Python
@@ -111,6 +156,8 @@ actant status workflows                   # 列出活跃工作流
 - 未经用户明确要求不修改公共 API。
 - 避免延迟导入，除非为打破循环依赖。
 - 异常层级镜像 Rust `ActantError`，通过 `raise_for_kind()` / `raise_for_state()` 抛出。
+- **禁止裸 `except Exception` 吞错误**：`emit` 等批量回调允许捕获但须提供可配置的错误策略（`"log"` / `"raise"` / `"collect"`）；`Runtime.stop()` 等关键路径捕获异常后必须向上传播。
+- 资源对象（文件句柄、连接）须实现 `__enter__`/`__exit__` 上下文管理器或使用 `try/finally` 确保释放。
 
 ## 测试
 
@@ -118,24 +165,3 @@ actant status workflows                   # 列出活跃工作流
 - 测试必须确定性；外部依赖需 mock。
 - 端到端测试用 `threading.Event` 做就绪信号。
 - Rust 基准测试：`cargo bench --bench <name>`
-
-## 按任务速查关键文件
-
-| 任务 | 阅读顺序 |
-|------|----------|
-| 理解调度模型 | `src/orchestrator/` → `src/worker/` → `actant/_orchestration.py` |
-| 理解 DAG 构造 | `src/orchestrator/dag.rs` → `actant/flow.py` → `actant/task.py` |
-| 理解 PyO3 边界 | `src/py/runtime.rs` → `actant/_node.py` → `actant/actant.pyi` |
-| 理解持久化 | `src/store/` → `src/common/config.rs` |
-| 理解网络与发现 | `src/network/` → `actant/config.py`（NetworkConfig） |
-| 理解 Actor 系统 | `src/actor/` → `actant/actor.py` → `actant/supervision.py` |
-| 添加 Python DSL 语法糖 | `actant/task.py` → `actant/flow.py` → `actant/_api.py` |
-| 配置 | `actant/config.py` → `src/common/config.rs` |
-| CLI | `actant/cli/` → `actant/_node.py` |
-
-## API 稳定性策略
-
-- **当前 MSRV：Rust 1.75**（声明于 `Cargo.toml` 的 `rust-version`）。
-- CI 必须在 MSRV + stable + beta 三个工具链上通过。
-- **0.1.0 发布后 Rust 核心 API 进入冻结状态**；新增功能优先在 Python 层实现，仅当涉及调度、持久化、网络等核心运行时再修改 Rust 核心。
-- **1.0.0 前所有层级的公共 API 均不保证向后兼容**，破坏性变更通过版本号 0.x 递增体现。

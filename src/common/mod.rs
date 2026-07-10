@@ -58,7 +58,8 @@ pub(crate) use wire::{
 };
 // 请求-响应协议所需类型（公共 API）
 pub use payload::{pack_group, pack_single};
-pub use serialization::{deserialize_rkyv_value, serialize_rkyv};
+pub use serialization::MAX_DECODE_SIZE;
+pub use serialization::{decode_postcard, deserialize_rkyv_value, serialize_rkyv};
 pub use wire::WireTaskOutcome;
 
 // 仅供测试使用的内部类型 — 不属于稳定公共 API

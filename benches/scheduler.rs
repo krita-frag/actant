@@ -1,12 +1,13 @@
 //! 调度器基准测试。
 //!
-//! 测量热点路径：
-//! - `PriorityScheduler::enqueue` / `dequeue` — BTreeMap + VecDeque 操作
-//! - `FifoScheduler::enqueue` / `dequeue` — VecDeque 操作
+//! 测量热点路径（通过 ActorScheduler → SchedulerActor 端到端）：
+//! - `enqueue` / `dequeue` — 优先级与 FIFO 两种 SchedulerActor
 //! - `enqueue_batch` — 批量入队
-//! - `dequeue_batch` — 批量出队（优先级排序）
+//! - `dequeue_batch` — 批量出队
 //!
-//! 调度器为异步 API，使用 tokio runtime 驱动。
+//! P4 Actor 化重构后，调度状态由 SchedulerActor 持有，客户端通过 ActorSystem
+//! 消息协议转发请求。本基准测量端到端开销（含消息编解码与 actor 调度），
+//! 反映真实生产路径。
 //!
 //! 运行：`cargo bench --bench scheduler`
 
@@ -15,8 +16,11 @@ use std::sync::Arc;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use tokio::runtime::Runtime;
 
-use actant::common::{RetryPolicy, TaskDefinition, TaskId, WorkflowId};
-use actant::orchestrator::{FifoScheduler, PriorityScheduler, Scheduler};
+use actant::common::{ActorId, RetryPolicy, TaskDefinition, TaskId, WorkflowId};
+use actant::runtime::actor::ActorSystem;
+use actant::runtime::workflow::{
+    fifo_scheduler_actor, priority_scheduler_actor, ActorScheduler, Scheduler,
+};
 
 fn make_task(idx: usize, priority: i32) -> TaskDefinition {
     TaskDefinition {
@@ -36,13 +40,31 @@ fn make_task(idx: usize, priority: i32) -> TaskDefinition {
     }
 }
 
+/// 启动一个 priority SchedulerActor 并返回客户端。
+fn priority_client(rt: &Runtime) -> Arc<dyn Scheduler> {
+    let actor_system = Arc::new(ActorSystem::new());
+    let actor_id = ActorId::new("sched-priority-bench".to_string());
+    rt.block_on(actor_system.spawn(actor_id.clone(), priority_scheduler_actor()))
+        .unwrap();
+    Arc::new(ActorScheduler::new(actor_id, actor_system))
+}
+
+/// 启动一个 fifo SchedulerActor 并返回客户端。
+fn fifo_client(rt: &Runtime) -> Arc<dyn Scheduler> {
+    let actor_system = Arc::new(ActorSystem::new());
+    let actor_id = ActorId::new("sched-fifo-bench".to_string());
+    rt.block_on(actor_system.spawn(actor_id.clone(), fifo_scheduler_actor()))
+        .unwrap();
+    Arc::new(ActorScheduler::new(actor_id, actor_system))
+}
+
 fn bench_enqueue_priority(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     let mut group = c.benchmark_group("scheduler/priority/enqueue");
     for &n in &[1_000usize, 10_000] {
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
             b.iter(|| {
-                let sched: Arc<dyn Scheduler> = Arc::new(PriorityScheduler::new());
+                let sched = priority_client(&rt);
                 rt.block_on(async {
                     for i in 0..n {
                         let _ = sched.enqueue(make_task(i, (i % 10) as i32 - 5)).await;
@@ -62,7 +84,7 @@ fn bench_dequeue_priority(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
             b.iter_batched(
                 || {
-                    let sched: Arc<dyn Scheduler> = Arc::new(PriorityScheduler::new());
+                    let sched = priority_client(&rt);
                     rt.block_on(async {
                         for i in 0..n {
                             let _ = sched.enqueue(make_task(i, (i % 10) as i32 - 5)).await;
@@ -93,12 +115,12 @@ fn bench_enqueue_batch_priority(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
             b.iter_batched(
                 || {
-                    let tasks: Vec<TaskDefinition> =
-                        (0..n).map(|i| make_task(i, (i % 10) as i32 - 5)).collect();
-                    tasks
+                    (0..n)
+                        .map(|i| make_task(i, (i % 10) as i32 - 5))
+                        .collect::<Vec<_>>()
                 },
                 |tasks| {
-                    let sched: Arc<dyn Scheduler> = Arc::new(PriorityScheduler::new());
+                    let sched = priority_client(&rt);
                     rt.block_on(async {
                         let _ = sched.enqueue_batch(tasks).await;
                         black_box(&sched);
@@ -117,7 +139,7 @@ fn bench_enqueue_fifo(c: &mut Criterion) {
     for &n in &[1_000usize, 10_000] {
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
             b.iter(|| {
-                let sched: Arc<dyn Scheduler> = Arc::new(FifoScheduler::new());
+                let sched = fifo_client(&rt);
                 rt.block_on(async {
                     for i in 0..n {
                         let _ = sched.enqueue(make_task(i, 0)).await;
@@ -137,7 +159,7 @@ fn bench_dequeue_batch_priority(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
             b.iter_batched(
                 || {
-                    let sched: Arc<dyn Scheduler> = Arc::new(PriorityScheduler::new());
+                    let sched = priority_client(&rt);
                     rt.block_on(async {
                         for i in 0..n {
                             let _ = sched.enqueue(make_task(i, (i % 10) as i32 - 5)).await;

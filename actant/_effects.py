@@ -14,12 +14,13 @@ Handler 通过 `Runtime.layer(name, kind).chain(handler)` 注册。
 
 from __future__ import annotations
 
-from typing import Any, NoReturn, Optional
+from typing import Any, NoReturn
 
-from actant._runtime import get_current_runtime
+from actant._runtime import Runtime, get_current_runtime
+from actant.capabilities import CapabilityMeta
 
 
-def _resolve_meta(name: str):
+def _resolve_meta(name: str) -> tuple[Runtime, CapabilityMeta]:
     """从当前 Runtime 解析 capability 元数据。"""
     runtime = get_current_runtime()
     if runtime is None:
@@ -29,7 +30,7 @@ def _resolve_meta(name: str):
     return runtime, runtime.capability_meta(name)
 
 
-def ask(name: str, request: Any) -> Optional[Any]:
+def ask(name: str, request: Any) -> Any | None:
     """决策型 effect：请求 capability，返回第一个非 `None` 的 handler 结果。
 
     Args:
@@ -73,23 +74,30 @@ def perform(name: str, request: Any) -> Any:
     return runtime._dispatch_perform(name, request)
 
 
-def emit(name: str, request: Any) -> None:
+def emit(name: str, request: Any, *, on_error: str = "log") -> None:
     """反应型 effect：触发所有订阅该 capability 的 handler。
 
     Args:
         name: capability 名称。
         request: 事件 payload。
+        on_error: 错误处理策略。``"log"``（默认）记录 warning 继续执行；
+            ``"raise"`` 首个失败立即抛出；``"collect"`` 聚合所有错误后抛出。
 
     Raises:
         RuntimeError: 当前未在 Runtime 上下文中，或 capability 未注册。
         KeyError: capability 未注册。
+        ValueError: ``on_error`` 不是合法值。
     """
+    if on_error not in ("log", "raise", "collect"):
+        raise ValueError(
+            f"on_error must be 'log'/'raise'/'collect', got {on_error!r}"
+        )
     runtime, meta = _resolve_meta(name)
     if meta.kind != "emit":
         raise RuntimeError(
             f"emit: capability {name!r} is {meta.kind!r}, not 'emit'"
         )
-    runtime._dispatch_emit(name, request)
+    runtime._dispatch_emit(name, request, on_error=on_error)
 
 
 def effect(name: str, kind: str, request: Any) -> Any:

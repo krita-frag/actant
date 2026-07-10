@@ -13,8 +13,14 @@
 use std::hint::black_box;
 use std::sync::Arc;
 
-use actant::common::{serialize_rkyv, RetryPolicy, TaskDefinition, TaskId, WorkflowId};
-use actant::orchestrator::{Dag, DagNode, FifoScheduler, PriorityScheduler, Scheduler};
+use actant::common::{
+    serialize_rkyv, ActorId, RetryPolicy, StoreConfig, TaskDefinition, TaskId, WorkflowId,
+};
+use actant::runtime::actor::ActorSystem;
+use actant::runtime::state::Store;
+use actant::runtime::workflow::{
+    fifo_scheduler_actor, priority_scheduler_actor, ActorScheduler, Dag, DagNode, Scheduler,
+};
 
 // dhat 全局分配器 — 仅在此 bench 二进制中注册，启用 dhat-heap feature 时生效。
 #[global_allocator]
@@ -62,6 +68,28 @@ fn make_task(idx: usize) -> TaskDefinition {
     }
 }
 
+/// 启动一个 priority SchedulerActor 并返回客户端。
+fn priority_client(
+    rt: &tokio::runtime::Runtime,
+    actor_system: &Arc<ActorSystem>,
+) -> Arc<dyn Scheduler> {
+    let actor_id = ActorId::new("mem-profile-priority".to_string());
+    rt.block_on(actor_system.spawn(actor_id.clone(), priority_scheduler_actor()))
+        .unwrap();
+    Arc::new(ActorScheduler::new(actor_id, actor_system.clone()))
+}
+
+/// 启动一个 fifo SchedulerActor 并返回客户端。
+fn fifo_client(
+    rt: &tokio::runtime::Runtime,
+    actor_system: &Arc<ActorSystem>,
+) -> Arc<dyn Scheduler> {
+    let actor_id = ActorId::new("mem-profile-fifo".to_string());
+    rt.block_on(actor_system.spawn(actor_id.clone(), fifo_scheduler_actor()))
+        .unwrap();
+    Arc::new(ActorScheduler::new(actor_id, actor_system.clone()))
+}
+
 fn main() {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
@@ -82,8 +110,11 @@ fn main() {
     );
     black_box(&dag_bytes);
 
+    // 共享 ActorSystem 供两个 scheduler 基准使用。
+    let actor_system = Arc::new(ActorSystem::new());
+
     // 3. PriorityScheduler 入队 10000 任务
-    let sched_p: Arc<dyn Scheduler> = Arc::new(PriorityScheduler::new());
+    let sched_p = priority_client(&rt, &actor_system);
     rt.block_on(async {
         for i in 0..10_000 {
             let _ = sched_p.enqueue(make_task(i)).await;
@@ -92,7 +123,7 @@ fn main() {
     eprintln!("[mem] 3/5 priority enqueue 10000 done");
 
     // 4. FifoScheduler 入队 10000 任务
-    let sched_f: Arc<dyn Scheduler> = Arc::new(FifoScheduler::new());
+    let sched_f = fifo_client(&rt, &actor_system);
     rt.block_on(async {
         for i in 0..10_000 {
             let _ = sched_f.enqueue(make_task(i)).await;
@@ -102,13 +133,13 @@ fn main() {
 
     // 5. Store put_batch 1000 键
     let dir = tempfile::tempdir().unwrap();
-    let store =
-        actant::store::Store::open_with_config(dir.path(), &actant::common::StoreConfig::default())
-            .unwrap();
+    let store = rt
+        .block_on(Store::open_with_config(dir.path(), StoreConfig::default()))
+        .unwrap();
     let entries: Vec<(String, Vec<u8>)> = (0..1000)
         .map(|i| (format!("key-{i}"), vec![0u8; 128]))
         .collect();
-    store.put_batch(&entries).unwrap();
+    rt.block_on(store.put_batch(&entries)).unwrap();
     eprintln!("[mem] 5/5 store put_batch 1000 done");
 
     eprintln!("[mem] memory profiling complete — see dhat-heap.json for full per-site report");

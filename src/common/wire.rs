@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use super::model::{
     ActorId, ActorMessageResult, MessageId, NodeId, TaskDefinition, TaskId, WorkflowId,
 };
-use crate::store::hlc::HlcTimestamp;
+use crate::runtime::state::HlcTimestamp;
 
 /// 网络协议常量 — 所有魔法字符串与数值限制的唯一真相来源。
 ///
@@ -25,6 +25,12 @@ pub mod constants {
     pub const TOPIC_ACTOR_REPLY_PREFIX: &str = "actant:actor-reply:";
     pub const TOPIC_WORKFLOW_STATE_REQ: &str = "actant:wf-state-req:";
     pub const TOPIC_WORKFLOW_STATE_RESP_PREFIX: &str = "actant:wf-state-resp:";
+    /// Capability gossip 话题。
+    ///
+    /// 注意：与其他 `actant:` 前缀的 gossip topic 不同，此 topic 使用 `actant://` 前缀。
+    /// 这是因为 capability gossip 走 `network.gossip_broadcast` 路径（直传字符串），不经过
+    /// `Topic` 构造器；保持稳定字符串便于跨版本兼容性审计。
+    pub const TOPIC_CAPABILITY_GOSSIP: &str = "actant://capability/gossip";
 
     // --- LMDB 持久化存储键前缀 ---
 
@@ -252,7 +258,8 @@ impl WireEnvelope {
     ///
     /// 反序列化失败或协议版本不兼容时返回 `None`（并记录告警）。
     pub fn decode(payload: &[u8]) -> Option<WireMessage> {
-        let envelope = match postcard::from_bytes::<WireEnvelope>(payload) {
+        // 远端 gossip 输入：先校验大小上限，避免恶意嵌套结构 OOM。
+        let envelope = match crate::common::decode_postcard::<WireEnvelope>(payload) {
             Ok(env) => env,
             Err(e) => {
                 tracing::warn!(

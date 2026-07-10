@@ -19,10 +19,6 @@ use opentelemetry_sdk::metrics::SdkMeterProvider;
 use parking_lot::Mutex;
 use prometheus::{Registry, TextEncoder};
 
-// ---------------------------------------------------------------------------
-// Instrument 定义
-// ---------------------------------------------------------------------------
-
 /// 所有 Actant 指标的类型化 OTel instrument。
 struct Instruments {
     // -- 任务计数器 --
@@ -37,6 +33,7 @@ struct Instruments {
     workflows_completed: Counter<u64>,
     workflows_failed: Counter<u64>,
     workflow_timeouts: Counter<u64>,
+    workflows_recovered_corrupt: Counter<u64>,
     retry_scheduled: Counter<u64>,
 
     // -- Gossip 计数器 --
@@ -127,6 +124,10 @@ impl Instruments {
             workflow_timeouts: meter
                 .u64_counter("actant.workflows.timeouts")
                 .with_description("Workflows timed out")
+                .build(),
+            workflows_recovered_corrupt: meter
+                .u64_counter("actant.workflows.recovered_corrupt")
+                .with_description("Workflows dropped during recovery due to corrupt persisted data")
                 .build(),
             retry_scheduled: meter
                 .u64_counter("actant.retry.scheduled")
@@ -278,10 +279,6 @@ impl Instruments {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 全局状态
-// ---------------------------------------------------------------------------
-
 /// 包装为 `Arc`，使 `Instruments` 句柄可从锁中克隆并在不持有锁的情况下使用。
 /// OTel instrument 句柄克隆开销很小。
 static INSTRUMENTS: Mutex<Option<Arc<Instruments>>> = Mutex::new(None);
@@ -301,10 +298,6 @@ fn instruments() -> Arc<Instruments> {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// 初始化
-// ---------------------------------------------------------------------------
 
 /// 初始化带 Prometheus exporter 的 OpenTelemetry 指标管道。
 ///
@@ -350,12 +343,6 @@ pub fn prometheus_text() -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 公共便捷函数 — 每个指标一个
-// ---------------------------------------------------------------------------
-
-// -- 任务计数器 --
-
 pub fn inc_tasks_submitted() {
     instruments().tasks_submitted.add(1, &[]);
 }
@@ -376,8 +363,6 @@ pub fn inc_tasks_retried() {
     instruments().tasks_retried.add(1, &[]);
 }
 
-// -- 工作流计数器 --
-
 pub fn inc_workflows_submitted() {
     instruments().workflows_submitted.add(1, &[]);
 }
@@ -394,11 +379,15 @@ pub fn inc_workflow_timeouts() {
     instruments().workflow_timeouts.add(1, &[]);
 }
 
+/// 因持久化数据损坏而在恢复期间被整体丢弃的 workflow 计数。
+pub fn inc_workflows_recovered_corrupt() {
+    instruments().workflows_recovered_corrupt.add(1, &[]);
+}
+
 pub fn inc_retry_scheduled() {
     instruments().retry_scheduled.add(1, &[]);
 }
 
-// -- Gossip 计数器 --
 
 pub fn inc_gossip_updates_sent() {
     instruments().gossip_updates_sent.add(1, &[]);
@@ -412,7 +401,6 @@ pub fn inc_gossip_updates_dropped() {
     instruments().gossip_updates_dropped.add(1, &[]);
 }
 
-// -- 故障转移计数器 --
 
 pub fn inc_heartbeats_sent() {
     instruments().heartbeats_sent.add(1, &[]);
@@ -426,8 +414,6 @@ pub fn inc_failover_reschedules() {
     instruments().failover_reschedules.add(1, &[]);
 }
 
-// -- Actor 计数器 --
-
 pub fn inc_actors_spawned() {
     instruments().actors_spawned.add(1, &[]);
 }
@@ -439,8 +425,6 @@ pub fn inc_actors_stopped() {
 pub fn inc_actors_failed() {
     instruments().actors_failed.add(1, &[]);
 }
-
-// -- 网络 / 事件总线计数器 --
 
 pub fn inc_direct_requests_capacity_exceeded() {
     instruments().direct_requests_capacity_exceeded.add(1, &[]);
@@ -458,8 +442,6 @@ pub fn inc_event_bus_dropped_events() {
     instruments().event_bus_dropped_events.add(1, &[]);
 }
 
-// -- 任务转发计数器 --
-
 pub fn inc_task_forward_succeeded() {
     instruments().task_forward_succeeded.add(1, &[]);
 }
@@ -476,7 +458,6 @@ pub fn inc_task_forward_reroute() {
     instruments().task_forward_reroute.add(1, &[]);
 }
 
-// -- UpDownCounter --
 
 pub fn inc_running_tasks() {
     instruments().running_tasks.add(1, &[]);
@@ -509,8 +490,6 @@ pub fn inc_connected_peers() {
 pub fn dec_connected_peers() {
     instruments().connected_peers.add(-1, &[]);
 }
-
-// -- 直方图 --
 
 pub fn observe_task_duration_ms(value: u64) {
     instruments().task_duration_ms.record(value, &[]);

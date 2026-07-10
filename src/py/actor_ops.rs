@@ -2,13 +2,13 @@ use std::sync::Arc;
 
 use pyo3::prelude::*;
 
-use crate::actor::ActorSystem;
 use crate::common::ActorId;
+use crate::runtime::actor::ActorSystem;
 use dashmap::DashMap;
 
 use super::actor::PythonActor;
-use super::awaitable::{future_into_py_iter, FutureResultToPy};
 use super::gil_thread::GilThread;
+use super::types::{future_into_py_iter, FutureResultToPy};
 
 #[pyclass(name = "_ActorCore", skip_from_py_object)]
 #[derive(Clone)]
@@ -19,25 +19,6 @@ pub struct PyActorCore {
     /// 存储 actor 的 Python dispatcher 引用，以便原子重启，
     /// 无需 Python 端单独跟踪和传递 dispatcher。
     dispatchers: Arc<DashMap<String, Py<PyAny>>>,
-}
-
-impl PyActorCore {
-    /// 使用来自 PyRuntimeCore 的共享 dispatcher 注册表创建。
-    /// 这允许 restart_actor 查找通过 create_actor/create_actor_with_id
-    /// 创建 actor 时注册的 dispatcher。
-    pub(crate) fn new_with_dispatchers(
-        system: Arc<ActorSystem>,
-        tokio_handle: tokio::runtime::Handle,
-        gil_thread: GilThread,
-        dispatchers: Arc<DashMap<String, Py<PyAny>>>,
-    ) -> Self {
-        Self {
-            system,
-            tokio_handle,
-            gil_thread,
-            dispatchers,
-        }
-    }
 }
 
 #[pymethods]
@@ -58,7 +39,7 @@ impl PyActorCore {
             self.tokio_handle.clone(),
             &self.gil_thread,
             async move {
-                match system.call(&actor_id_obj, method, payload).await {
+                match system.call(&actor_id_obj, &method, payload).await {
                     Ok(result) => {
                         if let Some(err) = result.error {
                             Python::attach(|_py| {
@@ -92,20 +73,25 @@ impl PyActorCore {
             .map_err(pyo3::PyErr::from)?;
         // 清理 dispatcher 引用，避免 actor 停止后 Python 可调用对象泄漏。
         // restart_actor 不经过此路径（直接调用 system.kill），故不受影响。
-        let _ = dispatchers.remove(&id_for_cleanup);
+        if dispatchers.remove(&id_for_cleanup).is_none() {
+            // 可选：记录警告，actor 停止时未找到对应的 dispatcher
+            eprintln!("warning: actor {} stopped but no dispatcher found", id_for_cleanup);
+        }
         Ok(())
     }
 
     fn kill_actor(&self, py: Python<'_>, actor_id: String) -> PyResult<()> {
         let system = self.system.clone();
-        let handle = self.tokio_handle.clone();
         let dispatchers = self.dispatchers.clone();
         let id_for_cleanup = actor_id.clone();
-        py.detach(|| handle.block_on(async { system.kill(&ActorId::from(actor_id)).await }))
+        py.detach(move || system.kill(&ActorId::from(actor_id)))
             .map_err(pyo3::PyErr::from)?;
         // 清理 dispatcher 引用，避免 actor 终止后 Python 可调用对象泄漏。
         // restart_actor 不经过此路径（直接调用 system.kill），故不受影响。
-        let _ = dispatchers.remove(&id_for_cleanup);
+        if dispatchers.remove(&id_for_cleanup).is_none() {
+            // 可选：记录警告，actor 终止时未找到对应的 dispatcher
+            eprintln!("warning: actor {} killed but no dispatcher found", id_for_cleanup);
+        }
         Ok(())
     }
 
@@ -120,7 +106,12 @@ impl PyActorCore {
         py.detach(|| {
             handle.block_on(async {
                 let aid = ActorId::from(actor_id.clone());
-                let _ = system.kill(&aid).await;
+                if let Err(e) = system.kill(&aid) {
+                    return Err(crate::common::ActantError::Actor(format!(
+                        "failed to kill actor {} during restart: {}",
+                        actor_id, e
+                    )));
+                }
                 let dispatcher =
                     Python::attach(|py| dispatchers.get(&actor_id).map(|d| d.clone_ref(py)));
                 if let Some(disp) = dispatcher {
@@ -150,8 +141,7 @@ impl PyActorCore {
 
     fn list_actors(&self, py: Python<'_>) -> PyResult<Vec<String>> {
         let system = self.system.clone();
-        let handle = self.tokio_handle.clone();
-        let actors = py.detach(move || handle.block_on(async move { system.list_actors().await }));
+        let actors = py.detach(move || system.list_actors());
         Ok(actors.into_iter().map(|a| a.to_string()).collect())
     }
 }

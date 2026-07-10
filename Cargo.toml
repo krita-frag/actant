@@ -1,9 +1,9 @@
 [package]
 name = "actant"
-version = "0.1.0"
+version = "0.2.0-alpha.1"
 edition = "2021"
 rust-version = "1.75"
-description = "基于 Actor 模型的跨平台通用分布式任务编排引擎 — 0.1.0"
+description = "基于 Actor 模型的跨平台通用分布式任务编排引擎 — 0.2.0-alpha.1"
 
 [dependencies]
 async-trait = "0.1"
@@ -99,6 +99,21 @@ required-features = []
 
 [[bench]]
 name = "store"
+harness = false
+required-features = []
+
+[[bench]]
+name = "actor_messaging"
+harness = false
+required-features = []
+
+[[bench]]
+name = "capability_dispatch"
+harness = false
+required-features = []
+
+[[bench]]
+name = "event_bus"
 harness = false
 required-features = []
 

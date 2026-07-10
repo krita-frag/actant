@@ -2,8 +2,8 @@ use async_trait::async_trait;
 
 use pyo3::prelude::*;
 
-use crate::actor::Actor;
 use crate::common::{ActorMessage, ActorMessageResult, Result};
+use crate::runtime::actor::Actor;
 
 pub struct PythonActor {
     actor_type: String,

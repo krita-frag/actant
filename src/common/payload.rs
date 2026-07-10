@@ -158,16 +158,11 @@ fn derive_key(key: &[u8]) -> [u8; 32] {
 ///
 /// 返回格式: `[MAC_PREFIX(4) | mac(32) | payload]`。
 ///
-/// # Errors
-///
-/// 若 `key` 为空返回 `Err`。空 key 不提供任何完整性保护，禁止签名。
-/// 正常配置路径下 `ActantConfig::validate` 已拦截空 key，此处为防御性检查，
-/// 确保 release 构建中直接调用 `sign` 也无法绕过。
+/// - 非空密钥：生成 BLAKE3 keyed MAC 并前置到 payload。
+/// - 空密钥：直接返回原始 payload，表示禁用签名验证（仅用于开发/测试）。
 pub fn sign(key: &[u8], payload: &[u8]) -> Result<Vec<u8>, String> {
     if key.is_empty() {
-        return Err(
-            "empty signing key rejected: cannot sign payload without integrity protection".into(),
-        );
+        return Ok(payload.to_vec());
     }
     let derived = derive_key(key);
     let mac = blake3::keyed_hash(&derived, payload);
@@ -179,9 +174,16 @@ pub fn sign(key: &[u8], payload: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 /// 验证并提取 payload。签名不匹配时返回 `Err`。
+///
+/// - 非空密钥：要求数据以 `MAC_PREFIX` 开头并验证 MAC；拒绝未签名 payload。
+/// - 空密钥：禁用签名验证，直接返回原始数据；若数据以 `MAC_PREFIX` 开头则报错，
+///   避免在禁用签名的节点上误处理本应签名的 payload。
 pub fn verify(key: &[u8], data: &[u8]) -> Result<Vec<u8>, String> {
     if key.is_empty() {
-        return Err("empty signing key rejected: cannot verify payload integrity".into());
+        if data.len() >= MAC_PREFIX.len() && &data[..MAC_PREFIX.len()] == MAC_PREFIX {
+            return Err("signing disabled but payload appears signed".into());
+        }
+        return Ok(data.to_vec());
     }
     if data.len() < MAC_PREFIX.len() + MAC_LEN {
         return Err("payload too short: missing MAC header".into());
@@ -281,17 +283,19 @@ mod tests {
     }
 
     #[test]
-    fn empty_key_rejected_for_verification() {
+    fn empty_key_rejects_signed_payload() {
         let signed = sign(b"non-empty-key", b"payload").unwrap();
         assert!(verify(b"", &signed).is_err());
     }
 
-    /// H1 回归：空 key 签名在 release 构建中也必须被拒绝。
-    ///
-    /// 旧实现用 `debug_assert!`，release 构建可绕过；新实现返回 `Err`。
+    /// 空 key 禁用签名：sign 直接返回原始 payload，verify 直接返回原始 data。
     #[test]
-    fn empty_key_rejected_for_signing() {
-        assert!(sign(b"", b"payload").is_err());
+    fn empty_key_disables_signing() {
+        let payload = b"plain payload";
+        let signed = sign(b"", payload).unwrap();
+        assert_eq!(&signed, payload);
+        let verified = verify(b"", payload).unwrap();
+        assert_eq!(&verified, payload);
     }
 
     /// 回归测试（SE1）：所有字节位错的 MAC 都应被拒绝，且不依赖前缀提前返回。

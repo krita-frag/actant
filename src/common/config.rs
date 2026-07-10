@@ -1,11 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-/// 发现模式 — 已注册的策略名称。
+/// 发现模式 — 内置策略名称。
 ///
 /// 包装 `String` 的新类型，构造须经过 [`DiscoveryMode::parse`] 校验。
 /// 未知名称在启动时返回 [`crate::common::ActantError::Config`] 而非静默回退默认值。
 ///
-/// 内置名称见 [`discovery_mode`] 模块。可通过 [`crate::network::discovery::register_discovery`] 注册新名称。
+/// 内置名称见 [`discovery_mode`] 模块。自定义发现策略应通过 Rust `Discovery` trait
+/// 扩展（纯 Rust 嵌入场景）或后续由 Python 层注入。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct DiscoveryMode(pub String);
@@ -23,13 +24,13 @@ impl DiscoveryMode {
     /// 仅当名称已在发现注册表中注册时返回 `Ok`，否则返回
     /// [`crate::common::ActantError::Config`] — 不做静默回退。
     pub fn parse(s: &str) -> Result<Self, crate::common::ActantError> {
-        if crate::network::discovery::is_registered(s) {
+        if crate::runtime::network::is_registered(s) {
             Ok(Self(s.to_string()))
         } else {
             Err(crate::common::ActantError::Config(format!(
                 "unknown discovery mode '{}': expected one of {}",
                 s,
-                crate::network::discovery::registered_names().join(", ")
+                crate::runtime::network::registered_names().join(", ")
             )))
         }
     }
@@ -57,6 +58,9 @@ impl std::fmt::Display for DiscoveryMode {
 }
 
 /// 内置发现模式常量。
+///
+/// 当前仅实现 `none` / `local` / `mdns` 三种策略。`dns` / `relay` 等策略
+/// 属于 0.2 预留，待实现后再加入常量，避免用户引用未支持的模式。
 pub mod discovery_mode {
     /// 无自动发现。须通过 `bootstrap_nodes` 或 `dial()` 显式拨号。用于测试和 CI。
     pub const NONE: &str = "none";
@@ -64,10 +68,6 @@ pub mod discovery_mode {
     pub const LOCAL: &str = "local";
     /// 仅局域网：n0 预设但禁用 relay。
     pub const MDNS: &str = "mdns";
-    /// 基于 DNS 的发现，适用于企业 / Kubernetes 部署。
-    pub const DNS: &str = "dns";
-    /// 仅 relay 发现，适用于跨 NAT 部署。
-    pub const RELAY: &str = "relay";
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -79,25 +79,24 @@ pub struct ActantConfig {
     pub store: StoreConfig,
     pub failover: FailoverConfig,
     pub gossip: GossipConfig,
-    pub event_bus: crate::event_bus::EventBusConfig,
-    /// 非空时，所有任务 payload 使用 BLAKE3 keyed hash 签名，
-    /// 反序列化前验证签名，防止恶意节点投递篡改 payload。
+    pub event_bus: crate::runtime::event_bus::EventBusConfig,
+    /// 任务 payload 签名密钥。
+    ///
+    /// - 非空时：所有任务 payload 使用 BLAKE3 keyed hash 签名，反序列化前验证签名，
+    ///   防止恶意节点投递篡改 payload（生产环境推荐）。
+    /// - 空时：禁用签名验证，payload 直接透传（仅用于开发/测试）。
     pub payload_signing_key: Vec<u8>,
 }
 
 impl ActantConfig {
-    /// 校验所有策略名称字段是否在对应注册表中，并确保关键安全字段有效。
+    /// 校验所有策略名称字段是否在对应注册表中。
     ///
-    /// 在启动时、反序列化或 PyConfig 转换后调用，
-    /// 以明确的错误拒绝未知发现模式、调度器类型和空 payload 签名密钥。
+    /// 在启动时、反序列化或 PyConfig 转换后调用，以明确的错误拒绝未知发现模式
+    /// 和调度器类型。payload 签名密钥允许为空，表示禁用签名验证。
     pub fn validate(&self) -> Result<(), crate::common::ActantError> {
         self.worker.scheduler_kind.validate()?;
         self.network.discovery_mode.validate()?;
-        if self.payload_signing_key.is_empty() {
-            return Err(crate::common::ActantError::Config(
-                "payload_signing_key must be non-empty: provide a shared secret to protect task payloads".into(),
-            ));
-        }
+        self.failover.validate()?;
         Ok(())
     }
 }
@@ -114,6 +113,9 @@ pub struct ActorConfig {
     pub supervision_event_capacity: usize,
     /// WAL 压缩后每个 Actor 保留的最新检查点数量。旧检查点将被清理。默认为 1。
     pub checkpoint_retention_count: usize,
+    /// 单个 Actor stop 超时（毫秒）。超时后放弃等待，使 shutdown 路径总能完成
+    /// （如 network.shutdown）。默认 500ms（M1 改进：从硬编码提取为配置）。
+    pub stop_timeout_ms: u64,
 }
 
 impl Default for ActorConfig {
@@ -126,16 +128,18 @@ impl Default for ActorConfig {
             wal_compaction_interval_secs: 60,
             supervision_event_capacity: 256,
             checkpoint_retention_count: 1,
+            stop_timeout_ms: 500,
         }
     }
 }
 
-/// 调度器类型 — 已注册的策略名称。
+/// 调度器类型 — 内置策略名称。
 ///
 /// 包装 `String` 的新类型，通过 [`SchedulerKind::parse`] 校验。
 /// 未知名称在启动时返回 [`crate::common::ActantError::Config`] 而非静默回退默认值。
 ///
-/// 内置名称见 [`scheduler_kind`] 模块。可通过 [`crate::orchestrator::scheduler::register_scheduler`] 注册新名称。
+/// 内置名称见 [`scheduler_kind`] 模块。自定义调度策略应通过 Rust `Scheduler` trait
+/// 扩展（纯 Rust 嵌入场景）或后续由 Python 层注入。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SchedulerKind(pub String);
@@ -148,13 +152,13 @@ impl SchedulerKind {
 
     /// 校验构造器 — 检查调度器注册表。
     pub fn parse(s: &str) -> Result<Self, crate::common::ActantError> {
-        if crate::orchestrator::scheduler::is_registered(s) {
+        if crate::runtime::workflow::scheduler::is_registered(s) {
             Ok(Self(s.to_string()))
         } else {
             Err(crate::common::ActantError::Config(format!(
                 "unknown scheduler kind '{}': expected one of {}",
                 s,
-                crate::orchestrator::scheduler::registered_names().join(", ")
+                crate::runtime::workflow::scheduler::registered_names().join(", ")
             )))
         }
     }
@@ -274,6 +278,24 @@ pub struct NetworkConfig {
     /// iroh 绑定的 IPv4 监听 IP。空字符串或 "0.0.0.0" = 所有接口（默认）。
     #[serde(default)]
     pub listen_ip: String,
+    /// Capability gossip 广播间隔（毫秒）。默认 60 秒。
+    #[serde(default = "default_capability_gossip_interval_ms")]
+    pub capability_gossip_interval_ms: u64,
+    /// 网络事件有界通道容量。
+    ///
+    /// `NetworkManager` 内部使用此容量的 `mpsc::channel` 缓冲 `NetworkEvent`。
+    /// 当事件生产速率超过消费速率时，新事件被丢弃（仅记录日志）以避免无界队列导致 OOM。
+    /// 高吞吐场景下应适当增大此值。默认 1024。
+    #[serde(default = "default_event_channel_capacity")]
+    pub event_channel_capacity: usize,
+}
+
+fn default_capability_gossip_interval_ms() -> u64 {
+    NetworkConfig::DEFAULT_CAPABILITY_GOSSIP_INTERVAL_MS
+}
+
+fn default_event_channel_capacity() -> usize {
+    NetworkConfig::DEFAULT_EVENT_CHANNEL_CAPACITY
 }
 
 impl NetworkConfig {
@@ -285,6 +307,10 @@ impl NetworkConfig {
     pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
     /// 默认直连请求-响应超时（30s）。
     pub const DEFAULT_DIRECT_REQUEST_TIMEOUT_MS: u64 = 30_000;
+    /// 默认 capability gossip 广播间隔（60s）。
+    pub const DEFAULT_CAPABILITY_GOSSIP_INTERVAL_MS: u64 = 60_000;
+    /// 默认网络事件通道容量。
+    pub const DEFAULT_EVENT_CHANNEL_CAPACITY: usize = 1024;
 }
 
 fn default_direct_request_timeout_ms() -> u64 {
@@ -312,6 +338,8 @@ impl Default for NetworkConfig {
             direct_request_timeout_ms: default_direct_request_timeout_ms(),
             listen_port: 0,
             listen_ip: String::new(),
+            capability_gossip_interval_ms: default_capability_gossip_interval_ms(),
+            event_channel_capacity: default_event_channel_capacity(),
         }
     }
 }
@@ -356,11 +384,69 @@ impl Default for StoreConfig {
     }
 }
 
+/// 故障转移相关时序参数。
+///
+/// # 参数关系
+///
+/// 四个时序参数共同决定故障检测与工作流接管的行为，必须满足以下关系：
+///
+/// ```text
+/// heartbeat_interval_ms < failure_timeout_ms < lease_duration_ms
+///                                          <
+///                            lease_expiry_check_interval_secs * 1000
+///                                            (建议，非硬性约束)
+/// ```
+///
+/// - **`heartbeat_interval_ms`**：节点发送心跳的间隔。必须远小于
+///   `failure_timeout_ms`，以确保在超时窗口内至少有 2-3 次心跳机会，
+///   避免网络抖动导致误判。建议 `failure_timeout_ms >= heartbeat_interval_ms * 3`。
+///
+/// - **`failure_timeout_ms`**：判定节点失联的超时阈值。超过此时间未收到心跳即认为
+///   节点故障。必须小于 `lease_duration_ms`，否则旧持有者的租约尚未过期，
+///   新节点无法安全接管工作流，可能导致双主。
+///
+/// - **`lease_duration_ms`**：工作流租约时长。持有者必须在此时间内续约，否则租约过期，
+///   其他节点可竞争接管。默认 = `failure_timeout_ms * 2`，确保故障检测（约
+///   `failure_timeout_ms`）完成后仍有充足时间让原持有者的租约自然过期。
+///
+/// - **`lease_expiry_check_interval_secs`**：租约过期扫描周期。此值决定了从租约实际
+///   过期到被检测到的延迟。建议 `lease_expiry_check_interval_secs * 1000 <=
+///   lease_duration_ms / 2`，避免过期租约长时间未被清理。注意此参数以**秒**为单位，
+///   其余三个以**毫秒**为单位，配置时注意单位转换。
+///
+/// # 故障转移时序示例
+///
+/// 默认值（`heartbeat=2s, failure=8s, lease=16s, check=30s`）下的典型流程：
+///
+/// ```text
+/// t=0s    节点 A 持有工作流 W 的租约（有效期至 t=16s）
+/// t=2s    A 发送心跳
+/// t=4s    A 发送心跳
+/// t=6s    A 发送心跳
+/// t=8s    A 崩溃，停止心跳
+/// t=10s   其他节点发现 A 已超过 failure_timeout (8s) 未心跳 → 标记 A 失联
+/// t=16s   W 的租约过期
+/// t≤46s   下次 lease_expiry_check 扫描发现 W 租约过期 → 触发接管选举
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FailoverConfig {
+    /// 心跳发送间隔（毫秒）。建议 `failure_timeout_ms / 3` 以上。
     pub heartbeat_interval_ms: u64,
+    /// 节点失联判定阈值（毫秒）。超过此时间未收到心跳即认为节点故障。
+    /// 必须严格大于 `heartbeat_interval_ms`，严格小于 `lease_duration_ms`。
     pub failure_timeout_ms: u64,
+    /// 租约过期扫描周期（**秒**）。注意与其他参数的单位差异。
+    /// 建议此值（换算为毫秒）不超过 `lease_duration_ms / 2`。
     pub lease_expiry_check_interval_secs: u64,
+    /// 工作流租约时长（毫秒）。默认 = `failure_timeout_ms * 2`。
+    /// 必须严格大于 `failure_timeout_ms`，否则故障检测完成前租约未过期，
+    /// 可能导致双主。
+    #[serde(default = "default_lease_duration_ms")]
+    pub lease_duration_ms: u64,
+}
+
+fn default_lease_duration_ms() -> u64 {
+    16_000
 }
 
 impl Default for FailoverConfig {
@@ -369,7 +455,50 @@ impl Default for FailoverConfig {
             heartbeat_interval_ms: 2000,
             failure_timeout_ms: 8000,
             lease_expiry_check_interval_secs: 30,
+            lease_duration_ms: default_lease_duration_ms(),
         }
+    }
+}
+
+impl FailoverConfig {
+    /// 校验时序参数关系满足故障转移安全约束。
+    ///
+    /// 调用方：[`ActantConfig::validate`]。在启动时调用以尽早发现配置错误。
+    ///
+    /// # 约束
+    ///
+    /// 1. `heartbeat_interval_ms > 0`：心跳间隔必须为正。
+    /// 2. `failure_timeout_ms > heartbeat_interval_ms`：超时阈值必须大于心跳间隔，
+    ///    确保至少一次心跳机会（建议 3 倍以上，但此处仅强制最小约束）。
+    /// 3. `lease_duration_ms > failure_timeout_ms`：租约时长必须大于故障检测阈值，
+    ///    防止双主。
+    /// 4. `lease_expiry_check_interval_secs > 0`：扫描周期必须为正。
+    pub fn validate(&self) -> Result<(), crate::common::ActantError> {
+        if self.heartbeat_interval_ms == 0 {
+            return Err(crate::common::ActantError::Config(format!(
+                "failover.heartbeat_interval_ms must be > 0, got {}",
+                self.heartbeat_interval_ms
+            )));
+        }
+        if self.failure_timeout_ms <= self.heartbeat_interval_ms {
+            return Err(crate::common::ActantError::Config(format!(
+                "failover.failure_timeout_ms ({}) must be > heartbeat_interval_ms ({})",
+                self.failure_timeout_ms, self.heartbeat_interval_ms
+            )));
+        }
+        if self.lease_duration_ms <= self.failure_timeout_ms {
+            return Err(crate::common::ActantError::Config(format!(
+                "failover.lease_duration_ms ({}) must be > failure_timeout_ms ({}) to prevent split-brain",
+                self.lease_duration_ms, self.failure_timeout_ms
+            )));
+        }
+        if self.lease_expiry_check_interval_secs == 0 {
+            return Err(crate::common::ActantError::Config(format!(
+                "failover.lease_expiry_check_interval_secs must be > 0, got {}",
+                self.lease_expiry_check_interval_secs
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -381,6 +510,8 @@ pub struct GossipConfig {
     pub retry_attempts: usize,
     /// 重试间隔基数（毫秒）。实际延迟采用指数退避：`retry_base_delay_ms * attempt_number`。
     pub retry_base_delay_ms: u64,
+    /// 周期性广播 DAG heads 的间隔（毫秒）。默认 30 秒。
+    pub heads_broadcast_interval_ms: u64,
 }
 
 impl Default for GossipConfig {
@@ -390,6 +521,7 @@ impl Default for GossipConfig {
             dedup_ttl_secs: 300,
             retry_attempts: 3,
             retry_base_delay_ms: 100,
+            heads_broadcast_interval_ms: 30_000,
         }
     }
 }
@@ -399,22 +531,70 @@ mod tests {
     use super::*;
 
     #[test]
-    fn validate_rejects_empty_signing_key() {
-        let mut config = ActantConfig::default();
-        config.payload_signing_key = Vec::new();
-        let err = config.validate().unwrap_err();
+    fn validate_accepts_empty_signing_key() {
+        let config = ActantConfig {
+            payload_signing_key: Vec::new(),
+            ..Default::default()
+        };
         assert!(
-            err.to_string()
-                .contains("payload_signing_key must be non-empty"),
-            "expected empty signing key error, got: {}",
-            err
+            config.validate().is_ok(),
+            "empty signing key should disable signing"
         );
     }
 
     #[test]
     fn validate_accepts_non_empty_signing_key() {
-        let mut config = ActantConfig::default();
-        config.payload_signing_key = b"shared-secret".to_vec();
+        let config = ActantConfig {
+            payload_signing_key: b"shared-secret".to_vec(),
+            ..Default::default()
+        };
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn failover_validate_accepts_default() {
+        assert!(FailoverConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn failover_validate_rejects_zero_heartbeat() {
+        let cfg = FailoverConfig {
+            heartbeat_interval_ms: 0,
+            ..FailoverConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(format!("{err}").contains("heartbeat_interval_ms"));
+    }
+
+    #[test]
+    fn failover_validate_rejects_failure_le_heartbeat() {
+        let default = FailoverConfig::default();
+        let cfg = FailoverConfig {
+            failure_timeout_ms: default.heartbeat_interval_ms,
+            ..default
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(format!("{err}").contains("failure_timeout_ms"));
+    }
+
+    #[test]
+    fn failover_validate_rejects_lease_le_failure() {
+        let default = FailoverConfig::default();
+        let cfg = FailoverConfig {
+            lease_duration_ms: default.failure_timeout_ms,
+            ..default
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(format!("{err}").contains("split-brain"));
+    }
+
+    #[test]
+    fn failover_validate_rejects_zero_check_interval() {
+        let cfg = FailoverConfig {
+            lease_expiry_check_interval_secs: 0,
+            ..FailoverConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(format!("{err}").contains("lease_expiry_check_interval_secs"));
     }
 }

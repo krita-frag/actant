@@ -17,10 +17,6 @@
     target = actant.ask("Routing", ctx)
     actant.emit("TaskLifecycle", task_event)
 
-# 注意
-
-0.2.0 处于激进重构阶段，旧 API（`@actant.task`、`actant.submit`、`actant.Actor` 等）
-已完全移除。新 DSL（`@task` / `@flow`）将在 0.2.0-beta.2 重新引入。
 """
 
 from __future__ import annotations
@@ -51,8 +47,8 @@ from actant.exceptions import ActantError
 __version__ = get_version()
 
 __all__ = [
-    "ActantError",
     "BUILTIN_CAPABILITIES",
+    "ActantError",
     "CapabilityMeta",
     "EffectKind",
     "ExecuteCtx",

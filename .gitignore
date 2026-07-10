@@ -38,5 +38,8 @@ coverage.xml
 .pytest_cache/
 **/__pycache__/
 
+# Agent skills (embedded git repos)
+.agents/skills/
+
 
 /docs
