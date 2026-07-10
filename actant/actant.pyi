@@ -155,9 +155,6 @@ class _ActantConfig:
     @property
     def scheduler(self) -> str: ...
 
-# ---------------------------------------------------------------------------
-# Event types — delivered via PyEventBridge (call_soon_threadsafe)
-# ---------------------------------------------------------------------------
 
 class _Event:
     @property
