@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import time
@@ -55,11 +56,15 @@ class TestWorkerLifecycle:
 
         验证 iroh endpoint 被正确 close，无 "Endpoint dropped" 警告。
         """
+        # 基于 os.environ.copy() 继承父进程环境变量，仅覆盖必要项，
+        # 避免 LANG/HOME 等缺失引发子进程异常。
+        env = os.environ.copy()
+        env["ACTANT_DISCOVERY"] = "none"
         proc = subprocess.Popen(
             [sys.executable, "-m", "actant.cli", "worker"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env={"ACTANT_DISCOVERY": "none", "PATH": ""},
+            env=env,
         )
         try:
             # 等待 worker 启动

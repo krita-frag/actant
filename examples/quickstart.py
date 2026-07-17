@@ -29,7 +29,7 @@ from actant import (
 
 def main() -> None:
     # ``with_defaults()`` 预装 Python 策略层默认 handler（LocalRouter /
-    # FifoScheduler / NoRetryPolicy）。也可用 ``Runtime()`` 从零开始。
+    # FifoScheduler / DefaultRetryPolicy）。也可用 ``Runtime()`` 从零开始。
     with Runtime.with_defaults() as rt:
         print("=== ask 决策型 ===")
 
@@ -81,14 +81,14 @@ def main() -> None:
     print("\n=== 退出后的错误路径 ===")
     try:
         ask("Routing", RouteCtx(task_name="x"))
-    except RuntimeError as exc:
-        print(f"  预期错误: {exc}")
+    except actant.InvalidStateError as exc:
+        print(f"  预期错误 (InvalidStateError): {exc}")
 
     # impossible() 用于标记"此 effect 必须有 handler 处理"的不可达分支。
     try:
         impossible("此处不应到达")
-    except RuntimeError as exc:
-        print(f"  impossible(): {exc}")
+    except actant.InternalError as exc:
+        print(f"  impossible() (InternalError): {exc}")
 
 
 if __name__ == "__main__":

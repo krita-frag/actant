@@ -106,27 +106,70 @@ impl DirectResponseChannel {
 }
 
 /// 网络传输的抽象。
+///
+/// Runtime 其他部分只依赖此 trait，不直接依赖 iroh。实现需要同时支持 gossip
+/// 主题广播、peer 发现事件和直连 request/response。
 #[async_trait::async_trait]
 pub trait Transport: Send + Sync + 'static {
+    /// 返回本 Actant 节点 ID。
     fn node_id(&self) -> &NodeId;
+    /// 返回底层传输 peer ID（iroh endpoint id 字符串）。
     fn local_peer_id(&self) -> &str;
+    /// 向已订阅的 gossip topic 广播字节消息。
+    ///
+    /// # Errors
+    ///
+    /// 如果 topic 未订阅或底层 gossip 发送失败，返回错误。
     async fn broadcast(&self, topic: &str, data: Vec<u8>) -> crate::common::Result<()>;
+    /// 订阅 gossip topic 并把后续消息转发为 [`NetworkEvent`]。
+    ///
+    /// # Errors
+    ///
+    /// 如果底层传输无法订阅 topic，返回错误。
     async fn subscribe(&self, topic: &str) -> crate::common::Result<()>;
+    /// 接收下一条网络事件。
     async fn recv_event(&self) -> Option<NetworkEvent>;
+    /// 通过 endpoint address 建立直连，并把 peer 加入已有 gossip topic。
+    ///
+    /// # Errors
+    ///
+    /// 如果地址解析或连接失败，返回错误。
     async fn dial(&self, addr: &str) -> crate::common::Result<()>;
+    /// 将已知 peer id 加入所有已订阅 gossip topic。
+    ///
+    /// # Errors
+    ///
+    /// 如果 peer id 格式无效，返回错误。
     async fn add_gossip_peer(&self, peer_id: &str) -> crate::common::Result<()>;
+    /// 返回当前节点可被其他节点连接的地址信息。
+    ///
+    /// # Errors
+    ///
+    /// 如果 endpoint address 无法序列化，返回错误。
     fn listen_addresses(&self) -> crate::common::Result<ListenAddresses>;
+    /// 发送一次直连 request 并等待 response。
+    ///
+    /// # Errors
+    ///
+    /// 如果连接、写入、读取、反序列化或超时失败，返回错误。
     async fn send_direct_request(
         &self,
         peer_id_str: &str,
         request: DirectRequest,
     ) -> crate::common::Result<DirectResponse>;
+    /// 通过收到的 response channel 回复直连请求。
+    ///
+    /// # Errors
+    ///
+    /// 如果底层 channel 写入失败，返回错误。
     async fn send_direct_response(
         &self,
         channel: DirectResponseChannel,
         response: DirectResponse,
     ) -> crate::common::Result<()>;
+    /// 返回当前 gossip 视图中仍连接的 peer。
     async fn discover_peers(&self) -> crate::common::Result<Vec<PeerId>>;
+    /// 关闭传输并释放底层 endpoint。
     async fn shutdown(&self) -> crate::common::Result<()>;
 }
 
@@ -320,6 +363,11 @@ const ACTANT_DIRECT_ALPN: &[u8] = b"actant/direct/1";
 const LEN_PREFIX_SIZE: usize = 4;
 
 #[derive(Clone)]
+/// 基于 iroh 的 [`Transport`] 实现。
+///
+/// `NetworkManager` 同时维护 gossip 订阅和直连协议。gossip 用于 topic 广播
+/// （任务分发、心跳、DAG 状态、取消），直连协议用于需要确认的请求响应
+/// （远端任务结果投递、Actor call 等）。
 pub struct NetworkManager {
     endpoint: Endpoint,
     gossip: Gossip,
@@ -337,6 +385,12 @@ pub struct NetworkManager {
 }
 
 impl NetworkManager {
+    /// 创建 iroh endpoint、gossip router 和 direct request 处理循环。
+    ///
+    /// # Errors
+    ///
+    /// 如果配置校验失败、发现策略未知、endpoint bind 失败、router 启动失败，
+    /// 或 bootstrap peer 解析失败，返回错误。
     pub async fn new(node_id: NodeId, config: NetworkConfig) -> crate::common::Result<Self> {
         let _span = tracing::info_span!("network.new", node = %node_id).entered();
         tracing::info!(
@@ -472,6 +526,11 @@ impl NetworkManager {
         Ok(manager)
     }
 
+    /// 向已订阅 topic 广播 gossip 消息。
+    ///
+    /// # Errors
+    ///
+    /// 如果 topic 未订阅或底层 gossip 广播失败，返回错误。
     pub async fn broadcast(&self, topic: &str, data: Vec<u8>) -> crate::common::Result<()> {
         let subs = self.topic_subscriptions.read().await;
         if let Some((_topic_id, sender)) = subs.get(topic) {
@@ -487,6 +546,13 @@ impl NetworkManager {
         }
     }
 
+    /// 订阅 gossip topic 并启动对应的接收任务。
+    ///
+    /// 重复订阅同一 topic 是 no-op。
+    ///
+    /// # Errors
+    ///
+    /// 如果 iroh gossip 订阅失败，返回错误。
     pub async fn subscribe(&self, topic: &str) -> crate::common::Result<()> {
         {
             let subs = self.topic_subscriptions.read().await;
@@ -517,35 +583,14 @@ impl NetworkManager {
         let allowed_peer_ids = self.allowed_peer_ids.clone();
         tokio::spawn(async move {
             while let Some(result) = receiver.next().await {
-                match result {
-                    Ok(Event::Received(msg)) => {
-                        if !peer_allowed(&allowed_peer_ids, &msg.delivered_from.to_string()) {
-                            tracing::warn!(
-                                "gossip message on '{}' from {} rejected: peer not in allowed_peer_ids",
-                                topic_name,
-                                msg.delivered_from,
-                            );
-                            crate::metrics::inc_gossip_updates_dropped();
-                            continue;
-                        }
-                        let content_len = msg.content.len();
-                        if content_len > max_gossip_msg_size {
-                            tracing::warn!(
-                                "gossip message on '{}' from {} exceeds size limit: {} > {}, dropping",
-                                topic_name,
-                                msg.delivered_from,
-                                content_len,
-                                max_gossip_msg_size,
-                            );
-                            crate::metrics::inc_gossip_updates_dropped();
-                            continue;
-                        }
-                        if let Err(mpsc::error::TrySendError::Full(_)) =
-                            event_tx.try_send(NetworkEvent::Message(NetworkMessage {
-                                topic: topic_name.clone(),
-                                data: msg.content.to_vec(),
-                            }))
-                        {
+                match handle_gossip_event(
+                    result,
+                    &topic_name,
+                    &allowed_peer_ids,
+                    max_gossip_msg_size,
+                ) {
+                    GossipEventOutcome::Message(event) => {
+                        if let Err(mpsc::error::TrySendError::Full(_)) = event_tx.try_send(event) {
                             tracing::warn!(
                                 "network event channel full, dropping gossip message on '{}'",
                                 topic_name
@@ -553,9 +598,7 @@ impl NetworkManager {
                             crate::metrics::inc_gossip_updates_dropped();
                         }
                     }
-                    Ok(Event::NeighborUp(peer_id)) => {
-                        let peer_str = peer_id.to_string();
-                        tracing::debug!("gossip neighbor up on '{}': {}", topic_name, peer_str);
+                    GossipEventOutcome::PeerConnected(peer_str) => {
                         let mut counts = peer_counts.write().await;
                         let count = counts.entry(peer_str.clone()).or_insert(0);
                         *count += 1;
@@ -570,9 +613,7 @@ impl NetworkManager {
                             }
                         }
                     }
-                    Ok(Event::NeighborDown(peer_id)) => {
-                        let peer_str = peer_id.to_string();
-                        tracing::debug!("gossip neighbor down on '{}': {}", topic_name, peer_str);
+                    GossipEventOutcome::PeerDisconnected(peer_str) => {
                         let mut counts = peer_counts.write().await;
                         if let Some(count) = counts.get_mut(&peer_str) {
                             *count = count.saturating_sub(1);
@@ -582,17 +623,14 @@ impl NetworkManager {
                                 if let Err(mpsc::error::TrySendError::Full(_)) = event_tx
                                     .try_send(NetworkEvent::PeerDisconnected { peer_id: peer_str })
                                 {
-                                    tracing::warn!("network event channel full, dropping peer disconnected event");
+                                    tracing::warn!(
+                                        "network event channel full, dropping peer disconnected event"
+                                    );
                                 }
                             }
                         }
                     }
-                    Ok(Event::Lagged) => {
-                        tracing::warn!("gossip lagged on topic '{}'", topic_name);
-                    }
-                    Err(e) => {
-                        tracing::warn!("gossip error on '{}': {}", topic_name, e);
-                    }
+                    GossipEventOutcome::None => {}
                 }
             }
         });
@@ -600,17 +638,24 @@ impl NetworkManager {
         Ok(())
     }
 
+    /// 返回当前已发现的 peer。
     pub async fn discover_peers(&self) -> crate::common::Result<Vec<PeerId>> {
         let counts = self.peer_neighbor_count.read().await;
         let peers = counts.keys().map(|id| PeerId(id.clone())).collect();
         Ok(peers)
     }
 
+    /// 接收下一条网络事件。
     pub async fn recv_event(&self) -> Option<NetworkEvent> {
         let mut guard = self.event_rx.lock().await;
         guard.recv().await
     }
 
+    /// 连接 endpoint address，并把该 peer 加入所有已订阅 gossip topic。
+    ///
+    /// # Errors
+    ///
+    /// 如果 address 解码或 iroh 连接失败，返回错误。
     pub async fn dial(&self, addr: &str) -> crate::common::Result<()> {
         let endpoint_addr = parse_endpoint_addr(addr)
             .map_err(|e| ActantError::Network(format!("invalid endpoint address: {e}")))?;
@@ -631,6 +676,11 @@ impl NetworkManager {
         Ok(())
     }
 
+    /// 手动把 peer id 加入所有已订阅 gossip topic。
+    ///
+    /// # Errors
+    ///
+    /// 如果 peer id 不是合法 endpoint id，返回错误。
     pub async fn add_gossip_peer(&self, peer_id_str: &str) -> crate::common::Result<()> {
         let peer_id: EndpointId = peer_id_str.parse().map_err(|e| {
             ActantError::Network(format!("invalid endpoint id '{peer_id_str}': {e}"))
@@ -666,6 +716,11 @@ impl NetworkManager {
         }
     }
 
+    /// 返回 endpoint id、relay URL、direct addresses 和 hex 编码 endpoint address。
+    ///
+    /// # Errors
+    ///
+    /// 如果 endpoint address 不能序列化，返回错误。
     pub fn listen_addresses(&self) -> crate::common::Result<ListenAddresses> {
         let addr = self.endpoint.addr();
         let endpoint_id = addr.id.to_string();
@@ -692,10 +747,17 @@ impl NetworkManager {
         })
     }
 
+    /// 返回本 Actant 节点 ID。
     pub fn node_id(&self) -> &NodeId {
         &self.node_id
     }
 
+    /// 发送一次直连请求并等待响应。
+    ///
+    /// # Errors
+    ///
+    /// 如果 peer address 无效、连接失败、请求或响应序列化失败、读取超过大小上限、
+    /// 或超过 `direct_request_timeout`，返回错误。
     #[tracing::instrument(level = "debug", skip(self, request), fields(peer = %peer_id_str))]
     pub async fn send_direct_request(
         &self,
@@ -760,6 +822,11 @@ impl NetworkManager {
         }
     }
 
+    /// 回复一次直连请求。
+    ///
+    /// # Errors
+    ///
+    /// 如果 response channel 写入失败，返回错误。
     pub async fn send_direct_response(
         &self,
         channel: DirectResponseChannel,
@@ -768,6 +835,11 @@ impl NetworkManager {
         channel.send_response(response).await
     }
 
+    /// 关闭 router 和 iroh endpoint。
+    ///
+    /// # Errors
+    ///
+    /// 如果 router shutdown 失败，返回错误。
     pub async fn shutdown(&self) -> crate::common::Result<()> {
         self.router
             .shutdown()
@@ -882,6 +954,76 @@ enum DirectEvent {
         request: DirectRequest,
         channel: DirectResponseChannel,
     },
+}
+
+/// Gossip 事件处理结果，将 ``subscribe`` 中的后台循环逻辑抽出为可单元测试的纯函数。
+#[derive(Debug)]
+enum GossipEventOutcome {
+    /// 应转发为 ``NetworkEvent::Message`` 的消息事件。
+    Message(NetworkEvent),
+    /// 有 peer 加入该 topic，需更新邻居计数并可能触发 ``PeerConnected``。
+    PeerConnected(String),
+    /// 有 peer 离开该 topic，需更新邻居计数并可能触发 ``PeerDisconnected``。
+    PeerDisconnected(String),
+    /// 无需进一步处理的事件（已被丢弃、Lagged、错误等）。
+    None,
+}
+
+/// 将单个 gossip 接收结果转换为可处理的事件 outcome。
+///
+/// 负责 peer allowlist、消息大小检查、邻居计数语义，便于在测试中直接驱动
+/// 而不必构造真实 iroh gossip receiver。
+fn handle_gossip_event<E: std::fmt::Display>(
+    result: Result<Event, E>,
+    topic_name: &str,
+    allowed_peer_ids: &HashSet<String>,
+    max_gossip_msg_size: usize,
+) -> GossipEventOutcome {
+    match result {
+        Ok(Event::Received(msg)) => {
+            if !peer_allowed(allowed_peer_ids, &msg.delivered_from.to_string()) {
+                tracing::warn!(
+                    "gossip message on '{}' from {} rejected: peer not in allowed_peer_ids",
+                    topic_name,
+                    msg.delivered_from,
+                );
+                crate::metrics::inc_gossip_updates_dropped();
+                return GossipEventOutcome::None;
+            }
+            let content_len = msg.content.len();
+            if content_len > max_gossip_msg_size {
+                tracing::warn!(
+                    "gossip message on '{}' from {} exceeds size limit: {} > {}, dropping",
+                    topic_name,
+                    msg.delivered_from,
+                    content_len,
+                    max_gossip_msg_size,
+                );
+                crate::metrics::inc_gossip_updates_dropped();
+                return GossipEventOutcome::None;
+            }
+            GossipEventOutcome::Message(NetworkEvent::Message(NetworkMessage {
+                topic: topic_name.to_string(),
+                data: msg.content.to_vec(),
+            }))
+        }
+        Ok(Event::NeighborUp(peer_id)) => {
+            tracing::debug!("gossip neighbor up on '{}': {}", topic_name, peer_id);
+            GossipEventOutcome::PeerConnected(peer_id.to_string())
+        }
+        Ok(Event::NeighborDown(peer_id)) => {
+            tracing::debug!("gossip neighbor down on '{}': {}", topic_name, peer_id);
+            GossipEventOutcome::PeerDisconnected(peer_id.to_string())
+        }
+        Ok(Event::Lagged) => {
+            tracing::warn!("gossip lagged on topic '{}'", topic_name);
+            GossipEventOutcome::None
+        }
+        Err(e) => {
+            tracing::warn!("gossip error on '{}': {}", topic_name, e);
+            GossipEventOutcome::None
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1056,57 +1198,5 @@ async fn read_length_prefixed(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_peer_allowed_empty() {
-        let allowed = build_allowed_peer_ids(&[]);
-        assert!(peer_allowed(&allowed, "any"));
-    }
-
-    #[test]
-    fn test_peer_allowed_specific() {
-        let allowed = build_allowed_peer_ids(&["abc".to_string()]);
-        assert!(peer_allowed(&allowed, "abc"));
-        assert!(!peer_allowed(&allowed, "def"));
-    }
-
-    #[tokio::test]
-    async fn test_send_direct_request_returns_timeout_for_unreachable_peer() {
-        let config = NetworkConfig {
-            discovery_mode: crate::common::DiscoveryMode::parse(discovery_mode::NONE).unwrap(),
-            listen_ip: "127.0.0.1".into(),
-            listen_port: 0,
-            bootstrap_nodes: vec![],
-            gossip_bootstrap_peers: vec![],
-            hlc_max_drift_ms: 500,
-            max_message_size: 1024 * 1024,
-            direct_request_timeout_ms: 100,
-            max_pending_direct_requests: 16,
-            allowed_peer_ids: vec![],
-            capability_gossip_interval_ms: NetworkConfig::DEFAULT_CAPABILITY_GOSSIP_INTERVAL_MS,
-            event_channel_capacity: NetworkConfig::DEFAULT_EVENT_CHANNEL_CAPACITY,
-        };
-
-        let manager = NetworkManager::new(NodeId::from("test-node"), config)
-            .await
-            .expect("create manager");
-
-        let unreachable_addr =
-            "0000000000000000000000000000000000000000000000000000000000000000@127.0.0.1:1";
-        let request = DirectRequest::QueryWorkflowState {
-            workflow_id: WorkflowId::from("wf-1"),
-            requesting_node: NodeId::from("test-node"),
-        };
-
-        let result = manager.send_direct_request(unreachable_addr, request).await;
-        match result {
-            Err(ActantError::Timeout(_)) => { /* expected */ }
-            Err(ActantError::Network(msg)) => {
-                tracing::debug!("got Network error (acceptable): {}", msg);
-            }
-            other => panic!("expected Timeout or Network error, got {:?}", other),
-        }
-    }
-}
+#[path = "../../tests/rust/unit/runtime/network.rs"]
+mod tests;

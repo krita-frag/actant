@@ -60,13 +60,11 @@ impl PyCapabilityRuntime {
 impl PyCapabilityRuntime {
     #[new]
     fn new() -> PyResult<Self> {
-        let tokio = Arc::new(
-            tokio::runtime::Runtime::new().map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "failed to create tokio runtime for capability bridge: {e}"
-                ))
-            })?,
-        );
+        let tokio = Arc::new(tokio::runtime::Runtime::new().map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "failed to create tokio runtime for capability bridge: {e}"
+            ))
+        })?);
         let inner = Arc::new(CapabilityRuntime::new());
         register_defaults(&inner);
         Ok(Self {

@@ -1,18 +1,18 @@
 [package]
 name = "actant"
-version = "0.2.0-alpha.1"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.75"
-description = "基于 Actor 模型的跨平台通用分布式任务编排引擎 — 0.2.0-alpha.1"
+description = "基于 Actor 模型的跨平台通用分布式任务编排引擎 — 0.2.0"
 
 [dependencies]
 async-trait = "0.1"
 crossbeam-channel = "0.5"
 dashmap = { version = "6.1", features = ["serde"] }
-heed = "0.22.1"
+heed = { version = "0.22.1", default-features = false }
 num_cpus = "1.17"
 parking_lot = "0.12"
-postcard = { version = "1.1", features = ["use-std"] }
+postcard = { version = "1.1", default-features = false, features = ["use-std"] }
 rkyv = { version = "0.8", features = ["std", "uuid-1"] }
 serde = { version = "1.0", features = ["derive", "rc"] }
 thiserror = "2.0.18"
@@ -39,7 +39,6 @@ opentelemetry-appender-tracing = "0.32"
 opentelemetry-semantic-conventions = "0.32"
 prometheus = "0.14"
 dhat = { version = "0.3.3", optional = true }
-pprof = { version = "0.14", optional = true, features = ["flamegraph"] }
 console-subscriber = { version = "0.4", optional = true }
 
 
@@ -47,14 +46,13 @@ console-subscriber = { version = "0.4", optional = true }
 tempfile = "3.24.0"
 criterion = { version = "0.5", features = ["html_reports"] }
 serde_json = "1.0"
+proptest = "1.5"
 
 [features]
 dhat-heap = ["dep:dhat"]
 python = ["dep:pyo3", "dep:pyo3-log"]
 # tokio-console 支持（ACTANT_TOKIO_CONSOLE=1 激活）
 tokio-console = ["dep:console-subscriber"]
-# pprof CPU 火焰图（ACTANT_PPROF=<path> 激活）
-pprof = ["dep:pprof"]
 default = ["python"]
 
 [lib]
@@ -117,9 +115,32 @@ name = "event_bus"
 harness = false
 required-features = []
 
+# Orchestrator DAG 拓扑计算基准（topological_sort / roots / sinks / successors_of）。
+# 运行：cargo bench --bench orchestrator
+[[bench]]
+name = "orchestrator"
+harness = false
+required-features = []
+
+# 网络层 wire 协议编解码基准（WireEnvelope wrap / decode / round_trip）。
+# 运行：cargo bench --bench network
+[[bench]]
+name = "network"
+harness = false
+required-features = []
+
 # 内存分配跟踪测试 — 通过 dhat 测量热点路径的堆分配。
 # 运行：cargo test --bench mem_profile --features dhat-heap -- --nocapture
 [[bench]]
 name = "mem_profile"
 harness = false
 required-features = ["dhat-heap"]
+
+# ---------------------------------------------------------------------------
+# Property-based 测试（proptest）
+# ---------------------------------------------------------------------------
+# 验证 payload 编解码与 DAG 拓扑的不变量，覆盖手写测试难以穷举的边界情况。
+# 运行：cargo test --test property
+[[test]]
+name = "property"
+path = "tests/rust/property/main.rs"

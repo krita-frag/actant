@@ -25,6 +25,8 @@ pub mod constants {
     pub const TOPIC_ACTOR_REPLY_PREFIX: &str = "actant:actor-reply:";
     pub const TOPIC_WORKFLOW_STATE_REQ: &str = "actant:wf-state-req:";
     pub const TOPIC_WORKFLOW_STATE_RESP_PREFIX: &str = "actant:wf-state-resp:";
+    /// 跨节点任务取消广播话题。
+    pub const TOPIC_CANCEL: &str = "actant:cancel";
     /// Capability gossip 话题。
     ///
     /// 注意：与其他 `actant:` 前缀的 gossip topic 不同，此 topic 使用 `actant://` 前缀。
@@ -57,8 +59,8 @@ pub use constants::{
         DAG as STORE_KEY_DAG, EXEC as STORE_KEY_EXEC, LEASE as STORE_KEY_LEASE,
         PENDING as STORE_KEY_PENDING, RESULT as STORE_KEY_RESULT,
     },
-    TOPIC_DAG_STATE, TOPIC_FAILOVER, TOPIC_HEADS, TOPIC_HEARTBEAT, TOPIC_WORKFLOW_STATE_REQ,
-    TOPIC_WORKFLOW_STATE_RESP_PREFIX, WIRE_PROTOCOL_VERSION,
+    TOPIC_CANCEL, TOPIC_DAG_STATE, TOPIC_FAILOVER, TOPIC_HEADS, TOPIC_HEARTBEAT,
+    TOPIC_WORKFLOW_STATE_REQ, TOPIC_WORKFLOW_STATE_RESP_PREFIX, WIRE_PROTOCOL_VERSION,
 };
 
 /// Gossip 话题标识符。
@@ -163,6 +165,7 @@ impl Topic {
                 constants::TOPIC_HEARTBEAT => TopicRoute::Heartbeat,
                 constants::TOPIC_FAILOVER => TopicRoute::Failover,
                 constants::TOPIC_HEADS => TopicRoute::Heads,
+                constants::TOPIC_CANCEL => TopicRoute::Cancel,
                 _ => TopicRoute::Unknown,
             }
         }
@@ -206,7 +209,7 @@ impl From<&str> for Topic {
 
 /// Gossip 话题路由分类。
 ///
-/// 由 [`Topic::classify`] 产生。路由器代码匹配此枚举而非做字符串前缀比较，
+/// 由 `Topic::classify` 产生。路由器代码匹配此枚举而非做字符串前缀比较，
 /// 使分发表显式且可穷举。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TopicRoute {
@@ -228,6 +231,8 @@ pub enum TopicRoute {
     Failover,
     /// Heads 交换（工作流进度）话题。
     Heads,
+    /// 跨节点任务取消广播话题。
+    Cancel,
     /// 未识别话题 — 记录日志后丢弃。
     Unknown,
 }
@@ -240,14 +245,31 @@ pub type ReplyRegistry =
 pub struct WireEnvelope {
     pub version: u8,
     pub message: WireMessage,
+    /// 跨节点 trace 关联 ID。
+    ///
+    /// 发送方在 [`WireEnvelope::wrap`] 时生成（UUID v4），接收方在
+    /// [`WireEnvelope::decode`] 后用于创建 `wire.recv` 子 span，使跨节点
+    /// 消息流可在日志中通过该 ID 串联。
+    ///
+    /// 该字段不参与协议版本协商，旧版本节点发送的消息反序列化时为 `None`
+    /// （`#[serde(default)]`），新版本节点发送给旧版本节点的消息会被
+    /// 旧版本因 version 不匹配而丢弃，无前向兼容问题。
+    #[serde(default)]
+    pub trace_id: Option<String>,
 }
 
 impl WireEnvelope {
-    /// 用当前协议版本封装 [`WireMessage`]。
+    /// 用当前协议版本封装 [`WireMessage`]，并注入跨节点 trace 关联 ID。
+    ///
+    /// 生成的 `trace_id` 同时通过 `tracing::Span::current()` 记录到发送方
+    /// 当前 span 的 `wire.trace_id` field，便于在发送方日志中按 ID 检索。
     pub fn wrap(msg: WireMessage) -> Self {
+        let trace_id = uuid::Uuid::new_v4().to_string();
+        tracing::Span::current().record("wire.trace_id", &trace_id);
         Self {
             version: constants::WIRE_PROTOCOL_VERSION,
             message: msg,
+            trace_id: Some(trace_id),
         }
     }
 
@@ -257,7 +279,10 @@ impl WireEnvelope {
     /// 调用方无需重复版本比较样板代码。
     ///
     /// 反序列化失败或协议版本不兼容时返回 `None`（并记录告警）。
-    pub fn decode(payload: &[u8]) -> Option<WireMessage> {
+    ///
+    /// 返回的元组包含消息本体与可选的跨节点 trace 关联 ID；调用方应使用
+    /// 该 ID 创建 `wire.recv` 子 span 以串联跨节点日志。
+    pub fn decode(payload: &[u8]) -> Option<(WireMessage, Option<String>)> {
         // 远端 gossip 输入：先校验大小上限，避免恶意嵌套结构 OOM。
         let envelope = match crate::common::decode_postcard::<WireEnvelope>(payload) {
             Ok(env) => env,
@@ -278,7 +303,7 @@ impl WireEnvelope {
             );
             return None;
         }
-        Some(envelope.message)
+        Some((envelope.message, envelope.trace_id))
     }
 }
 
@@ -335,6 +360,16 @@ pub enum WireTaskOutcome {
     Skipped,
 }
 
+/// 跨节点任务取消广播消息。
+///
+/// 由节点通过 gossip topic ``actant:cancel`` 广播，接收方根据 task_id/workflow_id
+/// 定位本地正在执行的任务并触发取消。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CancelBroadcast {
+    pub task_id: TaskId,
+    pub workflow_id: WorkflowId,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WireDagStateUpdate {
     pub workflow_id: WorkflowId,
@@ -373,7 +408,7 @@ pub enum WireTaskState {
 impl WireTaskState {
     /// PyO3 边界使用的稳定字符串表示。
     ///
-    /// 返回 [`state_str`] 常量之一 — 绝不返回字面量。
+    /// 返回 `state_str` 常量之一 — 绝不返回字面量。
     pub fn as_str(&self) -> &'static str {
         match self {
             WireTaskState::Running => state_str::RUNNING,
@@ -386,7 +421,7 @@ impl WireTaskState {
 
     /// 将 Python 层的状态字符串解析为 `WireTaskState`。
     ///
-    /// 与 [`state_str`] 常量（小写形式）做大小写不敏感比较，
+    /// 与 `state_str` 常量（小写形式）做大小写不敏感比较，
     /// 以容忍异构 gossip 来源。无法识别的状态字符串返回 `None`。
     pub fn from_python_str(state: &str, data: Vec<u8>) -> Option<Self> {
         // 与规范常量做大小写不敏感比较。
@@ -474,286 +509,5 @@ pub struct HeadsExchange {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn node(s: &str) -> NodeId {
-        NodeId::from(s.to_string())
-    }
-
-    // --- Topic 构造器 ---
-
-    #[test]
-    fn topic_task_uses_correct_prefix() {
-        let t = Topic::task(&node("worker-1"));
-        assert_eq!(t.as_str(), "actant:task:worker-1");
-        assert!(t.starts_with(constants::TOPIC_TASK_PREFIX));
-    }
-
-    #[test]
-    fn topic_actor_uses_correct_prefix() {
-        let t = Topic::actor(&node("node-a"));
-        assert_eq!(t.as_str(), "actant:actor:node-a");
-    }
-
-    #[test]
-    fn topic_actor_reply_distinct_from_actor() {
-        let n = node("n1");
-        assert_ne!(Topic::actor(&n), Topic::actor_reply(&n));
-        assert_eq!(Topic::actor_reply(&n).as_str(), "actant:actor-reply:n1");
-    }
-
-    #[test]
-    fn topic_dag_state_is_constant() {
-        assert_eq!(Topic::dag_state().as_str(), constants::TOPIC_DAG_STATE);
-    }
-
-    #[test]
-    fn topic_heartbeat_is_constant() {
-        assert_eq!(Topic::heartbeat().as_str(), constants::TOPIC_HEARTBEAT);
-    }
-
-    #[test]
-    fn topic_failover_is_constant() {
-        assert_eq!(Topic::failover().as_str(), constants::TOPIC_FAILOVER);
-    }
-
-    #[test]
-    fn topic_heads_is_constant() {
-        assert_eq!(Topic::heads().as_str(), constants::TOPIC_HEADS);
-    }
-
-    #[test]
-    fn topic_workflow_state_req_resp_are_distinct() {
-        let n = node("worker-9");
-        let req = Topic::workflow_state_req(&n);
-        let resp = Topic::workflow_state_resp(&n);
-        assert_ne!(req, resp);
-        assert!(req
-            .as_str()
-            .starts_with(constants::TOPIC_WORKFLOW_STATE_REQ));
-        assert!(resp
-            .as_str()
-            .starts_with(constants::TOPIC_WORKFLOW_STATE_RESP_PREFIX));
-    }
-
-    // --- Topic::classify 路由分发（关键路径） ---
-
-    #[test]
-    fn classify_task_extracts_node() {
-        assert_eq!(
-            Topic::task(&node("w1")).classify(),
-            TopicRoute::Task("w1".to_string())
-        );
-    }
-
-    #[test]
-    fn classify_actor_extracts_node() {
-        assert_eq!(
-            Topic::actor(&node("a1")).classify(),
-            TopicRoute::Actor("a1".to_string())
-        );
-    }
-
-    #[test]
-    fn classify_actor_reply_extracts_node() {
-        assert_eq!(
-            Topic::actor_reply(&node("r1")).classify(),
-            TopicRoute::ActorReply("r1".to_string())
-        );
-    }
-
-    #[test]
-    fn classify_workflow_state_req_resp() {
-        assert_eq!(
-            Topic::workflow_state_req(&node("n")).classify(),
-            TopicRoute::WorkflowStateReq("n".to_string())
-        );
-        assert_eq!(
-            Topic::workflow_state_resp(&node("n")).classify(),
-            TopicRoute::WorkflowStateResp("n".to_string())
-        );
-    }
-
-    #[test]
-    fn classify_dag_state_heartbeat_failover_heads() {
-        assert_eq!(Topic::dag_state().classify(), TopicRoute::DagState);
-        assert_eq!(Topic::heartbeat().classify(), TopicRoute::Heartbeat);
-        assert_eq!(Topic::failover().classify(), TopicRoute::Failover);
-        assert_eq!(Topic::heads().classify(), TopicRoute::Heads);
-    }
-
-    #[test]
-    fn classify_unknown_for_unrecognized_topic() {
-        assert_eq!(Topic::from("garbage").classify(), TopicRoute::Unknown);
-        assert_eq!(Topic::from("").classify(), TopicRoute::Unknown);
-    }
-
-    #[test]
-    fn classify_actor_prefix_does_not_match_task_prefix() {
-        // 关键：prefix 不能互相包含，否则路由错误
-        let actor_topic = Topic::actor(&node("task"));
-        assert_eq!(
-            actor_topic.classify(),
-            TopicRoute::Actor("task".to_string())
-        );
-        // 反向：task topic 不应被分类为 actor
-        let task_topic = Topic::task(&node("actor"));
-        assert_eq!(task_topic.classify(), TopicRoute::Task("actor".to_string()));
-    }
-
-    // --- Topic::from 边界保护 ---
-
-    #[test]
-    fn from_truncates_oversized_topic() {
-        let huge = "x".repeat(constants::MAX_TOPIC_LEN + 10);
-        let t = Topic::from(huge.as_str());
-        assert_eq!(t.as_str().len(), constants::MAX_TOPIC_LEN);
-    }
-
-    #[test]
-    fn from_preserves_normal_length_topic() {
-        let s = "actant:task:worker-1";
-        let t = Topic::from(s);
-        assert_eq!(t.as_str(), s);
-    }
-
-    /// 回归测试：UTF-8 多字节字符在 MAX_TOPIC_LEN 边界处截断不应 panic。
-    ///
-    /// 曾用 `s[..MAX_TOPIC_LEN]` 按字节切片，截断点落在多字节 UTF-8 字符内部
-    /// 会导致 panic。已改为字符边界安全截断。
-    #[test]
-    fn from_truncation_at_utf8_boundary_should_not_panic() {
-        // 构造：255 个 ASCII + 1 个 3 字节中文字符 = 258 字节
-        // 截断点 256 会切到中文字符的第二个字节
-        let mut s = "a".repeat(255);
-        s.push('中'); // U+4E2D, 3 字节 UTF-8
-        assert!(
-            s.len() > constants::MAX_TOPIC_LEN,
-            "test string must exceed MAX_TOPIC_LEN"
-        );
-
-        // 修复后应成功返回，截断到 char 边界
-        let t = Topic::from(s.as_str());
-        // 应截断到 255 字节（中文字符完整被移除）
-        assert_eq!(t.as_str().len(), 255);
-        assert!(t.as_str().is_char_boundary(t.as_str().len()));
-    }
-
-    // --- Display / From<Topic> for String ---
-
-    #[test]
-    fn display_matches_as_str() {
-        let t = Topic::task(&node("worker-1"));
-        assert_eq!(format!("{}", t), t.as_str());
-    }
-
-    #[test]
-    fn into_string_consumes_inner() {
-        let t = Topic::heartbeat();
-        let s: String = t.into();
-        assert_eq!(s, constants::TOPIC_HEARTBEAT);
-    }
-
-    // --- WireEnvelope::decode 错误处理 ---
-
-    /// 捕获 tracing 输出到 `Vec<u8>` 的 `MakeWriter`，用于断言 `decode` 发出 WARN。
-    #[derive(Clone)]
-    struct CapturingWriter {
-        buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
-    }
-
-    impl CapturingWriter {
-        fn new() -> Self {
-            Self {
-                buf: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            }
-        }
-        fn captured(&self) -> String {
-            String::from_utf8_lossy(&self.buf.lock().unwrap()).into_owned()
-        }
-    }
-
-    impl std::io::Write for CapturingWriter {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.buf.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturingWriter {
-        type Writer = CapturingWriter;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    #[test]
-    fn test_decode_returns_none_on_invalid_payload() {
-        assert!(WireEnvelope::decode(b"definitely-not-valid-postcard").is_none());
-    }
-
-    #[test]
-    fn test_decode_logs_warning_on_invalid_payload() {
-        // P1-B1：反序列化失败必须发出 warn，而非静默丢弃。
-        let writer = CapturingWriter::new();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(writer.clone())
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .finish();
-        let dispatch = tracing::dispatcher::Dispatch::new(subscriber);
-
-        let result = tracing::dispatcher::with_default(&dispatch, || {
-            WireEnvelope::decode(b"definitely-not-valid-postcard")
-        });
-
-        assert!(
-            result.is_none(),
-            "decode should return None on invalid payload"
-        );
-        let captured = writer.captured();
-        assert!(
-            captured.contains("WARN"),
-            "decode should log a WARN on deserialization failure, got: {captured}"
-        );
-    }
-
-    #[test]
-    fn test_decode_logs_warning_on_version_mismatch() {
-        // 版本不兼容路径已有 warn，此测试确保不回归。
-        let envelope = WireEnvelope {
-            version: 255, // 不存在的版本
-            message: WireMessage::NodeHeartbeat(NodeHeartbeat {
-                node_id: node("n"),
-                active_workflows: vec![],
-                timestamp_ms: 0,
-                available_slots: 0,
-                max_slots: 0,
-                endpoint_addr: None,
-            }),
-        };
-        let payload = postcard::to_allocvec::<WireEnvelope>(&envelope).unwrap();
-
-        let writer = CapturingWriter::new();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(writer.clone())
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .finish();
-        let dispatch = tracing::dispatcher::Dispatch::new(subscriber);
-
-        let result =
-            tracing::dispatcher::with_default(&dispatch, || WireEnvelope::decode(&payload));
-
-        assert!(result.is_none());
-        let captured = writer.captured();
-        assert!(
-            captured.contains("WARN"),
-            "version mismatch should log WARN, got: {captured}"
-        );
-    }
-}
+#[path = "../../tests/rust/unit/common/wire.rs"]
+mod tests;

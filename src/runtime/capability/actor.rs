@@ -11,7 +11,7 @@ use async_trait::async_trait;
 
 use crate::common::{ActorMessage, ActorMessageResult, MessageId};
 use crate::runtime::actor::Actor;
-use crate::runtime::capability::{CapabilityCodec, EffectKind, ErasedHandler};
+use crate::runtime::capability::{CapabilityCodec, CapabilityEnvelope, EffectKind, ErasedHandler};
 
 /// Capability 执行 Actor。
 ///
@@ -49,7 +49,7 @@ impl CapabilityActor {
         ActorMessageResult {
             message_id,
             payload: vec![],
-            error: Some(err.to_string()),
+            error: Some(crate::common::ActorErrorEnvelope::from(err)),
         }
     }
 }
@@ -65,13 +65,12 @@ impl Actor for CapabilityActor {
         msg: ActorMessage,
     ) -> crate::common::Result<ActorMessageResult> {
         let msg_id = msg.id.clone();
-        let envelope: crate::runtime::capability::CapabilityEnvelope =
-            match crate::common::decode_postcard(&msg.payload) {
-                Ok(e) => e,
-                Err(e) => {
-                    return Ok(Self::error(msg_id, e));
-                }
-            };
+        let envelope: CapabilityEnvelope = match crate::common::decode_postcard(&msg.payload) {
+            Ok(e) => e,
+            Err(e) => {
+                return Ok(Self::error(msg_id, e));
+            }
+        };
 
         let req = match self.codec.deserialize_request(&envelope.payload) {
             Ok(r) => r,
@@ -127,3 +126,7 @@ impl Actor for CapabilityActor {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../../tests/rust/unit/runtime/capability_actor.rs"]
+mod tests;

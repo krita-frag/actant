@@ -5,9 +5,11 @@
 //! 共享同一条分发路径，消除 Python 侧独立维护注册表的双分发。
 
 use std::any::Any;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::time::Instant;
 
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use pyo3::prelude::*;
 
 use crate::common::ActantError;
@@ -48,9 +50,11 @@ where
     async fn ask(&self, req: Arc<dyn Any + Send + Sync>) -> Option<Box<dyn Any + Send + Sync>> {
         let req = req.downcast_ref::<C::Request>()?;
         Python::attach(|py| {
-            let handler = self.handler.lock().ok()?.clone_ref(py);
+            let handler = self.handler.lock().clone_ref(py);
             let py_req = Codec::encode_request(py, req).ok()?;
+            let t0 = Instant::now();
             let py_resp = handler.call1(py, (&py_req,)).ok()?.into_bound(py);
+            crate::metrics::observe_python_handler_ms(t0.elapsed().as_millis() as u64);
             if py_resp.is_none() {
                 return None;
             }
@@ -108,17 +112,15 @@ where
             ActantError::Internal("python perform handler: request mismatch".into())
         })?;
         let resp = Python::attach(|py| -> Result<C::Response, ActantError> {
-            let handler = self
-                .handler
-                .lock()
-                .map(|g| g.clone_ref(py))
-                .map_err(|_| ActantError::Internal("python handler mutex poisoned".into()))?;
+            let handler = self.handler.lock().clone_ref(py);
             let py_req = Codec::encode_request(py, req)
                 .map_err(|e| ActantError::Internal(format!("encode request: {}", e)))?;
+            let t0 = Instant::now();
             let py_resp = handler
                 .call1(py, (&py_req,))
                 .map_err(|e| ActantError::Internal(format!("python handler: {}", e)))?
                 .into_bound(py);
+            crate::metrics::observe_python_handler_ms(t0.elapsed().as_millis() as u64);
             let resp = Codec::decode_response(py, &py_resp)
                 .map_err(|e| ActantError::Internal(format!("decode response: {}", e)))?;
             Ok(resp)
@@ -171,17 +173,15 @@ where
             .downcast_ref::<C::Request>()
             .ok_or_else(|| ActantError::Internal("python emit handler: request mismatch".into()))?;
         Python::attach(|py| -> Result<(), ActantError> {
-            let handler = self
-                .handler
-                .lock()
-                .map(|g| g.clone_ref(py))
-                .map_err(|_| ActantError::Internal("python handler mutex poisoned".into()))?;
+            let handler = self.handler.lock().clone_ref(py);
             let py_req = Codec::encode_request(py, req)
                 .map_err(|e| ActantError::Internal(format!("encode request: {}", e)))?;
+            let t0 = Instant::now();
             match handler.call1(py, (&py_req,)) {
                 Ok(_) => (),
                 Err(e) => return Err(ActantError::Internal(format!("python handler: {}", e))),
             }
+            crate::metrics::observe_python_handler_ms(t0.elapsed().as_millis() as u64);
             Ok(())
         })
     }

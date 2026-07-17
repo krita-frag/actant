@@ -1,0 +1,21 @@
+# cargo-audit 项目级配置
+# 位置：.cargo/audit.toml
+# 文档：https://github.com/RustSec/rustsec/blob/main/cargo-audit/audit.toml.example
+
+[advisories]
+# 已处理：移除 pprof、升级 crossbeam-epoch、升级 plist/quick-xml、
+# 禁用 heed 默认 features、禁用 postcard 默认 features。
+# 剩余均为上游传递依赖暂无法升级的信息性警告：
+ignore = [
+    # paste 1.0.15 已由作者声明停止维护。
+    # 当前通过 netlink-packet-core 0.8.1 -> netwatch 0.19.1 -> netdev 0.45.0 -> iroh 1.0.2
+    # 传递引入；netwatch 0.19.1 强制要求 netlink-packet-core ^0.8.1，无法降级到使用 pastey 的 0.8.0。
+    # 该 crate 为 proc-macro，运行时攻击面极小，等待上游 netlink/netwatch 迁移。
+    "RUSTSEC-2024-0436",
+]
+informational_warnings = ["unmaintained"]
+severity_threshold = "low"
+
+[yanked]
+enabled = true
+update_index = true

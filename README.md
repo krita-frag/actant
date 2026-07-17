@@ -4,21 +4,7 @@
 
 Actant 采用 **Rust + iroh** 构建核心运行时，通过 **PyO3** 暴露给 Python 用户。P2P 对等节点混合架构，每个节点同时具备编排、执行、Actor 管理、持久化完整能力。
 
-> ⚠️ **实验性项目** — API 尚未冻结，**1.0.0 前不保证向后兼容**。版本号 0.x 的任何升级都应视为潜在破坏性变更，需查阅变更日志并相应调整调用方代码。请勿用于生产环境。
-
----
-
-## ERH 扩展架构
-
-0.2.0 起，所有扩展点（路由、调度、重试、存储、传输、执行、Actor、生命周期）统一建模为 **Capability**（能力声明）+ **Handler**（能力实现）+ **Layer**（handler 组合）+ **Effect**（请求能力）。
-
-| Effect | 语义 | 调用方式 | 返回值 |
-|--------|------|----------|--------|
-| `ask` | 决策型 | 逆序调用，首个非 `None` 决定结果 | `Optional[Any]` |
-| `perform` | 副作用型 | 调用最后注册的 handler | handler 返回值 |
-| `emit` | 反应型 | 顺序调用所有 handler | `None` |
-
-后注册的 handler 优先级更高（`ask` 逆序决策，自定义覆盖默认）。内置 13 个 capability：策略型 `Routing`/`Scheduling`/`RetryPolicy`（纯 Python），其余由 Rust 核心提供 codec 与默认 handler、Python 可覆盖。
+> ⚠️ **实验性项目** — API 尚未冻结，**1.0.0 前不保证向后兼容**。请勿用于生产环境。
 
 ---
 
@@ -34,50 +20,78 @@ uv sync
 uv run maturin develop
 
 uv run python -c "import actant; print(actant.__version__)"
-# 0.2.0-alpha.1
 ```
-
----
-
-## 启动 Worker 节点
-
-```bash
-# CLI（前台常驻，SIGINT/SIGTERM 触发优雅 drain）
-uv run actant worker
-
-# 或嵌入应用
-import actant
-with actant.Runtime.with_defaults() as rt:
-    rt.layer("Routing").chain(my_router)
-    rt.serve()                       # 启动 worker 守护循环（非阻塞）
-    result = actant.ask("Routing", ctx)
-```
-
-节点通过 iroh P2P 自动发现对端，**无需连接中心服务器**。退出 `with` 块时 `Runtime.stop()` 自动 drain 在途任务并关闭 iroh endpoint。
 
 ---
 
 ## 快速开始
 
+### 定义与提交任务
+
 ```python
 import actant
-from actant import Runtime, RouteCtx, ScheduleCtx, ask, emit
+from actant import Runtime, task
+
+@task
+def add(a: int, b: int) -> int:
+    return a + b
+
+@task(retries=3, retry_delay_ms=100, timeout_ms=5000)
+def fetch(url: str) -> str:
+    ...  # 自动重试 3 次，每次间隔 100ms，单次超时 5s
 
 with Runtime.with_defaults() as rt:
-    # ask：决策型，请求 Routing capability（按 task_name 稳定哈希到 peer）
-    target = ask("Routing", RouteCtx(task_name="etl-1", peers=["node-a", "node-b"], local_node="me"))
-    print(target)  # node-a
+    handle = add.submit(2, 3)    # 异步提交，返回 AsyncResult
+    print(handle.result())        # 5（阻塞等待结果）
 
-    # 追加自定义 router：后注册=高优先级，覆盖默认
-    rt.layer("Routing").chain(lambda ctx: "gpu-node" if "gpu" in ctx.tags else None)
-    print(ask("Routing", RouteCtx(task_name="train", peers=["a", "b"], tags=["gpu"])))  # gpu-node
-
-    # emit：反应型，自定义 capability 多播
-    rt.layer("Audit", "emit").chain(lambda e: print(f"audit: {e}"))
-    emit("Audit", {"action": "login", "user": "alice"})
+    # 直接调用（同步，不走执行池）
+    print(add(2, 3))              # 5
 ```
 
-核心 API：`Runtime` / `Runtime.with_defaults()` / `Layer`（`rt.layer(name).chain(handler)`）/ `ask` / `perform` / `emit` / `effect` / `impossible` / `capability`。请求/事件类型（`RouteCtx`、`ScheduleCtx`、`RetryCtx`、`StoreReq` 等）与 Handler Protocol 定义于 `actant.capabilities`。
+### 任务依赖
+
+`AsyncResult` 作为下游任务的参数时自动阻塞等待：
+
+```python
+@task
+def double(x: int) -> int:
+    return x * 2
+
+with Runtime.with_defaults():
+    a = add.submit(10)        # 11
+    b = double.submit(a)      # 自动等待 a 完成，传入 11，得 22
+    print(b.result())          # 22
+```
+
+依赖解析递归处理嵌套容器（`list` / `tuple` / `dict`）。
+
+### 工作流编排
+
+```python
+from actant import flow
+
+@flow
+def pipeline(a: int, b: int) -> int:
+    result = add.submit(a, b)
+    return double.submit(result).result()
+
+with Runtime.with_defaults():
+    print(pipeline(2, 3))  # (2+3)*2 = 10
+```
+
+`@flow` 广播生命周期事件（`submitted` → `started` → `completed`/`failed`），可通过 `rt.layer("WorkflowLifecycle").chain(handler)` 订阅。
+
+### 启动 Worker 节点
+
+```bash
+# CLI（前台常驻，SIGINT/SIGTERM 触发优雅 drain）
+uv run actant worker --log-level info
+
+# 自定义 Worker 参数
+uv run actant worker --max-concurrent-tasks 8 --scheduler priority
+```
+
+节点通过 iroh P2P 自动发现对端，**无需连接中心服务器**。
 
 ---
 
@@ -89,16 +103,6 @@ uv run python examples/custom_capability.py     # 自定义 capability、handler
 uv run python -m examples.github_analyzer       # 大型示例：真实 GitHub 仓库分析
 ```
 
-[`examples/github_analyzer/`](examples/github_analyzer/) 演示真实拉取 GitHub issues/PRs、按 owner 内容路由、PR 优先调度、指数退避重试、令牌桶限流、分仓库聚合、文件持久化等生产级关注点。
-
-```bash
-# 默认分析 tokio-rs/tokio 与 astral-sh/uv（首次真实拉取，之后读缓存）
-uv run python -m examples.github_analyzer
-
-# 自定义仓库列表（可选 GITHUB_TOKEN 提升速率限制到 5000 req/hour）
-ACTANT_GH_REPOS=owner1/repo1,owner2/repo2 uv run python -m examples.github_analyzer
-```
-
 ---
 
 ## 开发
@@ -107,6 +111,15 @@ ACTANT_GH_REPOS=owner1/repo1,owner2/repo2 uv run python -m examples.github_analy
 uv run pytest tests/ -v          # Python 测试
 cargo nextest run                # Rust 测试
 cargo clippy && ruff check actant tests
+mypy actant
 ```
 
-架构分层、目录结构、Worker 运行模型、重构路线图、代码约定与测试规范详见 [AGENTS.md](AGENTS.md)。
+架构分层、ERH 扩展模型、目录结构、Worker 运行模型、代码约定详见 [AGENTS.md](AGENTS.md)。
+
+### 可观测性
+
+Actant 内置三种可观测能力，均通过环境变量开关，无需改动业务代码：
+
+- `ACTANT_TRACING=1`：启用 Rust 侧 `tracing` 结构化日志（默认已初始化）。
+- `ACTANT_VIZTRACER=/tmp/actant.json`：启用 Python 调用追踪（需安装 `actant[observability]`）。
+- `ACTANT_TOKIO_CONSOLE=1`：启用 tokio-console 异步运行时可视化（需使用 `cargo build --features tokio-console` 重新编译 Rust 核心）。

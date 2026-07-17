@@ -496,6 +496,7 @@ impl TryFrom<&PyActantConfig> for ActantConfig {
 
     fn try_from(c: &PyActantConfig) -> PyResult<Self> {
         let default = ActantConfig::default();
+        let task_thread_pool_workers = c.max_concurrent_tasks.max(1);
         Ok(Self {
             network: NetworkConfig::try_from(&c.network)?,
             failover: FailoverConfig::from(c.failover.clone()),
@@ -505,6 +506,8 @@ impl TryFrom<&PyActantConfig> for ActantConfig {
                 default_task_timeout_ms: c.default_task_timeout_ms,
                 drain_timeout_secs: c.drain_timeout_secs,
                 remote_fallback_delay_ms: c.remote_fallback_delay_ms,
+                task_thread_pool_workers,
+                task_thread_pool_channel_capacity: task_thread_pool_workers * 16,
                 scheduler_kind: scheduler_kind_from_str(&c.scheduler)?,
                 ..default.worker
             },

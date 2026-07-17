@@ -148,9 +148,13 @@ pub struct WorkerInitParams<'a> {
 /// 调度状态由 Actor 持有。
 pub async fn init_worker(params: WorkerInitParams<'_>) -> Result<Worker, ActantError> {
     let scheduler_actor_id = ActorId::scheduler(params.node_id);
+    // 注入 EventBus 到 SchedulerActor：Actor 在 enqueue 后发布 TaskEnqueued 事件，
+    // Worker 订阅该 topic 实现事件驱动唤醒。
     let scheduler_actor = match params.scheduler_kind {
-        scheduler_kind::FIFO => SchedulerActor::fifo(),
-        scheduler_kind::PRIORITY => SchedulerActor::priority(),
+        scheduler_kind::FIFO => SchedulerActor::with_event_bus(params.event_bus.clone()),
+        scheduler_kind::PRIORITY => {
+            SchedulerActor::with_event_bus(params.event_bus.clone()).with_priority()
+        }
         other => {
             return Err(ActantError::Config(format!(
                 "unknown scheduler kind '{}': expected one of: {}, {}",
@@ -272,10 +276,11 @@ impl RuntimeBuilder {
             .map_err(|e| ActantError::Storage(format!("failed to open store: {}", e)))?;
         let store = Store::new(lmdb_store.clone());
 
-        let task_dispatcher: Arc<dyn TaskDispatcher> = TaskRegistry::new(
+        let task_dispatcher: Arc<dyn TaskDispatcher> = TaskRegistry::with_drain_timeout(
             self.config.worker.task_thread_pool_workers.max(1),
             self.config.worker.task_thread_pool_channel_capacity.max(1),
             self.config.payload_signing_key.clone(),
+            std::time::Duration::from_secs(self.config.worker.drain_timeout_secs.max(1)),
         )
         .map_err(|e| ActantError::Config(format!("failed to create task dispatcher: {}", e)))?
         .into_dispatcher();
@@ -362,6 +367,8 @@ impl RuntimeBuilder {
             event_bus.clone(),
             task_dispatcher.clone(),
         ));
+        runtime.subscribe_cancel().await?;
+        failover.subscribe_topics().await?;
 
         // ── CapabilityGossip ──────────────────────────────────────────
         // 跨节点 capability 元信息扩散。直接启动后台广播循环，
@@ -397,7 +404,7 @@ impl RuntimeBuilder {
         .await?;
         tracing::info!("build: init_worker done");
         // Worker 持有 Arc<dyn Scheduler>，让 failover 也能拿到 scheduler 引用。
-        let worker = Arc::new(worker);
+        let worker = Arc::new(worker.with_failover_manager(failover.clone()));
         // 注入 worker 到 runtime。此处 runtime 仍是唯一 Arc 引用
         //（register_background_loop_cancel 只借用 &self，未 clone Arc），
         // 故 Arc::get_mut 可直接获取可变引用。此前用 runtime.clone() 会使
@@ -421,320 +428,5 @@ impl RuntimeBuilder {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn empty_data_dir_rejected() {
-        assert!(matches!(validate_data_dir(""), Err(ActantError::Config(_))));
-        assert!(matches!(
-            validate_data_dir("   "),
-            Err(ActantError::Config(_))
-        ));
-    }
-
-    #[test]
-    fn normal_relative_path_accepted() {
-        assert!(validate_data_dir("./actant-data").is_ok());
-        assert!(validate_data_dir("actant-data").is_ok());
-    }
-
-    #[test]
-    fn normal_absolute_path_accepted() {
-        assert!(validate_data_dir("/tmp/actant-test-does-not-exist-xyz").is_ok());
-    }
-
-    #[test]
-    fn parent_component_accepted() {
-        assert!(validate_data_dir("../actant-data").is_ok());
-        assert!(validate_data_dir("../../actant-data").is_ok());
-    }
-
-    #[test]
-    fn system_root_rejected() {
-        let result = validate_data_dir("/");
-        assert!(
-            matches!(result, Err(ActantError::Config(_))),
-            "data_dir=/ must be rejected, got {:?}",
-            result
-        );
-    }
-
-    #[test]
-    fn system_etc_rejected() {
-        let result = validate_data_dir("/etc");
-        assert!(
-            matches!(result, Err(ActantError::Config(_))),
-            "data_dir=/etc must be rejected, got {:?}",
-            result
-        );
-    }
-
-    #[test]
-    fn system_bin_rejected() {
-        let result = validate_data_dir("/bin");
-        assert!(
-            matches!(result, Err(ActantError::Config(_))),
-            "data_dir=/bin must be rejected, got {:?}",
-            result
-        );
-    }
-
-    #[test]
-    fn system_dev_rejected() {
-        let result = validate_data_dir("/dev");
-        assert!(
-            matches!(result, Err(ActantError::Config(_))),
-            "data_dir=/dev must be rejected, got {:?}",
-            result
-        );
-    }
-
-    #[test]
-    fn symlink_to_system_dir_rejected() {
-        let result = validate_data_dir("/etc/./");
-        assert!(
-            matches!(result, Err(ActantError::Config(_))),
-            "data_dir=/etc/. should canonicalize and be rejected, got {:?}",
-            result
-        );
-    }
-
-    #[test]
-    fn subdir_of_system_dir_accepted() {
-        assert!(validate_data_dir("/etc/actant-nonexistent-xyz-123").is_ok());
-    }
-
-    // ───────────────────────── init_actor_system 测试 ─────────────────────────
-
-    use crate::common::WorkerConfig;
-    use crate::runtime::workflow::FailoverManager;
-    use crate::test_support::MockTransport;
-    use tempfile::tempdir;
-
-    fn make_node(id: &str) -> NodeId {
-        NodeId::from(id.to_string())
-    }
-
-    #[test]
-    fn init_actor_system_without_data_dir_returns_in_memory_system() {
-        let node_id = make_node("node-A");
-        let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-A"));
-        let event_bus = EventBus::new();
-        let system = init_actor_system(None, &node_id, &network, &event_bus).unwrap();
-        assert!(Arc::strong_count(&system) >= 1);
-    }
-
-    #[test]
-    fn init_actor_system_with_data_dir_creates_persistence_files() {
-        let dir = tempdir().unwrap();
-        let node_id = make_node("node-B");
-        let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-B"));
-        let event_bus = EventBus::new();
-        let system = init_actor_system(
-            Some(dir.path().to_str().unwrap()),
-            &node_id,
-            &network,
-            &event_bus,
-        )
-        .unwrap();
-        // 验证 actor 子目录与 WAL 文件已创建。
-        assert!(dir.path().join("actor").exists());
-        assert!(dir.path().join("actor.wal").exists());
-        drop(system);
-    }
-
-    #[test]
-    fn init_actor_system_with_invalid_data_dir_returns_storage_io_error() {
-        let node_id = make_node("node-C");
-        let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-C"));
-        let event_bus = EventBus::new();
-        // /dev/null 是文件而非目录，create_dir_all 应失败。
-        let result = init_actor_system(Some("/dev/null"), &node_id, &network, &event_bus);
-        assert!(matches!(result, Err(ActantError::StorageIo(_))));
-    }
-
-    // ───────────────────────── init_orchestrator 测试 ─────────────────────────
-
-    #[tokio::test]
-    async fn init_orchestrator_without_data_dir_returns_new_orchestrator() {
-        let node_id = make_node("node-D");
-        let config = ActantConfig::default();
-        let orchestrator = init_orchestrator(None, &node_id, &config).await.unwrap();
-        assert!(Arc::strong_count(&orchestrator) >= 1);
-    }
-
-    #[tokio::test]
-    async fn init_orchestrator_with_data_dir_recovers_from_store() {
-        let dir = tempdir().unwrap();
-        let node_id = make_node("node-E");
-        let config = ActantConfig::default();
-        let orchestrator = init_orchestrator(Some(dir.path().to_str().unwrap()), &node_id, &config)
-            .await
-            .unwrap();
-        // 验证 orchestrator 子目录已创建。
-        assert!(dir.path().join("orchestrator").exists());
-        drop(orchestrator);
-    }
-
-    // ───────────────────────── init_worker 测试 ─────────────────────────
-
-    async fn make_failover(node_id: &NodeId, network: &Arc<dyn Transport>) -> Arc<FailoverManager> {
-        let actor_system = Arc::new(ActorSystem::new());
-        let workflow_actor_id = ActorId::workflow(node_id);
-        Arc::new(FailoverManager::new(
-            node_id.clone(),
-            network.clone(),
-            actor_system,
-            workflow_actor_id,
-        ))
-    }
-
-    #[tokio::test]
-    async fn init_worker_with_fifo_scheduler_spawns_actor_and_returns_worker() {
-        let node_id = make_node("node-F");
-        let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-F"));
-        let event_bus = EventBus::new();
-        let actor_system = Arc::new(ActorSystem::new());
-        let dispatcher = TaskRegistry::new(1, 8, Vec::new())
-            .expect("TaskRegistry init")
-            .into_dispatcher();
-        let failover = make_failover(&node_id, &network).await;
-        let handle = tokio::runtime::Handle::current();
-
-        let worker = init_worker(WorkerInitParams {
-            node_id: &node_id,
-            network: &network,
-            event_bus,
-            scheduler_kind: scheduler_kind::FIFO,
-            worker_config: &WorkerConfig::default(),
-            actor_system: actor_system.clone(),
-            task_dispatcher: dispatcher,
-            failover: &failover,
-            tokio_handle: handle,
-            workflow_actor_id: None,
-            dag_gossip_actor_id: None,
-        })
-        .await
-        .expect("init_worker FIFO ok");
-
-        assert_eq!(worker.node_id(), &node_id);
-        assert!(worker.scheduler_actor_id().is_some());
-    }
-
-    #[tokio::test]
-    async fn init_worker_with_priority_scheduler_spawns_actor() {
-        let node_id = make_node("node-G");
-        let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-G"));
-        let event_bus = EventBus::new();
-        let actor_system = Arc::new(ActorSystem::new());
-        let dispatcher = TaskRegistry::new(1, 8, Vec::new())
-            .expect("TaskRegistry init")
-            .into_dispatcher();
-        let failover = make_failover(&node_id, &network).await;
-        let handle = tokio::runtime::Handle::current();
-
-        let worker = init_worker(WorkerInitParams {
-            node_id: &node_id,
-            network: &network,
-            event_bus,
-            scheduler_kind: scheduler_kind::PRIORITY,
-            worker_config: &WorkerConfig::default(),
-            actor_system: actor_system.clone(),
-            task_dispatcher: dispatcher,
-            failover: &failover,
-            tokio_handle: handle,
-            workflow_actor_id: None,
-            dag_gossip_actor_id: None,
-        })
-        .await
-        .expect("init_worker PRIORITY ok");
-
-        assert_eq!(worker.node_id(), &node_id);
-    }
-
-    #[tokio::test]
-    async fn init_worker_with_unknown_scheduler_kind_returns_config_error() {
-        let node_id = make_node("node-H");
-        let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-H"));
-        let event_bus = EventBus::new();
-        let actor_system = Arc::new(ActorSystem::new());
-        let dispatcher = TaskRegistry::new(1, 8, Vec::new())
-            .expect("TaskRegistry init")
-            .into_dispatcher();
-        let failover = make_failover(&node_id, &network).await;
-        let handle = tokio::runtime::Handle::current();
-
-        let result = init_worker(WorkerInitParams {
-            node_id: &node_id,
-            network: &network,
-            event_bus,
-            scheduler_kind: "lifo",
-            worker_config: &WorkerConfig::default(),
-            actor_system: actor_system.clone(),
-            task_dispatcher: dispatcher,
-            failover: &failover,
-            tokio_handle: handle,
-            workflow_actor_id: None,
-            dag_gossip_actor_id: None,
-        })
-        .await;
-
-        assert!(
-            matches!(result, Err(ActantError::Config(_))),
-            "expected Config error for unknown scheduler kind"
-        );
-    }
-
-    #[tokio::test]
-    async fn init_worker_attaches_optional_actor_ids_when_provided() {
-        let node_id = make_node("node-I");
-        let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-I"));
-        let event_bus = EventBus::new();
-        let actor_system = Arc::new(ActorSystem::new());
-        let dispatcher = TaskRegistry::new(1, 8, Vec::new())
-            .expect("TaskRegistry init")
-            .into_dispatcher();
-        let failover = make_failover(&node_id, &network).await;
-        let handle = tokio::runtime::Handle::current();
-        let workflow_actor_id = ActorId::workflow(&node_id);
-        let dag_gossip_actor_id = ActorId::dag_gossip(&node_id);
-
-        let worker = init_worker(WorkerInitParams {
-            node_id: &node_id,
-            network: &network,
-            event_bus,
-            scheduler_kind: scheduler_kind::FIFO,
-            worker_config: &WorkerConfig::default(),
-            actor_system: actor_system.clone(),
-            task_dispatcher: dispatcher,
-            failover: &failover,
-            tokio_handle: handle,
-            workflow_actor_id: Some(workflow_actor_id.clone()),
-            dag_gossip_actor_id: Some(dag_gossip_actor_id.clone()),
-        })
-        .await
-        .expect("init_worker with actor ids ok");
-
-        // 通过 worker 的 scheduler_actor_id 验证 spawn 成功。
-        assert!(worker.scheduler_actor_id().is_some());
-    }
-
-    // ───────────────────────── RuntimeBuilder 测试 ─────────────────────────
-
-    #[test]
-    fn runtime_builder_new_initializes_without_data_dir() {
-        let node_id = make_node("node-J");
-        let builder = RuntimeBuilder::new(node_id, ActantConfig::default());
-        // build 需要 data_dir，但 builder 构造本身不应失败。
-        assert!(builder.data_dir.is_none());
-    }
-
-    #[test]
-    fn runtime_builder_with_data_dir_stores_path() {
-        let node_id = make_node("node-K");
-        let builder = RuntimeBuilder::new(node_id, ActantConfig::default())
-            .with_data_dir("/tmp/actant-test".into());
-        assert_eq!(builder.data_dir.as_deref(), Some("/tmp/actant-test"));
-    }
-}
+#[path = "../../tests/rust/unit/runtime/builder.rs"]
+mod tests;

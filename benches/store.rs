@@ -28,8 +28,12 @@ fn open_temp_store(rt: &Runtime) -> (Store, tempfile::TempDir) {
 fn bench_put_single(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     let mut group = c.benchmark_group("store/put_single");
-    // 单键 put 每次都开启+提交独立事务（含 fsync），成本高。
-    // 使用较小 n 避免单次迭代过长导致 criterion 采样不足。
+    // 单键 put 每次都开启+提交独立事务（含 fsync），成本高（~2.88ms/次）。
+    // n=1000 时单次迭代 ~2.88s，默认 sample_size=100 会导致单组耗时 ~5min。
+    // 降低 sample_size 与 measurement_time 使整组在 ~30s 内完成，仍保持统计有效性。
+    group.sample_size(10);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.warm_up_time(std::time::Duration::from_secs(1));
     for &n in &[100usize, 1_000] {
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
             let (store, _dir) = open_temp_store(&rt);
@@ -70,6 +74,11 @@ fn bench_get_single(c: &mut Criterion) {
 fn bench_put_batch(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     let mut group = c.benchmark_group("store/put_batch");
+    // put_batch 单次事务含 fsync，但批量写入摊薄了开销。
+    // batch_size=1000 单次迭代 ~3ms，默认配置可行但仍适度降低以保持一致性。
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.warm_up_time(std::time::Duration::from_secs(1));
     for &batch_size in &[10usize, 100, 1_000] {
         group.bench_with_input(
             BenchmarkId::from_parameter(batch_size),
@@ -97,6 +106,10 @@ fn bench_put_batch(c: &mut Criterion) {
 fn bench_delete_single(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     let mut group = c.benchmark_group("store/delete_single");
+    // delete 同 put，每次独立事务含 fsync，降低 sample_size 避免长耗时。
+    group.sample_size(10);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.warm_up_time(std::time::Duration::from_secs(1));
     let (store, _dir) = open_temp_store(&rt);
     for &n in &[100usize, 1_000] {
         let value = vec![0u8; 128];

@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import os
+import shutil
+import tempfile
+
 import pytest
 
 import actant
@@ -31,6 +35,38 @@ class TestRuntimeLifecycle:
             assert get_current_runtime() is rt2
         assert get_current_runtime() is rt1
         rt1.stop()
+
+    def test_runtime_accepts_worker_convenience_params(self):
+        """验证 worker 便捷参数能构造 _ActantConfig。"""
+        rt = Runtime(
+            max_concurrent_tasks=4,
+            default_task_timeout_ms=60000,
+            drain_timeout_secs=60,
+            remote_fallback_delay_ms=1000,
+            scheduler="fifo",
+        )
+        assert rt._config is not None
+        assert rt._config.max_concurrent_tasks == 4
+        assert rt._config.default_task_timeout_ms == 60000
+        assert rt._config.drain_timeout_secs == 60
+        assert rt._config.remote_fallback_delay_ms == 1000
+        assert rt._config.scheduler == "fifo"
+
+    def test_runtime_config_param_takes_precedence(self):
+        """提供 config 时便捷参数被忽略。"""
+        from actant.actant import _ActantConfig
+
+        cfg = _ActantConfig(payload_signing_key="", max_concurrent_tasks=8)
+        rt = Runtime(config=cfg, max_concurrent_tasks=2)
+        assert rt._config is cfg
+        assert rt._config.max_concurrent_tasks == 8
+
+    def test_runtime_no_params_uses_test_config(self):
+        rt = Runtime()
+        # 无参数时 _build_config 仍会构造一个 _ActantConfig，临时 data_dir
+        # 使用 preset="none" 避免测试受 P2P 发现抖动影响。
+        assert rt._config is not None
+        assert rt._config.network.preset == "none"
 
 
 class TestLayerRegistration:
@@ -143,3 +179,28 @@ class TestEffectKindValidation:
         rt.layer("CustomAsk", "ask").chain(lambda x: x)
         with pytest.raises(RuntimeError, match="not 'perform'"), rt:
             actant.perform("CustomAsk", "x")
+
+
+class TestRuntimeCleanup:
+    def test_stop_is_idempotent_for_temp_data_dir(self):
+        """重复 stop() 不应因临时 data_dir 已清理而报错。"""
+        rt = Runtime()
+        data_dir = rt._data_dir
+        assert data_dir is not None
+        rt.start()
+        rt.stop()
+        assert not rt._started
+        assert not os.path.exists(data_dir)
+        rt.stop()  # 幂等，不应抛 FileNotFoundError
+        assert not os.path.exists(data_dir)
+
+    def test_user_data_dir_not_cleaned(self):
+        """用户显式传入的 data_dir 不应被 Runtime 清理。"""
+        data_dir = tempfile.mkdtemp()
+        try:
+            rt = Runtime(data_dir=data_dir)
+            rt.start()
+            rt.stop()
+            assert os.path.exists(data_dir)
+        finally:
+            shutil.rmtree(data_dir, ignore_errors=True)

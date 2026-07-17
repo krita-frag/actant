@@ -94,6 +94,9 @@ fn bench_dequeue_priority(c: &mut Criterion) {
                 },
                 |sched| {
                     rt.block_on(async {
+                        // close() 使 dequeue() 在队列清空后返回 None 而非阻塞等待。
+                        // 不调用 close 会导致 dequeue 在队列空时永久阻塞（hang）。
+                        sched.close();
                         let mut count = 0;
                         while sched.dequeue().await.is_some() {
                             count += 1;

@@ -24,6 +24,7 @@ pub struct PyActorCore {
 #[pymethods]
 impl PyActorCore {
     #[pyo3(signature = (actor_id, method, payload))]
+    #[tracing::instrument(name = "py.actor.call_method", level = "info", skip(self, py, payload), fields(actor_id = %actor_id, method = %method))]
     fn call_method(
         &self,
         py: Python<'_>,
@@ -44,7 +45,7 @@ impl PyActorCore {
                         if let Some(err) = result.error {
                             Python::attach(|_py| {
                                 FutureResultToPy::Err(pyo3::PyErr::from(
-                                    crate::common::ActantError::Actor(err),
+                                    crate::common::ActantError::from(err),
                                 ))
                             })
                         } else {
@@ -64,6 +65,7 @@ impl PyActorCore {
         .map(|b| b.unbind())
     }
 
+    #[tracing::instrument(name = "py.actor.stop", level = "info", skip(self, py), fields(actor_id = %actor_id))]
     fn stop_actor(&self, py: Python<'_>, actor_id: String) -> PyResult<()> {
         let system = self.system.clone();
         let handle = self.tokio_handle.clone();
@@ -75,11 +77,15 @@ impl PyActorCore {
         // restart_actor 不经过此路径（直接调用 system.kill），故不受影响。
         if dispatchers.remove(&id_for_cleanup).is_none() {
             // 可选：记录警告，actor 停止时未找到对应的 dispatcher
-            eprintln!("warning: actor {} stopped but no dispatcher found", id_for_cleanup);
+            eprintln!(
+                "warning: actor {} stopped but no dispatcher found",
+                id_for_cleanup
+            );
         }
         Ok(())
     }
 
+    #[tracing::instrument(name = "py.actor.kill", level = "info", skip(self, py), fields(actor_id = %actor_id))]
     fn kill_actor(&self, py: Python<'_>, actor_id: String) -> PyResult<()> {
         let system = self.system.clone();
         let dispatchers = self.dispatchers.clone();
@@ -90,7 +96,10 @@ impl PyActorCore {
         // restart_actor 不经过此路径（直接调用 system.kill），故不受影响。
         if dispatchers.remove(&id_for_cleanup).is_none() {
             // 可选：记录警告，actor 终止时未找到对应的 dispatcher
-            eprintln!("warning: actor {} killed but no dispatcher found", id_for_cleanup);
+            eprintln!(
+                "warning: actor {} killed but no dispatcher found",
+                id_for_cleanup
+            );
         }
         Ok(())
     }
@@ -99,6 +108,7 @@ impl PyActorCore {
     /// 这是 actor 重启的唯一真实来源 — Python supervision 应调用此方法，
     /// 而非分别调用 kill_actor + create_actor_with_id，
     /// 后者存在消息可能丢失的竞态窗口。
+    #[tracing::instrument(name = "py.actor.restart", level = "info", skip(self, py), fields(actor_id = %actor_id, actor_type = %actor_type))]
     fn restart_actor(&self, py: Python<'_>, actor_id: String, actor_type: String) -> PyResult<()> {
         let system = self.system.clone();
         let dispatchers = self.dispatchers.clone();

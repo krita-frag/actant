@@ -46,42 +46,48 @@ class ActorError(ActantError):
     """Actor 系统错误。"""
 
     def __init__(self, message: str) -> None:
-        super().__init__(message, kind="actor")
+        hint = " Check actor mailbox capacity, message serialization, and that the target actor is still alive."
+        super().__init__(message + hint, kind="actor")
 
 
 class WorkflowError(ActantError):
     """Workflow 编排错误。"""
 
     def __init__(self, message: str) -> None:
-        super().__init__(message, kind="workflow")
+        hint = " Verify DAG structure (no cycles, all task_ids referenced in edges exist), and that task payloads are valid."
+        super().__init__(message + hint, kind="workflow")
 
 
 class TaskError(ActantError):
     """任务执行错误。"""
 
     def __init__(self, message: str) -> None:
-        super().__init__(message, kind="task")
+        hint = " Check task function implementation, argument types, and that all dependencies are importable in the worker process."
+        super().__init__(message + hint, kind="task")
 
 
 class WorkerError(ActantError):
     """Worker 运行时错误。"""
 
     def __init__(self, message: str) -> None:
-        super().__init__(message, kind="worker")
+        hint = " Check worker logs, max_concurrent_tasks capacity, and that the Runtime is not in drain mode."
+        super().__init__(message + hint, kind="worker")
 
 
 class ConfigError(ActantError):
     """配置错误。"""
 
     def __init__(self, message: str) -> None:
-        super().__init__(message, kind="config")
+        hint = " Review ActantConfig fields — failover params must satisfy heartbeat < failure_timeout < lease_duration, and data_dir must be writable."
+        super().__init__(message + hint, kind="config")
 
 
 class MetricsError(ActantError):
     """指标管道错误（初始化或采集失败）。"""
 
     def __init__(self, message: str) -> None:
-        super().__init__(message, kind="metrics")
+        hint = " Check that the metrics port is not already in use and prometheus_client is installed."
+        super().__init__(message + hint, kind="metrics")
 
 
 class NotFoundError(ActantError):
@@ -112,21 +118,24 @@ class TaskCancelledError(ActantError):
     """操作被取消。"""
 
     def __init__(self, message: str) -> None:
-        super().__init__(message, kind="cancelled")
+        hint = " The task was cancelled via Runtime.cancel_task() or a parent flow was cancelled. Use AsyncResult.state to check cancellation status."
+        super().__init__(message + hint, kind="cancelled")
 
 
 class InvalidStateError(ActantError):
     """无效状态操作（如在 drain 模式下提交任务）。"""
 
     def __init__(self, message: str) -> None:
-        super().__init__(message, kind="invalid_state")
+        hint = " Ensure Runtime.start() has been called and the Runtime is not stopped/draining. Use 'with Runtime(...) as rt:' to manage lifecycle."
+        super().__init__(message + hint, kind="invalid_state")
 
 
 class InternalError(ActantError):
     """内部错误。"""
 
     def __init__(self, message: str) -> None:
-        super().__init__(message, kind="internal")
+        hint = " This is likely a bug in Actant — please report it with the full stack trace and reproduction steps."
+        super().__init__(message + hint, kind="internal")
 
 
 class PayloadTooLargeError(ActantError):
@@ -135,8 +144,12 @@ class PayloadTooLargeError(ActantError):
     def __init__(self, actual: int, limit: int) -> None:
         self.actual = actual
         self.limit = limit
+        hint = (
+            " Reduce task argument/return value size, avoid passing large objects (use references or external storage),"
+            " or increase the message size limit in ActantConfig."
+        )
         super().__init__(
-            f"serialized payload size {actual} bytes exceeds limit {limit} bytes",
+            f"serialized payload size {actual} bytes exceeds limit {limit} bytes. {hint}",
             kind="payload_too_large",
         )
 
@@ -150,14 +163,16 @@ class WorkflowFailedError(ActantError):
     ) -> None:
         self.task_name = task_name
         self.task_error = task_error
-        super().__init__(message, kind="workflow_failed")
+        hint = " Inspect task_name/task_error attributes for the failing task. Consider adding retries or adjusting failure_strategy in the DAG."
+        super().__init__(message + " " + hint, kind="workflow_failed")
 
 
 class WorkflowCancelledError(ActantError):
     """Workflow 被取消。"""
 
     def __init__(self, message: str) -> None:
-        super().__init__(message, kind="workflow_cancelled")
+        hint = " The workflow was cancelled by a user call or a parent flow cancellation. Check cancel_event propagation in nested flows."
+        super().__init__(message + " " + hint, kind="workflow_cancelled")
 
 
 # Rust ActantError variant → Python exception class

@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use crate::common::wire::{CancelBroadcast, TOPIC_CANCEL};
 use crate::common::{ActantConfig, ActantError, ActorId, NodeId};
 use crate::runtime::actor::ActorSystem;
 use crate::runtime::capability::CapabilityRuntime;
@@ -123,6 +124,30 @@ impl Runtime {
         &self.task_dispatcher
     }
 
+    /// 订阅跨节点任务取消广播话题。
+    ///
+    /// 应在 worker 启动前调用，确保 ``broadcast_cancel`` 可立即发送。
+    pub async fn subscribe_cancel(&self) -> crate::common::Result<()> {
+        self.network.subscribe(TOPIC_CANCEL).await
+    }
+
+    /// 广播一条跨节点任务取消消息。
+    ///
+    /// 接收方应监听 ``TOPIC_CANCEL`` 话题并据此取消本地对应任务。
+    pub async fn broadcast_cancel(
+        &self,
+        task_id: &str,
+        workflow_id: &str,
+    ) -> crate::common::Result<()> {
+        let msg = CancelBroadcast {
+            task_id: task_id.into(),
+            workflow_id: workflow_id.into(),
+        };
+        let bytes = postcard::to_allocvec(&msg)
+            .map_err(|e| ActantError::Serialization(format!("cancel broadcast encode: {e}")))?;
+        self.network.broadcast(TOPIC_CANCEL, bytes).await
+    }
+
     /// 使用当前 Runtime 的子系统初始化一个 [`Worker`]。
     ///
     /// 返回的 worker 共享本 Runtime 的 `task_dispatcher`，避免重复创建线程池。
@@ -188,9 +213,7 @@ impl Runtime {
             // 导致 cancel 不被处理，故设短超时。
             let mut state_rx = worker.subscribe_state();
             let _ = tokio::time::timeout(stop_timeout, async {
-                while *state_rx.borrow()
-                    != crate::runtime::workflow::WorkerState::Stopped
-                {
+                while *state_rx.borrow() != crate::runtime::workflow::WorkerState::Stopped {
                     if state_rx.changed().await.is_err() {
                         break;
                     }
@@ -198,8 +221,7 @@ impl Runtime {
             })
             .await;
             if let Some(sched_id) = worker.scheduler_actor_id() {
-                let _ =
-                    tokio::time::timeout(stop_timeout, self.actor_system.stop(sched_id)).await;
+                let _ = tokio::time::timeout(stop_timeout, self.actor_system.stop(sched_id)).await;
             }
         }
 
@@ -212,9 +234,11 @@ impl Runtime {
         let _ = tokio::time::timeout(stop_timeout, self.actor_system.stop(&dag_gossip_id)).await;
 
         // 4. 停止 WorkflowActor（on_stop 取消 timeout/persist 循环）。
-        let _ =
-            tokio::time::timeout(stop_timeout, self.actor_system.stop(&self.workflow_actor_id))
-                .await;
+        let _ = tokio::time::timeout(
+            stop_timeout,
+            self.actor_system.stop(&self.workflow_actor_id),
+        )
+        .await;
 
         // 5. 停止所有 CapabilityActor（按注册名）。
         for meta in self.capability.capabilities() {
@@ -222,7 +246,12 @@ impl Runtime {
             let _ = tokio::time::timeout(stop_timeout, self.actor_system.stop(&cap_id)).await;
         }
 
-        // 6. 关闭网络（iroh endpoint.close()）。必须在所有 Actor / 后台循环停止后
+        // 6. 关闭任务分发器线程池（等待在途任务完成或超时放弃 join）。
+        //    必须在 Actor / 后台循环停止后、网络关闭前执行：线程池中的任务
+        //    handler 可能访问 network / capability 等共享资源。
+        self.task_dispatcher.shutdown();
+
+        // 7. 关闭网络（iroh endpoint.close()）。必须在所有 Actor / 后台循环停止后
         //    执行：否则 Endpoint 被无声 drop 会触发 iroh 的
         //    "Endpoint dropped without calling Endpoint::close. Aborting ungracefully."
         //    警告，并可能中断在途 gossip/直连请求。
@@ -236,113 +265,5 @@ impl Runtime {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::common::{ActantConfig, ActorId, NodeId};
-    use crate::runtime::actor::ActorSystem;
-    use crate::runtime::capability::CapabilityRuntime;
-    use crate::runtime::dispatcher::TaskRegistry;
-    use crate::runtime::event_bus::EventBus;
-    use crate::runtime::state::{LmdbStore, Store};
-    use crate::test_support::MockTransport;
-    use tempfile::tempdir;
-
-    fn make_runtime(node_id: &str) -> Runtime {
-        let network: Arc<dyn Transport> = Arc::new(MockTransport::new(node_id));
-        let dir = tempdir().unwrap();
-        let lmdb = LmdbStore::open(dir.path()).unwrap();
-        let store = Store::new(lmdb);
-        let actor_system = Arc::new(ActorSystem::new());
-        let workflow_actor_id = ActorId::workflow(&NodeId::from(node_id.to_string()));
-        let capability = Arc::new(CapabilityRuntime::new());
-        let event_bus = EventBus::new();
-        let dispatcher = TaskRegistry::new(1, 8, Vec::new())
-            .expect("TaskRegistry init")
-            .into_dispatcher();
-        Runtime::new(
-            NodeId::from(node_id.to_string()),
-            ActantConfig::default(),
-            network,
-            store,
-            actor_system,
-            workflow_actor_id,
-            None,
-            capability,
-            event_bus,
-            dispatcher,
-        )
-    }
-
-    #[test]
-    fn getters_return_configured_values() {
-        let rt = make_runtime("node-X");
-        assert_eq!(rt.node_id().as_str(), "node-X");
-        assert!(
-            rt.config().worker.scheduler_kind.as_str().is_empty()
-                || !rt.config().worker.scheduler_kind.as_str().is_empty()
-        );
-        assert_eq!(rt.workflow_actor_id().as_str(), "workflow-node-X");
-        assert!(rt.worker().is_none());
-        assert!(rt.network().node_id().as_str() == "node-X");
-    }
-
-    #[test]
-    fn register_background_loop_cancel_is_noop_on_shutdown_when_unused() {
-        // 注册一个取消句柄但不发送，验证它被存入列表且不 panic。
-        let rt = make_runtime("node-A");
-        let (tx, _rx) = tokio::sync::watch::channel(false);
-        rt.register_background_loop_cancel(tx);
-        // 列表非空不影响其它访问器
-        assert_eq!(rt.node_id().as_str(), "node-A");
-    }
-
-    #[test]
-    fn shutdown_completes_without_worker_or_actors() {
-        // 无 worker、无已注册 Actor：shutdown 应顺序停止所有不存在的 Actor 并返回 Ok。
-        let rt = make_runtime("node-A");
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let result = runtime.block_on(rt.shutdown());
-        assert!(result.is_ok(), "shutdown should succeed: {:?}", result);
-    }
-
-    #[test]
-    fn shutdown_sends_cancel_to_registered_loops() {
-        // 注册一个取消句柄；shutdown 应发送 true，使 receiver 观察到 true。
-        let rt = make_runtime("node-B");
-        let (tx, rx) = tokio::sync::watch::channel(false);
-        rt.register_background_loop_cancel(tx);
-
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let result = runtime.block_on(rt.shutdown());
-        assert!(result.is_ok());
-        // 取消信号应已被发送
-        assert!(*rx.borrow(), "cancel signal should be sent on shutdown");
-    }
-
-    #[test]
-    fn clone_preserves_handles() {
-        // Runtime 是 Clone（廉价 Arc 句柄复制）；clone 后访问器应指向同一节点。
-        let rt = make_runtime("node-C");
-        let rt2 = rt.clone();
-        assert_eq!(rt.node_id().as_str(), rt2.node_id().as_str());
-        assert_eq!(
-            rt.workflow_actor_id().as_str(),
-            rt2.workflow_actor_id().as_str()
-        );
-    }
-
-    #[tokio::test]
-    async fn store_accessor_round_trips_data() {
-        // 验证 store 访问器返回的 Store 可正常读写（间接验证 Store 句柄有效）。
-        let rt = make_runtime("node-D");
-        rt.store().put("ctx-test", b"hello").await.unwrap();
-        let val = rt.store().get("ctx-test").await.unwrap();
-        assert_eq!(val, Some(b"hello".to_vec()));
-    }
-}
+#[path = "../../tests/rust/unit/runtime/context.rs"]
+mod tests;

@@ -1,0 +1,2 @@
+# cargo-llvm-cov 配置：排除 PyO3 绑定层（由 Python 测试覆盖）
+exclude-from-report = ["src/py/", "benches/"]

@@ -4,13 +4,13 @@ build-backend = "maturin"
 
 [project]
 name = "actant"
-version = "0.2.0-alpha.1"
+version = "0.2.0"
 description = "基于 Actor 模型的跨平台通用分布式任务编排引擎"
 readme = "README.md"
 authors = [{ name = "Actant Team" }]
 license = { file = "LICENSE" }
 classifiers = [
-    "Development Status :: 2 - Pre-Alpha",
+    "Development Status :: 3 - Alpha",
     "Environment :: Console",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
@@ -47,7 +47,6 @@ dev = [
 #   ACTANT_VIZTRACER=/tmp/actant.json  → Python 调用追踪
 #   ACTANT_TRACING=1                   → Rust 结构化日志
 #   ACTANT_TOKIO_CONSOLE=1             → Rust 异步运行时可视化（需 cargo --features tokio-console）
-#   ACTANT_PPROF=/tmp/actant.svg       → Rust CPU 火焰图（需 cargo --features pprof）
 observability = [
     "viztracer>=0.16",
 ]
@@ -120,12 +119,9 @@ parallel = true  # 配合 pytest-xdist
 # 排除难以测试或非业务关键模块
 omit = [
     "actant/cli/*",          # CLI 入口，手动测试
-    "actant/_pidfile.py",    # 守护进程 PID 文件，需 fork 进程
-    "actant/_logging.py",    # 日志配置，副作用为主
     "actant/actant.pyi",     # 类型存根
     "actant/py.typed",       # PEP 561 标记
-    # Rust 扩展模块（PyO3 生成）：
-    # actant.actant 是 Rust 编译产物，覆盖率由 cargo 工具链负责
+    # Rust 扩展模块（PyO3 生成）覆盖率由 cargo 工具链负责
 ]
 
 [tool.coverage.paths]
@@ -137,7 +133,7 @@ source = [
 
 [tool.coverage.report]
 # 整体门禁：所有模块平均
-fail_under = 75
+fail_under = 85
 show_missing = true
 skip_covered = false
 skip_empty = true
@@ -155,16 +151,8 @@ exclude_lines = [
 # 通过 `coverage report --include=<glob> --fail-under=N` 在 CI 中分阶段执行
 [tool.coverage.thresholds]
 # 此节为自定义文档，coverage 工具不解析；CI 脚本读取并强制执行。
-# 详见 .github/workflows/ci.yml 或 scripts/check-coverage-thresholds.sh
 public_api = 85           # actant/__init__.py 导出的公共 API
-serialization = 95        # _serialization.py
-flow_dag = 95             # flow.py + task.py（DAG 构建）
-router = 90               # router.py
-config = 90               # config.py
-exceptions = 95           # exceptions.py
-annotations = 90          # _annotations.py
-result = 85               # result.py
-node_runtime = 70         # _node.py（含网络/线程，部分难测）
+flow_dag = 95             # flow.py + task/*.py（DAG 构建）
 
 [tool.mypy]
 python_version = "3.10"
@@ -185,5 +173,10 @@ ignore_missing_imports = true
 
 # Third-party libs without stubs
 [[tool.mypy.overrides]]
-module = ["cloudpickle.*", "tomli.*", "tomllib.*", "yaml.*", "viztracer.*"]
+module = ["cloudpickle.*"]
 ignore_missing_imports = true
+
+[dependency-groups]
+dev = [
+    "pytest-forked>=1.6.0",
+]

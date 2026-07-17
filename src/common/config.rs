@@ -217,11 +217,14 @@ fn default_scheduler_kind() -> SchedulerKind {
     SchedulerKind::default()
 }
 
-const DEFAULT_MAX_CONCURRENT_TASKS: usize = 8;
+/// 默认每个 Worker 节点仅并发执行一个任务（单线程模型）。
+/// 需要更高并发时，在同一机器上启动多个 Worker 进程。
+const DEFAULT_MAX_CONCURRENT_TASKS: usize = 1;
 
 impl Default for WorkerConfig {
     fn default() -> Self {
-        let pool_workers = std::cmp::max(4, num_cpus::get());
+        // 单线程模型：每个 Worker 节点仅一个任务执行线程。
+        const POOL_WORKERS: usize = 1;
         Self {
             scheduler_kind: default_scheduler_kind(),
             timeout_check_interval_ms: 10,
@@ -232,8 +235,8 @@ impl Default for WorkerConfig {
             broadcast_retry_base_delay_ms: 100,
             drain_timeout_secs: 30,
             remote_fallback_delay_ms: 500,
-            task_thread_pool_workers: pool_workers,
-            task_thread_pool_channel_capacity: pool_workers * 16,
+            task_thread_pool_workers: POOL_WORKERS,
+            task_thread_pool_channel_capacity: POOL_WORKERS * 16,
             pending_result_channel_capacity: 256,
         }
     }
@@ -527,74 +530,5 @@ impl Default for GossipConfig {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn validate_accepts_empty_signing_key() {
-        let config = ActantConfig {
-            payload_signing_key: Vec::new(),
-            ..Default::default()
-        };
-        assert!(
-            config.validate().is_ok(),
-            "empty signing key should disable signing"
-        );
-    }
-
-    #[test]
-    fn validate_accepts_non_empty_signing_key() {
-        let config = ActantConfig {
-            payload_signing_key: b"shared-secret".to_vec(),
-            ..Default::default()
-        };
-        assert!(config.validate().is_ok());
-    }
-
-    #[test]
-    fn failover_validate_accepts_default() {
-        assert!(FailoverConfig::default().validate().is_ok());
-    }
-
-    #[test]
-    fn failover_validate_rejects_zero_heartbeat() {
-        let cfg = FailoverConfig {
-            heartbeat_interval_ms: 0,
-            ..FailoverConfig::default()
-        };
-        let err = cfg.validate().unwrap_err();
-        assert!(format!("{err}").contains("heartbeat_interval_ms"));
-    }
-
-    #[test]
-    fn failover_validate_rejects_failure_le_heartbeat() {
-        let default = FailoverConfig::default();
-        let cfg = FailoverConfig {
-            failure_timeout_ms: default.heartbeat_interval_ms,
-            ..default
-        };
-        let err = cfg.validate().unwrap_err();
-        assert!(format!("{err}").contains("failure_timeout_ms"));
-    }
-
-    #[test]
-    fn failover_validate_rejects_lease_le_failure() {
-        let default = FailoverConfig::default();
-        let cfg = FailoverConfig {
-            lease_duration_ms: default.failure_timeout_ms,
-            ..default
-        };
-        let err = cfg.validate().unwrap_err();
-        assert!(format!("{err}").contains("split-brain"));
-    }
-
-    #[test]
-    fn failover_validate_rejects_zero_check_interval() {
-        let cfg = FailoverConfig {
-            lease_expiry_check_interval_secs: 0,
-            ..FailoverConfig::default()
-        };
-        let err = cfg.validate().unwrap_err();
-        assert!(format!("{err}").contains("lease_expiry_check_interval_secs"));
-    }
-}
+#[path = "../../tests/rust/unit/common/config.rs"]
+mod tests;

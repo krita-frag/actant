@@ -41,6 +41,31 @@ impl SeenEntry {
 /// `DagGossip` 类型与具体的传输实现解耦。
 /// 运行时在启动时一次性选择具体的传输实现；下游代码
 /// （orchestrator、worker、failover）将其视为黑盒。
+///
+/// # 网络分区（split-brain）语义
+///
+/// Actant 使用 **最终一致性** 模型处理网络分区，不追求线性一致：
+///
+/// 1. **分区期间**：各分区的节点独立处理本地任务，DAG 状态更新通过 HLC
+///    （混合逻辑时钟）打时间戳。分区期间 gossip 消息无法跨分区传递，
+///    各分区维护各自的 `seen` 去重表与状态视图。
+/// 2. **分区恢复后**：gossip 重新连通，节点间交换 `WireDagStateUpdate`。
+///    `SeenEntry::is_superseded_by` 基于 HLC 时间戳与 `state_priority`
+///    进行 CRDT 风格合并——HLC 较大者胜出；HLC 相同时 priority 高者胜出。
+///    这保证了同一 task 的状态最终收敛到单一值，但**不保证**收敛到
+///    "全局最新"的状态（取决于 HLC 与 priority 的组合）。
+/// 3. **冲突任务结果**：若分区期间两个分区都执行了同一 task（failover
+///    误判导致），恢复后两个结果都会通过 gossip 传播。先到达的结果被
+///    `seen` 表记录，后到达的被视为重复而丢弃。**最终保留的结果取决于
+///    到达顺序，而非结果正确性**——这是 Actant 选择最终一致性的代价。
+/// 4. **工作流租约**：`FailoverConfig` 强制 `lease_duration_ms >
+///    failure_timeout_ms`，确保故障检测完成前旧持有者的租约未过期，
+///    避免分区期间双主同时操作同一工作流。分区恢复后，租约过期的节点
+///    通过 `should_claim_workflow` 一致性哈希重新选举唯一持有者。
+///
+/// **用户责任**：对强一致性要求的任务（如金融交易），用户应在 task 内
+/// 添加幂等性保护或使用外部协调器（如数据库事务），不应依赖 Actant 的
+/// gossip 合并保证唯一执行。
 #[derive(Clone)]
 pub struct DagGossip {
     network: Arc<dyn Transport>,
@@ -65,7 +90,7 @@ impl Drop for DagGossip {
 impl DagGossip {
     /// 从任意 [`Transport`] 实现创建一个 `DagGossip`。
     ///
-    /// `DagGossip` 不再直接持有 [`Orchestrator`]，而是通过 `actor_system`
+    /// `DagGossip` 不再直接持有 `Orchestrator`，而是通过 `actor_system`
     /// 向 `WorkflowActor` 发送消息，使编排器状态完全由 Actor 独占持有。
     pub fn new(
         network: Arc<dyn Transport>,
@@ -115,6 +140,10 @@ impl DagGossip {
     }
 
     /// 调用无返回值的 WorkflowActor 方法，仅检查错误。
+    ///
+    /// 若 WorkflowActor 返回 `NotFound` 错误（本节点未托管该 workflow），
+    /// 则保留原始 `ActantError::NotFound` 类型，使调用方可通过
+    /// `matches!(e, ActantError::NotFound(_))` 判定。
     async fn call_workflow_void<T: serde::Serialize>(
         &self,
         method: &str,
@@ -122,7 +151,7 @@ impl DagGossip {
     ) -> crate::common::Result<()> {
         let result = self.call_workflow(method, payload).await?;
         if let Some(err) = result.error {
-            Err(crate::common::ActantError::Actor(err))
+            Err(crate::common::ActantError::from(err))
         } else {
             Ok(())
         }
@@ -643,215 +672,5 @@ impl DagGossip {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::common::{GossipConfig, NodeId, TaskId, WireTaskState, WorkflowId};
-    use crate::runtime::actor::ActorSystem;
-    use crate::runtime::state::HlcTimestamp;
-    use crate::test_support::MockTransport;
-
-    fn make_gossip(node_id: &str, config: GossipConfig) -> DagGossip {
-        let network: Arc<dyn Transport> = Arc::new(MockTransport::new(node_id));
-        let actor_system = Arc::new(ActorSystem::new());
-        let wf_id = ActorId::workflow(&NodeId::from(node_id.to_string()));
-        DagGossip::new(network, actor_system, wf_id, config)
-    }
-
-    fn make_entry(ts: u64, prio: u8) -> SeenEntry {
-        SeenEntry {
-            inserted_at: std::time::Instant::now(),
-            hlc_timestamp: HlcTimestamp::from_parts(ts, 0),
-            state_priority: prio,
-        }
-    }
-
-    #[test]
-    fn state_priority_orders_terminal_above_running() {
-        assert_eq!(state_priority(&WireTaskState::Running), 1);
-        assert_eq!(state_priority(&WireTaskState::Skipped), 2);
-        assert_eq!(state_priority(&WireTaskState::Cancelled), 3);
-        assert_eq!(
-            state_priority(&WireTaskState::Failed { error: "e".into() }),
-            4
-        );
-        assert_eq!(
-            state_priority(&WireTaskState::Completed { result: Vec::new() }),
-            5
-        );
-    }
-
-    #[test]
-    fn seen_entry_superseded_by_higher_hlc() {
-        let entry = make_entry(10, 3);
-        assert!(entry.is_superseded_by(&HlcTimestamp::from_parts(20, 0), 1));
-    }
-
-    #[test]
-    fn seen_entry_not_superseded_by_lower_hlc() {
-        let entry = make_entry(20, 1);
-        assert!(!entry.is_superseded_by(&HlcTimestamp::from_parts(10, 0), 5));
-    }
-
-    #[test]
-    fn seen_entry_superseded_by_equal_hlc_and_higher_or_equal_prio() {
-        let entry = make_entry(10, 3);
-        // 同 HLC、更高 prio → 覆盖
-        assert!(entry.is_superseded_by(&HlcTimestamp::from_parts(10, 0), 4));
-        // 同 HLC、同 prio → 覆盖（>=）
-        assert!(entry.is_superseded_by(&HlcTimestamp::from_parts(10, 0), 3));
-        // 同 HLC、更低 prio → 不覆盖
-        assert!(!entry.is_superseded_by(&HlcTimestamp::from_parts(10, 0), 2));
-    }
-
-    #[test]
-    fn getters_return_configured_values() {
-        let cfg = GossipConfig {
-            dedup_window_size: 50,
-            dedup_ttl_secs: 30,
-            retry_attempts: 4,
-            retry_base_delay_ms: 200,
-            heads_broadcast_interval_ms: 1500,
-        };
-        let g = make_gossip("node-A", cfg);
-        assert_eq!(g.node_id().as_str(), "node-A");
-        assert_eq!(g.heads_broadcast_interval(), Duration::from_millis(1500));
-        let (seen, window, ttl, retries) = g.dedup_stats();
-        assert_eq!(seen, 0);
-        assert_eq!(window, 50);
-        assert_eq!(ttl, 30);
-        assert_eq!(retries, 4);
-    }
-
-    #[test]
-    fn seen_count_tracks_inserts() {
-        let g = make_gossip("node-A", GossipConfig::default());
-        assert_eq!(g.seen_count(), 0);
-        let key = SeenKey(
-            WorkflowId("wf-1".to_string()),
-            TaskId::from("t-1".to_string()),
-        );
-        g.seen.insert(key, make_entry(5, 1));
-        assert_eq!(g.seen_count(), 1);
-    }
-
-    #[test]
-    fn evict_seen_noop_below_window_threshold() {
-        // dedup_window_size * 2 是触发阈值；小于该值不应清理。
-        let cfg = GossipConfig {
-            dedup_window_size: 10,
-            dedup_ttl_secs: 60,
-            retry_attempts: 1,
-            retry_base_delay_ms: 1,
-            heads_broadcast_interval_ms: 1000,
-        };
-        let g = make_gossip("node-A", cfg);
-        for i in 0..15 {
-            let key = SeenKey(
-                WorkflowId(format!("wf-{}", i)),
-                TaskId::from(format!("t-{}", i)),
-            );
-            g.seen.insert(key, make_entry(i as u64, 1));
-        }
-        g.evict_seen();
-        // 15 < 10*2=20，不应触发清理
-        assert_eq!(g.seen_count(), 15);
-    }
-
-    #[test]
-    fn evict_seen_trims_to_window_size_when_exceeding_double() {
-        let cfg = GossipConfig {
-            dedup_window_size: 5,
-            dedup_ttl_secs: 60,
-            retry_attempts: 1,
-            retry_base_delay_ms: 1,
-            heads_broadcast_interval_ms: 1000,
-        };
-        let g = make_gossip("node-A", cfg);
-        // 插入 12 个条目（> 5*2=10），触发清理。
-        for i in 0..12 {
-            let key = SeenKey(
-                WorkflowId(format!("wf-{}", i)),
-                TaskId::from(format!("t-{}", i)),
-            );
-            g.seen.insert(
-                key,
-                SeenEntry {
-                    // 递增 inserted_at，使最旧的被先驱逐
-                    inserted_at: std::time::Instant::now()
-                        - std::time::Duration::from_millis(100 - i as u64),
-                    hlc_timestamp: HlcTimestamp::from_parts(i as u64, 0),
-                    state_priority: 1,
-                },
-            );
-        }
-        g.evict_seen();
-        assert!(
-            g.seen_count() <= 5,
-            "expected <= 5 after eviction, got {}",
-            g.seen_count()
-        );
-    }
-
-    #[test]
-    fn apply_remote_update_drops_stale_lower_hlc() {
-        // 先写入高 HLC 的终态，再尝试用低 HLC 的 Running 覆盖 — 应被丢弃。
-        let g = make_gossip("node-A", GossipConfig::default());
-        let wf = WorkflowId("wf-1".to_string());
-        let task = TaskId::from("t-1".to_string());
-
-        let newer = WireDagStateUpdate {
-            workflow_id: wf.clone(),
-            task_id: task.clone(),
-            task_state: WireTaskState::Completed {
-                result: vec![1, 2, 3],
-            },
-            hlc_timestamp: HlcTimestamp::from_parts(100, 5),
-            origin_node: NodeId::from("node-B".to_string()),
-        };
-        // 直接操作 seen 表验证 CRDT 逻辑（不调用 actor）。
-        let key = SeenKey(wf.clone(), task.clone());
-        g.seen.insert(
-            key.clone(),
-            SeenEntry {
-                inserted_at: std::time::Instant::now(),
-                hlc_timestamp: newer.hlc_timestamp,
-                state_priority: state_priority(&newer.task_state),
-            },
-        );
-        assert_eq!(g.seen_count(), 1);
-
-        // 构造一个更老的 Running 更新，应被丢弃（不增加 seen，CRDT 保留高优先级）。
-        let older = WireDagStateUpdate {
-            workflow_id: wf,
-            task_id: task,
-            task_state: WireTaskState::Running,
-            hlc_timestamp: HlcTimestamp::from_parts(50, 0),
-            origin_node: NodeId::from("node-C".to_string()),
-        };
-        // 直接复用 apply_remote_update 的 dedup 判定逻辑（不调用 actor）：
-        let existing = g.seen.get(&key).unwrap();
-        assert!(!existing.is_superseded_by(&older.hlc_timestamp, state_priority(&older.task_state)));
-        drop(existing);
-        assert_eq!(g.seen_count(), 1);
-        // 保留旧值不被覆盖
-        let entry = g.seen.get(&key).unwrap();
-        assert_eq!(entry.state_priority, 5);
-    }
-
-    #[test]
-    fn clock_tick_monotonic() {
-        let g = make_gossip("node-A", GossipConfig::default());
-        let t1 = g.clock().tick();
-        let t2 = g.clock().tick();
-        assert!(t2 > t1, "HLC tick must be monotonic: {:?} -> {:?}", t1, t2);
-    }
-
-    #[test]
-    fn clock_merges_remote_timestamp() {
-        let g = make_gossip("node-A", GossipConfig::default());
-        let remote = HlcTimestamp::from_parts(999, 9);
-        g.clock().merge(&remote);
-        let local = g.clock().tick();
-        assert!(local > remote, "after merge, local tick must exceed remote");
-    }
-}
+#[path = "../../../tests/rust/unit/runtime/workflow/gossip.rs"]
+mod tests;

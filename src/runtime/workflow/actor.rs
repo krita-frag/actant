@@ -23,6 +23,7 @@ use crate::common::{
     OrchestratorClaim, Result, TaskDefinition, TaskId, WorkflowId,
 };
 use crate::runtime::actor::Actor;
+use crate::runtime::event_bus::{BusEvent, EventBus};
 use crate::runtime::network::Transport;
 use crate::runtime::workflow::messaging::{decode, encode, ok_result, payload_result};
 use crate::runtime::workflow::{Dag, DagGossip, FailoverManager, FailureScope, Orchestrator};
@@ -58,7 +59,7 @@ pub mod workflow_methods {
     pub const RESCHEDULE_RUNNING_TASKS: &str = "reschedule_running_tasks";
 }
 
-/// 封装 [`Orchestrator`] 的 Actor，负责 DAG 提交、执行推进与状态查询。
+/// 封装 `Orchestrator` 的 Actor，负责 DAG 提交、执行推进与状态查询。
 ///
 /// 后台循环（超时监控、定期落盘）由 `on_start` 启动、`on_stop` 取消，
 /// Actor 生命周期与后台任务生命周期严格绑定。
@@ -505,18 +506,54 @@ impl InnerScheduler {
 /// 调度状态完全内化的 Actor，负责任务队列的入队/出队与状态维护。
 pub struct SchedulerActor {
     inner: InnerScheduler,
+    /// 用于发布 `TaskEnqueued` 事件唤醒 Worker 的 EventBus。
+    /// `None` 时（如纯单元测试）退化为无事件发布，Worker 需自行轮询。
+    /// 生产路径由 `init_worker` 注入与 Worker 共享的 EventBus。
+    event_bus: Option<EventBus>,
 }
 
 impl SchedulerActor {
     pub fn fifo() -> Self {
         Self {
             inner: InnerScheduler::fifo(),
+            event_bus: None,
         }
     }
 
     pub fn priority() -> Self {
         Self {
             inner: InnerScheduler::priority(),
+            event_bus: None,
+        }
+    }
+
+    /// 用给定的 EventBus 构造 FIFO SchedulerActor。
+    ///
+    /// `enqueue` / `enqueue_batch` / `close` 后会向 EventBus 发布
+    /// `BusEvent::TaskEnqueued` 事件，使订阅 `Topic::TaskEnqueued` 的 Worker
+    /// 立即被唤醒。通过 EventBus 事件 + 非阻塞 `try_dequeue` 组合，
+    /// 避免直接调用 `dequeue()` 阻塞 Actor 邮箱导致的死锁。
+    pub fn with_event_bus(event_bus: EventBus) -> Self {
+        Self {
+            inner: InnerScheduler::fifo(),
+            event_bus: Some(event_bus),
+        }
+    }
+
+    /// 设置优先级调度策略并返回 self（builder 风格）。
+    pub fn with_priority(mut self) -> Self {
+        self.inner = InnerScheduler::priority();
+        self
+    }
+
+    /// 发布 `TaskEnqueued` 事件到 EventBus，唤醒等待的 Worker。
+    ///
+    /// `TaskEnqueued` 是 `BestEffort` 事件：通道满时丢弃，不影响正确性——
+    /// Worker 下次 `try_dequeue` 仍会拉取已入队任务。
+    /// 无 EventBus（`None`）时为 no-op，仅单元测试路径会落入此分支。
+    async fn notify_task_enqueued(&self) {
+        if let Some(ref bus) = self.event_bus {
+            bus.publish(BusEvent::TaskEnqueued).await;
         }
     }
 }
@@ -533,11 +570,16 @@ impl Actor for SchedulerActor {
             scheduler_methods::ENQUEUE => {
                 let task: TaskDefinition = decode(&msg.payload)?;
                 self.inner.enqueue(task)?;
+                // 事件驱动唤醒 Worker：通过 EventBus 发布 TaskEnqueued 事件，
+                // 订阅的 Worker 立即被唤醒拉取任务。BestEffort 投递——
+                // 丢弃不影响正确性，Worker 下次 try_dequeue 仍会拉取已入队任务。
+                self.notify_task_enqueued().await;
                 Ok(ok_result(msg_id))
             }
             scheduler_methods::ENQUEUE_BATCH => {
                 let tasks: Vec<TaskDefinition> = decode(&msg.payload)?;
                 self.inner.enqueue_batch(tasks)?;
+                self.notify_task_enqueued().await;
                 Ok(ok_result(msg_id))
             }
             scheduler_methods::DEQUEUE => {
@@ -567,6 +609,9 @@ impl Actor for SchedulerActor {
             }
             scheduler_methods::CLOSE => {
                 self.inner.close();
+                // close 后发布事件，唤醒等待的 Worker 使其 try_dequeue
+                // 得到 None 并退出主循环。
+                self.notify_task_enqueued().await;
                 Ok(ok_result(msg_id))
             }
             scheduler_methods::IS_CLOSED => {
@@ -608,8 +653,8 @@ pub mod failover_methods {
 /// 持有 `Arc<FailoverManager>` 而非 owned，避免 `FailoverManager` 派生 `Clone`
 /// （其内部含 `Mutex` 不可 `Clone`）。Builder 与 Actor 共享同一实例。
 ///
-/// 后台循环（心跳、故障检测、租约过期检查）由 `Runtime` 在初始化末期启动，
-/// 并通过 [`Runtime::shutdown`] 统一取消；FailoverActor 本身仅作为消息网关。
+/// 后台循环（心跳、故障检测、租约过期检查）由 runtime 初始化末期启动，
+/// 并通过 runtime shutdown 路径统一取消；FailoverActor 本身仅作为消息网关。
 pub struct FailoverActor {
     manager: Arc<FailoverManager>,
 }
@@ -854,111 +899,5 @@ pub async fn failover_actor(
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
-
-    use super::*;
-    use crate::common::{ActorId, RetryPolicy};
-    use crate::runtime::actor::ActorSystem;
-    use crate::runtime::workflow::DagNode;
-
-    fn make_node(id: &str, name: &str) -> DagNode {
-        DagNode {
-            task_id: TaskId::from(id.to_string()),
-            name: name.to_string(),
-            payload: Vec::new(),
-            retry_policy: None,
-            timeout_ms: None,
-            priority: 0,
-            metadata: HashMap::new(),
-        }
-    }
-
-    #[tokio::test]
-    async fn workflow_actor_submit_and_start_roundtrip() {
-        let system = ActorSystem::new();
-        let actor_id = ActorId::from("wf-actor-1");
-        let actor = WorkflowActor::new(Orchestrator::new());
-        system.spawn(actor_id.clone(), actor).await.unwrap();
-
-        let mut dag = Dag::new();
-        dag.add_node(make_node("a", "task_a")).unwrap();
-        dag.add_node(make_node("b", "task_b")).unwrap();
-        dag.add_edge(TaskId::from("a"), TaskId::from("b")).unwrap();
-
-        let wf_id = WorkflowId::from("wf-1");
-        system
-            .call(
-                &actor_id,
-                &workflow_methods::SUBMIT,
-                encode(&(wf_id.clone(), dag)).unwrap(),
-            )
-            .await
-            .unwrap();
-
-        let result = system
-            .call(
-                &actor_id,
-                &workflow_methods::START,
-                encode(&wf_id).unwrap(),
-            )
-            .await
-            .unwrap();
-        assert!(result.error.is_none(), "{:?}", result.error);
-        let roots: Vec<TaskDefinition> = decode(&result.payload).unwrap();
-        assert_eq!(roots.len(), 1);
-        assert_eq!(roots[0].id.as_str(), "a");
-
-        system.stop(&actor_id).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn scheduler_actor_enqueue_and_dequeue() {
-        let system = ActorSystem::new();
-        let actor_id = ActorId::from("sched-actor-1");
-        system
-            .spawn(actor_id.clone(), fifo_scheduler_actor())
-            .await
-            .unwrap();
-
-        let tasks = vec![TaskDefinition {
-            id: TaskId::from("t1"),
-            name: "task1".into(),
-            payload: vec![1, 2, 3],
-            workflow_id: None,
-            target_node: None,
-            origin_node: None,
-            retry_policy: Some(RetryPolicy::default()),
-            priority: 0,
-            timeout_ms: None,
-            attempt: 0,
-            enqueued_at_ms: 0,
-            target_endpoint_addr: None,
-            origin_endpoint_addr: None,
-        }];
-
-        system
-            .call(
-                &actor_id,
-                &scheduler_methods::ENQUEUE_BATCH,
-                encode(&tasks).unwrap(),
-            )
-            .await
-            .unwrap();
-
-        let result = system
-            .call(
-                &actor_id,
-                &scheduler_methods::DEQUEUE_BATCH,
-                encode(&1usize).unwrap(),
-            )
-            .await
-            .unwrap();
-        assert!(result.error.is_none());
-        let out: Vec<TaskDefinition> = decode(&result.payload).unwrap();
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].id.as_str(), "t1");
-
-        system.stop(&actor_id).await.unwrap();
-    }
-}
+#[path = "../../../tests/rust/unit/runtime/workflow/actor.rs"]
+mod tests;

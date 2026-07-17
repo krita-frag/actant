@@ -82,3 +82,7 @@ impl From<Arc<std::io::Error>> for ActantError {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/rust/unit/common/error.rs"]
+mod tests;

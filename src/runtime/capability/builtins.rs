@@ -18,7 +18,9 @@ use crate::common::{ActantError, ActorId, MessageId, NodeId, TaskId, WorkflowId}
 use crate::runtime::dispatcher::TaskDispatcher;
 use crate::runtime::state::LmdbStore as StateStore;
 
-use super::{erase_handler, Capability, CapabilityMeta, CapabilityRuntime, EffectKind, Handler, Layer};
+use super::{
+    erase_handler, Capability, CapabilityMeta, CapabilityRuntime, EffectKind, Handler, Layer,
+};
 pub struct Serialization;
 impl Capability for Serialization {
     type Request = SerializationReq;

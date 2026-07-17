@@ -1,23 +1,37 @@
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Callable
+from typing import Any, final
 
 def get_version() -> str: ...
 def refresh_logger() -> None: ...
 
-class ActantError(Exception): ...
+# Rust-exposed exceptions (register_exceptions in src/py/error.rs)
+class ActantError(RuntimeError): ...
+class StorageError(ActantError): ...
+class NetworkError(ActantError): ...
+class SerializationError(ActantError): ...
+class ActorError(ActantError): ...
+class WorkflowError(ActantError): ...
+class TaskError(ActantError): ...
+class WorkerError(ActantError): ...
+class ConfigError(ActantError): ...
+class MetricsError(ActantError): ...
 class NotFoundError(ActantError): ...
-class PayloadTooLargeError(ActantError):
-    actual: int
-    limit: int
-    def __init__(self, actual: int, limit: int) -> None: ...
+class AlreadyExistsError(ActantError): ...
+class TimeoutError(ActantError): ...
+class CancelledError(ActantError): ...
+class InvalidStateError(ActantError): ...
+class InternalError(ActantError): ...
 
+@final
 class CancelToken:
     """Cooperative cancellation flag shared between Rust and Python."""
     def is_cancelled(self) -> bool: ...
     @property
     def cancelled(self) -> bool: ...
 
+@final
 class _WorkflowState:
     PENDING: _WorkflowState
     RUNNING: _WorkflowState
@@ -26,14 +40,15 @@ class _WorkflowState:
     CANCELLED: _WorkflowState
     SKIPPED: _WorkflowState
 
+@final
 class _RetryPolicy:
-    def __init__(
-        self,
+    def __new__(
+        cls,
         max_retries: int = 3,
         delay_ms: int = 1000,
         backoff_multiplier: float = 2.0,
         max_delay_ms: int = 60000,
-    ) -> None: ...
+    ) -> _RetryPolicy: ...
     @property
     def max_retries(self) -> int: ...
     @property
@@ -44,9 +59,10 @@ class _RetryPolicy:
     def max_delay_ms(self) -> int: ...
     def to_bytes(self) -> bytes: ...
 
+@final
 class _NetworkConfig:
-    def __init__(
-        self,
+    def __new__(
+        cls,
         preset: str | None = None,
         bootstrap_nodes: list[str] | None = None,
         hlc_max_drift_ms: int = 500,
@@ -59,7 +75,7 @@ class _NetworkConfig:
         listen_ip: str = "",
         capability_gossip_interval_ms: int = 5000,
         event_channel_capacity: int = 256,
-    ) -> None: ...
+    ) -> _NetworkConfig: ...
     @property
     def preset(self) -> str: ...
     @property
@@ -85,14 +101,15 @@ class _NetworkConfig:
     @property
     def event_channel_capacity(self) -> int: ...
 
+@final
 class _FailoverConfig:
-    def __init__(
-        self,
+    def __new__(
+        cls,
         heartbeat_interval_ms: int | None = None,
         failure_timeout_ms: int | None = None,
         lease_expiry_check_interval_secs: int | None = None,
         lease_duration_ms: int | None = None,
-    ) -> None: ...
+    ) -> _FailoverConfig: ...
     @property
     def heartbeat_interval_ms(self) -> int: ...
     @property
@@ -102,15 +119,16 @@ class _FailoverConfig:
     @property
     def lease_duration_ms(self) -> int: ...
 
+@final
 class _GossipConfig:
-    def __init__(
-        self,
+    def __new__(
+        cls,
         dedup_window_size: int = 1024,
         dedup_ttl_secs: int = 300,
         retry_attempts: int = 3,
         retry_base_delay_ms: int = 100,
         heads_broadcast_interval_ms: int = 30000,
-    ) -> None: ...
+    ) -> _GossipConfig: ...
     @property
     def dedup_window_size(self) -> int: ...
     @property
@@ -122,9 +140,10 @@ class _GossipConfig:
     @property
     def heads_broadcast_interval_ms(self) -> int: ...
 
+@final
 class _ActantConfig:
-    def __init__(
-        self,
+    def __new__(
+        cls,
         payload_signing_key: str,
         network: _NetworkConfig | None = None,
         failover: _FailoverConfig | None = None,
@@ -135,7 +154,7 @@ class _ActantConfig:
         drain_timeout_secs: int | None = None,
         remote_fallback_delay_ms: int | None = None,
         scheduler: str | None = None,
-    ) -> None: ...
+    ) -> _ActantConfig: ...
     @property
     def payload_signing_key(self) -> str: ...
     @property
@@ -156,6 +175,7 @@ class _ActantConfig:
     def scheduler(self) -> str: ...
 
 
+@final
 class _Event:
     @property
     def kind(self) -> str: ...  # "completion" | "orchestration" | "supervision"
@@ -166,6 +186,7 @@ class _Event:
     @property
     def supervision(self) -> _SupervisionEventData | None: ...
 
+@final
 class _TaskCompletion:
     @property
     def workflow_id(self) -> str: ...
@@ -182,6 +203,7 @@ class _TaskCompletion:
     @property
     def target_node(self) -> str | None: ...
 
+@final
 class _OrchestrationEvent:
     @property
     def event_type(self) -> str: ...
@@ -202,6 +224,7 @@ class _OrchestrationEvent:
     @property
     def max_capacity(self) -> int | None: ...
 
+@final
 class _DagNode:
     """DAG 节点定义，由 Python 层构造后通过 `submit_dag` 提交。
 
@@ -215,16 +238,17 @@ class _DagNode:
     priority: int | None
     metadata: dict[str, str] | None
 
-    def __init__(
-        self,
+    def __new__(
+        cls,
         name: str,
         payload: bytes,
         retry: _RetryPolicy | None = None,
         timeout_ms: int | None = None,
         priority: int | None = None,
         metadata: dict[str, str] | None = None,
-    ) -> None: ...
+    ) -> _DagNode: ...
 
+@final
 class _TaskDef:
     """任务运行时定义：Rust 编排器输出，Python 路由后入队执行。
 
@@ -244,8 +268,8 @@ class _TaskDef:
     timeout_ms: int | None
     retry_policy: _RetryPolicy | None
 
-    def __init__(
-        self,
+    def __new__(
+        cls,
         task_id: str,
         name: str,
         payload: bytes,
@@ -254,8 +278,9 @@ class _TaskDef:
         target_endpoint_addr: str | None = None,
         timeout_ms: int | None = None,
         retry_policy: _RetryPolicy | None = None,
-    ) -> None: ...
+    ) -> _TaskDef: ...
 
+@final
 class _CapabilityRuntime:
     """Rust `capability::Runtime` 的 PyO3 包装。
 
@@ -263,16 +288,18 @@ class _CapabilityRuntime:
     handler。普通用户直接使用 `actant.Runtime()` 即可。
     """
 
-    def __init__(self) -> None: ...
+    def __new__(cls) -> _CapabilityRuntime: ...
     def builtin_capabilities(self) -> list[tuple[str, str]]: ...
     @property
     def capability_count(self) -> int: ...
     def registered_capabilities(self) -> list[str]: ...
     def handler_count(self, name: str) -> int: ...
+    def chain_python_handler(self, name: str, handler: Callable[..., Any]) -> None: ...
     def ask(self, name: str, request: Any) -> Any | None: ...
     def perform(self, name: str, request: Any) -> Any: ...
     def emit(self, name: str, request: Any) -> None: ...
 
+@final
 class _SupervisionEventData:
     @property
     def event_type(self) -> str: ...
@@ -281,6 +308,20 @@ class _SupervisionEventData:
     @property
     def error(self) -> str | None: ...
 
+@final
+class _ListenAddresses:
+    """本节点监听地址信息，由 ``_RuntimeCore.listen_addresses()`` 返回。"""
+
+    @property
+    def endpoint_id(self) -> str: ...
+    @property
+    def relay_url(self) -> str | None: ...
+    @property
+    def direct_addrs(self) -> list[str]: ...
+    @property
+    def endpoint_addr(self) -> str: ...
+
+@final
 class _ActorCore:
     async def call_method(
         self,
@@ -294,6 +335,7 @@ class _ActorCore:
     def actor_status(self, actor_id: str) -> str: ...
     def list_actors(self) -> list[str]: ...
 
+@final
 class _RuntimeCore:
     """Rust 统一运行时核心的 PyO3 包装。
 
@@ -301,13 +343,25 @@ class _RuntimeCore:
     `serve()` 在 tokio 后台 spawn worker 守护循环（非阻塞），`shutdown()`
     优雅关闭所有子系统并关闭 iroh endpoint。
     """
-    def __init__(
-        self,
+    def __new__(
+        cls,
         name: str | None = None,
         data_dir: str | None = None,
         config: _ActantConfig | None = None,
-    ) -> None: ...
+    ) -> _RuntimeCore: ...
     def capability_runtime(self) -> _CapabilityRuntime: ...
     def serve(self) -> None: ...
     def shutdown(self, timeout_ms: int = 5000) -> None: ...
     def node_id(self) -> str: ...
+    def peer_id(self) -> str: ...
+    def listen_addresses(self) -> _ListenAddresses: ...
+    def dial(self, addr: str) -> None: ...
+    def add_gossip_peer(self, peer_id: str) -> None: ...
+    def discover_peers(self) -> list[str]: ...
+    def cancel_task(self, task_id: str) -> bool: ...
+    def set_max_concurrent_tasks(self, new_max: int) -> None: ...
+    def max_concurrent_tasks(self) -> int: ...
+    def broadcast_cancel(self, task_id: str, workflow_id: str) -> None: ...
+    def submit_task(self, task: _TaskDef) -> None: ...
+    def register_task_result_callback(self, callback: Callable[[_TaskCompletion], None]) -> None: ...
+    def register_python_dispatch_handler(self, handler: Callable[[bytes, CancelToken], bytes]) -> None: ...

@@ -29,6 +29,8 @@ pub type TaskHandler =
 /// 这样可以避免无限制的线程创建（每个任务一个线程），同时将任务执行与 Tokio 的运行时线程隔离。
 struct TaskThreadPool {
     sender: crossbeam_channel::Sender<Job>,
+    /// 工作线程句柄，用于 shutdown 时 join。
+    workers: Vec<std::thread::JoinHandle<()>>,
 }
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
@@ -41,9 +43,10 @@ impl TaskThreadPool {
             ));
         }
         let (sender, receiver) = crossbeam_channel::bounded::<Job>(channel_capacity);
+        let mut workers = Vec::with_capacity(worker_count);
         for i in 0..worker_count {
             let rx = receiver.clone();
-            std::thread::Builder::new()
+            let handle = std::thread::Builder::new()
                 .name(format!("actant-task-worker-{i}"))
                 .spawn(move || {
                     while let Ok(job) = rx.recv() {
@@ -53,8 +56,56 @@ impl TaskThreadPool {
                 .map_err(|e| {
                     ActantError::Worker(format!("failed to spawn task worker thread: {e}"))
                 })?;
+            workers.push(handle);
         }
-        Ok(Self { sender })
+        // 注：工作线程非 daemon。shutdown_and_wait 通过关闭 channel 让
+        // 空闲线程退出并 join；正在执行不可中断任务的线程会阻塞 join
+        // 直到任务完成（由 drain_timeout_secs 限制总时长）。
+        Ok(Self { sender, workers })
+    }
+
+    /// 关闭线程池并等待所有工作线程退出。
+    ///
+    /// 通过替换 sender 为一个无关的、已关闭的 channel，使原 channel 的所有 sender
+    /// 都被 drop，工作线程的 `rx.recv()` 返回 `Err` 并退出。
+    /// 不会中断正在执行的任务。
+    ///
+    /// `timeout` 限制总等待时长。超时后尚未退出的工作线程被放弃 join（线程为
+    /// 非 daemon，进程退出时仍会等待，但调用方不会被无限阻塞）。
+    fn shutdown_and_wait(&mut self, timeout: std::time::Duration) {
+        // 替换 sender 为无关的新 channel，原 sender 被 drop。
+        let (dummy_tx, _) = crossbeam_channel::bounded::<Job>(0);
+        let _ = std::mem::replace(&mut self.sender, dummy_tx);
+        let workers = std::mem::take(&mut self.workers);
+        if workers.is_empty() {
+            return;
+        }
+        // 在独立线程中 join 所有 worker，主线程通过 channel 超时等待。
+        let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(1);
+        let _ = std::thread::Builder::new()
+            .name("actant-task-pool-shutdown".into())
+            .spawn(move || {
+                for handle in workers {
+                    if let Err(e) = handle.join() {
+                        tracing::warn!("task worker thread join failed: {:?}", e);
+                    }
+                }
+                let _ = done_tx.send(());
+            });
+        match done_rx.recv_timeout(timeout) {
+            Ok(()) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                tracing::warn!(
+                    "task thread pool shutdown timed out after {:?}; \
+                     abandoning {} worker thread(s) still running",
+                    timeout,
+                    self.workers.len(),
+                );
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                // join 线程已退出（所有 worker 均已 join 完成）
+            }
+        }
     }
 
     fn submit<F>(&self, f: F) -> Result<(), ActantError>
@@ -96,13 +147,32 @@ pub trait TaskDispatcher: Send + Sync {
         payload: Vec<u8>,
         cancel_flag: CancelFlag,
     ) -> crate::common::Result<Vec<u8>>;
+
+    /// 注册一个任务处理程序。
+    ///
+    /// 默认实现返回错误，表示此 dispatcher 不支持动态注册。
+    /// `TaskRegistry` 覆盖此方法以支持运行时注册。
+    fn register_handler(&self, _name: &str, _handler: TaskHandler) -> crate::common::Result<()> {
+        Err(ActantError::Internal(
+            "this dispatcher does not support register_handler".into(),
+        ))
+    }
+
+    /// 关闭 dispatcher 并等待所有执行中的任务完成。
+    ///
+    /// 默认实现为空操作；`TaskRegistry` 覆盖以关闭线程池。
+    /// 调用方应在 Worker drain 阶段调用此方法，确保在 Runtime 关闭前
+    /// 所有任务线程已退出，避免访问已释放的资源。
+    fn shutdown(&self) {}
 }
 
 pub struct TaskRegistry {
     handlers: DashMap<String, TaskHandler>,
-    pool: TaskThreadPool,
+    pool: parking_lot::Mutex<TaskThreadPool>,
     /// Payload 签名密钥。非空时 dispatch 会验证 payload MAC。
     payload_signing_key: Vec<u8>,
+    /// shutdown 时等待工作线程退出的总超时。
+    drain_timeout: std::time::Duration,
 }
 
 impl TaskRegistry {
@@ -111,10 +181,32 @@ impl TaskRegistry {
         pool_channel_capacity: usize,
         payload_signing_key: Vec<u8>,
     ) -> crate::common::Result<Self> {
+        Self::with_drain_timeout(
+            pool_workers,
+            pool_channel_capacity,
+            payload_signing_key,
+            std::time::Duration::from_secs(30),
+        )
+    }
+
+    /// 创建 `TaskRegistry` 并指定 shutdown 超时。
+    ///
+    /// `drain_timeout` 限制 `shutdown` 时等待工作线程退出的总时长，超时后
+    /// 放弃 join 尚未退出的线程。默认 30s（对应 `WorkerConfig::drain_timeout_secs`）。
+    pub fn with_drain_timeout(
+        pool_workers: usize,
+        pool_channel_capacity: usize,
+        payload_signing_key: Vec<u8>,
+        drain_timeout: std::time::Duration,
+    ) -> crate::common::Result<Self> {
         Ok(Self {
             handlers: DashMap::new(),
-            pool: TaskThreadPool::new(pool_workers, pool_channel_capacity)?,
+            pool: parking_lot::Mutex::new(TaskThreadPool::new(
+                pool_workers,
+                pool_channel_capacity,
+            )?),
             payload_signing_key,
+            drain_timeout,
         })
     }
 
@@ -173,7 +265,7 @@ impl TaskDispatcher for TaskRegistry {
 
         let (tx, rx) = tokio::sync::oneshot::channel();
 
-        self.pool.submit(move || {
+        self.pool.lock().submit(move || {
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 (handler)(verified_payload, cancel_flag)
             }));
@@ -214,190 +306,17 @@ impl TaskDispatcher for TaskRegistry {
             Err(_) => Err(ActantError::Internal("task handler panicked".into())),
         }
     }
+
+    fn register_handler(&self, name: &str, handler: TaskHandler) -> crate::common::Result<()> {
+        self.handlers.insert(name.to_string(), handler);
+        Ok(())
+    }
+
+    fn shutdown(&self) {
+        self.pool.lock().shutdown_and_wait(self.drain_timeout);
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    const TEST_KEY: &[u8] = b"test-key";
-
-    fn signed(payload: &[u8]) -> Vec<u8> {
-        crate::common::payload::sign(TEST_KEY, payload).unwrap()
-    }
-
-    #[tokio::test]
-    async fn dispatch_executes_registered_handler() {
-        let registry = TaskRegistry::new(2, 16, TEST_KEY.to_vec()).unwrap();
-        registry.register("echo", |_payload, _flag| Ok(b"echo-response".to_vec()));
-
-        let result = registry
-            .dispatch("echo", signed(b"input"), new_cancel_flag())
-            .await
-            .unwrap();
-        assert_eq!(result, b"echo-response");
-    }
-
-    #[tokio::test]
-    async fn dispatch_returns_error_for_unknown_handler_without_generic() {
-        let registry = TaskRegistry::new(1, 8, TEST_KEY.to_vec()).unwrap();
-        let err = registry
-            .dispatch("nonexistent", signed(b""), new_cancel_flag())
-            .await
-            .unwrap_err();
-        assert!(matches!(err, ActantError::Internal(_)));
-    }
-
-    #[tokio::test]
-    async fn dispatch_falls_back_to_generic_handler() {
-        let registry = TaskRegistry::new(1, 8, TEST_KEY.to_vec()).unwrap();
-        registry.register(GENERIC_DISPATCH_NAME, |payload, _flag| {
-            Ok([b"generic:", &payload[..]].concat())
-        });
-
-        let result = registry
-            .dispatch("custom-task", signed(b"data"), new_cancel_flag())
-            .await
-            .unwrap();
-        assert_eq!(result, b"generic:data");
-    }
-
-    #[tokio::test]
-    async fn dispatch_propagates_handler_error() {
-        let registry = TaskRegistry::new(1, 8, TEST_KEY.to_vec()).unwrap();
-        registry.register("failing", |_payload, _flag| {
-            Err(ActantError::Worker("handler error".into()))
-        });
-
-        let err = registry
-            .dispatch("failing", signed(b""), new_cancel_flag())
-            .await
-            .unwrap_err();
-        assert!(matches!(err, ActantError::Worker(_)));
-    }
-
-    #[tokio::test]
-    async fn dispatch_isolates_handler_panic() {
-        let registry = TaskRegistry::new(1, 8, TEST_KEY.to_vec()).unwrap();
-        registry.register("panicker", |_payload, _flag| {
-            panic!("intentional test panic");
-        });
-
-        let err = registry
-            .dispatch("panicker", signed(b""), new_cancel_flag())
-            .await
-            .unwrap_err();
-        assert!(matches!(err, ActantError::Internal(ref m) if m.contains("panicked")));
-    }
-
-    #[tokio::test]
-    async fn dispatch_passes_cancel_flag_to_handler() {
-        let registry = TaskRegistry::new(1, 8, TEST_KEY.to_vec()).unwrap();
-        registry.register("cancel-aware", |_payload, flag| {
-            if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                Err(ActantError::Worker("cancelled".into()))
-            } else {
-                Ok(b"completed".to_vec())
-            }
-        });
-
-        // Not cancelled — should complete
-        let flag = new_cancel_flag();
-        let result = registry
-            .dispatch("cancel-aware", signed(b""), flag.clone())
-            .await
-            .unwrap();
-        assert_eq!(result, b"completed");
-
-        // Cancelled — should return error
-        let flag2 = new_cancel_flag();
-        flag2.store(true, std::sync::atomic::Ordering::Relaxed);
-        let err = registry
-            .dispatch("cancel-aware", signed(b""), flag2)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, ActantError::Worker(_)));
-    }
-
-    #[tokio::test]
-    async fn dispatch_concurrent_tasks_run_in_parallel() {
-        let registry = TaskRegistry::new(4, 32, TEST_KEY.to_vec()).unwrap();
-        registry.register("slow", |_payload, _flag| {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            Ok(b"done".to_vec())
-        });
-
-        // TaskDispatcher::dispatch takes &self, so Arc<TaskRegistry> allows
-        // concurrent dispatch calls from multiple tasks.
-        let registry = Arc::new(registry);
-        let r1 = registry.clone();
-        let r2 = registry.clone();
-
-        let start = std::time::Instant::now();
-
-        let h1 = tokio::spawn(async move {
-            TaskDispatcher::dispatch(&*r1, "slow", signed(b""), new_cancel_flag()).await
-        });
-        let h2 = tokio::spawn(async move {
-            TaskDispatcher::dispatch(&*r2, "slow", signed(b""), new_cancel_flag()).await
-        });
-
-        let (res1, res2) = tokio::join!(h1, h2);
-        let elapsed = start.elapsed();
-
-        assert!(res1.unwrap().is_ok());
-        assert!(res2.unwrap().is_ok());
-        assert!(
-            elapsed < std::time::Duration::from_millis(350),
-            "dispatch took too long: {elapsed:?}"
-        );
-    }
-
-    #[test]
-    fn new_cancel_flag_starts_false() {
-        let flag = new_cancel_flag();
-        assert!(!flag.load(std::sync::atomic::Ordering::Relaxed));
-    }
-
-    #[test]
-    fn task_registry_new_with_invalid_workers_returns_error() {
-        let registry = TaskRegistry::new(0, 8, TEST_KEY.to_vec());
-        assert!(registry.is_err());
-    }
-
-    #[tokio::test]
-    async fn dispatch_rejects_unsigned_payload() {
-        let registry = TaskRegistry::new(1, 8, TEST_KEY.to_vec()).unwrap();
-        registry.register("echo", |_payload, _flag| Ok(b"ok".to_vec()));
-
-        let err = registry
-            .dispatch("echo", b"raw-unsigned".to_vec(), new_cancel_flag())
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, ActantError::Internal(ref m) if m.contains("payload verification")),
-            "expected payload verification error, got: {:?}",
-            err
-        );
-    }
-
-    #[tokio::test]
-    async fn dispatch_rejects_tampered_payload() {
-        let registry = TaskRegistry::new(1, 8, TEST_KEY.to_vec()).unwrap();
-        registry.register("echo", |_payload, _flag| Ok(b"ok".to_vec()));
-
-        let mut tampered = signed(b"original");
-        let last = tampered.len() - 1;
-        tampered[last] ^= 0xFF;
-
-        let err = registry
-            .dispatch("echo", tampered, new_cancel_flag())
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, ActantError::Internal(ref m) if m.contains("signature mismatch")),
-            "expected signature mismatch error, got: {:?}",
-            err
-        );
-    }
-}
+#[path = "../../tests/rust/unit/runtime/dispatcher.rs"]
+mod tests;

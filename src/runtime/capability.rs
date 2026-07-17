@@ -530,7 +530,7 @@ impl CapabilityRuntime {
             .await
             .map_err(|e| ActantError::Actor(e.to_string()))?;
         if let Some(err) = result.error {
-            return Err(ActantError::Internal(err));
+            return Err(ActantError::from(err));
         }
         let local_bytes = if result.payload.is_empty() || result.payload[0] == 0 {
             None
@@ -618,7 +618,7 @@ impl CapabilityRuntime {
                 .await
                 .map_err(|e| ActantError::Actor(e.to_string()))?;
             if let Some(err) = result.error {
-                return Err(ActantError::Internal(err));
+                return Err(ActantError::from(err));
             }
             result.payload
         };
@@ -683,7 +683,7 @@ impl CapabilityRuntime {
                 .await
                 .map_err(|e| ActantError::Actor(e.to_string()))?;
             if let Some(err) = result.error {
-                return Err(ActantError::Internal(err));
+                return Err(ActantError::from(err));
             }
         }
 
@@ -706,6 +706,12 @@ impl CapabilityRuntime {
         C::Request: Any + Clone + Send + Sync,
         C::Response: Any + Send + Sync,
     {
+        // Fast path：单节点场景（无任何远端 capability 元信息）直接返回 None，
+        // 避免获取 metas 读锁与线性扫描。
+        if self.cap_to_peers.is_empty() {
+            return Ok(None);
+        }
+
         let type_id = TypeId::of::<C>();
         let meta = self
             .metas
@@ -727,7 +733,7 @@ impl CapabilityRuntime {
             .ok_or_else(|| ActantError::Internal("actor system not bound".into()))?;
 
         let target_node = {
-            // P1-P3: 使用反向索引 cap_to_peers，O(1) 查找而非 O(N×M) 全表扫描。
+            // 使用反向索引 cap_to_peers，O(1) 查找而非 O(N×M) 全表扫描。
             let mut target: Option<NodeId> = None;
             if let Some(peers) = self.cap_to_peers.get(meta.name) {
                 for node in peers.iter() {
@@ -756,7 +762,7 @@ impl CapabilityRuntime {
             .await
             .map_err(|e| ActantError::Actor(e.to_string()))?;
         if let Some(err) = result.error {
-            return Err(ActantError::Internal(err));
+            return Err(ActantError::from(err));
         }
         Ok(Some(result.payload))
     }
@@ -767,6 +773,13 @@ impl CapabilityRuntime {
         C::Request: Any + Clone + Send + Sync,
         C::Response: Any + Send + Sync,
     {
+        // Fast path：若全局尚无任何远端 capability 元信息（典型单节点场景），
+        // 直接跳过 metas 锁获取与 cap_to_peers 查找。这把单节点 emit 的
+        // 远端分发检查从"读锁 + 线性扫描 metas"降为单次 DashMap len() 调用。
+        if self.cap_to_peers.is_empty() {
+            return Ok(());
+        }
+
         let type_id = TypeId::of::<C>();
         let meta = self
             .metas
@@ -787,7 +800,7 @@ impl CapabilityRuntime {
             .cloned()
             .ok_or_else(|| ActantError::Internal("actor system not bound".into()))?;
 
-        // P1-P3: 使用反向索引 cap_to_peers，O(1) 查找而非 O(N×M) 全表扫描。
+        // 使用反向索引 cap_to_peers，O(1) 查找而非 O(N×M) 全表扫描。
         let target_nodes: Vec<NodeId> = self
             .cap_to_peers
             .get(meta.name)
@@ -891,522 +904,5 @@ pub mod gossip;
 pub use builtins::*;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::common::{TaskId, WorkflowId};
-    use crate::runtime::state::LmdbStore as StateStore;
-    use tempfile::tempdir;
-
-    #[tokio::test]
-    async fn store_handler_roundtrip() {
-        let dir = tempdir().unwrap();
-        let store = StateStore::open(dir.path()).unwrap();
-        let runtime = Arc::new(CapabilityRuntime::new());
-        register_defaults(&runtime);
-        register_store_handler(&runtime, store).unwrap();
-        // 强制走 Actor 路径：必须 bind_actor_system 后才能 perform。
-        let actor_system = Arc::new(crate::runtime::actor::ActorSystem::new());
-        Arc::clone(&runtime).bind_actor_system(actor_system).await;
-
-        let put = StoreReq::Put {
-            key: b"hello".to_vec(),
-            value: b"world".to_vec(),
-        };
-        let _ = runtime.perform::<Store>(put).await.unwrap();
-
-        let get = StoreReq::Get {
-            key: b"hello".to_vec(),
-        };
-        let result = runtime.perform::<Store>(get).await.unwrap();
-        assert_eq!(result, Ok(Some(b"world".to_vec())));
-    }
-
-    #[tokio::test]
-    async fn store_handler_roundtrip_via_actor() {
-        let dir = tempdir().unwrap();
-        let store = StateStore::open(dir.path()).unwrap();
-        let runtime = Arc::new(CapabilityRuntime::new());
-        register_defaults(&runtime);
-        register_store_handler(&runtime, store).unwrap();
-
-        let actor_system = Arc::new(crate::runtime::actor::ActorSystem::new());
-        Arc::clone(&runtime)
-            .bind_actor_system(actor_system.clone())
-            .await;
-
-        let put = StoreReq::Put {
-            key: b"actor".to_vec(),
-            value: b"via_actor".to_vec(),
-        };
-        let _ = runtime.perform::<Store>(put).await.unwrap();
-
-        let get = StoreReq::Get {
-            key: b"actor".to_vec(),
-        };
-        let result = runtime.perform::<Store>(get).await.unwrap();
-        assert_eq!(result, Ok(Some(b"via_actor".to_vec())));
-    }
-
-    #[test]
-    fn gossip_meta_from_capability_meta_preserves_fields() {
-        let meta = CapabilityMeta::new::<Store>("Store", EffectKind::Perform);
-        let gossip: GossipCapabilityMeta = meta.into();
-        assert_eq!(gossip.name, "Store");
-        assert_eq!(gossip.default_kind, EffectKind::Perform);
-    }
-
-    #[test]
-    fn effect_kind_variants_are_distinct() {
-        assert_ne!(EffectKind::Ask, EffectKind::Perform);
-        assert_ne!(EffectKind::Perform, EffectKind::Emit);
-        assert_ne!(EffectKind::Ask, EffectKind::Emit);
-    }
-
-    #[tokio::test]
-    async fn typed_codec_roundtrips_store_request() {
-        let codec = TypedCodec::<Store>::new();
-        let req = StoreReq::Put {
-            key: b"k".to_vec(),
-            value: b"v".to_vec(),
-        };
-        let req_arc: Arc<dyn Any + Send + Sync> = Arc::new(req.clone());
-        let bytes = codec.serialize_request(req_arc).unwrap();
-        let decoded = codec.deserialize_request(&bytes).unwrap();
-        let decoded_req = decoded.downcast_ref::<StoreReq>().unwrap();
-        match decoded_req {
-            StoreReq::Put { key, value } => {
-                assert_eq!(key, b"k");
-                assert_eq!(value, b"v");
-            }
-            _ => panic!("expected Put"),
-        }
-    }
-
-    #[tokio::test]
-    async fn typed_codec_roundtrips_store_response() {
-        let codec = TypedCodec::<Store>::new();
-        let resp: <Store as Capability>::Response = Ok(Some(b"data".to_vec()));
-        let bytes = codec.serialize_response(Box::new(resp.clone())).unwrap();
-        let decoded = codec.deserialize_response(&bytes).unwrap();
-        let decoded_resp = decoded
-            .downcast::<<Store as Capability>::Response>()
-            .unwrap();
-        assert_eq!(*decoded_resp, resp);
-    }
-
-    #[test]
-    fn typed_codec_serialize_request_type_mismatch_returns_error() {
-        let codec = TypedCodec::<Store>::new();
-        // 传入错误类型的 request
-        let wrong_req: Arc<dyn Any + Send + Sync> = Arc::new(42i32);
-        let result = codec.serialize_request(wrong_req);
-        assert!(matches!(result, Err(ActantError::Internal(_))));
-    }
-
-    #[test]
-    fn typed_codec_serialize_response_type_mismatch_returns_error() {
-        let codec = TypedCodec::<Store>::new();
-        let wrong_resp: Box<dyn Any + Send + Sync> = Box::new(42i32);
-        let result = codec.serialize_response(wrong_resp);
-        assert!(matches!(result, Err(ActantError::Internal(_))));
-    }
-
-    #[test]
-    fn typed_codec_deserialize_request_invalid_bytes_returns_error() {
-        let codec = TypedCodec::<Store>::new();
-        let result = codec.deserialize_request(b"garbage");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn typed_codec_deserialize_response_invalid_bytes_returns_error() {
-        let codec = TypedCodec::<Store>::new();
-        let result = codec.deserialize_response(b"garbage");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn handler_list_new_starts_empty() {
-        let meta = CapabilityMeta::new::<Store>("Store", EffectKind::Perform);
-        let list = HandlerList::new(meta);
-        assert!(list.is_empty());
-        assert_eq!(list.len(), 0);
-    }
-
-    #[test]
-    fn handler_list_push_increments_len() {
-        let meta = CapabilityMeta::new::<Store>("Store", EffectKind::Perform);
-        let mut list = HandlerList::new(meta);
-        let handler = erase_handler(StoreHandler::new(
-            StateStore::open(tempdir().unwrap().path()).unwrap(),
-        ));
-        list.push(handler);
-        assert!(!list.is_empty());
-        assert_eq!(list.len(), 1);
-    }
-
-    #[test]
-    fn layer_new_starts_empty() {
-        let meta = CapabilityMeta::new::<Store>("Store", EffectKind::Perform);
-        let layer = Layer::<Store>::new(meta);
-        assert!(layer.is_empty());
-        assert_eq!(layer.len(), 0);
-    }
-
-    #[test]
-    fn layer_for_capability_creates_with_correct_meta() {
-        let layer = Layer::<Store>::for_capability("Store", EffectKind::Perform);
-        assert_eq!(layer.meta().name, "Store");
-        assert_eq!(layer.meta().default_kind, EffectKind::Perform);
-        assert!(layer.is_empty());
-    }
-
-    #[test]
-    fn layer_chain_adds_handler() {
-        let store = StateStore::open(tempdir().unwrap().path()).unwrap();
-        let layer = Layer::<Store>::for_capability("Store", EffectKind::Perform)
-            .chain(StoreHandler::new(store));
-        assert_eq!(layer.len(), 1);
-    }
-
-    #[test]
-    fn layer_chain_erased_adds_handler() {
-        let store = StateStore::open(tempdir().unwrap().path()).unwrap();
-        let handler = erase_handler(StoreHandler::new(store));
-        let layer =
-            Layer::<Store>::for_capability("Store", EffectKind::Perform).chain_erased(handler);
-        assert_eq!(layer.len(), 1);
-    }
-
-    #[test]
-    fn layer_into_list_transfers_handlers() {
-        let store = StateStore::open(tempdir().unwrap().path()).unwrap();
-        let layer = Layer::<Store>::for_capability("Store", EffectKind::Perform)
-            .chain(StoreHandler::new(store));
-        let list = layer.into_list();
-        assert_eq!(list.len(), 1);
-        assert_eq!(list.meta.name, "Store");
-    }
-
-    #[test]
-    fn runtime_new_starts_empty() {
-        let rt = CapabilityRuntime::new();
-        assert_eq!(rt.capability_count(), 0);
-        assert!(rt.capabilities().is_empty());
-        assert_eq!(rt.handler_count::<Store>(), 0);
-        assert!(rt.handler_count_by_type_id(TypeId::of::<Store>()).is_none());
-    }
-
-    #[test]
-    fn runtime_register_increments_count() {
-        let rt = CapabilityRuntime::new();
-        let store = StateStore::open(tempdir().unwrap().path()).unwrap();
-        register_store_handler(&rt, store).unwrap();
-        assert_eq!(rt.capability_count(), 1);
-        assert_eq!(rt.handler_count::<Store>(), 1);
-        assert_eq!(rt.handler_count_by_type_id(TypeId::of::<Store>()), Some(1));
-        let caps = rt.capabilities();
-        assert_eq!(caps.len(), 1);
-        assert_eq!(caps[0].name, "Store");
-    }
-
-    #[test]
-    fn runtime_register_codec_does_not_register_layer() {
-        let rt = CapabilityRuntime::new();
-        rt.register_codec::<Store>();
-        // register_codec 只注册 codec，不注册 layer
-        assert_eq!(rt.capability_count(), 0);
-        assert!(rt.handler_count::<Store>().eq(&0));
-    }
-
-    #[test]
-    fn runtime_chain_appends_handler_to_registered_layer() {
-        let rt = CapabilityRuntime::new();
-        let store = StateStore::open(tempdir().unwrap().path()).unwrap();
-        register_store_handler(&rt, store).unwrap();
-        assert_eq!(rt.handler_count::<Store>(), 1);
-
-        let store2 = StateStore::open(tempdir().unwrap().path()).unwrap();
-        let handler = erase_handler(StoreHandler::new(store2));
-        rt.chain::<Store>(handler).unwrap();
-        assert_eq!(rt.handler_count::<Store>(), 2);
-    }
-
-    #[test]
-    fn runtime_chain_without_registration_returns_error() {
-        let rt = CapabilityRuntime::new();
-        let store = StateStore::open(tempdir().unwrap().path()).unwrap();
-        let handler = erase_handler(StoreHandler::new(store));
-        let result = rt.chain::<Store>(handler);
-        assert!(matches!(result, Err(ActantError::Internal(_))));
-    }
-
-    #[tokio::test]
-    async fn runtime_register_after_bind_returns_error() {
-        let rt = Arc::new(CapabilityRuntime::new());
-        let actor_system = Arc::new(crate::runtime::actor::ActorSystem::new());
-        Arc::clone(&rt).bind_actor_system(actor_system).await;
-
-        let layer = Layer::<Store>::for_capability("Store", EffectKind::Perform);
-        let result = rt.register(layer);
-        assert!(matches!(result, Err(ActantError::Internal(_))));
-    }
-
-    #[tokio::test]
-    async fn runtime_chain_after_bind_returns_error() {
-        let rt = Arc::new(CapabilityRuntime::new());
-        let store = StateStore::open(tempdir().unwrap().path()).unwrap();
-        register_store_handler(&rt, store).unwrap();
-
-        let actor_system = Arc::new(crate::runtime::actor::ActorSystem::new());
-        Arc::clone(&rt).bind_actor_system(actor_system).await;
-
-        let store2 = StateStore::open(tempdir().unwrap().path()).unwrap();
-        let handler = erase_handler(StoreHandler::new(store2));
-        let result = rt.chain::<Store>(handler);
-        assert!(matches!(result, Err(ActantError::Internal(_))));
-    }
-
-    #[test]
-    fn runtime_update_peer_capabilities_stores_and_indexes() {
-        let rt = CapabilityRuntime::new();
-        let node = NodeId::from("peer-A".to_string());
-        let caps = vec![
-            GossipCapabilityMeta {
-                name: "Store".to_string(),
-                default_kind: EffectKind::Perform,
-            },
-            GossipCapabilityMeta {
-                name: "Execute".to_string(),
-                default_kind: EffectKind::Perform,
-            },
-        ];
-        rt.update_peer_capabilities(node.clone(), caps.clone());
-        assert_eq!(rt.peer_capabilities(&node), Some(caps));
-        assert_eq!(rt.peer_nodes(), vec![node.clone()]);
-    }
-
-    #[test]
-    fn runtime_update_peer_capabilities_replaces_existing() {
-        let rt = CapabilityRuntime::new();
-        let node = NodeId::from("peer-B".to_string());
-        rt.update_peer_capabilities(
-            node.clone(),
-            vec![GossipCapabilityMeta {
-                name: "Store".to_string(),
-                default_kind: EffectKind::Perform,
-            }],
-        );
-        rt.update_peer_capabilities(
-            node.clone(),
-            vec![GossipCapabilityMeta {
-                name: "Execute".to_string(),
-                default_kind: EffectKind::Perform,
-            }],
-        );
-        let caps = rt.peer_capabilities(&node).unwrap();
-        assert_eq!(caps.len(), 1);
-        assert_eq!(caps[0].name, "Execute");
-    }
-
-    #[test]
-    fn runtime_peer_capabilities_returns_none_for_unknown_node() {
-        let rt = CapabilityRuntime::new();
-        let node = NodeId::from("unknown".to_string());
-        assert!(rt.peer_capabilities(&node).is_none());
-    }
-
-    #[test]
-    fn runtime_peer_nodes_returns_empty_when_no_peers() {
-        let rt = CapabilityRuntime::new();
-        assert!(rt.peer_nodes().is_empty());
-    }
-
-    #[tokio::test]
-    async fn ask_without_bound_actor_system_returns_error() {
-        let rt = CapabilityRuntime::new();
-        rt.register_codec::<Store>();
-        let result = rt.ask::<Store>(StoreReq::Get { key: b"k".to_vec() }).await;
-        assert!(matches!(result, Err(ActantError::Internal(_))));
-    }
-
-    #[tokio::test]
-    async fn perform_without_bound_actor_system_returns_error() {
-        let rt = CapabilityRuntime::new();
-        rt.register_codec::<Store>();
-        let result = rt
-            .perform::<Store>(StoreReq::Get { key: b"k".to_vec() })
-            .await;
-        assert!(matches!(result, Err(ActantError::Internal(_))));
-    }
-
-    #[tokio::test]
-    async fn emit_without_bound_actor_system_returns_error() {
-        let rt = CapabilityRuntime::new();
-        rt.register_codec::<TaskLifecycle>();
-        let result = rt
-            .emit::<TaskLifecycle>(TaskEvent::Started {
-                task_id: TaskId::from("t-1".to_string()),
-                workflow_id: WorkflowId::from("wf-1".to_string()),
-            })
-            .await;
-        assert!(matches!(result, Err(ActantError::Internal(_))));
-    }
-
-    #[tokio::test]
-    async fn ask_without_codec_returns_error() {
-        let rt = CapabilityRuntime::new();
-        // 不调用 register_codec
-        let actor_system = Arc::new(crate::runtime::actor::ActorSystem::new());
-        let rt = Arc::new(rt);
-        Arc::clone(&rt).bind_actor_system(actor_system).await;
-
-        let result = rt.ask::<Store>(StoreReq::Get { key: b"k".to_vec() }).await;
-        assert!(matches!(result, Err(ActantError::Internal(_))));
-    }
-
-    #[test]
-    fn builtin_capabilities_returns_all_ten() {
-        let caps = builtin_capabilities();
-        assert_eq!(caps.len(), 10);
-        let names: Vec<&str> = caps.iter().map(|c| c.name).collect();
-        assert!(names.contains(&"Serialization"));
-        assert!(names.contains(&"Transport"));
-        assert!(names.contains(&"Store"));
-        assert!(names.contains(&"Execute"));
-        assert!(names.contains(&"TaskLifecycle"));
-        assert!(names.contains(&"WorkflowLifecycle"));
-        assert!(names.contains(&"NodeLifecycle"));
-        assert!(names.contains(&"ActorMessaging"));
-        assert!(names.contains(&"ActorSupervision"));
-        assert!(names.contains(&"ActorLifecycle"));
-    }
-
-    #[test]
-    fn register_defaults_registers_all_codecs() {
-        let rt = CapabilityRuntime::new();
-        register_defaults(&rt);
-        // register_defaults 注册 codec 与空 layer（ensure_layer），
-        // 使所有内置 capability 都有 layer entry。
-        assert_eq!(rt.capability_count(), 10);
-        // handler_count 查 layer 中 handler 数量，应为 0（空 layer）
-        assert_eq!(rt.handler_count::<Store>(), 0);
-    }
-
-    #[tokio::test]
-    async fn store_handler_put_get_delete_roundtrip() {
-        let store = StateStore::open(tempdir().unwrap().path()).unwrap();
-        let handler = StoreHandler::new(store);
-
-        // Put
-        let put_resp = handler
-            .handle(StoreReq::Put {
-                key: b"key1".to_vec(),
-                value: b"val1".to_vec(),
-            })
-            .await;
-        assert!(matches!(put_resp, Some(Ok(None))));
-
-        // Get
-        let get_resp = handler
-            .handle(StoreReq::Get {
-                key: b"key1".to_vec(),
-            })
-            .await;
-        assert!(matches!(get_resp, Some(Ok(Some(ref v))) if v == b"val1"));
-
-        // Delete
-        let del_resp = handler
-            .handle(StoreReq::Delete {
-                key: b"key1".to_vec(),
-            })
-            .await;
-        assert!(matches!(del_resp, Some(Ok(None))));
-
-        // Get after delete
-        let get_after = handler
-            .handle(StoreReq::Get {
-                key: b"key1".to_vec(),
-            })
-            .await;
-        assert!(matches!(get_after, Some(Ok(None))));
-    }
-
-    #[tokio::test]
-    async fn execute_handler_dispatches_payload_and_returns_outcome() {
-        use crate::runtime::dispatcher::TaskDispatcher;
-        use async_trait::async_trait;
-
-        struct EchoDispatcher;
-        #[async_trait]
-        impl TaskDispatcher for EchoDispatcher {
-            async fn dispatch(
-                &self,
-                _task_id: &str,
-                payload: Vec<u8>,
-                _cancel: crate::runtime::dispatcher::CancelFlag,
-            ) -> crate::common::Result<Vec<u8>> {
-                Ok(payload)
-            }
-        }
-
-        let dispatcher: Arc<dyn TaskDispatcher> = Arc::new(EchoDispatcher);
-        let handler = ExecuteHandler::new(dispatcher, Vec::new());
-        let ctx = ExecuteCtx {
-            task_id: TaskId::from("t-1".to_string()),
-            workflow_id: WorkflowId::from("wf-1".to_string()),
-            payload: b"echo".to_vec(),
-            timeout_ms: 1000,
-        };
-        let result = handler.handle(ctx).await;
-        match result {
-            Some(Ok(outcome)) => {
-                assert_eq!(outcome.task_id.as_ref(), "t-1");
-                assert!(!outcome.result_payload.is_empty());
-            }
-            other => panic!("expected Ok outcome, got {:?}", other),
-        }
-    }
-
-    #[tokio::test]
-    async fn execute_handler_returns_error_on_dispatch_failure() {
-        use crate::runtime::dispatcher::TaskDispatcher;
-        use async_trait::async_trait;
-
-        struct FailingDispatcher;
-        #[async_trait]
-        impl TaskDispatcher for FailingDispatcher {
-            async fn dispatch(
-                &self,
-                _task_id: &str,
-                _payload: Vec<u8>,
-                _cancel: crate::runtime::dispatcher::CancelFlag,
-            ) -> crate::common::Result<Vec<u8>> {
-                Err(ActantError::Internal("boom".to_string()))
-            }
-        }
-
-        let dispatcher: Arc<dyn TaskDispatcher> = Arc::new(FailingDispatcher);
-        let handler = ExecuteHandler::new(dispatcher, Vec::new());
-        let ctx = ExecuteCtx {
-            task_id: TaskId::from("t-2".to_string()),
-            workflow_id: WorkflowId::from("wf-2".to_string()),
-            payload: Vec::new(),
-            timeout_ms: 1000,
-        };
-        let result = handler.handle(ctx).await;
-        assert!(matches!(result, Some(Err(_))));
-    }
-
-    #[test]
-    fn register_execute_handler_adds_layer() {
-        use crate::runtime::dispatcher::TaskRegistry;
-        let rt = CapabilityRuntime::new();
-        let dispatcher = TaskRegistry::new(1, 8, Vec::new())
-            .unwrap()
-            .into_dispatcher();
-        register_execute_handler(&rt, dispatcher, Vec::new()).unwrap();
-        assert_eq!(rt.capability_count(), 1);
-        assert_eq!(rt.handler_count::<Execute>(), 1);
-    }
-}
+#[path = "../../tests/rust/unit/runtime/capability.rs"]
+mod tests;

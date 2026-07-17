@@ -894,7 +894,6 @@ impl PyCancelToken {
     }
 }
 
-
 /// 通过事件总线交付给 Python 的统一事件类型。
 #[pyclass(name = "_Event", skip_from_py_object)]
 #[derive(Clone)]
@@ -983,7 +982,6 @@ impl From<SupervisionEvent> for PySupervisionEventData {
         }
     }
 }
-
 
 /// 生成 Rust 内置 capability 的 PyO3 分发函数。
 #[macro_export]

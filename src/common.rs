@@ -5,8 +5,6 @@ pub(crate) mod payload;
 pub mod serialization;
 pub(crate) mod wire;
 
-pub use payload::{sign, verify};
-
 /// 返回 UNIX 纪元起的当前时间（毫秒）。
 pub(crate) fn epoch_millis() -> u64 {
     std::time::SystemTime::now()
@@ -47,8 +45,8 @@ pub use error::{ActantError, Result};
 pub use wire::TopicRoute;
 // 领域类型 — 公共 API
 pub use model::{
-    ActorId, ActorMessage, ActorMessageResult, ActorStatus, MessageId, NodeId, RetryPolicy,
-    TaskCompletion, TaskDefinition, TaskId, WorkflowId,
+    ActorErrorEnvelope, ActorErrorKind, ActorId, ActorMessage, ActorMessageResult, ActorStatus,
+    MessageId, NodeId, RetryPolicy, TaskCompletion, TaskDefinition, TaskId, WorkflowId,
 };
 // 协议类型 — crate 内部
 pub(crate) use wire::{
@@ -57,7 +55,10 @@ pub(crate) use wire::{
     TOPIC_FAILOVER, TOPIC_HEADS, TOPIC_HEARTBEAT, TOPIC_WORKFLOW_STATE_REQ,
 };
 // 请求-响应协议所需类型（公共 API）
-pub use payload::{pack_group, pack_single};
+pub use payload::{
+    pack_group, pack_single, pack_upstream_prefix, sign, unpack_payload, verify,
+    TAG_UPSTREAM_PREFIX,
+};
 pub use serialization::MAX_DECODE_SIZE;
 pub use serialization::{decode_postcard, deserialize_rkyv_value, serialize_rkyv};
 pub use wire::WireTaskOutcome;

@@ -21,6 +21,36 @@ from typing import Literal, Protocol, runtime_checkable
 EffectKind = Literal["ask", "perform", "emit"]
 
 
+# ============================================================================
+# Capability 名称常量
+# ============================================================================
+#
+# 这些常量用于避免在 ``ask``/``perform``/``emit`` 调用中硬编码魔法字符串，
+# 提供 IDE 自动补全与编译期拼写检查。值与 ``BUILTIN_CAPABILITIES`` 的键一致。
+# 用法：``ask(actant.ROUTING, RouteCtx(...))`` 而非 ``ask("Routing", ...)``。
+
+#: 策略型（纯 Python，无 Rust fallback）
+ROUTING = "Routing"
+SCHEDULING = "Scheduling"
+RETRY_POLICY = "RetryPolicy"
+
+#: 副作用型（Rust 提供默认 handler，Python 可覆盖）
+SERIALIZATION = "Serialization"
+TRANSPORT = "Transport"
+STORE = "Store"
+EXECUTE = "Execute"
+ACTOR_MESSAGING = "ActorMessaging"
+
+#: 决策型（Rust Actor 系统提供）
+ACTOR_SUPERVISION = "ActorSupervision"
+
+#: 反应型（Rust 事件总线广播，Python 可订阅）
+TASK_LIFECYCLE = "TaskLifecycle"
+WORKFLOW_LIFECYCLE = "WorkflowLifecycle"
+NODE_LIFECYCLE = "NodeLifecycle"
+ACTOR_LIFECYCLE = "ActorLifecycle"
+
+
 @dataclass
 class CapabilityMeta:
     """Capability 的元数据。"""
@@ -101,10 +131,17 @@ class ExecuteCtx:
 
 @dataclass
 class ExecuteOutcome:
-    """`Execute` capability 的执行结果。"""
+    """`Execute` capability 的执行结果。
+
+    成功时 ``result_payload`` 携带 cloudpickle 序列化的返回值，``error_payload`` 为空。
+    失败时 ``error_payload`` 携带 cloudpickle 序列化的异常实例，``result_payload`` 为空；
+    调用方（如 ``AsyncResult.result``）据此重新抛出异常。此设计使任务失败可跨节点传播，
+    而非依赖 ``perform`` 抛出异常（后者在跨节点时无法保证异常类型可序列化）。
+    """
 
     task_id: str
     result_payload: bytes
+    error_payload: bytes = b""
 
 
 # ============================================================================
@@ -320,35 +357,31 @@ BUILTIN_CAPABILITIES: dict[str, CapabilityMeta] = {
     "ActorLifecycle": CapabilityMeta("ActorLifecycle", "emit"),
 }
 
-#: Rust 核心通过 `capability_registry!` 注册的 capability 名称集合。
-#: 仅这些 capability 在 Python handler 缺失/弃权时可回退到 Rust 内置 handler。
-#: `Routing` / `Scheduling` / `RetryPolicy` 不在此集合中——它们是纯 Python 策略。
-RUST_BACKED_CAPABILITIES: frozenset[str] = frozenset({
-    "Serialization",
-    "Transport",
-    "Store",
-    "Execute",
-    "ActorMessaging",
-    "ActorSupervision",
-    "TaskLifecycle",
-    "WorkflowLifecycle",
-    "NodeLifecycle",
-    "ActorLifecycle",
-})
-
 #: 仅 Python 层实现的策略型 capability（无 Rust fallback）。
+#: 单点维护：``RUST_BACKED_CAPABILITIES`` 从 ``BUILTIN_CAPABILITIES`` 与此集合派生。
 PYTHON_ONLY_CAPABILITIES: frozenset[str] = frozenset({
     "Routing",
     "Scheduling",
     "RetryPolicy",
 })
 
+#: Rust 核心通过 `capability_registry!` 注册的 capability 名称集合。
+#: 仅这些 capability 在 Python handler 缺失/弃权时可回退到 Rust 内置 handler。
+#: 从 ``BUILTIN_CAPABILITIES`` 键集合中减去 ``PYTHON_ONLY_CAPABILITIES`` 派生，
+#: 避免新增 Rust-backed capability 时遗漏更新此集合。
+RUST_BACKED_CAPABILITIES: frozenset[str] = frozenset(
+    BUILTIN_CAPABILITIES.keys() - PYTHON_ONLY_CAPABILITIES
+)
 
-def get_capability_meta(name: str) -> CapabilityMeta:
-    """返回指定 capability 的元数据。
+
+def get_builtin_capability_meta(name: str) -> CapabilityMeta:
+    """返回指定**内置** capability 的元数据。
+
+    仅查 ``BUILTIN_CAPABILITIES``。如需查询 Runtime 已注册（含自定义）的
+    capability，用 ``Runtime.capability_meta(name)``。
 
     Args:
-        name: capability 名称（如 `"Routing"`）。
+        name: capability 名称（如 ``ROUTING``）。
 
     Raises:
         KeyError: capability 不存在。
@@ -360,56 +393,27 @@ def get_capability_meta(name: str) -> CapabilityMeta:
     return BUILTIN_CAPABILITIES[name]
 
 
-# 用户自定义 capability 也用 CapabilityMeta 表示，但不在 BUILTIN_CAPABILITIES 中。
-# 用户通过 `actant.capability(name, kind)` 声明自定义 capability。
-
-
-def capability(name: str, kind: EffectKind = "perform") -> CapabilityMeta:
-    """声明一个自定义 capability。
-
-    Args:
-        name: capability 名称。必须是唯一的（不能与内置重复）。
-        kind: effect 类型，`"ask"` / `"perform"` / `"emit"`。
-
-    Returns:
-        该 capability 的元数据。注册到 Runtime 时使用。
-    """
-    if name in BUILTIN_CAPABILITIES:
-        raise ValueError(
-            f"capability name {name!r} conflicts with builtin; use a different name"
-        )
-    if kind not in ("ask", "perform", "emit"):
-        raise ValueError(f"kind must be 'ask'/'perform'/'emit', got {kind!r}")
-    return CapabilityMeta(name, kind)
-
-
-# ============================================================================
-# 请求类型映射（用于运行时校验）
-# ============================================================================
-
-#: 每个 capability 对应的请求类型（用于运行时 isinstance 校验）。
-REQUEST_TYPES: dict[str, type] = {
-    "Routing": RouteCtx,
-    "Scheduling": ScheduleCtx,
-    "RetryPolicy": RetryCtx,
-    "Serialization": SerializationReq,
-    "Transport": TransportReq,
-    "Store": StoreReq,
-    "Execute": ExecuteCtx,
-    "ActorMessaging": ActorMessageReq,
-    "ActorSupervision": ActorFailureCtx,
-    "TaskLifecycle": TaskEvent,
-    "WorkflowLifecycle": WorkflowEvent,
-    "NodeLifecycle": NodeEvent,
-    "ActorLifecycle": ActorEvent,
-}
+# 用户自定义 capability 通过 `rt.layer(name, kind)` 直接注册，
+# layer() 会自动创建 CapabilityMeta 并存入 Runtime._metas。
 
 
 __all__ = [
+    "ACTOR_LIFECYCLE",
+    "ACTOR_MESSAGING",
+    "ACTOR_SUPERVISION",
     "BUILTIN_CAPABILITIES",
+    "EXECUTE",
+    "NODE_LIFECYCLE",
     "PYTHON_ONLY_CAPABILITIES",
-    "REQUEST_TYPES",
+    "RETRY_POLICY",
+    "ROUTING",
     "RUST_BACKED_CAPABILITIES",
+    "SCHEDULING",
+    "SERIALIZATION",
+    "STORE",
+    "TASK_LIFECYCLE",
+    "TRANSPORT",
+    "WORKFLOW_LIFECYCLE",
     "ActorEvent",
     "ActorFailureCtx",
     "ActorLifecycleHandler",
@@ -439,6 +443,5 @@ __all__ = [
     "TransportReq",
     "WorkflowEvent",
     "WorkflowLifecycleHandler",
-    "capability",
-    "get_capability_meta",
+    "get_builtin_capability_meta",
 ]

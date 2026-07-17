@@ -1,3 +1,20 @@
+//! 任务调度抽象与 Actor 化调度客户端。
+//!
+//! [`Scheduler`] 定义 Worker 与调度策略之间的最小契约。实际生产路径使用
+//! [`SchedulerActor`] 持有队列状态，
+//! [`ActorScheduler`] 作为客户端通过 Actor 消息调用它。
+//!
+//! ## 阻塞语义
+//!
+//! `dequeue()` 在队列为空时可以等待任务；`try_dequeue()` 必须立即返回。
+//! Worker 主循环通过订阅 `Topic::TaskEnqueued` 事件驱动 `try_dequeue()`，
+//! 而非 sleep 轮询——SchedulerActor 在 `enqueue` 后发布事件，Worker 立即被唤醒。
+//!
+//! ## 扩展点
+//!
+//! 外部 Rust 用户可以实现 [`Scheduler`] 替换调度策略。实现应保证 `close()` 后
+//! 拒绝新任务并唤醒等待中的消费者。
+//!
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -12,7 +29,7 @@ use crate::runtime::workflow::messaging::{decode_result, encode, ok_or_error};
 /// 任务调度器抽象。
 ///
 /// 此 trait 将 DAG 编排器与具体调度策略解耦。生产实现为
-/// [`SchedulerActor`](crate::runtime::workflow::SchedulerActor) +
+/// [`SchedulerActor`] +
 /// [`ActorScheduler`]：调度状态由 Actor 持有，客户端通过 Actor 消息交互。
 ///
 /// # 公共扩展点
@@ -274,67 +291,5 @@ impl ActorScheduler {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::common::{ActorId, TaskId};
-    use crate::runtime::actor::ActorSystem;
-    use crate::runtime::workflow::SchedulerActor;
-
-    fn make_task(name: &str, priority: i32) -> TaskDefinition {
-        TaskDefinition {
-            id: TaskId::generate(),
-            name: name.to_string(),
-            payload: Vec::new(),
-            workflow_id: None,
-            target_node: None,
-            origin_node: None,
-            retry_policy: None,
-            priority,
-            timeout_ms: None,
-            attempt: 0,
-            enqueued_at_ms: 0,
-            target_endpoint_addr: None,
-            origin_endpoint_addr: None,
-        }
-    }
-
-    #[test]
-    fn is_registered_recognizes_builtin_kinds() {
-        assert!(is_registered(scheduler_kind::PRIORITY));
-        assert!(is_registered(scheduler_kind::FIFO));
-        assert!(!is_registered("nonexistent"));
-    }
-
-    #[test]
-    fn registered_names_includes_builtins() {
-        let names = registered_names();
-        assert!(names.contains(&scheduler_kind::PRIORITY.to_string()));
-        assert!(names.contains(&scheduler_kind::FIFO.to_string()));
-    }
-    
-    #[tokio::test]
-    async fn actor_scheduler_forwards_through_scheduler_actor() {
-        let actor_system = Arc::new(ActorSystem::new());
-        let actor_id = ActorId::new("scheduler-test".to_string());
-        actor_system
-            .spawn(actor_id.clone(), SchedulerActor::priority())
-            .await
-            .unwrap();
-
-        let client = ActorScheduler::new(actor_id, actor_system);
-        client.enqueue(make_task("low", -10)).await.unwrap();
-        client.enqueue(make_task("high", 10)).await.unwrap();
-        client.enqueue(make_task("mid", 0)).await.unwrap();
-
-        assert_eq!(client.len().await, 3);
-        assert!(!client.is_empty().await);
-        assert_eq!(client.try_dequeue().await.unwrap().name, "high");
-        assert_eq!(client.try_dequeue().await.unwrap().name, "mid");
-        assert_eq!(client.try_dequeue().await.unwrap().name, "low");
-        assert!(client.try_dequeue().await.is_none());
-
-        client.close();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert!(client.is_closed());
-    }
-}
+#[path = "../../../tests/rust/unit/runtime/workflow/scheduler.rs"]
+mod tests;

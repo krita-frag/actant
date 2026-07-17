@@ -27,6 +27,7 @@ struct Instruments {
     tasks_failed: Counter<u64>,
     tasks_timeout: Counter<u64>,
     tasks_retried: Counter<u64>,
+    tasks_cancelled: Counter<u64>,
 
     // -- 工作流计数器 --
     workflows_submitted: Counter<u64>,
@@ -68,9 +69,11 @@ struct Instruments {
     active_workflows: UpDownCounter<i64>,
     active_actors: UpDownCounter<i64>,
     connected_peers: UpDownCounter<i64>,
+    cancelled_tasks_pending: UpDownCounter<i64>,
 
     // -- 直方图 --
     task_duration_ms: Histogram<u64>,
+    cancel_latency_ms: Histogram<u64>,
     workflow_duration_ms: Histogram<u64>,
     scheduling_latency_ms: Histogram<u64>,
     payload_serialize_ms: Histogram<u64>,
@@ -106,6 +109,10 @@ impl Instruments {
             tasks_retried: meter
                 .u64_counter("actant.tasks.retried")
                 .with_description("Total tasks retried")
+                .build(),
+            tasks_cancelled: meter
+                .u64_counter("actant.tasks.cancelled")
+                .with_description("Total tasks cancelled")
                 .build(),
 
             // -- 工作流计数器 --
@@ -229,11 +236,21 @@ impl Instruments {
                 .i64_up_down_counter("actant.network.connected_peers")
                 .with_description("Connected peer count")
                 .build(),
+            cancelled_tasks_pending: meter
+                .i64_up_down_counter("actant.tasks.cancelled_pending")
+                .with_description(
+                    "Currently pending cancelled tasks (registered but not yet resolved)",
+                )
+                .build(),
 
             // -- 直方图 --
             task_duration_ms: meter
                 .u64_histogram("actant.tasks.duration_ms")
                 .with_description("Task duration in ms")
+                .build(),
+            cancel_latency_ms: meter
+                .u64_histogram("actant.tasks.cancel_latency_ms")
+                .with_description("Time from cancel request to task termination in ms")
                 .build(),
             workflow_duration_ms: meter
                 .u64_histogram("actant.workflows.duration_ms")
@@ -363,6 +380,10 @@ pub fn inc_tasks_retried() {
     instruments().tasks_retried.add(1, &[]);
 }
 
+pub fn inc_tasks_cancelled() {
+    instruments().tasks_cancelled.add(1, &[]);
+}
+
 pub fn inc_workflows_submitted() {
     instruments().workflows_submitted.add(1, &[]);
 }
@@ -388,7 +409,6 @@ pub fn inc_retry_scheduled() {
     instruments().retry_scheduled.add(1, &[]);
 }
 
-
 pub fn inc_gossip_updates_sent() {
     instruments().gossip_updates_sent.add(1, &[]);
 }
@@ -400,7 +420,6 @@ pub fn inc_gossip_updates_received() {
 pub fn inc_gossip_updates_dropped() {
     instruments().gossip_updates_dropped.add(1, &[]);
 }
-
 
 pub fn inc_heartbeats_sent() {
     instruments().heartbeats_sent.add(1, &[]);
@@ -458,7 +477,6 @@ pub fn inc_task_forward_reroute() {
     instruments().task_forward_reroute.add(1, &[]);
 }
 
-
 pub fn inc_running_tasks() {
     instruments().running_tasks.add(1, &[]);
 }
@@ -491,8 +509,24 @@ pub fn dec_connected_peers() {
     instruments().connected_peers.add(-1, &[]);
 }
 
+pub fn inc_cancelled_tasks_pending() {
+    instruments().cancelled_tasks_pending.add(1, &[]);
+}
+
+pub fn dec_cancelled_tasks_pending() {
+    instruments().cancelled_tasks_pending.add(-1, &[]);
+}
+
+pub fn dec_cancelled_tasks_pending_by(n: i64) {
+    instruments().cancelled_tasks_pending.add(-n, &[]);
+}
+
 pub fn observe_task_duration_ms(value: u64) {
     instruments().task_duration_ms.record(value, &[]);
+}
+
+pub fn observe_cancel_latency_ms(value: u64) {
+    instruments().cancel_latency_ms.record(value, &[]);
 }
 
 pub fn observe_workflow_duration_ms(value: u64) {
@@ -536,152 +570,5 @@ pub fn observe_direct_request_ms(value: u64) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    // metrics 模块依赖全局状态（opentelemetry global meter provider + 静态
-    // INSTRUMENTS/REGISTRY）。并行测试会因全局 set_meter_provider 的竞争
-    // 产生不确定行为，因此用一个进程级 Mutex 将所有 metrics 测试串行化。
-    static METRICS_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// 获取串行守卫；守卫持有直到测试结束，确保 init() / prometheus_text()
-    /// 的全局状态不被并发修改。
-    fn lock() -> std::sync::MutexGuard<'static, ()> {
-        METRICS_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    #[test]
-    fn init_returns_ok() {
-        let _g = lock();
-        // init() 必须返回 Ok，而非 panic（这是 P0 修复的核心契约）。
-        let result = init();
-        assert!(result.is_ok(), "init() should return Ok, got: {:?}", result);
-    }
-
-    #[test]
-    fn init_is_idempotent() {
-        let _g = lock();
-        // 文档约定：init() 可多次调用（用于多 _Node 实例的测试场景）。
-        assert!(init().is_ok(), "first init() should succeed");
-        assert!(init().is_ok(), "second init() should succeed");
-    }
-
-    #[test]
-    fn prometheus_text_contains_counter_after_inc() {
-        let _g = lock();
-        init().expect("init for test");
-        inc_tasks_submitted();
-        inc_tasks_submitted();
-        inc_tasks_completed();
-
-        let text = prometheus_text();
-        assert!(
-            !text.is_empty(),
-            "prometheus_text should be non-empty after init"
-        );
-        assert!(
-            text.contains("actant_tasks_submitted"),
-            "prometheus_text should contain actant_tasks_submitted counter, got: {text}"
-        );
-        assert!(
-            text.contains("actant_tasks_completed"),
-            "prometheus_text should contain actant_tasks_completed counter, got: {text}"
-        );
-    }
-
-    #[test]
-    fn up_down_counter_reflected_in_output() {
-        let _g = lock();
-        init().expect("init for test");
-        inc_running_tasks();
-        inc_running_tasks();
-        dec_running_tasks();
-        inc_active_workflows();
-        inc_connected_peers();
-        dec_connected_peers();
-
-        let text = prometheus_text();
-        assert!(
-            text.contains("actant_tasks_running"),
-            "prometheus_text should contain actant_tasks_running gauge, got: {text}"
-        );
-        assert!(
-            text.contains("actant_workflows_active"),
-            "prometheus_text should contain actant_workflows_active gauge, got: {text}"
-        );
-    }
-
-    #[test]
-    fn histogram_observe_reflected_in_output() {
-        let _g = lock();
-        init().expect("init for test");
-        observe_task_duration_ms(150);
-        observe_task_duration_ms(300);
-        observe_workflow_duration_ms(2000);
-        observe_scheduling_latency_ms(5);
-
-        let text = prometheus_text();
-        assert!(
-            text.contains("actant_tasks_duration_ms"),
-            "prometheus_text should contain actant_tasks_duration_ms histogram, got: {text}"
-        );
-        assert!(
-            text.contains("actant_workflows_duration_ms"),
-            "prometheus_text should contain actant_workflows_duration_ms histogram, got: {text}"
-        );
-        assert!(
-            text.contains("actant_scheduler_latency_ms"),
-            "prometheus_text should contain actant_scheduler_latency_ms histogram, got: {text}"
-        );
-    }
-
-    #[test]
-    fn all_counter_helpers_do_not_panic() {
-        let _g = lock();
-        init().expect("init for test");
-        // 烟雾测试：所有公共计数器辅助函数应可无 panic 调用。
-        inc_tasks_submitted();
-        inc_tasks_completed();
-        inc_tasks_failed();
-        inc_tasks_timeout();
-        inc_tasks_retried();
-        inc_workflows_submitted();
-        inc_workflows_completed();
-        inc_workflows_failed();
-        inc_workflow_timeouts();
-        inc_retry_scheduled();
-        inc_gossip_updates_sent();
-        inc_gossip_updates_received();
-        inc_gossip_updates_dropped();
-        inc_heartbeats_sent();
-        inc_failover_claims();
-        inc_failover_reschedules();
-        inc_actors_spawned();
-        inc_actors_stopped();
-        inc_actors_failed();
-        inc_direct_requests_capacity_exceeded();
-        inc_event_bus_subscriber_pruned();
-        inc_event_bus_publish_timeout();
-        inc_event_bus_dropped_events();
-        inc_task_forward_succeeded();
-        inc_task_forward_failed();
-        inc_task_forward_fallback_local();
-        inc_task_forward_reroute();
-        // 若执行到此行，所有辅助函数均未 panic。
-    }
-
-    #[test]
-    fn all_up_down_counter_helpers_do_not_panic() {
-        let _g = lock();
-        init().expect("init for test");
-        inc_running_tasks();
-        dec_running_tasks();
-        inc_active_workflows();
-        dec_active_workflows();
-        inc_active_actors();
-        dec_active_actors();
-        inc_connected_peers();
-        dec_connected_peers();
-        // 若执行到此行，所有 UpDownCounter 辅助函数均未 panic。
-    }
-}
+#[path = "../tests/rust/unit/metrics.rs"]
+mod tests;

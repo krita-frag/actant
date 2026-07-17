@@ -1,75 +1,146 @@
-"""`actant._effects` 纯单元测试。
-
-覆盖不依赖 Rust 运行时的路径：
-- `impossible()` 总是抛 RuntimeError。
-- `effect()` 的 kind 校验（未知 kind 抛 ValueError）。
-- `ask`/`perform`/`emit`/`effect` 在无活跃 Runtime 时抛 RuntimeError
-  （`_resolve_meta` 的 `get_current_runtime() is None` 分支）。
-"""
-
+"""``actant._effects`` 单元测试（构造 Runtime 但不 start Rust）。"""
 from __future__ import annotations
 
 import pytest
 
-from actant._effects import ask, effect, emit, impossible, perform
+import actant
+from actant import Runtime
+from actant.exceptions import InvalidStateError
 
 
-def test_impossible_raises_runtime_error() -> None:
-    with pytest.raises(RuntimeError, match="impossible: nope"):
-        impossible("nope")
+def _routing_ask(name: str) -> str:
+    return f"{name}?"
 
 
-def test_impossible_default_detail() -> None:
-    with pytest.raises(RuntimeError, match="unreachable"):
-        impossible()
+def test_ask_without_runtime_raises() -> None:
+    with pytest.raises(InvalidStateError):
+        actant.ask("Routing", "x")
 
 
-def test_impossible_is_no_return() -> None:
-    """impossible 标记为 NoReturn，调用方不应继续执行。"""
-    # NoReturn 在运行时不暴露为类型对象，断言函数可调用且抛异常即可
-    with pytest.raises(RuntimeError):
-        impossible("stop")
+def test_perform_without_runtime_raises() -> None:
+    with pytest.raises(InvalidStateError):
+        actant.perform("Routing", "x")
 
 
-def test_effect_unknown_kind_raises_value_error() -> None:
-    """effect 对未知 kind 抛 ValueError，在访问 Runtime 之前。"""
-    with pytest.raises(ValueError, match="kind must be 'ask'/'perform'/'emit'"):
-        effect("Whatever", "bogus", object())
+def test_emit_without_runtime_raises() -> None:
+    with pytest.raises(InvalidStateError):
+        actant.emit("Routing", "x")
 
 
-def test_ask_without_runtime_raises_runtime_error() -> None:
-    with pytest.raises(RuntimeError, match="no active Runtime"):
-        ask("Routing", {"x": 1})
+def test_ask_routing_basic() -> None:
+    rt = Runtime()
+    rt.layer("Routing", kind="ask").chain(_routing_ask)
+    with actant.use_runtime(rt):
+        result = actant.ask("Routing", "hello")
+    assert result == "hello?"
 
 
-def test_perform_without_runtime_raises_runtime_error() -> None:
-    with pytest.raises(RuntimeError, match="no active Runtime"):
-        perform("Execute", {"x": 1})
+def test_ask_returns_first_non_none() -> None:
+    rt = Runtime()
+    rt.layer("MyDecision", kind="ask").chain(lambda x: None)
+    rt.layer("MyDecision", kind="ask").chain(lambda x: f"second:{x}")
+    rt.layer("MyDecision", kind="ask").chain(lambda x: f"third:{x}")
+    with actant.use_runtime(rt):
+        result = actant.ask("MyDecision", "x")
+    # 后注册的 handler 优先级更高（逆序调用），因此第三个 handler 决定结果。
+    assert result == "third:x"
 
 
-def test_emit_without_runtime_raises_runtime_error() -> None:
-    with pytest.raises(RuntimeError, match="no active Runtime"):
-        emit("TaskLifecycle", {"x": 1})
+def test_ask_returns_none_when_all_abstain() -> None:
+    rt = Runtime()
+    rt.layer("MyDecision", kind="ask").chain(lambda x: None)
+    with actant.use_runtime(rt):
+        assert actant.ask("MyDecision", "x") is None
 
 
-def test_effect_ask_without_runtime_raises_runtime_error() -> None:
-    """effect('ask', ...) 会转调 ask，无 Runtime 时同样抛 RuntimeError。"""
-    with pytest.raises(RuntimeError, match="no active Runtime"):
-        effect("Routing", "ask", {"x": 1})
+def test_perform_uses_last_handler() -> None:
+    rt = Runtime.with_defaults()
+    rt.chain("Serialization", lambda x: "first")
+    rt.chain("Serialization", lambda x: "last")
+    with actant.use_runtime(rt):
+        assert actant.perform("Serialization", None) == "last"
 
 
-def test_effect_perform_without_runtime_raises_runtime_error() -> None:
-    with pytest.raises(RuntimeError, match="no active Runtime"):
-        effect("Execute", "perform", {"x": 1})
+def test_perform_without_handlers_raises() -> None:
+    rt = Runtime()
+    with actant.use_runtime(rt), pytest.raises(actant.NotFoundError):
+        actant.perform("Serialization", None)
 
 
-def test_effect_emit_without_runtime_raises_runtime_error() -> None:
-    with pytest.raises(RuntimeError, match="no active Runtime"):
-        effect("TaskLifecycle", "emit", {"x": 1})
+def test_emit_calls_all_handlers() -> None:
+    rt = Runtime.with_defaults()
+    called: list[str] = []
+    rt.chain("TaskLifecycle", lambda e: called.append("a"))
+    rt.chain("TaskLifecycle", lambda e: called.append("b"))
+    with actant.use_runtime(rt):
+        actant.emit("TaskLifecycle", "event")
+    assert called == ["a", "b"]
 
 
-def test_resolve_meta_without_runtime_includes_capability_name() -> None:
-    """错误消息应包含被请求的 capability 名称，便于定位。"""
-    with pytest.raises(RuntimeError) as ei:
-        ask("MyCap", None)
-    assert "MyCap" in str(ei.value)
+def test_emit_on_error_raise() -> None:
+    rt = Runtime.with_defaults()
+    rt.chain("TaskLifecycle", lambda e: (_ for _ in ()).throw(ValueError("boom")))
+    with actant.use_runtime(rt), pytest.raises(ValueError, match="boom"):
+        actant.emit("TaskLifecycle", "event", on_error="raise")
+
+
+def test_emit_on_error_collect() -> None:
+    rt = Runtime.with_defaults()
+    rt.chain("TaskLifecycle", lambda e: (_ for _ in ()).throw(ValueError("a")))
+    rt.chain("TaskLifecycle", lambda e: (_ for _ in ()).throw(ValueError("b")))
+    with actant.use_runtime(rt), pytest.raises(actant.ActantError):
+        actant.emit("TaskLifecycle", "event", on_error="collect")
+
+
+def test_emit_invalid_on_error() -> None:
+    with pytest.raises(ValueError, match="on_error"):
+        actant.emit("TaskLifecycle", "event", on_error="bad")  # type: ignore[arg-type]
+
+
+def test_ask_kind_mismatch() -> None:
+    rt = Runtime()
+    rt.layer("MyPerform", kind="perform").chain(lambda x: x)
+    with actant.use_runtime(rt), pytest.raises(InvalidStateError, match="not 'ask'"):
+        actant.ask("MyPerform", "x")
+
+
+def test_perform_kind_mismatch() -> None:
+    rt = Runtime()
+    rt.layer("MyAsk", kind="ask").chain(lambda x: x)
+    with actant.use_runtime(rt), pytest.raises(InvalidStateError, match="not 'perform'"):
+        actant.perform("MyAsk", "x")
+
+
+def test_emit_kind_mismatch() -> None:
+    rt = Runtime()
+    rt.layer("MyAsk", kind="ask").chain(lambda x: x)
+    with actant.use_runtime(rt), pytest.raises(InvalidStateError, match="not 'emit'"):
+        actant.emit("MyAsk", "x")
+
+
+def test_effect_dispatcher_perform_and_emit() -> None:
+    rt = Runtime()
+    rt.layer("MyPerform", kind="perform").chain(lambda x: f"performed:{x}")
+    called: list[str] = []
+    rt.layer("MyEmit", kind="emit").chain(lambda e: called.append(e))
+    with actant.use_runtime(rt):
+        assert actant.effect("MyPerform", "perform", "x") == "performed:x"
+        assert actant.effect("MyEmit", "emit", "event") is None
+    assert called == ["event"]
+
+
+def test_effect_dispatcher() -> None:
+    rt = Runtime()
+    rt.layer("Routing", kind="ask").chain(_routing_ask)
+    with actant.use_runtime(rt):
+        assert actant.effect("Routing", "ask", "x") == "x?"
+
+
+def test_effect_dispatcher_invalid_kind() -> None:
+    with pytest.raises(ValueError, match="kind"):
+        actant.effect("MyEffect", "bad", "x")  # type: ignore[arg-type]
+
+
+def test_impossible_raises() -> None:
+    with pytest.raises(actant.InternalError, match="impossible"):
+        actant.impossible("unreachable")

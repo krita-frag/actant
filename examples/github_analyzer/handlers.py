@@ -94,7 +94,7 @@ class PrFirstScheduler:
 
 
 # ---------------------------------------------------------------------------
-# ask：指数退避重试决策（覆盖默认 NoRetryPolicy，并组合 Audit emit）
+# ask：指数退避重试决策（覆盖默认 DefaultRetryPolicy，并组合 Audit emit）
 # ---------------------------------------------------------------------------
 
 
@@ -104,7 +104,7 @@ class ExponentialBackoffRetry:
     ``attempt < max_retries`` 时返回 ``True``（重试），并触发一次 ``Audit``
     事件记录决策（演示 handler 内组合 effect）。超出上限返回 ``None``（放弃）。
 
-    约定 ``attempt`` 从 1 起算（首次失败 attempt=1），与默认 ``NoRetryPolicy``
+    约定 ``attempt`` 从 1 起算（首次失败 attempt=1），与默认 ``DefaultRetryPolicy``
     的 ``<`` 语义保持一致（H1 改进）。
     """
 

@@ -1,7 +1,6 @@
 //! 基于话题的事件总线，用于内部解耦通信。
 //!
-//! 用单一的发布/订阅中枢取代分散的通道（completion_tx、worker_event_tx、
-//! event_forward、orch_tx）。模块将事件发布到话题，订阅者只接收自己关心的话题。
+//! 单一的发布/订阅中枢将事件发布到话题，订阅者只接收自己关心的话题。
 //!
 //! ## 投递保证
 //!
@@ -35,6 +34,12 @@ use crate::runtime::network::DirectResponseChannel;
 pub enum Topic {
     /// 任务已在此 worker 上开始执行。
     TaskStarted,
+    /// 任务已入队到调度器（唤醒 Worker 拉取）。
+    ///
+    /// 由 `SchedulerActor` 在 `enqueue` / `enqueue_batch` / `close` 后发布。
+    /// 事件本身不携带任务数据——仅为唤醒信号，Worker 收到后通过
+    /// `try_dequeue` 拉取实际任务。
+    TaskEnqueued,
     /// 任务成功完成。
     TaskCompleted,
     /// 任务失败。
@@ -87,6 +92,13 @@ pub enum BusEvent {
         workflow_id: WorkflowId,
         task_id: TaskId,
     },
+    /// 任务已入队到调度器（仅作唤醒信号，不携带任务数据）。
+    ///
+    /// 由 `SchedulerActor` 在 `enqueue` / `enqueue_batch` / `close` 后发布。
+    /// Worker 订阅 `Topic::TaskEnqueued` 后在此事件上 await。
+    /// 事件被丢弃（通道满）是安全的——Worker 已在前一次唤醒中
+    /// 处理任务，下次 `try_dequeue` 会拉取剩余任务。
+    TaskEnqueued,
     TaskCompleted(TaskCompletion),
     TaskFailed(TaskCompletion),
     TaskCancelled(TaskCompletion),
@@ -132,6 +144,7 @@ impl BusEvent {
     pub fn topic(&self) -> Topic {
         match self {
             BusEvent::TaskStarted { .. } => Topic::TaskStarted,
+            BusEvent::TaskEnqueued => Topic::TaskEnqueued,
             BusEvent::TaskCompleted(_) => Topic::TaskCompleted,
             BusEvent::TaskFailed(_) => Topic::TaskFailed,
             BusEvent::TaskCancelled(_) => Topic::TaskCancelled,
@@ -160,11 +173,11 @@ impl BusEvent {
     /// 仅对可广播事件返回 `Some`。`DirectRequest` 包含一次性响应通道，
     /// 无法克隆，返回 `None`。
     ///
-    /// 此方法取代了原本会在 `DirectRequest` 上 panic 的 `Clone` 实现，
-    /// 将"独占事件不可克隆"这一不变式从运行时 panic 提升为类型安全的
-    /// `Option` 返回值。调用方（`broadcast_to_subscribers`）由
-    /// `is_cloneable()` 守卫，确保 `None` 分支在实践中不会触发；
-    /// 即便因 bug 触发，也会被防御性地跳过而非崩溃。
+    /// 通过将"独占事件不可克隆"这一不变式表达为类型安全的 `Option` 返回值，
+    /// 避免在 `DirectRequest` 上实现 `Clone` 引发运行时 panic。
+    /// 调用方（`broadcast_to_subscribers`）由 `is_cloneable()` 守卫，
+    /// 确保 `None` 分支在实践中不会触发；即便因 bug 触发，
+    /// 也会被防御性地跳过而非崩溃。
     fn clone_broadcast(&self) -> Option<BusEvent> {
         Some(match self {
             BusEvent::TaskStarted {
@@ -174,6 +187,7 @@ impl BusEvent {
                 workflow_id: workflow_id.clone(),
                 task_id: task_id.clone(),
             },
+            BusEvent::TaskEnqueued => BusEvent::TaskEnqueued,
             BusEvent::TaskCompleted(c) => BusEvent::TaskCompleted(c.clone()),
             BusEvent::TaskFailed(c) => BusEvent::TaskFailed(c.clone()),
             BusEvent::TaskCancelled(c) => BusEvent::TaskCancelled(c.clone()),
@@ -217,7 +231,10 @@ impl BusEvent {
             | BusEvent::DagUpdate(_) => DeliveryGuarantee::Reliable,
 
             // 周期性/被覆盖：下一次心跳或对端事件会覆盖当前事件，丢弃可接受。
-            BusEvent::PeerConnected(_)
+            // TaskEnqueued 同理——事件仅为唤醒信号，丢弃后 Worker 下次
+            // try_dequeue 仍会拉取已入队任务。
+            BusEvent::TaskEnqueued
+            | BusEvent::PeerConnected(_)
             | BusEvent::PeerDisconnected(_)
             | BusEvent::Heartbeat(_)
             | BusEvent::HeadsExchange(_)
@@ -672,3 +689,7 @@ impl EventBus {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/rust/unit/runtime/event_bus.rs"]
+mod tests;

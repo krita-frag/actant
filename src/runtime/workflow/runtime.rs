@@ -1,49 +1,85 @@
+//! Worker 执行运行时。
+//!
+//! [`Worker`] 是每个节点上的任务执行循环：它从 [`Scheduler`] 拉取
+//! [`TaskDefinition`]，决定本地执行还是转发远端，
+//! 然后通过 [`TaskDispatcher`]
+//! 调用实际 handler。Worker 不理解任务 payload 的业务语义，只处理签名后的字节、
+//! 超时、取消、并发槽位和结果投递。
+//!
+//! ## 主循环结构
+//!
+//! 1. 启动网络事件循环，订阅 task / heartbeat / DAG state / cancel 等 topic。
+//! 2. 启动远端结果重试循环和取消 TTL 清理循环。
+//! 3. 订阅 `Topic::TaskEnqueued` 事件，SchedulerActor 在 `enqueue` 后发布事件
+//!    唤醒 Worker 拉取任务。
+//! 4. 为每个任务获取 semaphore 槽位，注册 cancel flag，执行或转发任务。
+//! 5. 将任务结果投递回 origin 节点或本地 WorkflowActor。
+//!
+//! ## 关闭语义
+//!
+//! [`Worker::shutdown`] 只发送取消信号；真正的 drain、任务线程池关闭和 iroh
+//! endpoint 关闭由 [`crate::runtime::Runtime::shutdown`] 编排。这样可以保证
+//! Actor、dispatcher 和网络按固定顺序退出，避免 Drop 阶段互相等待。
+//!
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::common::{
-    ActantError, NodeId, Result, TaskCompletion, TaskDefinition, TaskId, Topic, WireEnvelope,
-    WireMessage, WireTaskOutcome, WorkerConfig, WorkflowId,
+    ActantError, NodeId, Result, TaskCompletion, TaskDefinition, Topic, WorkerConfig, WorkflowId,
 };
 use crate::runtime::actor::ActorSystem;
-use crate::runtime::dispatcher::{new_cancel_flag, TaskDispatcher};
+use crate::runtime::dispatcher::{new_cancel_flag, CancelFlag, TaskDispatcher};
 use crate::runtime::event_bus::{BusEvent, EventBus};
-use crate::runtime::network::{DirectResponseChannel, NetworkEvent, Transport};
-use crate::runtime::workflow::messaging::encode;
+use crate::runtime::network::Transport;
 use crate::runtime::workflow::Scheduler;
 
-/// A task result that failed to deliver and is pending retry.
-struct PendingResult {
-    target: String,
-    request: crate::runtime::network::DirectRequest,
-    attempts: usize,
-}
+mod cancel;
+mod network_router;
+mod result_delivery;
 
-/// 尝试将待重试结果入队；通道满或关闭时发出 warn 并丢弃，而非静默丢失。
+use network_router::{NetworkEventRouter, NetworkEventRouterConfig};
+use result_delivery::{start_pending_result_loop, try_enqueue_pending_result, PendingResult};
+
+#[cfg(test)]
+use crate::common::TaskId;
+#[cfg(test)]
+use crate::runtime::network::DirectResponseChannel;
+
+/// 事件驱动的任务拉取。
 ///
-/// 使用 `try_send`（非阻塞）：通道满时立即返回 `Full`，
-/// 避免在高负载下无限阻塞任务执行循环。
-macro_rules! enqueue_pending_result {
-    ($tx:expr, $target:expr, $request:expr, $attempts:expr, $capacity:expr) => {{
-        let _target_for_log = $target.clone();
-        match $tx.try_send(PendingResult {
-            target: $target,
-            request: $request,
-            attempts: $attempts,
-        }) {
-            Ok(()) => {}
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                tracing::warn!(
-                    target = %_target_for_log,
-                    capacity = $capacity,
-                    "pending_results channel full, dropping result for retry"
-                );
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                tracing::warn!(target = %_target_for_log, "pending_results channel closed, dropping result");
-            }
+/// 先 ``try_dequeue`` 拉取已入队任务；无任务时在 EventBus 的
+/// ``TaskEnqueued`` 订阅上 await，由 SchedulerActor 在 ``enqueue`` 后
+/// 发布事件唤醒。无 sleep、无固定延迟、无 CPU 浪费。
+///
+/// # 为什么不直接调用 ``dequeue()``
+///
+/// ``dequeue()`` 会向 SchedulerActor 发送 ``DEQUEUE`` 消息，而
+/// SchedulerActor 的 ``handle_message`` 会调用 ``inner.dequeue().await``，
+/// 该方法在队列为空时阻塞。由于 Actor 单线程顺序处理消息，阻塞的
+/// DEQUEUE 会阻止后续 ENQUEUE 被处理，形成死锁。
+/// 通过 EventBus 事件 + 非阻塞 ``try_dequeue`` 组合，Actor 每条消息
+/// 都能立即返回，Worker 也能在任务入队时立即被唤醒。
+///
+/// # 事件丢失安全性
+///
+/// ``TaskEnqueued`` 是 ``BestEffort`` 投递——通道满时丢弃。这不会导致
+/// 任务丢失：Worker 每次被唤醒后会循环 ``try_dequeue`` 直到队列空，
+/// 丢弃事件仅意味着"少唤醒一次"，下一次事件或下一次循环仍会拉取到任务。
+async fn wait_for_task(
+    scheduler: &Arc<dyn Scheduler>,
+    event_rx: &mut tokio::sync::mpsc::Receiver<BusEvent>,
+) -> Option<TaskDefinition> {
+    loop {
+        if let Some(task) = scheduler.try_dequeue().await {
+            return Some(task);
         }
-    }};
+        // 无任务时等待 EventBus 事件。事件由 SchedulerActor 在
+        // enqueue/enqueue_batch/close 后发布。recv() 返回 None 表示
+        // EventBus 已 drop（仅在 Runtime shutdown 时发生）——
+        // 此时 Worker 的 cancel 信号也会触发，select! 会取 cancel 分支。
+        event_rx.recv().await?;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,339 +101,12 @@ impl WorkerState {
     }
 }
 
-/// 将传入的网络事件路由到适当的处理程序。
+/// 单节点任务执行器。
 ///
-/// 封装了主题匹配和反序列化逻辑，这些逻辑之前
-/// 内联在 `WorkerRuntime::run()` 中，使运行时主循环专注于任务执行。
-pub(crate) struct NetworkEventRouter {
-    network: Arc<dyn Transport>,
-    event_bus: EventBus,
-    scheduler: Arc<dyn Scheduler>,
-    actor_system: Option<Arc<ActorSystem>>,
-    /// 本地 WorkflowActor 的 id。若存在，远程 TaskResult 会直接路由给它。
-    workflow_actor_id: Option<crate::common::ActorId>,
-    /// 本地 DagGossipActor 的 id。若存在，工作流状态请求/响应会直接路由给它。
-    dag_gossip_actor_id: Option<crate::common::ActorId>,
-}
-
-impl NetworkEventRouter {
-    pub fn new(
-        network: Arc<dyn Transport>,
-        event_bus: EventBus,
-        scheduler: Arc<dyn Scheduler>,
-        actor_system: Option<Arc<ActorSystem>>,
-        workflow_actor_id: Option<crate::common::ActorId>,
-        dag_gossip_actor_id: Option<crate::common::ActorId>,
-    ) -> Self {
-        Self {
-            network,
-            event_bus,
-            scheduler,
-            actor_system,
-            workflow_actor_id,
-            dag_gossip_actor_id,
-        }
-    }
-
-    /// 将单个 `NetworkEvent` 分发给适当的处理程序。
-    pub async fn handle(&self, event: NetworkEvent) {
-        match event {
-            NetworkEvent::Message(msg) => {
-                self.handle_message(&msg.topic, &msg.data).await;
-            }
-            NetworkEvent::PeerConnected { peer_id } => {
-                tracing::info!("peer connected: {}", peer_id);
-                crate::metrics::inc_connected_peers();
-                self.event_bus
-                    .publish(BusEvent::PeerConnected(NodeId(peer_id.clone())))
-                    .await;
-            }
-            NetworkEvent::PeerDisconnected { peer_id } => {
-                tracing::info!("peer disconnected: {}", peer_id);
-                crate::metrics::dec_connected_peers();
-                self.event_bus
-                    .publish(BusEvent::PeerDisconnected(NodeId(peer_id)))
-                    .await;
-            }
-            NetworkEvent::DirectRequest {
-                peer_id,
-                request,
-                channel,
-            } => {
-                self.handle_direct_request(peer_id, *request, channel).await;
-            }
-        }
-    }
-
-    async fn handle_message(&self, topic_str: &str, payload: &[u8]) {
-        let topic = Topic::from(topic_str);
-        match topic.classify() {
-            crate::common::TopicRoute::Task(_) => {
-                if let Some(WireMessage::TaskDispatch(task)) = WireEnvelope::decode(payload) {
-                    if let Err(e) = self.scheduler.enqueue(task).await {
-                        tracing::warn!("scheduler rejected task (drain mode?): {}", e);
-                    }
-                }
-            }
-            crate::common::TopicRoute::Actor(_) => {
-                if let Some(ref sys) = self.actor_system {
-                    if let Ok(remote_req) =
-                        crate::common::decode_postcard::<crate::common::RemoteActorRequest>(payload)
-                    {
-                        sys.handle_remote_request(remote_req).await;
-                    }
-                }
-            }
-            crate::common::TopicRoute::ActorReply(_) => {
-                if let Some(ref sys) = self.actor_system {
-                    if let Some(WireMessage::RemoteActorReply(reply)) =
-                        WireEnvelope::decode(payload)
-                    {
-                        sys.deliver_reply(reply);
-                    }
-                }
-            }
-            crate::common::TopicRoute::DagState => {
-                if let Some(WireMessage::DagStateUpdate(update)) = WireEnvelope::decode(payload) {
-                    self.event_bus.publish(BusEvent::DagUpdate(update)).await;
-                }
-            }
-            crate::common::TopicRoute::Heartbeat => {
-                if let Some(WireMessage::NodeHeartbeat(hb)) = WireEnvelope::decode(payload) {
-                    tracing::debug!("publishing heartbeat from {} to event_bus", hb.node_id.0);
-                    self.event_bus.publish(BusEvent::Heartbeat(hb)).await;
-                } else {
-                    tracing::warn!(
-                        "heartbeat topic but failed to unwrap envelope, payload len={}",
-                        payload.len()
-                    );
-                }
-            }
-            crate::common::TopicRoute::Failover => {
-                if let Some(WireMessage::OrchestratorClaim(claim)) = WireEnvelope::decode(payload) {
-                    self.event_bus.publish(BusEvent::Claim(claim)).await;
-                }
-            }
-            crate::common::TopicRoute::Heads => {
-                if let Some(WireMessage::HeadsExchange(exchange)) = WireEnvelope::decode(payload) {
-                    self.event_bus
-                        .publish(BusEvent::HeadsExchange(exchange))
-                        .await;
-                }
-            }
-            crate::common::TopicRoute::WorkflowStateReq(_) => {
-                if let Some(WireMessage::WorkflowStateRequest(request)) =
-                    WireEnvelope::decode(payload)
-                {
-                    self.handle_workflow_state_event(
-                        crate::runtime::workflow::gossip_methods::HANDLE_WORKFLOW_STATE_REQUEST,
-                        &request,
-                    )
-                    .await;
-                }
-            }
-            crate::common::TopicRoute::WorkflowStateResp(_) => {
-                if let Some(WireMessage::WorkflowStateResponse(response)) =
-                    WireEnvelope::decode(payload)
-                {
-                    self.handle_workflow_state_event(
-                        crate::runtime::workflow::gossip_methods::HANDLE_WORKFLOW_STATE_RESPONSE,
-                        &response,
-                    )
-                    .await;
-                }
-            }
-            crate::common::TopicRoute::Unknown => {}
-        }
-    }
-
-    async fn handle_direct_request(
-        &self,
-        peer_id: String,
-        request: crate::runtime::network::DirectRequest,
-        channel: DirectResponseChannel,
-    ) {
-        match request {
-            crate::runtime::network::DirectRequest::DispatchTask { task } => {
-                let accepted = match self.scheduler.enqueue(task).await {
-                    Ok(()) => true,
-                    Err(e) => {
-                        tracing::warn!("scheduler rejected direct dispatch (drain mode?): {}", e);
-                        false
-                    }
-                };
-                let response = crate::runtime::network::DirectResponse::DispatchAck { accepted };
-                if let Err(e) = self.network.send_direct_response(channel, response).await {
-                    tracing::warn!("failed to send DispatchAck: {}", e);
-                }
-            }
-            crate::runtime::network::DirectRequest::TaskResult {
-                workflow_id,
-                task_id,
-                task_name,
-                outcome,
-                worker_node,
-            } => {
-                let accepted = self
-                    .handle_task_result(workflow_id, task_id, task_name, outcome, worker_node)
-                    .await;
-                let response = crate::runtime::network::DirectResponse::TaskResultAck { accepted };
-                if let Err(e) = self.network.send_direct_response(channel, response).await {
-                    tracing::warn!("failed to send TaskResultAck: {}", e);
-                }
-            }
-            other => {
-                self.event_bus
-                    .publish(BusEvent::DirectRequest {
-                        peer_id,
-                        request: Box::new(other),
-                        channel,
-                    })
-                    .await;
-            }
-        }
-    }
-
-    /// 将工作流状态请求/响应事件路由到本地 DagGossipActor。
-    async fn handle_workflow_state_event<T: serde::Serialize>(&self, method: &str, value: &T) {
-        let Some(ref actor_system) = self.actor_system else {
-            tracing::warn!("no actor system available to handle workflow state event");
-            return;
-        };
-        let Some(ref dag_gossip_actor_id) = self.dag_gossip_actor_id else {
-            tracing::warn!("no dag gossip actor configured to handle workflow state event");
-            return;
-        };
-
-        let payload = match encode(value) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::error!("failed to encode workflow state event: {}", e);
-                return;
-            }
-        };
-
-        if let Err(e) = actor_system
-            .call(dag_gossip_actor_id, method, payload)
-            .await
-        {
-            tracing::error!(
-                method = %method,
-                error = %e,
-                "failed to dispatch workflow state event to dag gossip actor"
-            );
-        }
-    }
-
-    /// 将远程 TaskResult 路由到本地 WorkflowActor。
-    ///
-    /// 根据 outcome 类型分别调用 COMPLETE_TASK / FAIL_TASK / CANCEL_TASK。
-    /// 返回 `true` 表示已成功提交给 WorkflowActor（不保证 workflow 状态更新成功）。
-    async fn handle_task_result(
-        &self,
-        workflow_id: WorkflowId,
-        task_id: TaskId,
-        _task_name: String,
-        outcome: WireTaskOutcome,
-        _worker_node: NodeId,
-    ) -> bool {
-        let Some(ref actor_system) = self.actor_system else {
-            tracing::warn!("no actor system available to handle remote task result");
-            return false;
-        };
-        let Some(ref workflow_actor_id) = self.workflow_actor_id else {
-            tracing::warn!("no workflow actor configured to handle remote task result");
-            return false;
-        };
-
-        let call_result = match outcome {
-            WireTaskOutcome::Completed(result_payload) => {
-                let payload = match encode(&(workflow_id.clone(), task_id.clone(), result_payload))
-                {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::error!("failed to encode COMPLETE_TASK message: {}", e);
-                        return false;
-                    }
-                };
-                actor_system
-                    .call(
-                        workflow_actor_id,
-                        crate::runtime::workflow::workflow_methods::COMPLETE_TASK,
-                        payload,
-                    )
-                    .await
-            }
-            WireTaskOutcome::Failed(error) => {
-                let scope = crate::runtime::workflow::dag::FailureScope::TaskOnly;
-                let payload = match encode(&(workflow_id.clone(), task_id.clone(), error, scope)) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::error!("failed to encode FAIL_TASK message: {}", e);
-                        return false;
-                    }
-                };
-                actor_system
-                    .call(
-                        workflow_actor_id,
-                        crate::runtime::workflow::workflow_methods::FAIL_TASK,
-                        payload,
-                    )
-                    .await
-            }
-            WireTaskOutcome::Cancelled => {
-                let payload = match encode(&(workflow_id.clone(), task_id.clone())) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::error!("failed to encode CANCEL_TASK message: {}", e);
-                        return false;
-                    }
-                };
-                actor_system
-                    .call(
-                        workflow_actor_id,
-                        crate::runtime::workflow::workflow_methods::CANCEL_TASK,
-                        payload,
-                    )
-                    .await
-            }
-            WireTaskOutcome::Skipped => {
-                tracing::warn!(
-                    workflow_id = %workflow_id.as_str(),
-                    task_id = %task_id.as_str(),
-                    "unexpected Skipped outcome in remote task result; ignoring"
-                );
-                return false;
-            }
-        };
-
-        match call_result {
-            Ok(result) => {
-                if let Some(error) = result.error {
-                    tracing::error!(
-                        workflow_id = %workflow_id.as_str(),
-                        task_id = %task_id.as_str(),
-                        error = %error,
-                        "workflow actor rejected task result"
-                    );
-                    false
-                } else {
-                    true
-                }
-            }
-            Err(e) => {
-                tracing::error!(
-                    workflow_id = %workflow_id.as_str(),
-                    task_id = %task_id.as_str(),
-                    error = %e,
-                    "failed to dispatch task result to workflow actor"
-                );
-                false
-            }
-        }
-    }
-}
-
+/// Worker 同时处理本地任务执行和跨节点任务转发。它持有 scheduler、dispatcher、
+/// 网络传输和运行中任务取消表，是 Python `@task.submit()` 进入 Rust 运行时后的
+/// 主要执行面。Worker 自身不拥有 workflow 状态；workflow 推进由
+/// `WorkflowActor`/`Orchestrator` 负责。
 pub struct Worker {
     node_id: NodeId,
     network: Arc<dyn Transport>,
@@ -412,7 +121,10 @@ pub struct Worker {
     workflow_actor_id: Option<crate::common::ActorId>,
     /// 本地 DagGossipActor 的 id。用于处理工作流状态请求/响应主题。
     dag_gossip_actor_id: Option<crate::common::ActorId>,
-    max_concurrent_tasks: usize,
+    /// 远端 peer 容量视图，用于 unrouted task 的自动路由。
+    failover: Option<Arc<crate::runtime::workflow::FailoverManager>>,
+    /// 最大并发任务数。用 AtomicUsize 支持运行时扩容（`set_max_concurrent_tasks`）。
+    max_concurrent_tasks: Arc<std::sync::atomic::AtomicUsize>,
     task_timeout: Duration,
     cancel: Arc<tokio::sync::watch::Sender<bool>>,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
@@ -428,6 +140,20 @@ pub struct Worker {
     /// Handle to the tokio runtime — used by publish_lifecycle to spawn
     /// tasks even when called from a non-tokio thread (e.g. Python).
     tokio_handle: tokio::runtime::Handle,
+    /// 运行中任务的 cancel_flag 注册表：task_id → CancelFlag。
+    /// Python 层调用 cancel_task(task_id) 时，通过此表找到对应的 cancel_flag 并置为 true。
+    cancel_flags: Arc<parking_lot::Mutex<std::collections::HashMap<String, CancelFlag>>>,
+    /// 通过远端取消广播标记的 task_id 集合（带 TTL 时间戳）。
+    /// 这只承载“跨节点取消”的可见性，不负责本地 Python 预取消状态。
+    /// key: task_id, value: 取消请求注册时间。
+    /// 超过 ``CANCELLED_TASKS_TTL`` 的条目由后台清理任务定期移除。
+    cancelled_tasks: Arc<parking_lot::Mutex<HashMap<String, Instant>>>,
+    /// Worker 就绪信号：``run()`` 完成初始化进入任务执行循环前设为 true。
+    /// ``wait_for_ready`` 据此阻塞，事件驱动等待 Worker 就绪。
+    /// 用 ``watch`` 而非 ``Notify`` 是因为 watch 的状态是持久的——
+    /// 即使 ``wait_for_ready`` 在 ``run()`` 设值后才调用也能立即返回，
+    /// 避免 notify 先于 wait 导致的永久阻塞。
+    ready: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
 impl Worker {
@@ -436,6 +162,10 @@ impl Worker {
         self.capacity_callback = None;
     }
 
+    /// 构造一个未绑定 ActorSystem 的 Worker。
+    ///
+    /// Builder 随后会通过 `with_*` 方法注入 SchedulerActor id、WorkflowActor id、
+    /// FailoverManager 和容量回调。测试也可直接使用该构造器创建最小 Worker。
     pub fn new(
         node_id: NodeId,
         network: Arc<dyn Transport>,
@@ -458,7 +188,8 @@ impl Worker {
             actor_system: None,
             workflow_actor_id: None,
             dag_gossip_actor_id: None,
-            max_concurrent_tasks: max_concurrent,
+            failover: None,
+            max_concurrent_tasks: Arc::new(std::sync::atomic::AtomicUsize::new(max_concurrent)),
             task_timeout: Duration::from_millis(config.default_task_timeout_ms),
             cancel: Arc::new(cancel_tx),
             cancel_rx,
@@ -471,6 +202,11 @@ impl Worker {
             pending_result_channel_capacity: config.pending_result_channel_capacity,
             capacity_callback: None,
             tokio_handle,
+            cancel_flags: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            // `watch::channel` 返回 (Sender, Receiver)，仅保留 Sender；
+            // 等待方通过 `subscribe()` 获取自己的 Receiver。
+            ready: Arc::new(tokio::sync::watch::channel(false).0),
         }
     }
 
@@ -486,9 +222,39 @@ impl Worker {
     }
 
     pub fn with_max_concurrent_tasks(mut self, max: usize) -> Self {
-        self.max_concurrent_tasks = max;
+        self.max_concurrent_tasks = Arc::new(std::sync::atomic::AtomicUsize::new(max));
         self.running_tasks = Arc::new(tokio::sync::Semaphore::new(max));
         self
+    }
+
+    /// 运行时调整最大并发任务数。
+    ///
+    /// **仅支持扩容**（new_max > 当前值）：通过 `Semaphore::add_permits` 增加可用槽位。
+    /// 缩容（new_max < 当前值）不受支持——Tokio `Semaphore` 不支持减少 permits，
+    /// 已运行的在途任务会继续执行直到完成。若需要缩容，建议重启 Worker。
+    ///
+    /// 调用后立即生效，后续任务可使用新增的槽位。`capacity_callback`（若设置）
+    /// 会被触发以通知 failover 层新的容量。
+    pub fn set_max_concurrent_tasks(&self, new_max: usize) {
+        use std::sync::atomic::Ordering;
+        let current = self.max_concurrent_tasks.load(Ordering::Acquire);
+        if new_max <= current {
+            tracing::warn!(
+                new_max,
+                current_max = current,
+                "set_max_concurrent_tasks: shrink not supported, ignoring"
+            );
+            return;
+        }
+        let diff = new_max - current;
+        self.running_tasks.add_permits(diff);
+        self.max_concurrent_tasks.store(new_max, Ordering::Release);
+        tracing::info!(
+            added = diff,
+            new_max,
+            "max_concurrent_tasks expanded via add_permits"
+        );
+        self.notify_capacity();
     }
 
     pub fn with_task_timeout(mut self, timeout: Duration) -> Self {
@@ -516,6 +282,14 @@ impl Worker {
         self
     }
 
+    pub(crate) fn with_failover_manager(
+        mut self,
+        manager: Arc<crate::runtime::workflow::FailoverManager>,
+    ) -> Self {
+        self.failover = Some(manager);
+        self
+    }
+
     pub fn with_capacity_callback(mut self, cb: Arc<dyn Fn(u32, u32) + Send + Sync>) -> Self {
         self.capacity_callback = Some(cb);
         self
@@ -538,67 +312,149 @@ impl Worker {
         self.scheduler.clone()
     }
 
+    /// 返回 task dispatcher 的 Arc 克隆，供外部注册 handler。
+    pub fn task_dispatcher(&self) -> &Arc<dyn TaskDispatcher> {
+        &self.task_dispatcher
+    }
+
+    /// 取消运行中的任务：将对应的 `cancel_flag` 置为 true。
+    ///
+    /// 这是低层运行时取消入口，仅作用于已进入执行中的任务。
+    /// 排队中的任务由 Python 侧预取消状态拦截，避免让 Rust Worker 维护
+    /// 两套并行的“待执行取消”语义。
+    ///
+    /// 返回 `true` 表示找到了运行中的任务并成功提交取消请求；
+    /// 返回 `false` 表示任务不存在或尚未进入运行态。
+    pub fn cancel_task(&self, task_id: &str) -> bool {
+        let flags = self.cancel_flags.lock();
+        if let Some(flag) = flags.get(task_id) {
+            flag.store(true, std::sync::atomic::Ordering::Release);
+            crate::metrics::inc_tasks_cancelled();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 返回当前 Worker 状态。
     pub fn state(&self) -> WorkerState {
         *self.state.borrow()
     }
 
+    /// 订阅 Worker 状态变化。
+    ///
+    /// Runtime shutdown 使用该 watch channel 等待 Worker 从 `Draining` 进入
+    /// `Stopped`，避免在任务仍在投递结果时关闭网络。
     pub fn subscribe_state(&self) -> tokio::sync::watch::Receiver<WorkerState> {
         self.state.subscribe()
     }
 
+    /// 将任务标记为目标节点并入队。
+    ///
+    /// # Errors
+    ///
+    /// 如果底层 scheduler 已关闭或无法接收任务，返回错误。
     pub async fn schedule_task(&self, mut task: TaskDefinition, target_node: NodeId) -> Result<()> {
         task.target_node = Some(target_node);
         self.scheduler.enqueue(task).await?;
         Ok(())
     }
 
+    /// 查询当前网络视图中的 peer 节点。
+    ///
+    /// # Errors
+    ///
+    /// 如果底层传输查询失败，返回网络错误。
     pub async fn discover_peers(&self) -> Result<Vec<NodeId>> {
         let peers = self.network.discover_peers().await?;
         Ok(peers.into_iter().map(|p| NodeId::from(p.0)).collect())
     }
 
+    /// 运行 Worker 主循环直到收到 shutdown 信号。
+    ///
+    /// 主循环负责网络订阅、远端取消清理、任务出队、并发槽位控制、本地执行、
+    /// 远端转发和结果投递。该函数通常由 PyO3 `serve()` 或 runtime 后台任务调用。
+    ///
+    /// # Errors
+    ///
+    /// 当前实现会尽量把单任务错误转换为 task lifecycle 事件并继续运行；
+    /// 只有主循环初始化或不可恢复的运行时错误才会返回 `Err`。
     pub async fn run(&self) -> Result<()> {
-        self.subscribe_topics().await?;
+        // P2P 订阅在后台执行，不阻塞本地任务执行循环。
+        // 网络订阅可能因 P2P 发现延迟而耗时；任务执行不应等待它。
+        self.spawn_subscribe_topics();
         self.notify_capacity();
         self.start_network_event_loop();
+        self.start_cancelled_tasks_cleanup_loop();
         let pending_tx = self.start_pending_result_loop();
+        // 进入任务执行循环前发送就绪信号：``serve()`` 据此返回。
+        // ``send_replace`` 写入持久状态，即使等待者晚于 ``run()`` 启动
+        // 也能立即观察到 true。
+        let _ = self.ready.send_replace(true);
         self.run_task_execution_loop(&pending_tx).await
     }
 
-    async fn subscribe_topics(&self) -> Result<()> {
-        // 使用 select! 监听 cancel 信号：shutdown 时若网络不可达，
-        // subscribe 会阻塞，cancel 让 worker.run() 尽快退出，
-        // 使 Runtime::shutdown() 的 network.shutdown() 得以执行。
-        let mut cancel = self.cancel_rx.clone();
-        let topics = [
-            Topic::task(&self.node_id),
-            Topic::actor(&self.node_id),
-            Topic::actor_reply(&self.node_id),
-            Topic::workflow_state_req(&self.node_id),
-            Topic::workflow_state_resp(&self.node_id),
-        ];
-        for topic in &topics {
-            tracing::info!("subscribing to topic: {}", topic);
-            tokio::select! {
-                _ = cancel.changed() => {
-                    tracing::info!("subscribe_topics cancelled during shutdown");
-                    return Err(ActantError::Internal("subscribe cancelled".into()));
-                }
-                r = self.network.subscribe(topic.as_str()) => r?,
-            }
+    /// 阻塞当前线程直到 Worker 进入任务执行循环（``run()`` 完成初始化）。
+    ///
+    /// 由 PyO3 ``serve()`` 在 tokio runtime 上 ``block_on`` 调用，
+    /// 事件驱动：基于 ``watch`` channel 的状态变更，无轮询、无固定延迟。
+    /// 若 ``run()`` 因 spawn 失败或早退未发送就绪信号，
+    /// ``watch::Sender`` 在 Worker drop 时被释放，``changed()`` 返回 Err，
+    /// 等待立即返回——不会永久阻塞。
+    pub async fn wait_for_ready(&self) -> Result<()> {
+        let mut rx = self.ready.subscribe();
+        if *rx.borrow() {
+            return Ok(());
         }
+        // `changed()` 在 Sender 被关闭时返回 Err，自然解除阻塞。
+        let _ = rx.changed().await;
         Ok(())
     }
 
+    /// 在 tokio 后台 spawn P2P topic 订阅。非阻塞。
+    fn spawn_subscribe_topics(&self) {
+        let network = self.network.clone();
+        let node_id = self.node_id.clone();
+        let mut cancel = self.cancel_rx.clone();
+        let tokio_handle = self.tokio_handle.clone();
+        tokio_handle.spawn(async move {
+            let topics = [
+                Topic::task(&node_id),
+                Topic::actor(&node_id),
+                Topic::actor_reply(&node_id),
+                Topic::workflow_state_req(&node_id),
+                Topic::workflow_state_resp(&node_id),
+                Topic::from(crate::common::wire::constants::TOPIC_CANCEL),
+            ];
+            for topic in &topics {
+                tracing::info!("subscribing to topic: {}", topic);
+                tokio::select! {
+                    _ = cancel.changed() => {
+                        tracing::info!("subscribe_topics cancelled during shutdown");
+                        return;
+                    }
+                    r = network.subscribe(topic.as_str()) => {
+                        if let Err(e) = r {
+                            tracing::warn!(error = %e, "subscribe to topic {} failed", topic);
+                        }
+                    }
+                }
+            }
+            tracing::info!("subscribe_topics completed");
+        });
+    }
+
     fn start_network_event_loop(&self) {
-        let router = NetworkEventRouter::new(
-            self.network.clone(),
-            self.event_bus.clone(),
-            self.scheduler.clone(),
-            self.actor_system.clone(),
-            self.workflow_actor_id.clone(),
-            self.dag_gossip_actor_id.clone(),
-        );
+        let router = NetworkEventRouter::new(NetworkEventRouterConfig {
+            network: self.network.clone(),
+            event_bus: self.event_bus.clone(),
+            scheduler: self.scheduler.clone(),
+            actor_system: self.actor_system.clone(),
+            workflow_actor_id: self.workflow_actor_id.clone(),
+            dag_gossip_actor_id: self.dag_gossip_actor_id.clone(),
+            cancel_flags: self.cancel_flags.clone(),
+            cancelled_tasks: self.cancelled_tasks.clone(),
+        });
         let network = self.network.clone();
         let mut event_cancel = self.cancel_rx.clone();
 
@@ -620,65 +476,22 @@ impl Worker {
         });
     }
 
+    fn start_cancelled_tasks_cleanup_loop(&self) {
+        cancel::spawn_cancelled_tasks_cleanup_loop(
+            &self.tokio_handle,
+            self.cancelled_tasks.clone(),
+            self.cancel_rx.clone(),
+        );
+    }
+
     fn start_pending_result_loop(&self) -> tokio::sync::mpsc::Sender<PendingResult> {
-        let (pending_tx, mut pending_rx) =
-            tokio::sync::mpsc::channel::<PendingResult>(self.pending_result_channel_capacity);
-        let pending_capacity = self.pending_result_channel_capacity;
-        let retry_network = self.network.clone();
-        let max_attempts = self.broadcast_retry_attempts;
-        let base_delay = self.broadcast_retry_base_delay;
-        let mut retry_cancel = self.cancel_rx.clone();
-        let retry_tx = pending_tx.clone();
-
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = retry_cancel.changed() => {
-                        tracing::info!("pending result retry loop shutting down");
-                        break;
-                    }
-                    Some(pending) = pending_rx.recv() => {
-                        if pending.attempts >= max_attempts {
-                            tracing::error!(
-                                "dropping result for {} after {} failed attempts",
-                                pending.target, max_attempts
-                            );
-                            continue;
-                        }
-                        let delay = base_delay * 2u32.saturating_pow(pending.attempts as u32);
-                        tokio::time::sleep(delay).await;
-                        match retry_network.send_direct_request(&pending.target, pending.request.clone()).await {
-                            Ok(crate::runtime::network::DirectResponse::TaskResultAck { accepted: true }) => {
-                                tracing::debug!("pending result delivered to {}", pending.target);
-                            }
-                            Ok(crate::runtime::network::DirectResponse::TaskResultAck { accepted: false }) => {
-                                tracing::warn!("pending result rejected by {}, will retry", pending.target);
-                                enqueue_pending_result!(
-                                    retry_tx,
-                                    pending.target,
-                                    pending.request,
-                                    pending.attempts + 1,
-                                    pending_capacity
-                                );
-                            }
-                            Ok(_) | Err(_) => {
-                                tracing::debug!("pending result delivery to {} failed, will retry (attempt {})", pending.target, pending.attempts + 1);
-                                enqueue_pending_result!(
-                                    retry_tx,
-                                    pending.target,
-                                    pending.request,
-                                    pending.attempts + 1,
-                                    pending_capacity
-                                );
-                            }
-                        }
-                    }
-                    else => break,
-                }
-            }
-        });
-
-        pending_tx
+        start_pending_result_loop(
+            self.network.clone(),
+            self.cancel_rx.clone(),
+            self.broadcast_retry_attempts,
+            self.broadcast_retry_base_delay,
+            self.pending_result_channel_capacity,
+        )
     }
 
     async fn run_task_execution_loop(
@@ -694,7 +507,13 @@ impl Worker {
         let mut task_cancel = self.cancel_rx.clone();
         let state_sender = self.state.clone();
         let drain_timeout = self.drain_timeout;
-        let pending_capacity = self.pending_result_channel_capacity;
+        let cancel_flags = self.cancel_flags.clone();
+        let cancelled_tasks = self.cancelled_tasks.clone();
+
+        // 订阅 TaskEnqueued 事件：SchedulerActor 在 enqueue 后发布事件，
+        // Worker 在此事件上 await 唤醒。
+        // 订阅在循环外创建，整个 Worker 生命周期复用同一 receiver。
+        let mut task_enqueued_rx = self.event_bus.subscribe(crate::runtime::event_bus::Topic::TaskEnqueued);
 
         loop {
             if *self.state.subscribe().borrow() == WorkerState::Draining {
@@ -709,13 +528,13 @@ impl Worker {
                 self.publish_lifecycle(BusEvent::WorkerDrained {
                     node_id: self.node_id.clone(),
                 });
-                let _ = state_sender.send(WorkerState::Stopped);
+                let _ = state_sender.send_replace(WorkerState::Stopped);
                 return Ok(());
             }
 
             let task = tokio::select! {
                 _ = task_cancel.changed() => {
-                    let _ = state_sender.send(WorkerState::Draining);
+                    let _ = state_sender.send_replace(WorkerState::Draining);
                     let running = self.running_task_count();
                     tracing::info!(
                         running_tasks = running,
@@ -727,7 +546,7 @@ impl Worker {
                         drain_timeout,
                         async {
                             let sem = semaphore.clone();
-                            let permit = sem.acquire_many(self.max_concurrent_tasks as u32).await;
+                            let permit = sem.acquire_many(self.max_concurrent_tasks.load(std::sync::atomic::Ordering::Acquire) as u32).await;
                             drop(permit);
                         },
                     ).await;
@@ -741,14 +560,55 @@ impl Worker {
                     self.publish_lifecycle(BusEvent::WorkerDrained {
                         node_id: self.node_id.clone(),
                     });
-                    let _ = state_sender.send(WorkerState::Stopped);
+                    let _ = state_sender.send_replace(WorkerState::Stopped);
                     return Ok(());
                 }
-                task = self.scheduler.dequeue() => task,
+                task = wait_for_task(&self.scheduler, &mut task_enqueued_rx) => task,
             };
             let Some(task) = task else {
                 continue;
             };
+
+            let mut task = task;
+            if task.target_node.is_none() {
+                if let Some((target_node, target_endpoint_addr)) = self.select_remote_target() {
+                    tracing::debug!(
+                        task_id = %task.id.as_str(),
+                        target_node = %target_node.as_str(),
+                        "routing unrouted task to remote peer"
+                    );
+                    task.target_node = Some(target_node);
+                    task.target_endpoint_addr = Some(target_endpoint_addr);
+                }
+            }
+
+            if cancelled_tasks.lock().contains_key(task.id.as_str()) {
+                tracing::info!(
+                    task_id = %task.id.as_str(),
+                    "skipping cancelled task before execution"
+                );
+                // 记录 cancel latency：从取消注册到任务被跳过的耗时。
+                {
+                    let registry = cancelled_tasks.lock();
+                    if let Some(ts) = registry.get(task.id.as_str()) {
+                        let latency_ms = ts.elapsed().as_millis() as u64;
+                        crate::metrics::observe_cancel_latency_ms(latency_ms);
+                    }
+                }
+                let completion = TaskCompletion::Cancelled {
+                    workflow_id: task
+                        .workflow_id
+                        .clone()
+                        .unwrap_or_else(|| WorkflowId::from(String::new())),
+                    task_id: task.id.clone(),
+                    task_name: task.name.clone(),
+                    target_node: task.target_node.clone(),
+                };
+                event_bus.publish(BusEvent::TaskCancelled(completion)).await;
+                cancelled_tasks.lock().remove(task.id.as_str());
+                crate::metrics::dec_cancelled_tasks_pending();
+                continue;
+            }
 
             if let Some(ref target) = task.target_node {
                 if target != &node_id {
@@ -759,9 +619,12 @@ impl Worker {
                         }
                         Err(e) => {
                             crate::metrics::inc_task_forward_failed();
+                            crate::metrics::inc_task_forward_reroute();
                             tracing::warn!(
                                 "forward task {} to node {} failed ({}), re-enqueueing for re-routing",
-                                task.id.as_str(), target.as_str(), e
+                                task.id.as_str(),
+                                target.as_str(),
+                                e
                             );
                             let mut rerouted_task = task;
                             rerouted_task.target_node = None;
@@ -776,7 +639,13 @@ impl Worker {
                 }
             }
 
-            if self.max_concurrent_tasks == 0 && task.target_node.is_none() {
+            if self
+                .max_concurrent_tasks
+                .load(std::sync::atomic::Ordering::Acquire)
+                == 0
+                && task.target_node.is_none()
+            {
+                crate::metrics::inc_task_forward_fallback_local();
                 tracing::debug!(
                     "submit-only node cannot execute task {} locally, re-enqueueing for re-routing",
                     task.id.as_str()
@@ -792,12 +661,14 @@ impl Worker {
             let event_bus = event_bus.clone();
             let network = network.clone();
             let pending_results = pending_tx.clone();
+            let pending_capacity = self.pending_result_channel_capacity;
 
             let permit = semaphore
                 .clone()
                 .acquire_owned()
                 .await
                 .map_err(|_| ActantError::Internal("semaphore closed".into()))?;
+            let cancel_flags = cancel_flags.clone();
 
             self.notify_capacity();
 
@@ -807,15 +678,21 @@ impl Worker {
             let dispatcher = task_dispatcher.clone();
             let dispatch_start_ms = crate::common::epoch_millis();
             let capacity_cb = self.capacity_callback.clone();
-            let max_concurrent = self.max_concurrent_tasks;
+            let max_concurrent = self
+                .max_concurrent_tasks
+                .load(std::sync::atomic::Ordering::Acquire);
             let semaphore_for_cb = semaphore.clone();
             crate::metrics::inc_running_tasks();
 
-            // Publish TaskStarted to EventBus
-            if let Some(ref wf_id) = task.workflow_id {
+            // Publish TaskStarted to EventBus (所有任务，使 Python @task 也能收到 running 状态)
+            {
+                let wf_id = task
+                    .workflow_id
+                    .clone()
+                    .unwrap_or_else(|| WorkflowId::from("".to_string()));
                 event_bus
                     .publish(BusEvent::TaskStarted {
-                        workflow_id: wf_id.clone(),
+                        workflow_id: wf_id,
                         task_id: task.id.clone(),
                     })
                     .await;
@@ -827,20 +704,42 @@ impl Worker {
                 tracing::trace!(task = ?task.id, latency_ms = latency, "scheduling latency");
             }
 
+            let cancelled_tasks_for_spawn = cancelled_tasks.clone();
+
             tokio::spawn(async move {
                 let _permit = permit;
                 let task_id_dbg = task.id.clone();
                 tracing::debug!(task = ?task_id_dbg, name = %task_name, "task executing");
 
+                // Rust Worker 超时：timeout_ms 由 Python @task 装饰器传入。
+                // 超时后设置 cancel_flag，dispatch handler 在协作检查点退出。
+                // 超时结果为 TaskCompletion::Failed，Python 层映射为 ActantError。
                 let effective_timeout = task
                     .timeout_ms
                     .map(std::time::Duration::from_millis)
                     .unwrap_or(task_timeout);
 
                 let cancel_flag = new_cancel_flag();
+                // 注册到 cancel_flags 表，使 Python cancel_task(task_id) 能找到此 flag。
+                {
+                    let mut flags = cancel_flags.lock();
+                    flags.insert(task.id.to_string(), cancel_flag.clone());
+                }
+                // 任务完成后从注册表移除（无论成功/失败/取消）。
+                let task_id_for_cleanup = task.id.clone();
+                let cancel_flags_for_cleanup = cancel_flags.clone();
+                let cancelled_tasks_for_cleanup = cancelled_tasks_for_spawn.clone();
+                let cleanup = || {
+                    let mut flags = cancel_flags_for_cleanup.lock();
+                    flags.remove(&task_id_for_cleanup.to_string());
+                    cancelled_tasks_for_cleanup
+                        .lock()
+                        .remove(task_id_for_cleanup.as_str());
+                };
+
                 tracing::debug!(task_id = ?task.id, "dispatching task");
 
-                // B1: 用 catch_unwind 包裹 dispatcher future，避免 spawn 句柄被丢弃后
+                // 用 catch_unwind 包裹 dispatcher future，避免 spawn 句柄被丢弃后
                 // panic 让 workflow 永久挂起。panic 时降级为 TaskCompletion::Failed。
                 use futures::future::FutureExt as _;
                 let dispatched = std::panic::AssertUnwindSafe(dispatcher.dispatch(
@@ -858,186 +757,28 @@ impl Worker {
                 }
 
                 // 三种结果：Ok(Ok(Ok(output))) | Ok(Ok(Err(e))) | Ok(Err(panic)) | Err(timeout)
-                let completion = match dispatch_result {
-                    Ok(Ok(Ok(result))) => {
-                        crate::metrics::inc_tasks_completed();
-                        crate::metrics::dec_running_tasks();
-                        crate::metrics::observe_task_duration_ms(
-                            crate::common::epoch_millis().saturating_sub(dispatch_start_ms),
-                        );
-                        TaskCompletion::Completed {
-                            workflow_id: task
-                                .workflow_id
-                                .clone()
-                                .unwrap_or_else(|| WorkflowId::from("".to_string())),
-                            task_id: task.id.clone(),
-                            task_name: task.name.clone(),
-                            result,
-                            target_node: task.target_node.clone(),
-                        }
-                    }
-                    Ok(Ok(Err(e))) => {
-                        crate::metrics::inc_tasks_failed();
-                        crate::metrics::dec_running_tasks();
-                        crate::metrics::observe_task_duration_ms(
-                            crate::common::epoch_millis().saturating_sub(dispatch_start_ms),
-                        );
-                        TaskCompletion::Failed {
-                            workflow_id: task
-                                .workflow_id
-                                .clone()
-                                .unwrap_or_else(|| WorkflowId::from("".to_string())),
-                            task_id: task.id.clone(),
-                            task_name: task.name.clone(),
-                            error: e.to_string(),
-                            target_node: task.target_node.clone(),
-                        }
-                    }
-                    Ok(Err(panic_payload)) => {
-                        // dispatcher panic：提取 panic 消息，降级为 Failed，
-                        // 让 workflow 能继续推进而非永久挂起。
-                        crate::metrics::inc_tasks_failed();
-                        crate::metrics::dec_running_tasks();
-                        crate::metrics::observe_task_duration_ms(
-                            crate::common::epoch_millis().saturating_sub(dispatch_start_ms),
-                        );
-                        let panic_msg = panic_payload
-                            .downcast_ref::<&'static str>()
-                            .copied()
-                            .map(String::from)
-                            .or_else(|| {
-                                panic_payload
-                                    .downcast_ref::<String>()
-                                    .map(String::as_str)
-                                    .map(String::from)
-                            })
-                            .unwrap_or_else(|| "<non-string panic>".to_string());
-                        tracing::error!(
-                            task_id = ?task.id,
-                            panic = %panic_msg,
-                            "dispatcher panicked; emitting TaskCompletion::Failed"
-                        );
-                        TaskCompletion::Failed {
-                            workflow_id: task
-                                .workflow_id
-                                .clone()
-                                .unwrap_or_else(|| WorkflowId::from("".to_string())),
-                            task_id: task.id.clone(),
-                            task_name: task.name.clone(),
-                            error: format!("dispatcher panicked: {panic_msg}"),
-                            target_node: task.target_node.clone(),
-                        }
-                    }
-                    Err(_) => {
-                        crate::metrics::inc_tasks_timeout();
-                        crate::metrics::dec_running_tasks();
-                        crate::metrics::observe_task_duration_ms(
-                            crate::common::epoch_millis().saturating_sub(dispatch_start_ms),
-                        );
-                        TaskCompletion::Failed {
-                            workflow_id: task
-                                .workflow_id
-                                .clone()
-                                .unwrap_or_else(|| WorkflowId::from("".to_string())),
-                            task_id: task.id.clone(),
-                            task_name: task.name.clone(),
-                            error: format!(
-                                "task timed out after {}ms",
-                                effective_timeout.as_millis()
-                            ),
-                            target_node: task.target_node.clone(),
-                        }
-                    }
-                };
+                let completion = build_completion_from_dispatch_result(
+                    dispatch_result,
+                    &task,
+                    dispatch_start_ms,
+                    effective_timeout,
+                );
 
-                let is_remote_task = task
-                    .origin_node
-                    .as_ref()
-                    .is_some_and(|o| o != &node_id_for_spawn);
-
-                if is_remote_task {
-                    if let Some(ref workflow_id) = task.workflow_id {
-                        let wire_result = completion.to_wire_result(workflow_id.clone());
-
-                        if let Some(ref origin) = task.origin_node {
-                            // 优先使用 origin_endpoint_addr（iroh 公钥），否则回退到 node_id
-                            let origin_addr = task
-                                .origin_endpoint_addr
-                                .as_deref()
-                                .unwrap_or(origin.as_str());
-                            let request = crate::runtime::network::DirectRequest::TaskResult {
-                                workflow_id: workflow_id.clone(),
-                                task_id: wire_result.task_id.clone(),
-                                task_name: wire_result.task_name.clone(),
-                                outcome: wire_result.outcome.clone(),
-                                worker_node: node_id_for_spawn.clone(),
-                            };
-                            // 尝试一次；失败则入队异步重试
-                            match network
-                                .send_direct_request(origin_addr, request.clone())
-                                .await
-                            {
-                                Ok(crate::runtime::network::DirectResponse::TaskResultAck {
-                                    accepted: true,
-                                }) => {
-                                    tracing::debug!(
-                                        "task result delivered directly to orchestrator {}",
-                                        origin_addr
-                                    );
-                                }
-                                Ok(crate::runtime::network::DirectResponse::TaskResultAck {
-                                    accepted: false,
-                                }) => {
-                                    tracing::warn!(
-                                        "orchestrator {} rejected task result, enqueuing for retry",
-                                        origin_addr
-                                    );
-                                    enqueue_pending_result!(
-                                        pending_results,
-                                        origin_addr.to_string(),
-                                        request,
-                                        0,
-                                        pending_capacity
-                                    );
-                                }
-                                Ok(_) => {
-                                    tracing::warn!(
-                                        "unexpected response from {}, enqueuing result for retry",
-                                        origin_addr
-                                    );
-                                    enqueue_pending_result!(
-                                        pending_results,
-                                        origin_addr.to_string(),
-                                        request,
-                                        0,
-                                        pending_capacity
-                                    );
-                                }
-                                Err(e) => {
-                                    tracing::warn!("direct result delivery to {} failed: {}, enqueuing for retry", origin_addr, e);
-                                    enqueue_pending_result!(
-                                        pending_results,
-                                        origin_addr.to_string(),
-                                        request,
-                                        0,
-                                        pending_capacity
-                                    );
-                                }
-                            }
-                        }
-                    }
-                } else if task.workflow_id.is_some() {
-                    // 本地 task 完成：发布到 EventBus
-                    let bus_event = match &completion {
-                        TaskCompletion::Failed { .. } => BusEvent::TaskFailed(completion),
-                        TaskCompletion::Cancelled { .. } => BusEvent::TaskCancelled(completion),
-                        TaskCompletion::Skipped { .. } => BusEvent::TaskSkipped(completion),
-                        TaskCompletion::Completed { .. } => BusEvent::TaskCompleted(completion),
-                    };
-                    event_bus.publish(bus_event).await;
-                }
+                publish_task_completion(
+                    completion,
+                    &task,
+                    &node_id_for_spawn,
+                    network.as_ref(),
+                    &event_bus,
+                    &pending_results,
+                    pending_capacity,
+                )
+                .await;
 
                 drop(_permit);
+
+                // 任务完成：从 cancel_flags 注册表移除。
+                cleanup();
 
                 if let Some(ref cb) = capacity_cb {
                     let available = semaphore_for_cb.available_permits();
@@ -1047,10 +788,18 @@ impl Worker {
         }
     }
 
+    /// 请求 Worker 进入 drain 并停止主循环。
+    ///
+    /// 此方法只广播取消信号，不等待任务完成。等待顺序由
+    /// [`crate::runtime::Runtime::shutdown`] 统一处理。
     pub fn shutdown(&self) {
+        let _ = self.state.send_replace(WorkerState::Draining);
         if let Err(e) = self.cancel.send(true) {
             tracing::warn!("failed to send shutdown signal: {}", e);
         }
+        // 关闭任务线程池并等待所有任务线程退出。
+        // 确保在 Runtime 关闭前所有任务线程已退出，避免访问已释放的资源。
+        self.task_dispatcher.shutdown();
     }
 
     /// 强制将 worker 状态设为 Stopped。
@@ -1058,11 +807,11 @@ impl Worker {
     /// 用于 `worker.run()` 异常退出（如 subscribe_topics 被 cancel）后，
     /// 确保 `Runtime::shutdown()` 中等待 `WorkerState::Stopped` 不会超时。
     pub fn notify_stopped(&self) {
-        let _ = self.state.send(WorkerState::Stopped);
+        let _ = self.state.send_replace(WorkerState::Stopped);
     }
 
     pub fn drain(&self) {
-        let _ = self.state.send(WorkerState::Draining);
+        let _ = self.state.send_replace(WorkerState::Draining);
         self.scheduler.close();
         if let Some(ref cb) = self.capacity_callback {
             cb(0, 0);
@@ -1086,18 +835,68 @@ impl Worker {
 
     pub fn running_task_count(&self) -> usize {
         self.max_concurrent_tasks
+            .load(std::sync::atomic::Ordering::Acquire)
             .saturating_sub(self.running_tasks.available_permits())
     }
 
     pub fn max_concurrent_tasks(&self) -> usize {
         self.max_concurrent_tasks
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     fn notify_capacity(&self) {
         if let Some(ref cb) = self.capacity_callback {
             let available = self.running_tasks.available_permits();
-            cb(available as u32, self.max_concurrent_tasks as u32);
+            cb(
+                available as u32,
+                self.max_concurrent_tasks
+                    .load(std::sync::atomic::Ordering::Acquire) as u32,
+            );
         }
+    }
+
+    fn select_remote_target(&self) -> Option<(NodeId, String)> {
+        let failover = self.failover.as_ref()?;
+        let local_available = self.running_tasks.available_permits() as u32;
+        // 心跳 TTL 过滤：排除心跳超时的 peer，避免将任务路由到
+        // 已失联的节点。使用 failover 的 failure_timeout_ms 作为 TTL 阈值。
+        let now_ms = crate::common::epoch_millis();
+        let heartbeat_ttl_ms = failover.failure_timeout_ms();
+        let mut peers: Vec<_> = failover
+            .get_peer_infos()
+            .into_iter()
+            .filter(|(_, info)| {
+                // available > 0 且 max > 0
+                if info.available_slots == 0 || info.max_slots == 0 {
+                    return false;
+                }
+                // 心跳 TTL：last_heartbeat_ms == 0 表示从未收到心跳，跳过；
+                // 若距上次心跳超过 failure_timeout_ms，视为失联，跳过。
+                if info.last_heartbeat_ms == 0 {
+                    return false;
+                }
+                now_ms.saturating_sub(info.last_heartbeat_ms) <= heartbeat_ttl_ms
+            })
+            .collect();
+        if peers.is_empty() {
+            return None;
+        }
+        peers.sort_by(|(a_id, a_info), (b_id, b_info)| {
+            b_info
+                .available_slots
+                .cmp(&a_info.available_slots)
+                .then_with(|| b_info.max_slots.cmp(&a_info.max_slots))
+                .then_with(|| a_id.as_str().cmp(b_id.as_str()))
+        });
+        let (node_id, info) = peers.into_iter().next()?;
+        if info.available_slots <= local_available {
+            return None;
+        }
+        Some((
+            node_id.clone(),
+            info.endpoint_addr
+                .unwrap_or_else(|| node_id.as_str().to_string()),
+        ))
     }
 
     async fn forward_remote_task(&self, task: &TaskDefinition, target: &NodeId) -> Result<()> {
@@ -1124,305 +923,249 @@ impl Worker {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// dispatcher.dispatch 的结果类型别名，避免在 spawn 与测试中长期写嵌套 Result。
+type PanicPayload = Box<dyn std::any::Any + Send>;
+type DispatchResult = std::result::Result<
+    std::result::Result<std::result::Result<Vec<u8>, ActantError>, PanicPayload>,
+    tokio::time::error::Elapsed,
+>;
 
-    #[tokio::test]
-    async fn pending_results_channel_rejects_when_full() {
-        // 验证：容量为 1 的 pending_results 通道，填满后 try_send 返回 Full。
-        // enqueue_pending_result! 宏在此情况下应发出 warn 并丢弃，而非阻塞或 panic。
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<PendingResult>(1);
-        let capacity = 1usize;
-
-        let req = crate::runtime::network::DirectRequest::QueryWorkflowState {
-            workflow_id: WorkflowId::from("wf-test"),
-            requesting_node: NodeId::from("n-test"),
-        };
-
-        // 第一次入队成功
-        enqueue_pending_result!(tx, "peer-1".to_string(), req.clone(), 0, capacity);
-        assert_eq!(rx.len(), 1, "first enqueue should succeed");
-
-        // 第二次入队：通道已满，应被丢弃（宏内部 warn），rx 不应增长。
-        enqueue_pending_result!(tx, "peer-2".to_string(), req, 0, capacity);
-        assert_eq!(
-            rx.len(),
-            1,
-            "second enqueue must be dropped (channel full), not blocked"
-        );
-
-        // 取出一个后，下一次入队应再次成功。
-        let _ = rx.recv().await.expect("first item present");
-        let req2 = crate::runtime::network::DirectRequest::QueryWorkflowState {
-            workflow_id: WorkflowId::from("wf-test"),
-            requesting_node: NodeId::from("n-test"),
-        };
-        enqueue_pending_result!(tx, "peer-3".to_string(), req2, 0, capacity);
-        assert_eq!(rx.len(), 1, "enqueue should succeed after drain");
-    }
-
-    // ───────────────────────── Worker 纯逻辑测试 ─────────────────────────
-
-    use crate::common::{NodeHeartbeat, WorkerConfig};
-    use crate::runtime::event_bus::BusEvent;
-    use crate::runtime::network::NetworkEvent;
-    use crate::runtime::workflow::Scheduler;
-    use crate::test_support::{MockScheduler, MockTransport};
-    use std::sync::Arc as StdArc;
-
-    fn make_worker(node_id: &str) -> Worker {
-        let network: Arc<dyn Transport> = Arc::new(MockTransport::new(node_id));
-        let scheduler: Arc<dyn Scheduler> = Arc::new(MockScheduler::new());
-        let event_bus = EventBus::new();
-        let dispatcher = crate::runtime::dispatcher::TaskRegistry::new(1, 8, Vec::new())
-            .expect("TaskRegistry init")
-            .into_dispatcher();
-        let handle = tokio::runtime::Handle::current();
-        Worker::new(
-            NodeId::from(node_id.to_string()),
-            network,
-            event_bus,
-            scheduler,
-            dispatcher,
-            &WorkerConfig::default(),
-            handle,
-        )
-    }
-
-    #[test]
-    fn worker_state_as_str_returns_canonical_strings() {
-        assert_eq!(WorkerState::Running.as_str(), "healthy");
-        assert_eq!(WorkerState::Draining.as_str(), "draining");
-        assert_eq!(WorkerState::Stopped.as_str(), "stopped");
-    }
-
-    #[tokio::test]
-    async fn worker_getters_return_configured_values() {
-        let worker = make_worker("node-A");
-        assert_eq!(worker.node_id().as_str(), "node-A");
-        assert_eq!(worker.network().node_id().as_str(), "node-A");
-        assert_eq!(worker.state(), WorkerState::Running);
-        assert_eq!(worker.max_concurrent_tasks(), 8); // WorkerConfig::default
-        assert_eq!(worker.running_task_count(), 0);
-        assert!(worker.scheduler_actor_id().is_none());
-    }
-
-    #[tokio::test]
-    async fn worker_builder_methods_update_state() {
-        let worker = make_worker("node-A")
-            .with_max_concurrent_tasks(4)
-            .with_task_timeout(Duration::from_millis(7500))
-            .with_drain_timeout(Duration::from_secs(10))
-            .with_scheduler_actor_id(crate::common::ActorId::scheduler(&NodeId::from(
-                "node-A".to_string(),
-            )))
-            .with_workflow_actor_id(crate::common::ActorId::workflow(&NodeId::from(
-                "node-A".to_string(),
-            )))
-            .with_dag_gossip_actor_id(crate::common::ActorId::dag_gossip(&NodeId::from(
-                "node-A".to_string(),
-            )))
-            .with_actor_system(Arc::new(crate::runtime::actor::ActorSystem::new()));
-
-        assert_eq!(worker.max_concurrent_tasks(), 4);
-        assert_eq!(worker.running_task_count(), 0);
-        assert!(worker.scheduler_actor_id().is_some());
-    }
-
-    #[tokio::test]
-    async fn worker_shutdown_sends_cancel_signal() {
-        let worker = make_worker("node-A");
-        // subscribe_state 用于观察；shutdown 通过 cancel watch 发送 true。
-        let rx = worker.subscribe_state();
-        worker.shutdown();
-        // shutdown 仅发送 cancel 信号，不直接改 state（state 由 run 循环处理）。
-        // 这里验证不 panic 即可。
-        drop(rx);
-    }
-
-    #[tokio::test]
-    async fn worker_drain_transitions_state_to_draining() {
-        let worker = make_worker("node-A");
-        let rx = worker.subscribe_state();
-        assert_eq!(worker.state(), WorkerState::Running);
-        worker.drain();
-        // drain 通过 state watch 发送 Draining
-        assert_eq!(*rx.borrow(), WorkerState::Draining);
-        assert_eq!(worker.state(), WorkerState::Draining);
-    }
-
-    #[tokio::test]
-    async fn worker_schedule_task_sets_target_node() {
-        let worker = make_worker("node-A");
-        let mut task = TaskDefinition {
-            id: TaskId::from("t-1".to_string()),
-            name: "echo".to_string(),
-            payload: Vec::new(),
-            workflow_id: None,
-            target_node: None,
-            origin_node: None,
-            retry_policy: None,
-            priority: 0,
-            timeout_ms: None,
-            attempt: 0,
-            enqueued_at_ms: 0,
-            target_endpoint_addr: None,
-            origin_endpoint_addr: None,
-        };
-        let result = worker
-            .schedule_task(task.clone(), NodeId::from("node-B".to_string()))
-            .await;
-        assert!(result.is_ok());
-        // 验证 schedule_task 内部将 target_node 写入 task（MockScheduler.enqueue 接受任意 task）。
-        task.target_node = Some(NodeId::from("node-B".to_string()));
-    }
-
-    #[tokio::test]
-    async fn worker_discover_peers_returns_empty_with_mock_transport() {
-        let worker = make_worker("node-A");
-        let peers = worker.discover_peers().await.expect("discover_peers ok");
-        assert!(peers.is_empty());
-    }
-
-    #[tokio::test]
-    async fn worker_clear_capacity_callback_releases_reference() {
-        let calls = StdArc::new(std::sync::Mutex::new(Vec::new()));
-        let calls_clone = calls.clone();
-        let cb: Arc<dyn Fn(u32, u32) + Send + Sync> = Arc::new(move |avail, max| {
-            calls_clone.lock().unwrap().push((avail, max));
-        });
-        let mut worker = make_worker("node-A").with_capacity_callback(cb);
-        // clear 后再调用 notify_capacity 不应 panic 且不再触发回调。
-        worker.clear_capacity_callback();
-        // 间接验证：running_task_count 不依赖 callback。
-        assert_eq!(worker.running_task_count(), 0);
-    }
-
-    // ───────────────────────── NetworkEventRouter 测试 ─────────────────────────
-
-    use crate::runtime::event_bus::Topic as BusTopic;
-
-    #[tokio::test]
-    async fn router_handle_peer_connected_publishes_event() {
-        let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-A"));
-        let event_bus = EventBus::new();
-        let scheduler: Arc<dyn Scheduler> = Arc::new(MockScheduler::new());
-        let router =
-            NetworkEventRouter::new(network, event_bus.clone(), scheduler, None, None, None);
-
-        let mut sub = event_bus.subscribe(BusTopic::NetworkPeer);
-        router
-            .handle(NetworkEvent::PeerConnected {
-                peer_id: "peer-B".to_string(),
-            })
-            .await;
-
-        // 订阅应在 publish 之后收到 BusEvent::PeerConnected
-        let event = tokio::time::timeout(Duration::from_millis(500), sub.recv())
-            .await
-            .expect("event published in time")
-            .expect("event present");
-        match event {
-            BusEvent::PeerConnected(node_id) => assert_eq!(node_id.as_str(), "peer-B"),
-            other => panic!("expected PeerConnected, got {:?}", other),
+/// 将任务派发结果转换为 ``TaskCompletion``。
+///
+/// 抽出为纯函数以便覆盖四种结果分支（成功、失败、panic、超时），
+/// 无需构造完整 Worker 与后台执行循环。
+fn build_completion_from_dispatch_result(
+    dispatch_result: DispatchResult,
+    task: &TaskDefinition,
+    dispatch_start_ms: u64,
+    effective_timeout: Duration,
+) -> TaskCompletion {
+    let workflow_id = task
+        .workflow_id
+        .clone()
+        .unwrap_or_else(|| WorkflowId::from("".to_string()));
+    match dispatch_result {
+        Ok(Ok(Ok(result))) => {
+            crate::metrics::inc_tasks_completed();
+            crate::metrics::dec_running_tasks();
+            crate::metrics::observe_task_duration_ms(
+                crate::common::epoch_millis().saturating_sub(dispatch_start_ms),
+            );
+            TaskCompletion::Completed {
+                workflow_id,
+                task_id: task.id.clone(),
+                task_name: task.name.clone(),
+                result,
+                target_node: task.target_node.clone(),
+            }
         }
-    }
-
-    #[tokio::test]
-    async fn router_handle_peer_disconnected_publishes_event() {
-        let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-A"));
-        let event_bus = EventBus::new();
-        let scheduler: Arc<dyn Scheduler> = Arc::new(MockScheduler::new());
-        let router =
-            NetworkEventRouter::new(network, event_bus.clone(), scheduler, None, None, None);
-
-        let mut sub = event_bus.subscribe(BusTopic::NetworkPeer);
-        router
-            .handle(NetworkEvent::PeerDisconnected {
-                peer_id: "peer-C".to_string(),
-            })
-            .await;
-
-        let event = tokio::time::timeout(Duration::from_millis(500), sub.recv())
-            .await
-            .expect("event published in time")
-            .expect("event present");
-        match event {
-            BusEvent::PeerDisconnected(node_id) => assert_eq!(node_id.as_str(), "peer-C"),
-            other => panic!("expected PeerDisconnected, got {:?}", other),
+        Ok(Ok(Err(e))) => {
+            crate::metrics::inc_tasks_failed();
+            crate::metrics::dec_running_tasks();
+            crate::metrics::observe_task_duration_ms(
+                crate::common::epoch_millis().saturating_sub(dispatch_start_ms),
+            );
+            TaskCompletion::Failed {
+                workflow_id,
+                task_id: task.id.clone(),
+                task_name: task.name.clone(),
+                error: e.to_string(),
+                target_node: task.target_node.clone(),
+            }
         }
-    }
-
-    #[tokio::test]
-    async fn router_handle_message_unknown_topic_is_noop() {
-        let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-A"));
-        let event_bus = EventBus::new();
-        let scheduler: Arc<dyn Scheduler> = Arc::new(MockScheduler::new());
-        let router =
-            NetworkEventRouter::new(network, event_bus.clone(), scheduler, None, None, None);
-
-        // 未知主题 + 无效 payload：不应 panic，不应产生事件。
-        router
-            .handle_message("totally/unknown/topic", b"garbage")
-            .await;
-        // 无从验证「无事件」，但只要不 panic 即认为通过。
-    }
-
-    #[tokio::test]
-    async fn router_handle_message_heartbeat_publishes_to_event_bus() {
-        let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-A"));
-        let event_bus = EventBus::new();
-        let scheduler: Arc<dyn Scheduler> = Arc::new(MockScheduler::new());
-        let router =
-            NetworkEventRouter::new(network, event_bus.clone(), scheduler, None, None, None);
-
-        let hb = NodeHeartbeat {
-            node_id: NodeId::from("node-HB".to_string()),
-            active_workflows: Vec::new(),
-            timestamp_ms: 12345,
-            available_slots: 4,
-            max_slots: 8,
-            endpoint_addr: Some("peer-node-HB".to_string()),
-        };
-        // 构造 heartbeat 主题的 WireEnvelope
-        let envelope = crate::common::WireEnvelope::wrap(
-            crate::common::WireMessage::NodeHeartbeat(hb.clone()),
-        );
-        let topic = crate::common::Topic::heartbeat().to_string();
-        let payload =
-            crate::runtime::workflow::messaging::encode(&envelope).expect("encode envelope");
-
-        let mut sub = event_bus.subscribe(BusTopic::ClusterHeartbeat);
-        router.handle_message(&topic, &payload).await;
-
-        let event = tokio::time::timeout(Duration::from_millis(500), sub.recv())
-            .await
-            .expect("event published in time")
-            .expect("event present");
-        match event {
-            BusEvent::Heartbeat(received) => assert_eq!(received.node_id, hb.node_id),
-            other => panic!("expected Heartbeat, got {:?}", other),
+        Ok(Err(panic_payload)) => {
+            // dispatcher panic：提取 panic 消息，降级为 Failed，
+            // 让 workflow 能继续推进而非永久挂起。
+            crate::metrics::inc_tasks_failed();
+            crate::metrics::dec_running_tasks();
+            crate::metrics::observe_task_duration_ms(
+                crate::common::epoch_millis().saturating_sub(dispatch_start_ms),
+            );
+            let panic_msg = panic_payload
+                .downcast_ref::<&'static str>()
+                .copied()
+                .map(String::from)
+                .or_else(|| {
+                    panic_payload
+                        .downcast_ref::<String>()
+                        .map(String::as_str)
+                        .map(String::from)
+                })
+                .unwrap_or_else(|| "<non-string panic>".to_string());
+            tracing::error!(
+                task_id = ?task.id,
+                panic = %panic_msg,
+                "dispatcher panicked; emitting TaskCompletion::Failed"
+            );
+            TaskCompletion::Failed {
+                workflow_id,
+                task_id: task.id.clone(),
+                task_name: task.name.clone(),
+                error: format!("dispatcher panicked: {panic_msg}"),
+                target_node: task.target_node.clone(),
+            }
         }
-    }
-
-    #[tokio::test]
-    async fn router_handle_task_result_returns_false_without_actor_system() {
-        // 无 actor_system / workflow_actor_id：handle_task_result 应返回 false。
-        let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-A"));
-        let event_bus = EventBus::new();
-        let scheduler: Arc<dyn Scheduler> = Arc::new(MockScheduler::new());
-        let router = NetworkEventRouter::new(network, event_bus, scheduler, None, None, None);
-
-        let accepted = router
-            .handle_task_result(
-                WorkflowId::from("wf-1".to_string()),
-                TaskId::from("t-1".to_string()),
-                "echo".to_string(),
-                crate::common::WireTaskOutcome::Completed(vec![1, 2, 3]),
-                NodeId::from("node-Z".to_string()),
-            )
-            .await;
-        assert!(!accepted, "should return false without actor system");
+        Err(_) => {
+            crate::metrics::inc_tasks_timeout();
+            crate::metrics::dec_running_tasks();
+            crate::metrics::observe_task_duration_ms(
+                crate::common::epoch_millis().saturating_sub(dispatch_start_ms),
+            );
+            TaskCompletion::Failed {
+                workflow_id,
+                task_id: task.id.clone(),
+                task_name: task.name.clone(),
+                error: format!("task timed out after {}ms", effective_timeout.as_millis()),
+                target_node: task.target_node.clone(),
+            }
+        }
     }
 }
+
+/// 将任务完成结果发布到事件总线或回传给远端 orchestrator。
+///
+/// 抽出为独立 async 函数，覆盖本地发布、远程 ``TaskResultAck`` 接受/拒绝、
+/// 异常响应、网络错误等路径，无需构造完整 Worker 执行循环。
+async fn publish_task_completion(
+    completion: TaskCompletion,
+    task: &TaskDefinition,
+    node_id: &NodeId,
+    network: &dyn crate::runtime::network::Transport,
+    event_bus: &EventBus,
+    pending_results: &tokio::sync::mpsc::Sender<PendingResult>,
+    pending_capacity: usize,
+) {
+    let is_remote_task = task.origin_node.as_ref().is_some_and(|o| o != node_id);
+
+    if is_remote_task {
+        let workflow_id = task
+            .workflow_id
+            .clone()
+            .unwrap_or_else(|| WorkflowId::from(String::new()));
+        let wire_result = completion.to_wire_result(workflow_id.clone());
+
+        if let Some(ref origin) = task.origin_node {
+            // 优先使用 origin_endpoint_addr（iroh 公钥），否则回退到 node_id
+            let origin_addr = task
+                .origin_endpoint_addr
+                .as_deref()
+                .unwrap_or(origin.as_str());
+            let request = crate::runtime::network::DirectRequest::TaskResult {
+                workflow_id: workflow_id.clone(),
+                task_id: wire_result.task_id.clone(),
+                task_name: wire_result.task_name.clone(),
+                outcome: wire_result.outcome.clone(),
+                worker_node: node_id.clone(),
+            };
+            // 尝试一次；失败则入队异步重试
+            match network
+                .send_direct_request(origin_addr, request.clone())
+                .await
+            {
+                Ok(crate::runtime::network::DirectResponse::TaskResultAck { accepted: true }) => {
+                    tracing::debug!(
+                        "task result delivered directly to orchestrator {}",
+                        origin_addr
+                    );
+                }
+                Ok(crate::runtime::network::DirectResponse::TaskResultAck { accepted: false }) => {
+                    tracing::warn!(
+                        "orchestrator {} rejected task result, enqueuing for retry",
+                        origin_addr
+                    );
+                    if !try_enqueue_pending_result(
+                        pending_results,
+                        origin_addr.to_string(),
+                        request,
+                        0,
+                        pending_capacity,
+                    )
+                    .await
+                    {
+                        // 通道满：降级为 TaskFailed 事件，避免结果静默丢失。
+                        let failed = TaskCompletion::Failed {
+                            workflow_id: workflow_id.clone(),
+                            task_id: task.id.clone(),
+                            task_name: task.name.clone(),
+                            error: format!(
+                                "result delivery to orchestrator {} rejected and retry queue full",
+                                origin_addr
+                            ),
+                            target_node: task.target_node.clone(),
+                        };
+                        event_bus.publish(BusEvent::TaskFailed(failed)).await;
+                    }
+                }
+                Ok(_) => {
+                    tracing::warn!(
+                        "unexpected response from {}, enqueuing result for retry",
+                        origin_addr
+                    );
+                    if !try_enqueue_pending_result(
+                        pending_results,
+                        origin_addr.to_string(),
+                        request,
+                        0,
+                        pending_capacity,
+                    )
+                    .await
+                    {
+                        let failed = TaskCompletion::Failed {
+                            workflow_id: workflow_id.clone(),
+                            task_id: task.id.clone(),
+                            task_name: task.name.clone(),
+                            error: format!(
+                                "unexpected response from {} and retry queue full",
+                                origin_addr
+                            ),
+                            target_node: task.target_node.clone(),
+                        };
+                        event_bus.publish(BusEvent::TaskFailed(failed)).await;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "direct result delivery to {} failed: {}, enqueuing for retry",
+                        origin_addr,
+                        e
+                    );
+                    if !try_enqueue_pending_result(
+                        pending_results,
+                        origin_addr.to_string(),
+                        request,
+                        0,
+                        pending_capacity,
+                    )
+                    .await
+                    {
+                        let failed = TaskCompletion::Failed {
+                            workflow_id: workflow_id.clone(),
+                            task_id: task.id.clone(),
+                            task_name: task.name.clone(),
+                            error: format!(
+                                "delivery to {} failed: {} and retry queue full",
+                                origin_addr, e
+                            ),
+                            target_node: task.target_node.clone(),
+                        };
+                        event_bus.publish(BusEvent::TaskFailed(failed)).await;
+                    }
+                }
+            }
+        }
+    } else {
+        // 本地 task 完成：始终发布到 EventBus（即使无 workflow_id），
+        // 使 Python @task 等非工作流任务也能通过事件总线获取结果。
+        let bus_event = match completion {
+            TaskCompletion::Failed { .. } => BusEvent::TaskFailed(completion),
+            TaskCompletion::Cancelled { .. } => BusEvent::TaskCancelled(completion),
+            TaskCompletion::Skipped { .. } => BusEvent::TaskSkipped(completion),
+            TaskCompletion::Completed { .. } => BusEvent::TaskCompleted(completion),
+        };
+        event_bus.publish(bus_event).await;
+    }
+}
+
+#[cfg(test)]
+#[path = "../../../tests/rust/unit/runtime/workflow/runtime.rs"]
+mod tests;

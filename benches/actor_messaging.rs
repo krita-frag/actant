@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use tokio::runtime::Runtime;
 
-use actant::common::{ActorId, ActorMessage, ActorMessageResult, ActantError};
+use actant::common::{ActantError, ActorId, ActorMessage, ActorMessageResult};
 use actant::runtime::actor::{Actor, ActorSystem};
 
 /// Echo actor：将收到的 payload 原样返回。
@@ -27,7 +27,10 @@ impl Actor for EchoActor {
         "echo"
     }
 
-    async fn handle_message(&mut self, msg: ActorMessage) -> Result<ActorMessageResult, ActantError> {
+    async fn handle_message(
+        &mut self,
+        msg: ActorMessage,
+    ) -> Result<ActorMessageResult, ActantError> {
         Ok(ActorMessageResult {
             message_id: msg.id,
             payload: msg.payload,
@@ -45,7 +48,10 @@ impl Actor for NoopActor {
         "noop"
     }
 
-    async fn handle_message(&mut self, msg: ActorMessage) -> Result<ActorMessageResult, ActantError> {
+    async fn handle_message(
+        &mut self,
+        msg: ActorMessage,
+    ) -> Result<ActorMessageResult, ActantError> {
         Ok(ActorMessageResult {
             message_id: msg.id,
             payload: vec![],
@@ -83,7 +89,7 @@ fn bench_call_latency(c: &mut Criterion) {
                 rt.block_on(async {
                     for _ in 0..n {
                         let result = system.call(&actor_id, "echo", payload.clone()).await;
-                        black_box(result);
+                        let _ = black_box(result);
                     }
                 });
             });
@@ -105,8 +111,9 @@ fn bench_send_throughput(c: &mut Criterion) {
             b.iter(|| {
                 rt.block_on(async {
                     for _ in 0..n {
-                        let msg = ActorMessage::new(actor_id.clone(), "noop".into(), payload.clone());
-                        system.send(&actor_id, msg).await;
+                        let msg =
+                            ActorMessage::new(actor_id.clone(), "noop".into(), payload.clone());
+                        let _ = system.send(&actor_id, msg).await;
                     }
                 });
             });
@@ -135,11 +142,11 @@ fn bench_concurrent_call(c: &mut Criterion) {
                             let id = actor_id.clone();
                             let payload = payload.clone();
                             handles.push(tokio::spawn(async move {
-                                system.call(&id, "echo", payload).await;
+                                let _ = system.call(&id, "echo", payload).await;
                             }));
                         }
                         for h in handles {
-                            h.await;
+                            let _ = h.await;
                         }
                     });
                 });

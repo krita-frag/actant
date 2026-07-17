@@ -1,6 +1,19 @@
-"""Actant 生产可行性示例：多仓库 GitHub issues/PRs 分析器。
+"""Actant 演示示例：多仓库 GitHub issues/PRs 分析器。
 
-用真实的 GitHub REST API 数据验证 ERH 架构在生产场景下的可行性，覆盖：
+.. warning::
+    **本示例仅供演示 ERH 架构用法，不构成生产就绪代码。** 具体限制：
+
+    - **无认证管理**：仅使用环境变量 ``GITHUB_TOKEN``，无 token 轮换、过期处理
+    - **无持久化恢复**：缓存为本地文件，崩溃后无法恢复中间状态
+    - **无错误隔离**：单个仓库拉取失败会触发重试但不会跳过继续后续仓库
+    - **无指标导出**：``Metrics`` capability 仅在内存累计，不对接 Prometheus
+    - **无并发控制**：未限制并发 HTTP 请求数（依赖 GitHub API 速率限制）
+    - **无安全审计**：``Audit`` handler 仅追加写入文件，无日志轮转/压缩
+
+    如需生产部署，应补充上述缺失项并参考 Actant 的 failover、WAL、
+    capacity_callback 等机制。
+
+用真实的 GitHub REST API 数据验证 ERH 架构在场景下的可行性，覆盖：
 
 - ``ask`` 决策型：``Routing``（按仓库 owner 路由到分析节点）、``Scheduling``（PR 优先于 issue）、
   ``RetryPolicy``（HTTP 失败指数退避重试）、自定义 ``Throttle``（GitHub 速率限制保护）

@@ -14,17 +14,18 @@ Handler 通过 `Runtime.layer(name, kind).chain(handler)` 注册。
 
 from __future__ import annotations
 
-from typing import Any, NoReturn
+from typing import Any, Literal, NoReturn
 
 from actant._runtime import Runtime, get_current_runtime
 from actant.capabilities import CapabilityMeta
+from actant.exceptions import InternalError, InvalidStateError
 
 
 def _resolve_meta(name: str) -> tuple[Runtime, CapabilityMeta]:
     """从当前 Runtime 解析 capability 元数据。"""
     runtime = get_current_runtime()
     if runtime is None:
-        raise RuntimeError(
+        raise InvalidStateError(
             f"effect {name!r}: no active Runtime; wrap your code in `with actant.Runtime() as rt:`"
         )
     return runtime, runtime.capability_meta(name)
@@ -41,12 +42,12 @@ def ask(name: str, request: Any) -> Any | None:
         第一个返回非 `None` 的 handler 的结果；若所有 handler 都返回 `None`，返回 `None`。
 
     Raises:
-        RuntimeError: 当前未在 Runtime 上下文中，或 capability 未注册。
+        InvalidStateError: 当前未在 Runtime 上下文中，或 capability kind 不匹配。
         KeyError: capability 未注册。
     """
     runtime, meta = _resolve_meta(name)
     if meta.kind != "ask":
-        raise RuntimeError(
+        raise InvalidStateError(
             f"ask: capability {name!r} is {meta.kind!r}, not 'ask'"
         )
     return runtime._dispatch_ask(name, request)
@@ -63,18 +64,23 @@ def perform(name: str, request: Any) -> Any:
         handler 的返回值。
 
     Raises:
-        RuntimeError: 当前未在 Runtime 上下文中，或 capability 未注册。
+        InvalidStateError: 当前未在 Runtime 上下文中，或 capability kind 不匹配。
         KeyError: capability 未注册。
     """
     runtime, meta = _resolve_meta(name)
     if meta.kind != "perform":
-        raise RuntimeError(
+        raise InvalidStateError(
             f"perform: capability {name!r} is {meta.kind!r}, not 'perform'"
         )
     return runtime._dispatch_perform(name, request)
 
 
-def emit(name: str, request: Any, *, on_error: str = "log") -> None:
+def emit(
+    name: str,
+    request: Any,
+    *,
+    on_error: Literal["log", "raise", "collect"] = "log",
+) -> None:
     """反应型 effect：触发所有订阅该 capability 的 handler。
 
     Args:
@@ -84,23 +90,29 @@ def emit(name: str, request: Any, *, on_error: str = "log") -> None:
             ``"raise"`` 首个失败立即抛出；``"collect"`` 聚合所有错误后抛出。
 
     Raises:
-        RuntimeError: 当前未在 Runtime 上下文中，或 capability 未注册。
+        InvalidStateError: 当前未在 Runtime 上下文中，或 capability kind 不匹配。
         KeyError: capability 未注册。
-        ValueError: ``on_error`` 不是合法值。
+        ValueError: ``on_error`` 不是合法值（动态构造时仍校验）。
     """
+    # Literal 仅供静态检查；动态构造（on_error 来自变量）时仍需运行时校验，
+    # 以防拼写错误延迟到首个 handler 失败时才暴露。
     if on_error not in ("log", "raise", "collect"):
         raise ValueError(
             f"on_error must be 'log'/'raise'/'collect', got {on_error!r}"
         )
     runtime, meta = _resolve_meta(name)
     if meta.kind != "emit":
-        raise RuntimeError(
+        raise InvalidStateError(
             f"emit: capability {name!r} is {meta.kind!r}, not 'emit'"
         )
     runtime._dispatch_emit(name, request, on_error=on_error)
 
 
-def effect(name: str, kind: str, request: Any) -> Any:
+def effect(
+    name: str,
+    kind: Literal["ask", "perform", "emit"],
+    request: Any,
+) -> Any:
     """通用 effect 调度：根据 kind 分发到 ask/perform/emit。
 
     Args:
@@ -126,7 +138,7 @@ def impossible(detail: str = "unreachable") -> NoReturn:
 
     用于 handler 中表达"此 effect 必须有 handler 处理，否则是编程错误"。
     """
-    raise RuntimeError(f"impossible: {detail}")
+    raise InternalError(f"impossible: {detail}")
 
 
 __all__ = [

@@ -1,3 +1,23 @@
+//! 基于心跳与租约的工作流故障转移。
+//!
+//! [`FailoverManager`] 维护远端节点心跳、可用槽位、活跃 workflow 列表和本地租约。
+//! 当节点被判定失效时，所有健康节点使用一致性哈希
+//! [`should_claim_workflow`] 对 workflow 归属做
+//! 确定性选择，只有获选节点会 claim 并重新调度该 workflow 的运行中任务。
+//!
+//! ## 时间参数
+//!
+//! [`FailoverConfig`] 要求
+//! `heartbeat_interval_ms < failure_timeout_ms < lease_duration_ms`。这个关系保证：
+//! - 节点有足够心跳机会，不会因为单次延迟就被误判；
+//! - 故障判定完成前旧租约不会先过期；
+//! - claim 后的租约有明确过期时间，避免永久双主。
+//!
+//! ## 持久化
+//!
+//! 新 claim 的租约同时记录墙钟时间和单调 deadline；从 store 恢复的租约没有
+//! 单调基线，只能回退到墙钟过期判断。
+//!
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -57,6 +77,56 @@ struct LeaseEntry {
     node_id: NodeId,
     claimed_at_ms: u64,
     expires_at_ms: u64,
+    /// 单调时钟租约到期时刻。``Some`` 时优先用于过期判定，避免 NTP 时钟跳变
+    /// 导致误判（M5-2 改进）。``None`` 表示租约从持久化恢复（无单调基线），
+    /// 回退到墙钟 ``expires_at_ms`` 比较。
+    deadline: Option<std::time::Instant>,
+}
+
+impl LeaseEntry {
+    /// 租约是否仍有效。
+    ///
+    /// 优先使用单调时钟 ``deadline``（若存在），否则回退到墙钟比较。
+    /// ``now_ms`` 为当前墙钟毫秒，``now_monotonic`` 为当前单调时刻。
+    fn is_valid(&self, now_ms: u64, now_monotonic: std::time::Instant) -> bool {
+        match self.deadline {
+            Some(deadline) => now_monotonic < deadline,
+            None => now_ms < self.expires_at_ms,
+        }
+    }
+
+    /// 构造一个带单调 deadline 的新租约（用于本进程新 claim 的租约）。
+    fn new_with_monotonic(
+        node_id: NodeId,
+        claimed_at_ms: u64,
+        expires_at_ms: u64,
+        lease_duration_ms: u64,
+    ) -> Self {
+        Self {
+            node_id,
+            claimed_at_ms,
+            expires_at_ms,
+            deadline: std::time::Instant::now()
+                .checked_add(std::time::Duration::from_millis(lease_duration_ms)),
+        }
+    }
+
+    /// 构造一个从持久化恢复的租约（无单调基线，回退墙钟比较）。
+    fn restored(node_id: NodeId, claimed_at_ms: u64, expires_at_ms: u64) -> Self {
+        Self {
+            node_id,
+            claimed_at_ms,
+            expires_at_ms,
+            deadline: None,
+        }
+    }
+
+    /// 续租：更新墙钟 expires_at_ms 并刷新单调 deadline。
+    fn renew(&mut self, lease_duration_ms: u64, now_ms: u64) {
+        self.expires_at_ms = now_ms + lease_duration_ms;
+        self.deadline = std::time::Instant::now()
+            .checked_add(std::time::Duration::from_millis(lease_duration_ms));
+    }
 }
 
 impl Clone for LeaseEntry {
@@ -65,10 +135,17 @@ impl Clone for LeaseEntry {
             node_id: self.node_id.clone(),
             claimed_at_ms: self.claimed_at_ms,
             expires_at_ms: self.expires_at_ms,
+            deadline: self.deadline,
         }
     }
 }
 
+/// 维护节点健康状态、workflow 租约和故障接管决策。
+///
+/// `FailoverManager` 通过 heartbeat topic 收集 peer 的活跃 workflow 与容量视图；
+/// 当 peer 超过 `failure_timeout_ms` 未更新时，本节点会按一致性哈希判断自己是否
+/// 应接管该 peer 的每个 workflow。接管流程先通知本地 `WorkflowActor` adopt 状态，
+/// 再持久化租约并广播 claim。
 pub struct FailoverManager {
     node_id: NodeId,
     network: Arc<dyn crate::runtime::network::Transport>,
@@ -96,6 +173,7 @@ impl Drop for FailoverManager {
 }
 
 impl FailoverManager {
+    /// 使用默认 failover 配置创建 manager。
     pub fn new(
         node_id: NodeId,
         network: Arc<dyn crate::runtime::network::Transport>,
@@ -163,7 +241,7 @@ impl FailoverManager {
     ) -> crate::common::Result<()> {
         let result = self.call_workflow(method, payload).await?;
         if let Some(err) = result.error {
-            Err(crate::common::ActantError::Actor(err))
+            Err(crate::common::ActantError::from(err))
         } else {
             Ok(())
         }
@@ -189,11 +267,18 @@ impl FailoverManager {
             .await
     }
 
+    /// 覆盖心跳发送间隔。
+    ///
+    /// 主要供测试或特殊部署调参使用；生产配置通常来自
+    /// [`FailoverConfig`]。
     pub fn with_heartbeat_interval(mut self, ms: u64) -> Self {
         self.heartbeat_interval_ms = ms;
         self
     }
 
+    /// 设置本节点当前可用容量快照。
+    ///
+    /// Worker 会通过容量回调持续更新该值，心跳广播会携带它供远端路由决策使用。
     pub fn with_capacity(self, available: u32, max: u32) -> Self {
         self.local_available_capacity
             .store(available, Ordering::Relaxed);
@@ -201,10 +286,16 @@ impl FailoverManager {
         self
     }
 
+    /// 注入用于 failover 重调度的 scheduler。
     pub fn set_scheduler(&self, scheduler: Arc<dyn crate::runtime::workflow::Scheduler>) {
         *self.scheduler.lock() = Some(scheduler);
     }
 
+    /// 订阅 failover 相关 gossip topic。
+    ///
+    /// # Errors
+    ///
+    /// 如果底层网络订阅任一 topic 失败，返回错误。
     pub async fn subscribe_topics(&self) -> Result<()> {
         self.network.subscribe(TOPIC_HEARTBEAT).await?;
         self.network.subscribe(TOPIC_FAILOVER).await?;
@@ -215,16 +306,26 @@ impl FailoverManager {
         Ok(())
     }
 
+    /// 广播本节点心跳、活跃 workflow 与可用容量。
+    ///
+    /// # Errors
+    ///
+    /// 如果查询本地 workflow 状态、序列化 heartbeat 或网络广播失败，返回错误。
     pub async fn send_heartbeat(&self) -> Result<()> {
         let active_workflows = self.active_workflow_ids().await?;
         let now_ms = crate::common::epoch_millis();
+        let endpoint_addr = self
+            .network
+            .listen_addresses()
+            .ok()
+            .map(|a| a.endpoint_addr);
         let hb = NodeHeartbeat {
             node_id: self.node_id.clone(),
             active_workflows,
             timestamp_ms: now_ms,
             available_slots: self.local_available_capacity.load(Ordering::Relaxed),
             max_slots: self.local_max_capacity.load(Ordering::Relaxed),
-            endpoint_addr: Some(self.network.local_peer_id().to_string()),
+            endpoint_addr,
         };
         let msg = WireMessage::NodeHeartbeat(hb);
         let data = postcard::to_allocvec(&WireEnvelope::wrap(msg))
@@ -280,11 +381,18 @@ impl FailoverManager {
         removed
     }
 
+    /// 声明本节点接管指定 workflow。
+    ///
+    /// # Errors
+    ///
+    /// 如果本地 `WorkflowActor` adopt 失败、租约持久化失败、claim 序列化失败
+    /// 或网络广播失败，返回错误。
     pub async fn claim_workflow(&self, workflow_id: &WorkflowId) -> Result<()> {
         let now_ms = crate::common::epoch_millis();
+        let now_monotonic = std::time::Instant::now();
         let lease_duration_ms = self.lease_duration_ms;
         if let Some(existing) = self.leases.get(workflow_id) {
-            if now_ms < existing.expires_at_ms {
+            if existing.is_valid(now_ms, now_monotonic) {
                 if existing.node_id == self.node_id {
                     return Ok(());
                 }
@@ -299,11 +407,12 @@ impl FailoverManager {
                 return Ok(());
             }
         }
-        let lease = LeaseEntry {
-            node_id: self.node_id.clone(),
-            claimed_at_ms: now_ms,
-            expires_at_ms: now_ms + lease_duration_ms,
-        };
+        let lease = LeaseEntry::new_with_monotonic(
+            self.node_id.clone(),
+            now_ms,
+            now_ms + lease_duration_ms,
+            lease_duration_ms,
+        );
 
         // 先 adopt workflow，成功后再持久化 lease，避免 adopt 失败但 lease 已写入
         self.adopt_workflow(workflow_id).await?;
@@ -324,6 +433,10 @@ impl FailoverManager {
         self.network.broadcast(TOPIC_FAILOVER, data).await
     }
 
+    /// 处理远端节点广播的 workflow claim。
+    ///
+    /// 远端 claim 会更新本地租约表；如果 claim 不属于本节点，本地会移除该 workflow
+    /// 的 active 状态以避免双主推进。
     pub async fn handle_claim(&self, claim: &OrchestratorClaim) {
         let lease_duration_ms = self.lease_duration_ms;
 
@@ -331,13 +444,15 @@ impl FailoverManager {
         // 在所有节点上一致，不受时钟偏差 / 网络
         // latency 影响。若使用接收方本地时间，
         // 会因网络传输时间而缩短租期。
-        let lease = LeaseEntry {
-            node_id: claim.node_id.clone(),
-            claimed_at_ms: claim.timestamp_ms,
-            expires_at_ms: claim.timestamp_ms + lease_duration_ms,
-        };
+        // 单调 deadline 以本节点接收时刻为起点，避免 NTP 跳变误判（M5-2）。
+        let lease = LeaseEntry::new_with_monotonic(
+            claim.node_id.clone(),
+            claim.timestamp_ms,
+            claim.timestamp_ms + lease_duration_ms,
+            lease_duration_ms,
+        );
         if let Err(e) = self.persist_lease(&claim.workflow_id, &lease) {
-            tracing::warn!("failed to persist lease for {}: {}", claim.workflow_id.0, e);
+            tracing::error!("failed to persist lease for {}: {}", claim.workflow_id.0, e);
         }
         self.leases.insert(claim.workflow_id.clone(), lease);
 
@@ -524,6 +639,10 @@ impl FailoverManager {
         cancel_tx
     }
 
+    /// 检测失效 peer 并按一致性哈希接管 orphan workflow。
+    ///
+    /// 单个 workflow 接管或重调度失败只记录错误并继续处理其他 workflow，避免一个
+    /// 损坏状态阻塞整批故障恢复。
     pub async fn detect_and_claim_failed_nodes(&self) {
         let peers = self.get_peer_infos();
         let now_ms = crate::common::epoch_millis();
@@ -572,6 +691,7 @@ impl FailoverManager {
         }
     }
 
+    /// 处理远端心跳并更新 peer 视图。
     pub fn handle_heartbeat(&self, hb: &NodeHeartbeat) {
         if hb.node_id != self.node_id {
             tracing::debug!(
@@ -600,6 +720,7 @@ impl FailoverManager {
 
     pub async fn expire_leases(&self) {
         let now_ms = crate::common::epoch_millis();
+        let now_monotonic = std::time::Instant::now();
         let active = match self.active_workflow_ids().await {
             Ok(ids) => ids,
             Err(e) => {
@@ -616,7 +737,8 @@ impl FailoverManager {
             .filter(|ref_multi| {
                 let wf_id = ref_multi.key();
                 let lease = ref_multi.value();
-                if now_ms < lease.expires_at_ms {
+                // 优先使用单调时钟判定过期，避免 NTP 跳变误判（M5-2）。
+                if lease.is_valid(now_ms, now_monotonic) {
                     return false;
                 }
                 if lease.node_id == self.node_id && active_set.contains(wf_id) {
@@ -636,7 +758,7 @@ impl FailoverManager {
                 let wf_id = ref_multi.key().clone();
                 let lease = ref_multi.value();
                 if lease.node_id == self.node_id
-                    && now_ms >= lease.expires_at_ms
+                    && !lease.is_valid(now_ms, now_monotonic)
                     && active_set.contains(&wf_id)
                 {
                     Some(wf_id)
@@ -649,7 +771,7 @@ impl FailoverManager {
         let mut to_renew: Vec<(WorkflowId, LeaseEntry)> = Vec::new();
         for wf_id in &to_renew_keys {
             if let Some(mut lease) = self.leases.get_mut(wf_id) {
-                lease.expires_at_ms = now_ms + lease_duration_ms;
+                lease.renew(lease_duration_ms, now_ms);
                 to_renew.push((wf_id.clone(), lease.clone()));
             }
         }
@@ -695,7 +817,7 @@ impl FailoverManager {
             let entries = match store.scan_prefix(STORE_KEY_LEASE) {
                 Ok(e) => e,
                 Err(e) => {
-                    tracing::warn!("failed to scan leases from store: {}", e);
+                    tracing::error!("failed to scan leases from store: {}", e);
                     return;
                 }
             };
@@ -706,13 +828,14 @@ impl FailoverManager {
                 match rkyv::from_bytes::<PersistedLease, rkyv::rancor::Error>(&data) {
                     Ok(persisted) => {
                         if now_ms < persisted.expires_at_ms {
+                            // 从持久化恢复的租约无单调基线，回退墙钟比较。
                             self.leases.insert(
                                 wf_id,
-                                LeaseEntry {
-                                    node_id: persisted.node_id,
-                                    claimed_at_ms: persisted.claimed_at_ms,
-                                    expires_at_ms: persisted.expires_at_ms,
-                                },
+                                LeaseEntry::restored(
+                                    persisted.node_id,
+                                    persisted.claimed_at_ms,
+                                    persisted.expires_at_ms,
+                                ),
                             );
                         } else if let Err(e) = store.delete(&key) {
                             tracing::warn!("failed to delete expired lease {}: {}", wf_id_str, e);
@@ -731,215 +854,5 @@ impl FailoverManager {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::common::{NodeHeartbeat, NodeId, WorkflowId};
-    use crate::runtime::actor::ActorSystem;
-    use crate::test_support::MockTransport;
-
-    fn make_fm(node_id: &str) -> FailoverManager {
-        let network: Arc<dyn crate::runtime::network::Transport> =
-            Arc::new(MockTransport::new(node_id));
-        let actor_system = Arc::new(ActorSystem::new());
-        let wf_id = ActorId::workflow(&NodeId::from(node_id.to_string()));
-        FailoverManager::new(
-            NodeId::from(node_id.to_string()),
-            network,
-            actor_system,
-            wf_id,
-        )
-    }
-
-    fn hb(node_id: &str, ts_ms: u64, workflows: &[&str]) -> NodeHeartbeat {
-        NodeHeartbeat {
-            node_id: NodeId::from(node_id.to_string()),
-            active_workflows: workflows
-                .iter()
-                .map(|w| WorkflowId(w.to_string()))
-                .collect(),
-            timestamp_ms: ts_ms,
-            available_slots: 4,
-            max_slots: 8,
-            endpoint_addr: Some(format!("peer-{}", node_id)),
-        }
-    }
-
-    #[test]
-    fn getters_return_configured_values() {
-        let fm = make_fm("node-A")
-            .with_heartbeat_interval(1234)
-            .with_capacity(3, 10);
-        assert_eq!(fm.heartbeat_interval_ms(), 1234);
-        assert_eq!(
-            fm.failure_timeout_ms(),
-            FailoverConfig::default().failure_timeout_ms
-        );
-        assert_eq!(fm.node_id().as_str(), "node-A");
-    }
-
-    #[test]
-    fn handle_heartbeat_records_peer() {
-        let fm = make_fm("node-A");
-        let now = crate::common::epoch_millis();
-        fm.handle_heartbeat(&hb("node-B", now, &["wf-1"]));
-
-        let infos = fm.get_peer_infos();
-        assert!(infos.contains_key(&NodeId::from("node-B".to_string())));
-        let peer = &infos[&NodeId::from("node-B".to_string())];
-        assert_eq!(peer.last_heartbeat_ms, now);
-        assert_eq!(peer.available_slots, 4);
-        assert_eq!(peer.max_slots, 8);
-        assert_eq!(peer.endpoint_addr.as_deref(), Some("peer-node-B"));
-        assert!(peer
-            .active_workflows
-            .contains(&WorkflowId("wf-1".to_string())));
-    }
-
-    #[test]
-    fn handle_heartbeat_ignores_own_node() {
-        let fm = make_fm("node-A");
-        fm.handle_heartbeat(&hb("node-A", crate::common::epoch_millis(), &[]));
-        assert!(fm.get_peer_infos().is_empty());
-    }
-
-    #[test]
-    fn handle_heartbeat_updates_existing_peer() {
-        let fm = make_fm("node-A");
-        let now = crate::common::epoch_millis();
-        fm.handle_heartbeat(&hb("node-B", now, &["wf-1"]));
-        fm.handle_heartbeat(&hb("node-B", now + 1000, &["wf-1", "wf-2"]));
-
-        let peer = &fm.get_peer_infos()[&NodeId::from("node-B".to_string())];
-        assert_eq!(peer.last_heartbeat_ms, now + 1000);
-        assert_eq!(peer.active_workflows.len(), 2);
-    }
-
-    #[test]
-    fn remove_peer_drops_entry() {
-        let fm = make_fm("node-A");
-        fm.handle_heartbeat(&hb("node-B", crate::common::epoch_millis(), &[]));
-        fm.remove_peer(&NodeId::from("node-B".to_string()));
-        assert!(!fm
-            .get_peer_infos()
-            .contains_key(&NodeId::from("node-B".to_string())));
-    }
-
-    #[test]
-    fn expire_stale_peers_removes_only_timed_out() {
-        let fm = make_fm("node-A");
-        let now = crate::common::epoch_millis();
-        let timeout = fm.failure_timeout_ms();
-        // node-B: 心跳新鲜；node-C: 心跳过期
-        fm.handle_heartbeat(&hb("node-B", now, &[]));
-        fm.handle_heartbeat(&hb("node-C", now.saturating_sub(timeout + 5000), &[]));
-
-        let removed = fm.expire_stale_peers();
-        let removed_ids: Vec<String> = removed.iter().map(|(n, _)| n.0.clone()).collect();
-        assert_eq!(removed_ids, vec!["node-C".to_string()]);
-        let infos = fm.get_peer_infos();
-        assert!(infos.contains_key(&NodeId::from("node-B".to_string())));
-        assert!(!infos.contains_key(&NodeId::from("node-C".to_string())));
-    }
-
-    #[test]
-    fn expire_stale_peers_skips_zero_heartbeat() {
-        // last_heartbeat_ms == 0 表示从未真正收到心跳，不应被判定为 stale。
-        let fm = make_fm("node-A");
-        fm.handle_heartbeat(&hb("node-B", 0, &[]));
-        let removed = fm.expire_stale_peers();
-        assert!(removed.is_empty());
-    }
-
-    #[test]
-    fn update_local_capacity_reflected_in_get_peer_capacities() {
-        let fm = make_fm("node-A");
-        fm.update_local_capacity(7, 16);
-        // 本节点容量不进入 peer 表（仅 peer 容量才进），但 send_heartbeat 会读取。
-        // 这里仅验证 update 不 panic 且 peer 表为空。
-        assert!(fm.get_peer_capacities().is_empty());
-    }
-
-    #[test]
-    fn update_peer_capacity_modifies_existing_peer() {
-        let fm = make_fm("node-A");
-        fm.handle_heartbeat(&hb("node-B", crate::common::epoch_millis(), &[]));
-        fm.update_peer_capacity(NodeId::from("node-B".to_string()), 2, 5);
-        let caps = fm.get_peer_capacities();
-        let b_cap = &caps[&NodeId::from("node-B".to_string())];
-        assert_eq!(b_cap.0, 2);
-        assert_eq!(b_cap.1, 5);
-    }
-
-    #[test]
-    fn update_peer_capacity_ignores_unknown_peer() {
-        let fm = make_fm("node-A");
-        fm.update_peer_capacity(NodeId::from("node-X".to_string()), 1, 2);
-        assert!(fm.get_peer_capacities().is_empty());
-    }
-
-    #[test]
-    fn active_leases_empty_initially() {
-        let fm = make_fm("node-A");
-        assert!(fm.active_leases().is_empty());
-    }
-
-    #[test]
-    fn handle_claim_same_node_records_lease_without_network_call() {
-        // 同节点 claim：不调用 remove_active_workflow（避免 actor 调用），
-        // 仅持久化 lease + 写入 leases map。
-        let fm = make_fm("node-A");
-        let now = crate::common::epoch_millis();
-        let claim = OrchestratorClaim {
-            node_id: fm.node_id().clone(),
-            workflow_id: WorkflowId("wf-same".to_string()),
-            timestamp_ms: now,
-        };
-        // 阻塞执行 async 方法
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(fm.handle_claim(&claim));
-
-        let leases = fm.active_leases();
-        assert_eq!(leases.len(), 1);
-        let (wf, node, claimed, expires) = &leases[0];
-        assert_eq!(wf, "wf-same");
-        assert_eq!(node, "node-A");
-        assert_eq!(*claimed, now);
-        assert_eq!(*expires, now + FailoverConfig::default().lease_duration_ms);
-    }
-
-    #[test]
-    fn handle_claim_remote_node_records_lease_and_skips_removal_on_actor_error() {
-        // 远端节点 claim：会调用 remove_active_workflow（actor 调用失败被吞掉），
-        // 但 lease 仍应被记录。
-        let fm = make_fm("node-A");
-        let now = crate::common::epoch_millis();
-        let claim = OrchestratorClaim {
-            node_id: NodeId::from("node-Z".to_string()),
-            workflow_id: WorkflowId("wf-remote".to_string()),
-            timestamp_ms: now,
-        };
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(fm.handle_claim(&claim));
-
-        let leases = fm.active_leases();
-        assert_eq!(leases.len(), 1);
-        assert_eq!(leases[0].1, "node-Z");
-        assert_eq!(
-            leases[0].3,
-            now + FailoverConfig::default().lease_duration_ms
-        );
-    }
-
-    #[test]
-    fn with_capacity_sets_atomic_counters() {
-        let fm = make_fm("node-A").with_capacity(5, 12);
-        // 通过 update_peer_capacity 间接验证 atomic 可用性（不 panic）。
-        fm.update_local_capacity(0, 0);
-    }
-}
+#[path = "../../../tests/rust/unit/runtime/workflow/failover.rs"]
+mod tests;

@@ -36,27 +36,69 @@ use crate::runtime::state::{
 };
 
 #[async_trait]
+/// Actant Actor 的最小行为契约。
+///
+/// Actor 由 [`ActorSystem`] 独占驱动：每个 actor 实例在自己的任务中顺序处理
+/// [`ActorMessage`]，因此实现内部通常不需要额外同步。Actor 可以选择实现状态
+/// 持久化钩子；不支持持久化的 actor 使用默认 no-op 实现即可。
+///
+/// # Lifecycle
+///
+/// [`ActorSystem::spawn`] 会先调用 [`Actor::on_start`]，再进入消息循环。
+/// [`ActorSystem::stop`] 发送停止信号后调用 [`Actor::on_stop`]。如果 actor panic，
+/// runtime 会把 panic 转换为 actor 错误并通过监督事件广播。
 pub trait Actor: Send + Sync + 'static {
+    /// 返回稳定的 actor 类型名称，用于日志、监督和跨节点 actor 路由。
     fn actor_type(&self) -> &str;
 
+    /// 处理一条消息并返回响应。
+    ///
+    /// # Errors
+    ///
+    /// 返回错误表示消息处理失败；调用方会收到该错误，监督树也可观测到失败事件。
+    /// 不要用 panic 表示业务错误，panic 只用于不可恢复的实现缺陷。
     async fn handle_message(&mut self, msg: ActorMessage) -> Result<ActorMessageResult>;
 
+    /// 序列化 actor 当前状态。
+    ///
+    /// 默认返回空字节，表示 actor 没有需要持久化的状态。
+    ///
+    /// # Errors
+    ///
+    /// 如果状态无法序列化或底层资源不可用，应返回错误。调用方会保留原状态，
+    /// 并通过 tracing 记录失败。
     fn save_state(&self) -> Result<Vec<u8>> {
         Ok(vec![])
     }
 
+    /// 从已保存字节恢复 actor 状态。
+    ///
+    /// # Errors
+    ///
+    /// 如果字节格式不兼容、损坏或无法应用到当前 actor，应返回错误。
     fn load_state(&mut self, _state: &[u8]) -> Result<()> {
         Ok(())
     }
 
+    /// 返回 actor 是否参与 checkpoint/WAL 恢复。
     fn supports_state_persistence(&self) -> bool {
         false
     }
 
+    /// actor 启动钩子。
+    ///
+    /// # Errors
+    ///
+    /// 返回错误会使 spawn 失败，actor 不会进入消息循环。
     async fn on_start(&mut self) -> Result<()> {
         Ok(())
     }
 
+    /// actor 停止钩子。
+    ///
+    /// # Errors
+    ///
+    /// 返回错误会传播给停止调用方，并通过 tracing 暴露。
     async fn on_stop(&mut self) -> Result<()> {
         Ok(())
     }
@@ -515,7 +557,7 @@ impl ActorPersistence {
                 };
 
                 if let Err(e) = checkpoint.save(&snapshot) {
-                    tracing::warn!("checkpoint save failed for {}: {}", actor_id.0, e);
+                    tracing::error!("checkpoint save failed for {}: {}", actor_id.0, e);
                 }
             }
 
@@ -575,7 +617,7 @@ impl ActorPersistence {
                             }
                         }).await;
                         if let Err(e) = result {
-                            tracing::warn!("WAL compaction task panicked: {}", e);
+                            tracing::error!("WAL compaction task panicked: {}", e);
                         }
                     }
                     Ok(()) = cancel_rx.changed() => break,
@@ -687,7 +729,7 @@ impl RunningActor {
                             "failed to ack message after error"
                         );
                     }
-                    self.handle_message_error(msg_id, reply_tx, e.to_string());
+                    self.handle_message_error(msg_id, reply_tx, e);
                 }
                 Err(_panic_payload) => {
                     if let Err(ack_err) = self.registry.ack_message(&self.actor_id, &msg_id).await {
@@ -712,12 +754,12 @@ impl RunningActor {
         &mut self,
         msg_id: MessageId,
         reply_tx: Option<oneshot::Sender<ActorMessageResult>>,
-        error: String,
+        error: ActantError,
     ) {
         tracing::error!("actor {} handle_message error: {}", self.actor_id.0, error);
         self.emit_supervision(SupervisionEvent::ActorFailed {
             actor_id: self.actor_id.clone(),
-            error: error.clone(),
+            error: error.to_string(),
         });
         crate::metrics::inc_actors_failed();
         crate::metrics::dec_active_actors();
@@ -726,7 +768,7 @@ impl RunningActor {
             let _ = tx.send(ActorMessageResult {
                 message_id: msg_id,
                 payload: vec![],
-                error: Some(error),
+                error: Some(crate::common::ActorErrorEnvelope::from(error)),
             });
         }
     }
@@ -748,7 +790,10 @@ impl RunningActor {
             let _ = tx.send(ActorMessageResult {
                 message_id: msg_id,
                 payload: vec![],
-                error: Some("actor panicked".to_string()),
+                error: Some(crate::common::ActorErrorEnvelope {
+                    kind: crate::common::ActorErrorKind::Internal,
+                    message: "actor panicked".to_string(),
+                }),
             });
         }
     }
@@ -759,7 +804,7 @@ impl RunningActor {
             futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(stop_future)).await;
         match result {
             Err(_) => {
-                tracing::warn!("actor {} panicked in on_stop", self.actor_id.0);
+                tracing::error!("actor {} panicked in on_stop", self.actor_id.0);
             }
             Ok(Err(e)) => {
                 tracing::warn!("actor {} on_stop error: {}", self.actor_id.0, e);
@@ -787,11 +832,11 @@ impl RunningActor {
 
         let state = match save_result {
             Err(_) => {
-                tracing::warn!("actor {} panicked in save_state", self.actor_id.0);
+                tracing::error!("actor {} panicked in save_state", self.actor_id.0);
                 return;
             }
             Ok(Err(e)) => {
-                tracing::warn!("actor {} save_state error: {}", self.actor_id.0, e);
+                tracing::error!("actor {} save_state error: {}", self.actor_id.0, e);
                 return;
             }
             Ok(Ok(state)) => state,
@@ -963,7 +1008,7 @@ impl ActorSystem {
         crate::metrics::observe_actor_load_state_ms(load_t0.elapsed().as_millis() as u64);
         match result {
             Err(_) => {
-                tracing::warn!("actor {} panicked in load_state", actor_id.as_str());
+                tracing::error!("actor {} panicked in load_state", actor_id.as_str());
             }
             Ok(Err(e)) => {
                 tracing::warn!(
@@ -1015,7 +1060,7 @@ impl ActorSystem {
             futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(start_future)).await;
         match catch_result {
             Err(_) => {
-                tracing::warn!("actor {} panicked in on_start", actor_id.as_str());
+                tracing::error!("actor {} panicked in on_start", actor_id.as_str());
                 Err(ActantError::Actor(format!(
                     "actor {} panicked in on_start",
                     actor_id.as_str()
@@ -1270,437 +1315,5 @@ impl Default for ActorSystem {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use async_trait::async_trait;
-    use std::sync::Mutex as StdMutex;
-
-    struct EchoActor {
-        received: Arc<StdMutex<Vec<String>>>,
-        fail_method: Option<String>,
-        panic_method: Option<String>,
-    }
-
-    impl EchoActor {
-        fn new() -> (Self, Arc<StdMutex<Vec<String>>>) {
-            let received = Arc::new(StdMutex::new(Vec::new()));
-            (
-                Self {
-                    received: received.clone(),
-                    fail_method: None,
-                    panic_method: None,
-                },
-                received,
-            )
-        }
-
-        fn with_fail(method: &str) -> (Self, Arc<StdMutex<Vec<String>>>) {
-            let (mut actor, received) = Self::new();
-            actor.fail_method = Some(method.to_string());
-            (actor, received)
-        }
-
-        fn with_panic(method: &str) -> (Self, Arc<StdMutex<Vec<String>>>) {
-            let (mut actor, received) = Self::new();
-            actor.panic_method = Some(method.to_string());
-            (actor, received)
-        }
-    }
-
-    #[async_trait]
-    impl Actor for EchoActor {
-        fn actor_type(&self) -> &str {
-            "echo"
-        }
-
-        async fn handle_message(&mut self, msg: ActorMessage) -> Result<ActorMessageResult> {
-            self.received.lock().unwrap().push(msg.method.clone());
-
-            if self.panic_method.as_deref() == Some(&msg.method) {
-                panic!("test panic in handle_message");
-            }
-            if self.fail_method.as_deref() == Some(&msg.method) {
-                return Err(ActantError::Actor("intentional failure".into()));
-            }
-
-            Ok(ActorMessageResult {
-                message_id: msg.id,
-                payload: msg.payload.clone(),
-                error: None,
-            })
-        }
-    }
-
-    #[tokio::test]
-    async fn new_context_starts_in_created_state() {
-        let ctx = ActorContext::new(ActorId("a1".into()));
-        assert_eq!(ctx.status, ActorStatus::Created);
-        assert_eq!(ctx.actor_id.0, "a1");
-    }
-
-    #[tokio::test]
-    async fn spawn_and_send_delivers_message_to_actor() {
-        let system = ActorSystem::new();
-        let actor_id = ActorId::from("echo-1");
-        let (actor, received) = EchoActor::new();
-        system.spawn(actor_id.clone(), actor).await.unwrap();
-
-        let msg = ActorMessage::new(actor_id.clone(), "ping".into(), b"data".to_vec());
-        system.send(&actor_id, msg).await.unwrap();
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let received = received.lock().unwrap();
-        assert_eq!(*received, vec!["ping".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn spawn_duplicate_actor_returns_already_exists() {
-        let system = ActorSystem::new();
-        let actor_id = ActorId::from("dup");
-        let (actor, _) = EchoActor::new();
-        system.spawn(actor_id.clone(), actor).await.unwrap();
-
-        let (actor2, _) = EchoActor::new();
-        let err = system.spawn(actor_id.clone(), actor2).await.unwrap_err();
-        assert!(err.to_string().contains("already exists"));
-    }
-
-    #[tokio::test]
-    async fn send_to_unknown_actor_returns_error() {
-        let system = ActorSystem::new();
-        let target = ActorId::from("ghost");
-        let msg = ActorMessage::new(target.clone(), "ping".into(), vec![]);
-        let err = system.send(&target, msg).await.unwrap_err();
-        assert!(err.to_string().contains("not found"));
-    }
-
-    #[tokio::test]
-    async fn call_returns_reply_from_actor() {
-        let system = ActorSystem::new();
-        let actor_id = ActorId::from("echo-2");
-        let (actor, _) = EchoActor::new();
-        system.spawn(actor_id.clone(), actor).await.unwrap();
-
-        let result = system
-            .call(&actor_id, "echo", b"hello".to_vec())
-            .await
-            .unwrap();
-
-        assert_eq!(result.payload, b"hello");
-        assert!(result.error.is_none());
-    }
-
-    #[tokio::test]
-    async fn call_returns_error_when_actor_fails() {
-        let system = ActorSystem::new();
-        let actor_id = ActorId::from("fail-1");
-        let (actor, _) = EchoActor::with_fail("boom");
-        system.spawn(actor_id.clone(), actor).await.unwrap();
-
-        let result = system.call(&actor_id, "boom", vec![]).await.unwrap();
-        assert!(result.error.is_some());
-        assert!(result.error.unwrap().contains("intentional failure"));
-    }
-
-    #[tokio::test]
-    async fn call_returns_error_when_actor_panics() {
-        let system = ActorSystem::new();
-        let actor_id = ActorId::from("panic-1");
-        let (actor, _) = EchoActor::with_panic("explode");
-        system.spawn(actor_id.clone(), actor).await.unwrap();
-
-        let result = system
-            .call(&actor_id, "explode", vec![])
-            .await
-            .unwrap();
-        assert!(result.error.is_some());
-        assert!(result.error.unwrap().contains("panicked"));
-    }
-
-    #[tokio::test]
-    async fn actor_panic_does_not_crash_other_actors() {
-        let system = ActorSystem::new();
-
-        let panic_id = ActorId::from("panic-2");
-        let (panic_actor, _) = EchoActor::with_panic("boom");
-        system.spawn(panic_id.clone(), panic_actor).await.unwrap();
-
-        let healthy_id = ActorId::from("healthy");
-        let (healthy_actor, healthy_received) = EchoActor::new();
-        system
-            .spawn(healthy_id.clone(), healthy_actor)
-            .await
-            .unwrap();
-
-        let _ = system.call(&panic_id, "boom", vec![]).await;
-
-        let result = system
-            .call(&healthy_id, "ping", b"data".to_vec())
-            .await
-            .unwrap();
-        assert_eq!(result.payload, b"data");
-
-        let received = healthy_received.lock().unwrap();
-        assert!(*received == vec!["ping".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn stop_terminates_actor_gracefully() {
-        let system = ActorSystem::new();
-        let actor_id = ActorId::from("stop-1");
-        let (actor, _) = EchoActor::new();
-        system.spawn(actor_id.clone(), actor).await.unwrap();
-
-        assert_eq!(system.actor_status(&actor_id), Some(ActorStatus::Running));
-
-        system.stop(&actor_id).await.unwrap();
-
-        let status = system.actor_status(&actor_id);
-        assert!(
-            status.is_none() || status == Some(ActorStatus::Stopped),
-            "expected None or Stopped, got {:?}",
-            status
-        );
-
-        let msg = ActorMessage::new(actor_id.clone(), "ping".into(), vec![]);
-        assert!(system.send(&actor_id, msg).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn kill_aborts_actor_immediately() {
-        let system = ActorSystem::new();
-        let actor_id = ActorId::from("kill-1");
-        let (actor, _) = EchoActor::new();
-        system.spawn(actor_id.clone(), actor).await.unwrap();
-
-        system.kill(&actor_id).unwrap();
-
-        let msg = ActorMessage::new(actor_id.clone(), "ping".into(), vec![]);
-        assert!(system.send(&actor_id, msg).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn list_actors_returns_all_spawned_actors() {
-        let system = ActorSystem::new();
-        let id1 = ActorId::from("list-1");
-        let id2 = ActorId::from("list-2");
-        let (a1, _) = EchoActor::new();
-        let (a2, _) = EchoActor::new();
-        system.spawn(id1.clone(), a1).await.unwrap();
-        system.spawn(id2.clone(), a2).await.unwrap();
-
-        let mut actors = system.list_actors();
-        actors.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-        assert_eq!(actors.len(), 2);
-        assert_eq!(actors[0].as_str(), "list-1");
-        assert_eq!(actors[1].as_str(), "list-2");
-    }
-
-    #[tokio::test]
-    async fn actor_status_none_for_unknown_actor() {
-        let system = ActorSystem::new();
-        assert_eq!(system.actor_status(&ActorId::from("ghost")), None);
-    }
-
-    #[tokio::test]
-    async fn stop_unknown_actor_is_noop() {
-        let system = ActorSystem::new();
-        system.stop(&ActorId::from("ghost")).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn spawn_emits_actor_started_supervision_event() {
-        let system = ActorSystem::new();
-        let mut rx = system.supervision.event_tx.subscribe();
-
-        let actor_id = ActorId::from("sup-1");
-        let (actor, _) = EchoActor::new();
-        system.spawn(actor_id.clone(), actor).await.unwrap();
-
-        let event = rx.try_recv().expect("should receive ActorStarted event");
-        match event {
-            SupervisionEvent::ActorStarted { actor_id: id } => {
-                assert_eq!(id.as_str(), "sup-1");
-            }
-            _ => panic!("expected ActorStarted, got {:?}", event),
-        }
-    }
-
-    #[tokio::test]
-    async fn stop_emits_actor_stopped_supervision_event() {
-        let system = ActorSystem::new();
-        let actor_id = ActorId::from("sup-2");
-        let (actor, _) = EchoActor::new();
-        system.spawn(actor_id.clone(), actor).await.unwrap();
-
-        let mut rx = system.supervision.event_tx.subscribe();
-        system.stop(&actor_id).await.unwrap();
-
-        let event = rx.try_recv().expect("should receive ActorStopped event");
-        assert!(matches!(event, SupervisionEvent::ActorStopped { .. }));
-    }
-
-    #[tokio::test]
-    async fn actor_failure_emits_actor_failed_supervision_event() {
-        let system = ActorSystem::new();
-        let actor_id = ActorId::from("sup-3");
-        let (actor, _) = EchoActor::with_fail("boom");
-        system.spawn(actor_id.clone(), actor).await.unwrap();
-
-        let mut rx = system.supervision.event_tx.subscribe();
-        let _ = system.call(&actor_id, "boom", vec![]).await;
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let event = rx.try_recv().expect("should receive ActorFailed event");
-        match event {
-            SupervisionEvent::ActorFailed {
-                actor_id: id,
-                error,
-            } => {
-                assert_eq!(id.as_str(), "sup-3");
-                assert!(error.contains("intentional failure"));
-            }
-            _ => panic!("expected ActorFailed, got {:?}", event),
-        }
-    }
-
-    #[tokio::test]
-    async fn multiple_actors_process_messages_concurrently() {
-        let system = ActorSystem::new();
-
-        let id1 = ActorId::from("conc-1");
-        let id2 = ActorId::from("conc-2");
-        let (a1, r1) = EchoActor::new();
-        let (a2, r2) = EchoActor::new();
-        system.spawn(id1.clone(), a1).await.unwrap();
-        system.spawn(id2.clone(), a2).await.unwrap();
-
-        let s1 = system.send(&id1, ActorMessage::new(id1.clone(), "m1".into(), vec![]));
-        let s2 = system.send(&id2, ActorMessage::new(id2.clone(), "m2".into(), vec![]));
-        let (send_r1, send_r2) = tokio::join!(s1, s2);
-        send_r1.unwrap();
-        send_r2.unwrap();
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        assert_eq!(*r1.lock().unwrap(), vec!["m1".to_string()]);
-        assert_eq!(*r2.lock().unwrap(), vec!["m2".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn call_remote_without_network_returns_error() {
-        let system = ActorSystem::new();
-        let target_node = NodeId::from("remote");
-        let result = system
-            .call_remote(&target_node, ActorId::from("a"), "method".into(), vec![])
-            .await;
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("network not configured"));
-    }
-
-    #[tokio::test]
-    async fn with_config_sets_mailbox_capacity() {
-        let config = ActorConfig {
-            mailbox_capacity: 16,
-            ..Default::default()
-        };
-        let system = ActorSystem::new().with_config(config);
-        assert_eq!(system.config.mailbox_capacity, 16);
-    }
-
-    #[tokio::test]
-    async fn with_node_id_stores_node_id() {
-        let system = ActorSystem::new().with_node_id(NodeId::from("node-1"));
-        assert_eq!(system.node_id().unwrap().as_str(), "node-1");
-    }
-
-    #[test]
-    fn supervision_delivers_to_subscriber() {
-        let tree = SupervisionTree::with_capacity(16);
-        let mut rx = tree.event_tx.subscribe();
-
-        tree.emit(SupervisionEvent::ActorStarted {
-            actor_id: ActorId("a1".into()),
-        });
-
-        let event = rx.try_recv().expect("should receive emitted event");
-        match event {
-            SupervisionEvent::ActorStarted { actor_id } => {
-                assert_eq!(actor_id.0, "a1");
-            }
-            _ => panic!("expected ActorStarted, got {:?}", event),
-        }
-    }
-
-    #[test]
-    fn supervision_without_subscribers_is_silent_noop() {
-        let tree = SupervisionTree::with_capacity(16);
-        tree.emit(SupervisionEvent::ActorStarted {
-            actor_id: ActorId("a1".into()),
-        });
-    }
-
-    #[tokio::test]
-    async fn mailbox_send_to_unknown_actor_returns_error() {
-        let registry = MailboxRegistry::new();
-        let target = ActorId("ghost".into());
-        let msg = ActorMessage::new(target.clone(), "ping".into(), b"payload".to_vec());
-        let err = registry.send(&target, msg).await.unwrap_err();
-        assert!(err.to_string().contains("not found in mailbox registry"));
-    }
-
-    #[tokio::test]
-    async fn replay_after_replays_all_wal_events_in_order() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = LmdbStore::open(dir.path()).unwrap();
-        let wal_path = dir.path().join("test.wal");
-        let wal_writer = WalWriter::open(&wal_path).unwrap();
-        let persistence = ActorPersistence::new().with_wal(wal_writer, store);
-
-        let actor_id = ActorId::from("replay-actor");
-        let other_id = ActorId::from("other-actor");
-
-        // 手动写入一个较早的检查点，模拟 checkpoint 之后仍有 WAL 事件的场景。
-        {
-            let checkpoint = persistence.checkpoint.lock();
-            let cm = checkpoint.as_ref().unwrap();
-            cm.save(&ActorSnapshot {
-                actor_id: actor_id.clone(),
-                actor_type: "test".to_string(),
-                state: b"state-1".to_vec(),
-                timestamp: HybridLogicalClock::new().tick(),
-                sequence: 1,
-                wal_offset: 0,
-            })
-            .unwrap();
-        }
-
-        // 追加多个 WAL 事件，并穿插其他 Actor 的事件。
-        persistence
-            .persist(actor_id.clone(), "test".to_string(), b"state-2".to_vec())
-            .await;
-        persistence
-            .persist(
-                other_id.clone(),
-                "test".to_string(),
-                b"other-state".to_vec(),
-            )
-            .await;
-        persistence
-            .persist(actor_id.clone(), "test".to_string(), b"state-3".to_vec())
-            .await;
-
-        // 从检查点 offset 重放，应返回该 Actor 的最终状态。
-        let replayed = persistence.replay_after(actor_id.clone(), 0).await.unwrap();
-        assert_eq!(replayed, b"state-3");
-
-        // 其他 Actor 的事件应独立返回其最终状态。
-        let other_replayed = persistence.replay_after(other_id.clone(), 0).await.unwrap();
-        assert_eq!(other_replayed, b"other-state");
-    }
-}
+#[path = "../../tests/rust/unit/runtime/actor.rs"]
+mod tests;

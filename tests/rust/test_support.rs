@@ -32,6 +32,7 @@ pub struct MockTransport {
     pub subscribed: Arc<Mutex<Vec<String>>>,
 }
 
+#[allow(dead_code)]
 impl MockTransport {
     pub fn new(node_id: &str) -> Self {
         Self {
@@ -134,6 +135,7 @@ pub struct MockScheduler {
     closed: Arc<std::sync::atomic::AtomicBool>,
 }
 
+#[allow(dead_code)]
 impl MockScheduler {
     pub fn new() -> Self {
         Self {

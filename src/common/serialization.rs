@@ -59,3 +59,7 @@ where
 {
     rkyv::from_bytes::<T, RkyvError>(data).map_err(|e| ActantError::Serialization(e.to_string()))
 }
+
+#[cfg(test)]
+#[path = "../../tests/rust/unit/common/serialization.rs"]
+mod tests;

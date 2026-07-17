@@ -46,9 +46,7 @@ fn bench_publish_best_effort(c: &mut Criterion) {
     let mut rx = bus.subscribe(Topic::ClusterHeartbeat);
 
     // 启动消费者
-    rt.spawn(async move {
-        while rx.recv().await.is_some() {}
-    });
+    rt.spawn(async move { while rx.recv().await.is_some() {} });
 
     let mut group = c.benchmark_group("event_bus/publish_best_effort");
     for &n in &[1_000usize, 10_000] {
@@ -73,9 +71,7 @@ fn bench_publish_reliable(c: &mut Criterion) {
     let mut rx = bus.subscribe(Topic::TaskCompleted);
 
     // 启动消费者
-    rt.spawn(async move {
-        while rx.recv().await.is_some() {}
-    });
+    rt.spawn(async move { while rx.recv().await.is_some() {} });
 
     let mut group = c.benchmark_group("event_bus/publish_reliable");
     for &n in &[1_000usize, 10_000] {
@@ -101,9 +97,7 @@ fn bench_publish_fanout(c: &mut Criterion) {
     // 4 个订阅者，各启动消费者
     for _ in 0..4 {
         let mut rx = bus.subscribe(Topic::ClusterHeartbeat);
-        rt.spawn(async move {
-            while rx.recv().await.is_some() {}
-        });
+        rt.spawn(async move { while rx.recv().await.is_some() {} });
     }
 
     let mut group = c.benchmark_group("event_bus/publish_fanout_4");

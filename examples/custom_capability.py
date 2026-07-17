@@ -2,7 +2,7 @@
 
 演示 0.2.0 的扩展能力：
 
-- 用 ``actant.capability(name, kind)`` 声明自定义 capability
+- 用 ``rt.layer(name, kind)`` 直接注册自定义 capability（自动创建 meta）
 - 用 Protocol 约定 handler 签名（``RoutingHandler`` / ``StoreHandler`` 等）
 - 多 handler 链式组合：ask 逆序决策、emit 顺序多播、perform 取末位
 - 用自定义 Store capability 替换内置副作用，无需 Rust 介入
@@ -22,7 +22,6 @@ from actant import (
     Runtime,
     ScheduleCtx,
     ask,
-    capability,
     emit,
     perform,
 )
@@ -43,10 +42,8 @@ class ThrottleCtx:
     capacity: int = 10
 
 
-# 用 ``capability()`` 声明一个全新的 capability（不能与内置重名）。
-# 这里仅演示声明；下方 ``rt.layer("Throttle", "ask")`` 也会自动注册同名 meta。
-_ThrottleMeta = capability("Throttle", "ask")
-assert _ThrottleMeta.kind == "ask"
+# 自定义 capability 通过 ``rt.layer(name, kind)`` 直接注册，
+# layer() 会自动创建 CapabilityMeta 并存入 Runtime._metas，无需单独声明。
 
 
 # ---------------------------------------------------------------------------

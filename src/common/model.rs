@@ -361,146 +361,139 @@ impl TaskCompletion {
     }
 }
 
+/// Actor 间消息返回的结构化错误信封。
+///
+/// 携带错误种类，使调用方可以按错误种类分支处理
+///（如 `NotFound`、`Timeout`），而不必依赖错误字符串前缀匹配。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActorErrorEnvelope {
+    pub kind: ActorErrorKind,
+    pub message: String,
+}
+
+impl std::fmt::Display for ActorErrorEnvelope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.kind.as_str(), self.message)
+    }
+}
+
+impl ActorErrorKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Storage => "storage",
+            Self::StorageIo => "storage_io",
+            Self::Heed => "heed",
+            Self::Network => "network",
+            Self::Serialization => "serialization",
+            Self::Postcard => "postcard",
+            Self::Actor => "actor",
+            Self::Workflow => "workflow",
+            Self::Task => "task",
+            Self::Worker => "worker",
+            Self::Config => "config",
+            Self::Metrics => "metrics",
+            Self::NotFound => "not_found",
+            Self::AlreadyExists => "already_exists",
+            Self::Timeout => "timeout",
+            Self::Cancelled => "cancelled",
+            Self::InvalidState => "invalid_state",
+            Self::Internal => "internal",
+        }
+    }
+}
+
+/// Actor 间错误种类。
+///
+/// 与 [`ActantError`] 的变体一一对应，但专门用于跨 Actor 边界序列化。
+/// 使用 `snake_case` 保证 wire 格式稳定可读。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ActorErrorKind {
+    Storage,
+    StorageIo,
+    Heed,
+    Network,
+    Serialization,
+    Postcard,
+    Actor,
+    Workflow,
+    Task,
+    Worker,
+    Config,
+    Metrics,
+    NotFound,
+    AlreadyExists,
+    Timeout,
+    Cancelled,
+    InvalidState,
+    Internal,
+}
+
+impl From<&crate::common::ActantError> for ActorErrorEnvelope {
+    fn from(err: &crate::common::ActantError) -> Self {
+        use crate::common::ActantError;
+        let (kind, message) = match err {
+            ActantError::Storage(m) => (ActorErrorKind::Storage, m.clone()),
+            ActantError::StorageIo(e) => (ActorErrorKind::StorageIo, e.to_string()),
+            ActantError::Heed(e) => (ActorErrorKind::Heed, e.to_string()),
+            ActantError::Network(m) => (ActorErrorKind::Network, m.clone()),
+            ActantError::Serialization(m) => (ActorErrorKind::Serialization, m.clone()),
+            ActantError::Postcard(e) => (ActorErrorKind::Postcard, e.to_string()),
+            ActantError::Actor(m) => (ActorErrorKind::Actor, m.clone()),
+            ActantError::Workflow(m) => (ActorErrorKind::Workflow, m.clone()),
+            ActantError::Task(m) => (ActorErrorKind::Task, m.clone()),
+            ActantError::Worker(m) => (ActorErrorKind::Worker, m.clone()),
+            ActantError::Config(m) => (ActorErrorKind::Config, m.clone()),
+            ActantError::Metrics(m) => (ActorErrorKind::Metrics, m.clone()),
+            ActantError::NotFound(m) => (ActorErrorKind::NotFound, m.clone()),
+            ActantError::AlreadyExists(m) => (ActorErrorKind::AlreadyExists, m.clone()),
+            ActantError::Timeout(m) => (ActorErrorKind::Timeout, m.clone()),
+            ActantError::Cancelled(m) => (ActorErrorKind::Cancelled, m.clone()),
+            ActantError::InvalidState(m) => (ActorErrorKind::InvalidState, m.clone()),
+            ActantError::Internal(m) => (ActorErrorKind::Internal, m.clone()),
+        };
+        Self { kind, message }
+    }
+}
+
+impl From<crate::common::ActantError> for ActorErrorEnvelope {
+    fn from(err: crate::common::ActantError) -> Self {
+        Self::from(&err)
+    }
+}
+
+impl From<ActorErrorEnvelope> for crate::common::ActantError {
+    fn from(envelope: ActorErrorEnvelope) -> Self {
+        match envelope.kind {
+            ActorErrorKind::Storage => Self::Storage(envelope.message),
+            ActorErrorKind::StorageIo => Self::StorageIo(std::io::Error::other(envelope.message)),
+            ActorErrorKind::Heed => Self::Actor(format!("heed: {}", envelope.message)),
+            ActorErrorKind::Network => Self::Network(envelope.message),
+            ActorErrorKind::Serialization => Self::Serialization(envelope.message),
+            ActorErrorKind::Postcard => Self::Serialization(envelope.message),
+            ActorErrorKind::Actor => Self::Actor(envelope.message),
+            ActorErrorKind::Workflow => Self::Workflow(envelope.message),
+            ActorErrorKind::Task => Self::Task(envelope.message),
+            ActorErrorKind::Worker => Self::Worker(envelope.message),
+            ActorErrorKind::Config => Self::Config(envelope.message),
+            ActorErrorKind::Metrics => Self::Metrics(envelope.message),
+            ActorErrorKind::NotFound => Self::NotFound(envelope.message),
+            ActorErrorKind::AlreadyExists => Self::AlreadyExists(envelope.message),
+            ActorErrorKind::Timeout => Self::Timeout(envelope.message),
+            ActorErrorKind::Cancelled => Self::Cancelled(envelope.message),
+            ActorErrorKind::InvalidState => Self::InvalidState(envelope.message),
+            ActorErrorKind::Internal => Self::Internal(envelope.message),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActorMessageResult {
     pub message_id: MessageId,
     pub payload: Vec<u8>,
-    pub error: Option<String>,
+    pub error: Option<ActorErrorEnvelope>,
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    // --- 访问器与构造器 ---
-
-    #[test]
-    fn test_id_as_str_returns_inner() {
-        let id = TaskId::new("task-123".to_string());
-        assert_eq!(id.as_str(), "task-123");
-    }
-
-    #[test]
-    fn test_id_new_constructs_correctly() {
-        let id = ActorId::new("actor-abc".to_string());
-        assert_eq!(id.as_str(), "actor-abc");
-    }
-
-    #[test]
-    fn test_id_generate_returns_nonempty_uuid() {
-        let id = WorkflowId::generate();
-        assert!(!id.as_str().is_empty());
-        // UUID v4 格式：8-4-4-4-12
-        assert_eq!(id.as_str().len(), 36);
-    }
-
-    #[test]
-    fn test_id_into_inner_consumes() {
-        let id = NodeId::new("node-1".to_string());
-        let inner: String = id.into_inner();
-        assert_eq!(inner, "node-1");
-    }
-
-    // --- From / FromStr / Display ---
-
-    #[test]
-    fn test_id_from_string() {
-        let id = MessageId::from("msg-1".to_string());
-        assert_eq!(id.as_str(), "msg-1");
-    }
-
-    #[test]
-    fn test_id_from_str_ref() {
-        let id = TaskId::from("task-x");
-        assert_eq!(id.as_str(), "task-x");
-    }
-
-    #[test]
-    fn test_id_fromstr_trait() {
-        let id: TaskId = "task-parse".parse().unwrap();
-        assert_eq!(id.as_str(), "task-parse");
-    }
-
-    #[test]
-    fn test_id_display_matches_as_str() {
-        let id = ActorId::new("actor-d".to_string());
-        assert_eq!(format!("{}", id), id.as_str());
-    }
-
-    #[test]
-    fn test_id_as_ref_str() {
-        let id = NodeId::new("node-r".to_string());
-        let s: &str = id.as_ref();
-        assert_eq!(s, "node-r");
-    }
-
-    // --- 序列化往返（serde + postcard）---
-
-    #[test]
-    fn test_id_postcard_roundtrip() {
-        let original = TaskId::new("task-postcard".to_string());
-        let bytes = postcard::to_allocvec::<TaskId>(&original).unwrap();
-        let decoded: TaskId = postcard::from_bytes(&bytes).unwrap();
-        assert_eq!(original, decoded);
-    }
-
-    #[test]
-    fn test_id_serde_json_roundtrip() {
-        let original = WorkflowId::new("wf-json".to_string());
-        let json = serde_json::to_string(&original).unwrap();
-        // transparent 序列化为纯字符串，而非 {"0": "..."}
-        assert_eq!(json, "\"wf-json\"");
-        let decoded: WorkflowId = serde_json::from_str(&json).unwrap();
-        assert_eq!(original, decoded);
-    }
-
-    #[test]
-    fn test_id_serde_transparent_format_unchanged() {
-        // 关键：transparent 保证序列化格式与 pub String 时期一致（纯字符串）。
-        let id = ActorId::new("actor-fmt".to_string());
-        let json = serde_json::to_string(&id).unwrap();
-        assert_eq!(json, "\"actor-fmt\"");
-    }
-
-    // --- rkyv 往返 ---
-
-    #[test]
-    fn test_id_rkyv_roundtrip() {
-        let original = NodeId::new("node-rkyv".to_string());
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&original).unwrap();
-        let decoded: NodeId = rkyv::from_bytes::<NodeId, rkyv::rancor::Error>(&bytes).unwrap();
-        assert_eq!(original, decoded);
-    }
-
-    #[test]
-    fn test_id_rkyv_archived_hash_eq() {
-        // rkyv(derive(Hash, Eq, PartialEq)) 保证归档形式可比较。
-        let a = MessageId::new("msg-1".to_string());
-        let b = MessageId::new("msg-1".to_string());
-        let bytes_a = rkyv::to_bytes::<rkyv::rancor::Error>(&a).unwrap();
-        let bytes_b = rkyv::to_bytes::<rkyv::rancor::Error>(&b).unwrap();
-        let arch_a: &rkyv::Archived<MessageId> =
-            rkyv::access::<rkyv::Archived<MessageId>, rkyv::rancor::Error>(&bytes_a).unwrap();
-        let arch_b: &rkyv::Archived<MessageId> =
-            rkyv::access::<rkyv::Archived<MessageId>, rkyv::rancor::Error>(&bytes_b).unwrap();
-        assert_eq!(arch_a, arch_b);
-    }
-
-    // --- 相等性与 Hash ---
-
-    #[test]
-    fn test_id_eq_and_hash() {
-        let a = TaskId::new("t1".to_string());
-        let b = TaskId::new("t1".to_string());
-        let c = TaskId::new("t2".to_string());
-        assert_eq!(a, b);
-        assert_ne!(a, c);
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut ha = DefaultHasher::new();
-        let mut hb = DefaultHasher::new();
-        a.hash(&mut ha);
-        b.hash(&mut hb);
-        assert_eq!(ha.finish(), hb.finish());
-    }
-}
+#[path = "../../tests/rust/unit/common/model.rs"]
+mod tests;
