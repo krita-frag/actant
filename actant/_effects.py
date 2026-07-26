@@ -141,10 +141,137 @@ def impossible(detail: str = "unreachable") -> NoReturn:
     raise InternalError(f"impossible: {detail}")
 
 
+# ──────────────────────────────────────────────────────────────────
+# 异步 effect：在 asyncio 上下文中并发执行多个 effect，
+# 避免同步 `ask`/`perform` 阻塞 event loop。
+#
+# - Rust-backed capability 且无 Python handler 命中时，转发到 Rust
+#   ``ask_async``/``perform_async``，结果通过 ``asyncio.Future`` 异步返回。
+# - Python handler 命中时，在默认 executor 线程池中执行，避免 GIL 阻塞 loop。
+# ──────────────────────────────────────────────────────────────────
+
+def ask_async(name: str, request: Any) -> Any:
+    """异步决策型 effect：返回 ``asyncio.Future``。
+
+    与 ``ask`` 的区别：返回 awaitable 而非同步结果，使调用方在
+    ``async def`` 函数中可并发执行多个 ask。
+
+    Returns:
+        ``asyncio.Future``，``await`` 后得到 handler 结果或 ``None``。
+
+    Raises:
+        InvalidStateError: 当前未在 Runtime 上下文中，或 capability kind 不匹配，
+            或当前线程无运行中的 asyncio 事件循环。
+        KeyError: capability 未注册。
+
+    用法::
+
+        async def handler():
+            r1 = await ask_async("Routing", ctx1)
+            r2 = await ask_async("Routing", ctx2)
+            # 或并发：
+            r1, r2 = await asyncio.gather(
+                ask_async("Routing", ctx1),
+                ask_async("Routing", ctx2),
+            )
+    """
+    runtime, meta = _resolve_meta(name)
+    if meta.kind != "ask":
+        raise InvalidStateError(
+            f"ask_async: capability {name!r} is {meta.kind!r}, not 'ask'"
+        )
+    return runtime._dispatch_ask_async(name, request)
+
+
+def perform_async(name: str, request: Any) -> Any:
+    """异步副作用型 effect：返回 ``asyncio.Future``。
+
+    与 ``perform`` 的区别：返回 awaitable 而非同步结果，使调用方在
+    ``async def`` 函数中可并发执行多个 perform，避免 GIL 阻塞 event loop。
+
+    Returns:
+        ``asyncio.Future``，``await`` 后得到 handler 结果。
+
+    Raises:
+        InvalidStateError: 当前未在 Runtime 上下文中，或 capability kind 不匹配，
+            或当前线程无运行中的 asyncio 事件循环。
+        KeyError: capability 未注册。
+
+    用法::
+
+        async def handler():
+            # 并发执行 3 个 Store put
+            await asyncio.gather(
+                perform_async("Store", {"op": "put", "key": b"k1", "value": b"v1"}),
+                perform_async("Store", {"op": "put", "key": b"k2", "value": b"v2"}),
+                perform_async("Store", {"op": "put", "key": b"k3", "value": b"v3"}),
+            )
+    """
+    runtime, meta = _resolve_meta(name)
+    if meta.kind != "perform":
+        raise InvalidStateError(
+            f"perform_async: capability {name!r} is {meta.kind!r}, not 'perform'"
+        )
+    return runtime._dispatch_perform_async(name, request)
+
+
+def perform_batch_async(
+    items: list[tuple[str, Any]],
+) -> Any:
+    """异步批量副作用型 effect：返回 ``asyncio.Future``。
+
+    接收 ``(name, request)`` 元组列表，并发执行所有 perform，返回结果列表。
+
+    与循环 ``await perform_async`` 相比，单次边界穿越（Rust-backed 路径），
+    总延迟 ≈ max(单次) 而非 sum(单次)。
+
+    单个 perform 失败不中断批量——失败项在结果列表对应位置为 ``Exception`` 实例。
+
+    Args:
+        items: ``(capability_name, request)`` 元组列表。
+
+    Returns:
+        ``asyncio.Future``，``await`` 后得到结果列表，顺序与输入一致。
+
+    Raises:
+        InvalidStateError: 当前未在 Runtime 上下文中，或当前线程无运行中的
+            asyncio 事件循环。
+
+    用法::
+
+        async def handler():
+            results = await perform_batch_async([
+                ("Store", {"op": "put", "key": b"k1", "value": b"v1"}),
+                ("Store", {"op": "put", "key": b"k2", "value": b"v2"}),
+            ])
+    """
+    if not isinstance(items, list):
+        raise TypeError(
+            f"perform_batch_async: items must be a list, got {type(items).__name__}"
+        )
+    runtime = get_current_runtime()
+    if runtime is None:
+        raise InvalidStateError(
+            "perform_batch_async: no active Runtime; "
+            "wrap your code in `with actant.Runtime() as rt:`"
+        )
+    # 校验每个 item 是 (name, request) 元组
+    for i, item in enumerate(items):
+        if not (isinstance(item, tuple) and len(item) == 2):
+            raise TypeError(
+                f"perform_batch_async: items[{i}] must be a (name, request) tuple, "
+                f"got {type(item).__name__}"
+            )
+    return runtime._dispatch_perform_batch_async(items)
+
+
 __all__ = [
     "ask",
+    "ask_async",
     "effect",
     "emit",
     "impossible",
     "perform",
+    "perform_async",
+    "perform_batch_async",
 ]

@@ -200,6 +200,8 @@ async fn router_handle_peer_connected_publishes_event() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
+        actor_registry_gossip: None,
+        capability_gossip: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
     });
@@ -234,6 +236,8 @@ async fn router_handle_peer_disconnected_publishes_event() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
+        actor_registry_gossip: None,
+        capability_gossip: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
     });
@@ -267,6 +271,8 @@ async fn router_handle_message_unknown_topic_is_noop() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
+        actor_registry_gossip: None,
+        capability_gossip: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
     });
@@ -290,6 +296,8 @@ async fn router_handle_message_heartbeat_publishes_to_event_bus() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
+        actor_registry_gossip: None,
+        capability_gossip: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
     });
@@ -334,6 +342,8 @@ async fn router_handle_task_result_returns_false_without_actor_system() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
+        actor_registry_gossip: None,
+        capability_gossip: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
     });
@@ -489,6 +499,8 @@ fn make_router(node_id: &str) -> (NetworkEventRouter, EventBus, Arc<MockTranspor
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
+        actor_registry_gossip: None,
+        capability_gossip: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
     });
@@ -516,6 +528,8 @@ async fn router_handle_message_cancel_broadcast_sets_cancel_flag() {
             actor_system: None,
             workflow_actor_id: None,
             dag_gossip_actor_id: None,
+            actor_registry_gossip: None,
+            capability_gossip: None,
             cancel_flags: cancel_flags.clone(),
             cancelled_tasks: cancelled_tasks.clone(),
         });
@@ -696,12 +710,11 @@ async fn router_handle_direct_request_task_result_publishes_event() {
 }
 
 #[tokio::test]
-async fn router_handle_direct_request_unknown_forwards_to_event_bus() {
-    let (router, event_bus, _network) = make_router("node-unknown-req");
+async fn router_handle_direct_request_unknown_returns_error_response() {
+    // 未识别 DirectRequest 变体不再转发到 EventBus，而是直接回送 DirectResponse::Error。
+    let (router, _event_bus, network) = make_router("node-unknown-req");
 
     let channel = DirectResponseChannel::test_stub();
-
-    let mut sub = event_bus.subscribe(BusTopic::NetworkDirect);
 
     router
         .handle(NetworkEvent::DirectRequest {
@@ -714,11 +727,14 @@ async fn router_handle_direct_request_unknown_forwards_to_event_bus() {
         })
         .await;
 
-    let event = tokio::time::timeout(Duration::from_millis(500), sub.recv())
-        .await
-        .expect("event published in time")
-        .expect("event present");
-    assert!(matches!(event, BusEvent::DirectRequest { .. }));
+    let responses = network.take_responses();
+    assert_eq!(responses.len(), 1, "should send exactly one error response");
+    match &responses[0].1 {
+        crate::runtime::network::DirectResponse::Error { message } => {
+            assert!(message.contains("no handler for DirectRequest variant"));
+        }
+        other => panic!("expected DirectResponse::Error, got {:?}", other),
+    }
 }
 
 #[tokio::test]
@@ -864,6 +880,8 @@ async fn router_handle_direct_request_dispatch_task_ack_rejected() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
+        actor_registry_gossip: None,
+        capability_gossip: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
     });
@@ -1846,55 +1864,44 @@ impl Scheduler for SequenceScheduler {
 async fn wait_for_task_returns_task_immediately_when_available() {
     let task = make_task_for_completion("t-wait", "wait_task");
     let scheduler: Arc<dyn Scheduler> = Arc::new(SequenceScheduler::new(vec![Some(task.clone())]));
-    let (_tx, mut rx) = tokio::sync::mpsc::channel::<BusEvent>(10);
+    let notify = Arc::new(tokio::sync::Notify::new());
 
-    let result = tokio::time::timeout(Duration::from_millis(100), wait_for_task(&scheduler, &mut rx))
-        .await
-        .expect("should return quickly")
-        .expect("should have a task");
+    let result = tokio::time::timeout(
+        Duration::from_millis(100),
+        wait_for_task(&scheduler, &notify),
+    )
+    .await
+    .expect("should return quickly");
 
     assert_eq!(result.id.as_str(), "t-wait");
 }
 
 #[tokio::test]
-async fn wait_for_task_wakes_on_event_after_empty_dequeue() {
+async fn wait_for_task_wakes_on_notify_after_empty_dequeue() {
     let task = make_task_for_completion("t-wait-event", "wait_event_task");
     let scheduler: Arc<dyn Scheduler> =
         Arc::new(SequenceScheduler::new(vec![None, None, Some(task.clone())]));
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<BusEvent>(10);
+    let notify = Arc::new(tokio::sync::Notify::new());
 
-    // 模拟 SchedulerActor 发布 TaskEnqueued 事件唤醒 wait_for_task
+    // 模拟 SchedulerActor 触发 notify_task_enqueued 唤醒 wait_for_task
+    let notify_clone = Arc::clone(&notify);
     tokio::spawn(async move {
-        // 第一次事件：唤醒后 try_dequeue 返回 None
+        // 第一次 notify：唤醒后 try_dequeue 返回 None
         tokio::time::sleep(Duration::from_millis(10)).await;
-        let _ = tx.send(BusEvent::TaskEnqueued).await;
-        // 第二次事件：唤醒后 try_dequeue 返回 Some(task)
+        notify_clone.notify_waiters();
+        // 第二次 notify：唤醒后 try_dequeue 返回 Some(task)
         tokio::time::sleep(Duration::from_millis(10)).await;
-        let _ = tx.send(BusEvent::TaskEnqueued).await;
+        notify_clone.notify_waiters();
     });
 
-    let result = tokio::time::timeout(Duration::from_millis(500), wait_for_task(&scheduler, &mut rx))
-        .await
-        .expect("should return within timeout")
-        .expect("should have a task");
+    let result = tokio::time::timeout(
+        Duration::from_millis(500),
+        wait_for_task(&scheduler, &notify),
+    )
+    .await
+    .expect("should return within timeout");
 
     assert_eq!(result.id.as_str(), "t-wait-event");
-}
-
-#[tokio::test]
-async fn wait_for_task_returns_none_when_event_bus_closed() {
-    // 当 EventBus 被 drop（所有 sender 关闭），wait_for_task 应返回 None
-    let scheduler: Arc<dyn Scheduler> = Arc::new(SequenceScheduler::new(vec![None]));
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<BusEvent>(10);
-
-    // 立即 drop sender，模拟 EventBus shutdown
-    drop(tx);
-
-    let result = tokio::time::timeout(Duration::from_millis(100), wait_for_task(&scheduler, &mut rx))
-        .await
-        .expect("should return quickly");
-
-    assert!(result.is_none(), "should return None when event bus is closed");
 }
 
 // ───────────────────────── Worker background loops ─────────────────────────
@@ -1916,7 +1923,11 @@ async fn run_task_execution_loop_enters_drain_and_stops() {
     let handle = tokio::spawn(async move {
         // 先 drain 再进入 loop，loop 开头检测到 Draining 会直接退出。
         worker.drain();
-        worker.run_task_execution_loop(&pending_tx).await.unwrap();
+        let notify = worker.event_bus.task_enqueued_notify();
+        worker
+            .run_task_execution_loop(&pending_tx, &notify)
+            .await
+            .unwrap();
     });
 
     tokio::time::timeout(Duration::from_millis(500), handle)
@@ -1933,7 +1944,8 @@ async fn run_task_execution_loop_cancel_signal_triggers_drain() {
     let handle = tokio::spawn(async move {
         // 让 loop 先运行一小段时间，然后 cancel。
         let cancel_tx = worker.cancel.clone();
-        let loop_fut = worker.run_task_execution_loop(&pending_tx);
+        let notify = worker.event_bus.task_enqueued_notify();
+        let loop_fut = worker.run_task_execution_loop(&pending_tx, &notify);
         tokio::pin!(loop_fut);
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_millis(50)) => {

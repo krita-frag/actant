@@ -31,14 +31,18 @@ fn test_build_allowed_peer_ids_trims_and_filters_empty() {
 
 #[test]
 fn test_discovery_from_name_known_modes() {
-    assert!(discovery_from_name(discovery_mode::NONE).is_ok());
-    assert!(discovery_from_name(discovery_mode::LOCAL).is_ok());
-    assert!(discovery_from_name(discovery_mode::MDNS).is_ok());
+    let cfg = NetworkConfig::default();
+    assert!(discovery_from_name(discovery_mode::NONE, &cfg).is_ok());
+    assert!(discovery_from_name(discovery_mode::LOCAL, &cfg).is_ok());
+    assert!(discovery_from_name(discovery_mode::MDNS, &cfg).is_ok());
+    assert!(discovery_from_name(discovery_mode::DNS, &cfg).is_ok());
+    assert!(discovery_from_name(discovery_mode::RELAY, &cfg).is_ok());
 }
 
 #[test]
 fn test_discovery_from_name_unknown_mode() {
-    let err = discovery_from_name("unknown-mode").unwrap_err();
+    let cfg = NetworkConfig::default();
+    let err = discovery_from_name("unknown-mode", &cfg).unwrap_err();
     assert!(matches!(err, ActantError::Config(_)));
     let msg = err.to_string();
     assert!(msg.contains("unknown discovery mode"));
@@ -76,15 +80,8 @@ async fn test_send_direct_request_returns_timeout_for_unreachable_peer() {
         discovery_mode: crate::common::DiscoveryMode::parse(discovery_mode::NONE).unwrap(),
         listen_ip: "127.0.0.1".into(),
         listen_port: 0,
-        bootstrap_nodes: vec![],
-        gossip_bootstrap_peers: vec![],
-        hlc_max_drift_ms: 500,
-        max_message_size: 1024 * 1024,
         direct_request_timeout_ms: 100,
-        max_pending_direct_requests: 16,
-        allowed_peer_ids: vec![],
-        capability_gossip_interval_ms: NetworkConfig::DEFAULT_CAPABILITY_GOSSIP_INTERVAL_MS,
-        event_channel_capacity: NetworkConfig::DEFAULT_EVENT_CHANNEL_CAPACITY,
+        ..NetworkConfig::default()
     };
 
     let manager = NetworkManager::new(NodeId::from("test-node"), config)
@@ -114,15 +111,8 @@ async fn test_network_manager_listen_addresses_roundtrip() {
         discovery_mode: crate::common::DiscoveryMode::parse(discovery_mode::NONE).unwrap(),
         listen_ip: "127.0.0.1".into(),
         listen_port: 0,
-        bootstrap_nodes: vec![],
-        gossip_bootstrap_peers: vec![],
-        hlc_max_drift_ms: 500,
-        max_message_size: 1024 * 1024,
         direct_request_timeout_ms: 100,
-        max_pending_direct_requests: 16,
-        allowed_peer_ids: vec![],
-        capability_gossip_interval_ms: NetworkConfig::DEFAULT_CAPABILITY_GOSSIP_INTERVAL_MS,
-        event_channel_capacity: NetworkConfig::DEFAULT_EVENT_CHANNEL_CAPACITY,
+        ..NetworkConfig::default()
     };
 
     let manager = NetworkManager::new(NodeId::from("test-node"), config)
@@ -148,15 +138,8 @@ async fn test_network_manager_node_id_and_peer_id() {
         discovery_mode: crate::common::DiscoveryMode::parse(discovery_mode::NONE).unwrap(),
         listen_ip: "127.0.0.1".into(),
         listen_port: 0,
-        bootstrap_nodes: vec![],
-        gossip_bootstrap_peers: vec![],
-        hlc_max_drift_ms: 500,
-        max_message_size: 1024 * 1024,
         direct_request_timeout_ms: 100,
-        max_pending_direct_requests: 16,
-        allowed_peer_ids: vec![],
-        capability_gossip_interval_ms: NetworkConfig::DEFAULT_CAPABILITY_GOSSIP_INTERVAL_MS,
-        event_channel_capacity: NetworkConfig::DEFAULT_EVENT_CHANNEL_CAPACITY,
+        ..NetworkConfig::default()
     };
 
     let manager = NetworkManager::new(NodeId::from("test-node"), config)
@@ -226,49 +209,81 @@ fn is_registered_returns_true_for_builtin_modes() {
     assert!(is_registered(discovery_mode::NONE));
     assert!(is_registered(discovery_mode::LOCAL));
     assert!(is_registered(discovery_mode::MDNS));
+    assert!(is_registered(discovery_mode::DNS));
+    assert!(is_registered(discovery_mode::RELAY));
 }
 
 #[test]
 fn is_registered_returns_false_for_unknown_mode() {
     assert!(!is_registered("unknown"));
     assert!(!is_registered(""));
-    assert!(!is_registered("dns"));
+    assert!(!is_registered("DNS-over-HTTPS"));
 }
 
 #[test]
 fn registered_names_contains_all_builtin_modes() {
     let names = registered_names();
-    assert_eq!(names.len(), 3);
+    assert_eq!(names.len(), 5);
     assert!(names.contains(&discovery_mode::NONE.to_string()));
     assert!(names.contains(&discovery_mode::LOCAL.to_string()));
     assert!(names.contains(&discovery_mode::MDNS.to_string()));
+    assert!(names.contains(&discovery_mode::DNS.to_string()));
+    assert!(names.contains(&discovery_mode::RELAY.to_string()));
 }
 
 // ───────────────────────── discovery_from_name ─────────────────────────
 
 #[test]
 fn discovery_from_name_none_returns_no_discovery() {
-    let d = discovery_from_name(discovery_mode::NONE).unwrap();
+    let cfg = NetworkConfig::default();
+    let d = discovery_from_name(discovery_mode::NONE, &cfg).unwrap();
     assert_eq!(d.name(), discovery_mode::NONE);
 }
 
 #[test]
 fn discovery_from_name_local_returns_local_discovery() {
-    let d = discovery_from_name(discovery_mode::LOCAL).unwrap();
+    let cfg = NetworkConfig::default();
+    let d = discovery_from_name(discovery_mode::LOCAL, &cfg).unwrap();
     assert_eq!(d.name(), discovery_mode::LOCAL);
 }
 
 #[test]
 fn discovery_from_name_mdns_returns_mdns_discovery() {
-    let d = discovery_from_name(discovery_mode::MDNS).unwrap();
+    let cfg = NetworkConfig::default();
+    let d = discovery_from_name(discovery_mode::MDNS, &cfg).unwrap();
     assert_eq!(d.name(), discovery_mode::MDNS);
 }
 
 #[test]
+fn discovery_from_name_dns_returns_dns_discovery() {
+    let cfg = NetworkConfig::default();
+    let d = discovery_from_name(discovery_mode::DNS, &cfg).unwrap();
+    assert_eq!(d.name(), discovery_mode::DNS);
+}
+
+#[test]
+fn discovery_from_name_dns_uses_custom_origin_domain() {
+    let cfg = NetworkConfig {
+        dns_origin_domain: "actant.internal.example.com".to_string(),
+        ..Default::default()
+    };
+    let d = discovery_from_name(discovery_mode::DNS, &cfg).unwrap();
+    assert_eq!(d.name(), discovery_mode::DNS);
+}
+
+#[test]
+fn discovery_from_name_relay_returns_relay_discovery() {
+    let cfg = NetworkConfig::default();
+    let d = discovery_from_name(discovery_mode::RELAY, &cfg).unwrap();
+    assert_eq!(d.name(), discovery_mode::RELAY);
+}
+
+#[test]
 fn discovery_from_name_case_sensitive() {
+    let cfg = NetworkConfig::default();
     // 大写不应匹配
-    assert!(discovery_from_name("NONE").is_err());
-    assert!(discovery_from_name("Local").is_err());
+    assert!(discovery_from_name("NONE", &cfg).is_err());
+    assert!(discovery_from_name("Local", &cfg).is_err());
 }
 
 // ───────────────────────── topic_id_from_str ─────────────────────────
@@ -487,15 +502,8 @@ async fn network_manager_subscribe_to_topic_succeeds() {
         discovery_mode: crate::common::DiscoveryMode::parse(discovery_mode::NONE).unwrap(),
         listen_ip: "127.0.0.1".into(),
         listen_port: 0,
-        bootstrap_nodes: vec![],
-        gossip_bootstrap_peers: vec![],
-        hlc_max_drift_ms: 500,
-        max_message_size: 1024 * 1024,
         direct_request_timeout_ms: 100,
-        max_pending_direct_requests: 16,
-        allowed_peer_ids: vec![],
-        capability_gossip_interval_ms: NetworkConfig::DEFAULT_CAPABILITY_GOSSIP_INTERVAL_MS,
-        event_channel_capacity: NetworkConfig::DEFAULT_EVENT_CHANNEL_CAPACITY,
+        ..NetworkConfig::default()
     };
 
     let manager = NetworkManager::new(NodeId::from("test-sub"), config)
@@ -516,15 +524,8 @@ async fn network_manager_broadcast_after_subscribe_succeeds() {
         discovery_mode: crate::common::DiscoveryMode::parse(discovery_mode::NONE).unwrap(),
         listen_ip: "127.0.0.1".into(),
         listen_port: 0,
-        bootstrap_nodes: vec![],
-        gossip_bootstrap_peers: vec![],
-        hlc_max_drift_ms: 500,
-        max_message_size: 1024 * 1024,
         direct_request_timeout_ms: 100,
-        max_pending_direct_requests: 16,
-        allowed_peer_ids: vec![],
-        capability_gossip_interval_ms: NetworkConfig::DEFAULT_CAPABILITY_GOSSIP_INTERVAL_MS,
-        event_channel_capacity: NetworkConfig::DEFAULT_EVENT_CHANNEL_CAPACITY,
+        ..NetworkConfig::default()
     };
 
     let manager = NetworkManager::new(NodeId::from("test-bcast"), config)
@@ -547,15 +548,8 @@ async fn network_manager_broadcast_without_subscribe_returns_error() {
         discovery_mode: crate::common::DiscoveryMode::parse(discovery_mode::NONE).unwrap(),
         listen_ip: "127.0.0.1".into(),
         listen_port: 0,
-        bootstrap_nodes: vec![],
-        gossip_bootstrap_peers: vec![],
-        hlc_max_drift_ms: 500,
-        max_message_size: 1024 * 1024,
         direct_request_timeout_ms: 100,
-        max_pending_direct_requests: 16,
-        allowed_peer_ids: vec![],
-        capability_gossip_interval_ms: NetworkConfig::DEFAULT_CAPABILITY_GOSSIP_INTERVAL_MS,
-        event_channel_capacity: NetworkConfig::DEFAULT_EVENT_CHANNEL_CAPACITY,
+        ..NetworkConfig::default()
     };
 
     let manager = NetworkManager::new(NodeId::from("test-nosub"), config)
@@ -714,15 +708,8 @@ fn test_network_config() -> NetworkConfig {
         discovery_mode: crate::common::DiscoveryMode::parse(discovery_mode::NONE).unwrap(),
         listen_ip: "127.0.0.1".into(),
         listen_port: 0,
-        bootstrap_nodes: vec![],
-        gossip_bootstrap_peers: vec![],
-        hlc_max_drift_ms: 500,
-        max_message_size: 1024 * 1024,
         direct_request_timeout_ms: 100,
-        max_pending_direct_requests: 16,
-        allowed_peer_ids: vec![],
-        capability_gossip_interval_ms: NetworkConfig::DEFAULT_CAPABILITY_GOSSIP_INTERVAL_MS,
-        event_channel_capacity: NetworkConfig::DEFAULT_EVENT_CHANNEL_CAPACITY,
+        ..NetworkConfig::default()
     }
 }
 

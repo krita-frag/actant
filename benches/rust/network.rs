@@ -18,8 +18,8 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 
 // wire 模块本身是 pub(crate)，类型通过 common 的 #[doc(hidden)] re-export 暴露
 // 供测试与基准测试使用。
-use actant::common::{NodeId, TaskDefinition, TaskId, WorkflowId};
 use actant::common::{NodeHeartbeat, WireEnvelope, WireMessage};
+use actant::common::{NodeId, TaskDefinition, TaskId, WorkflowId};
 
 /// 构造一个典型大小的 TaskDispatch 消息（payload 256 字节）。
 fn make_task_dispatch() -> WireMessage {
@@ -61,18 +61,26 @@ fn bench_wrap(c: &mut Criterion) {
     let heartbeat = make_node_heartbeat();
 
     let mut group = c.benchmark_group("network/wrap");
-    group.bench_with_input(BenchmarkId::new("task_dispatch", "256B"), &dispatch, |b, msg| {
-        b.iter(|| {
-            let env = WireEnvelope::wrap(black_box(msg.clone()));
-            black_box(env);
-        });
-    });
-    group.bench_with_input(BenchmarkId::new("node_heartbeat", "10wf"), &heartbeat, |b, msg| {
-        b.iter(|| {
-            let env = WireEnvelope::wrap(black_box(msg.clone()));
-            black_box(env);
-        });
-    });
+    group.bench_with_input(
+        BenchmarkId::new("task_dispatch", "256B"),
+        &dispatch,
+        |b, msg| {
+            b.iter(|| {
+                let env = WireEnvelope::wrap(black_box(msg.clone()));
+                black_box(env);
+            });
+        },
+    );
+    group.bench_with_input(
+        BenchmarkId::new("node_heartbeat", "10wf"),
+        &heartbeat,
+        |b, msg| {
+            b.iter(|| {
+                let env = WireEnvelope::wrap(black_box(msg.clone()));
+                black_box(env);
+            });
+        },
+    );
     group.finish();
 }
 
@@ -115,21 +123,20 @@ fn bench_round_trip(c: &mut Criterion) {
     let dispatch = make_task_dispatch();
 
     let mut group = c.benchmark_group("network/round_trip");
-    group.bench_with_input(BenchmarkId::new("task_dispatch", "256B"), &dispatch, |b, msg| {
-        b.iter(|| {
-            let env = WireEnvelope::wrap(black_box(msg.clone()));
-            let bytes = postcard::to_allocvec(&env).unwrap();
-            let decoded = WireEnvelope::decode(black_box(&bytes));
-            black_box(decoded);
-        });
-    });
+    group.bench_with_input(
+        BenchmarkId::new("task_dispatch", "256B"),
+        &dispatch,
+        |b, msg| {
+            b.iter(|| {
+                let env = WireEnvelope::wrap(black_box(msg.clone()));
+                let bytes = postcard::to_allocvec(&env).unwrap();
+                let decoded = WireEnvelope::decode(black_box(&bytes));
+                black_box(decoded);
+            });
+        },
+    );
     group.finish();
 }
 
-criterion_group!(
-    network_benches,
-    bench_wrap,
-    bench_decode,
-    bench_round_trip,
-);
+criterion_group!(network_benches, bench_wrap, bench_decode, bench_round_trip,);
 criterion_main!(network_benches);

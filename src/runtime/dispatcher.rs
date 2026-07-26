@@ -74,6 +74,8 @@ impl TaskThreadPool {
     /// 非 daemon，进程退出时仍会等待，但调用方不会被无限阻塞）。
     fn shutdown_and_wait(&mut self, timeout: std::time::Duration) {
         // 替换 sender 为无关的新 channel，原 sender 被 drop。
+        // mem::replace 总是返回旧值，此处明确丢弃旧 sender 以触发 worker
+        // 退出路径（drop sender → channel 关闭 → recv 返回 Err）。
         let (dummy_tx, _) = crossbeam_channel::bounded::<Job>(0);
         let _ = std::mem::replace(&mut self.sender, dummy_tx);
         let workers = std::mem::take(&mut self.workers);
@@ -81,7 +83,12 @@ impl TaskThreadPool {
             return;
         }
         // 在独立线程中 join 所有 worker，主线程通过 channel 超时等待。
+        // 在 workers 被 move 进 spawn 闭包前捕获数量，供超时日志使用。
+        let worker_count = workers.len();
         let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(1);
+        // spawn 失败仅发生在 OS 资源耗尽（OOM/thread limit），此时 worker
+        // 线程仍会自行退出（sender 已 drop）；done_tx 不会发送，主线程将
+        // 走 timeout 路径。失败信息由 OS 通过其他渠道报错。
         let _ = std::thread::Builder::new()
             .name("actant-task-pool-shutdown".into())
             .spawn(move || {
@@ -90,6 +97,8 @@ impl TaskThreadPool {
                         tracing::warn!("task worker thread join failed: {:?}", e);
                     }
                 }
+                // done_tx.send 失败仅当 done_rx 被 drop（主线程已 timeout 退出），
+                // 属正常竞争路径，无需处理。
                 let _ = done_tx.send(());
             });
         match done_rx.recv_timeout(timeout) {
@@ -99,7 +108,7 @@ impl TaskThreadPool {
                     "task thread pool shutdown timed out after {:?}; \
                      abandoning {} worker thread(s) still running",
                     timeout,
-                    self.workers.len(),
+                    worker_count,
                 );
             }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {

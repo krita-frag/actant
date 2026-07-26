@@ -43,4 +43,6 @@ pub use failover::{FailoverManager, PeerInfo};
 pub use gossip::DagGossip;
 pub(crate) use orchestrator::Orchestrator;
 pub use runtime::{Worker, WorkerState};
+#[doc(hidden)]
+pub use scheduler::spawn_fast_path_scheduler;
 pub use scheduler::{is_registered, registered_names, ActorScheduler, Scheduler};

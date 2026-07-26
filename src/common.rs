@@ -1,3 +1,4 @@
+pub(crate) mod backoff;
 pub(crate) mod config;
 pub(crate) mod error;
 pub(crate) mod model;
@@ -37,11 +38,13 @@ pub fn should_claim_workflow(
     candidate_ids[idx] == my_node_id
 }
 
+pub use backoff::{ExponentialBackoff, REMOTE_CALL_MAX_RETRY_DELAY};
 pub use config::{
     discovery_mode, scheduler_kind, ActantConfig, ActorConfig, DiscoveryMode, FailoverConfig,
-    GossipConfig, NetworkConfig, SchedulerKind, StoreConfig, WorkerConfig, WorkflowConfig,
+    GossipConfig, NetworkConfig, SchedulerKind, StoreConfig, SyncMode, WorkerConfig,
+    WorkflowConfig,
 };
-pub use error::{ActantError, Result};
+pub use error::{format_error_kind, ActantError, Result};
 pub use wire::TopicRoute;
 // 领域类型 — 公共 API
 pub use model::{
@@ -60,8 +63,10 @@ pub use payload::{
     TAG_UPSTREAM_PREFIX,
 };
 pub use serialization::MAX_DECODE_SIZE;
-pub use serialization::{decode_postcard, deserialize_rkyv_value, serialize_rkyv};
+pub use serialization::{decode_postcard, deserialize_rkyv_value, encode_postcard, serialize_rkyv};
+pub use wire::set_wire_signing_key;
 pub use wire::WireTaskOutcome;
+pub use wire::{current_trace_scope, TraceContext, TraceScopeGuard};
 
 // 仅供测试使用的内部类型 — 不属于稳定公共 API
 #[doc(hidden)]

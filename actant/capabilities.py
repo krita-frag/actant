@@ -14,17 +14,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal, Protocol, runtime_checkable
 
-# ============================================================================
-# Effect 类型
-# ============================================================================
-
 EffectKind = Literal["ask", "perform", "emit"]
 
-
-# ============================================================================
-# Capability 名称常量
-# ============================================================================
-#
 # 这些常量用于避免在 ``ask``/``perform``/``emit`` 调用中硬编码魔法字符串，
 # 提供 IDE 自动补全与编译期拼写检查。值与 ``BUILTIN_CAPABILITIES`` 的键一致。
 # 用法：``ask(actant.ROUTING, RouteCtx(...))`` 而非 ``ask("Routing", ...)``。
@@ -58,12 +49,6 @@ class CapabilityMeta:
     name: str
     kind: EffectKind
 
-
-# ============================================================================
-# 请求/响应数据类
-# ============================================================================
-
-
 @dataclass
 class RouteCtx:
     """`Routing` capability 的请求上下文。"""
@@ -91,7 +76,6 @@ class RetryCtx:
     attempt: int
     last_error: str
     max_retries: int
-
 
 @dataclass
 class SerializationReq:
@@ -143,12 +127,6 @@ class ExecuteOutcome:
     result_payload: bytes
     error_payload: bytes = b""
 
-
-# ============================================================================
-# 事件类型（emit capability 的请求）
-# ============================================================================
-
-
 @dataclass
 class TaskEvent:
     """`TaskLifecycle` capability 的事件。"""
@@ -181,7 +159,7 @@ class NodeEvent:
     timestamp_ms: int = 0
 
 
-# ── Actor 相关 capability 的请求/事件类型 ─────────────────────────────────
+# Actor 相关 capability 的请求/事件类型
 # 以下类型对应 Rust `ActorMessaging` / `ActorSupervision` / `ActorLifecycle`
 # capability，PyO3 codec 已在 `src/py/types.rs` 中实现。Python 层声明这些
 # dataclass 仅用于类型注解与运行时 isinstance 校验，实际编码由 Rust 完成。
@@ -226,12 +204,6 @@ class ActorEvent:
     name: str = ""
     error: str = ""
     attempt: int = 0
-
-
-# ============================================================================
-# Capability Protocol 声明
-# ============================================================================
-
 
 @runtime_checkable
 class RoutingHandler(Protocol):
@@ -322,11 +294,6 @@ class ActorLifecycleHandler(Protocol):
     """反应型：Actor 生命周期事件订阅。"""
 
     def __call__(self, event: ActorEvent) -> None: ...
-
-
-# ============================================================================
-# 内置 Capability 注册表
-# ============================================================================
 
 #: 所有内置 capability 的元数据。
 #:

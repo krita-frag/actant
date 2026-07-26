@@ -7,6 +7,7 @@
 CLI 保持极简：只负责 worker 启动与状态查询（节点、任务、集群），不直接执行或
 提交任务。任务提交应通过用户代码调用 `task.submit()` / `flow()` 完成。
 """
+
 from __future__ import annotations
 
 import argparse
@@ -41,8 +42,7 @@ def _print_task_event(event: TaskEvent) -> None:
     if event.error:
         suffix += f" error={event.error}"
     print(
-        f"[task] {event.kind:<10} id={event.task_id} "
-        f"wf={event.workflow_id or '-'}{suffix}",
+        f"[task] {event.kind:<10} id={event.task_id} wf={event.workflow_id or '-'}{suffix}",
         file=sys.stderr,
     )
 
@@ -84,10 +84,7 @@ def _build_config(args: argparse.Namespace) -> Any:
     )
 
     network = None
-    if any(
-        getattr(args, k, None) is not None
-        for k in ("bootstrap_nodes", "listen_port")
-    ):
+    if any(getattr(args, k, None) is not None for k in ("bootstrap_nodes", "listen_port")):
         network = _NetworkConfig(
             bootstrap_nodes=_split_comma(args.bootstrap_nodes),
             listen_port=args.listen_port or 0,
@@ -95,8 +92,7 @@ def _build_config(args: argparse.Namespace) -> Any:
 
     failover = None
     if any(
-        getattr(args, k, None) is not None
-        for k in ("heartbeat_interval_ms", "failure_timeout_ms")
+        getattr(args, k, None) is not None for k in ("heartbeat_interval_ms", "failure_timeout_ms")
     ):
         failover = _FailoverConfig(
             heartbeat_interval_ms=args.heartbeat_interval_ms,
@@ -123,11 +119,54 @@ def _split_comma(value: str | None) -> list[str] | None:
     return [v.strip() for v in value.split(",") if v.strip()]
 
 
+def cmd_metrics(args: argparse.Namespace) -> int:
+    """启动独立的 Prometheus HTTP exporter。
+
+    仅暴露 ``/metrics`` 端点，不启动 worker；适合在边车或测试场景中
+    验证 exporter 配置（OTLP 端点、Prometheus 抓取）。无 worker 运行时，
+    抓取到的指标只有 SDK 启动时初始化的零值计数器。
+
+    若需在 worker 中同时暴露指标，使用 ``actant worker --metrics-port``。
+    """
+    _configure_logging(args.log_level)
+
+    # 必须创建一个 _RuntimeCore 以触发 metrics::init()——否则全局 registry 为空，
+    # /metrics 返回空字符串。轻量：不订阅任务 topic，不参与 P2P 发现。
+    rt = actant.Runtime.with_defaults(name=f"metrics-{os.getpid()}")
+    rt.start()
+    # 不调用 rt.serve()——不参与 worker 调度循环。
+
+    actual_port = rt.start_metrics_server(args.port)
+    print(
+        f"actant metrics exporter listening on http://0.0.0.0:{actual_port}/metrics",
+        file=sys.stderr,
+    )
+    print("press Ctrl+C to shutdown", file=sys.stderr)
+
+    stop_event = threading.Event()
+
+    def _handle_signal(_signum: int, _frame: object) -> None:
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
+
+    stop_event.wait()
+    print("shutting down...", file=sys.stderr)
+    rt.stop()
+    print("stopped", file=sys.stderr)
+    return 0
+
+
 def cmd_worker(args: argparse.Namespace) -> int:
     """启动一个 Worker 节点作为后台常驻进程。
 
     节点启动后通过 P2P 自动发现对端，订阅任务 topic 并执行分配到本节点的任务。
     SIGINT/SIGTERM 触发优雅 drain（等待在途任务完成）后退出。
+
+    若指定 ``--metrics-port``，会在该端口启动一个 HTTP 服务器暴露
+    Prometheus exposition format（``/metrics`` 端点），供 Prometheus 抓取。
+    服务器在独立线程中运行，不阻塞 worker 主循环。
     """
     _configure_logging(args.log_level)
 
@@ -142,10 +181,20 @@ def cmd_worker(args: argparse.Namespace) -> int:
     rt.start()
     rt.serve()  # 非阻塞：worker.run() 在 tokio 后台 spawn
 
+    # 可选：启动 Prometheus HTTP exporter。
+    metrics_port = None
+    if args.metrics_port:
+        metrics_port = rt.start_metrics_server(args.metrics_port)
+
     node_id = rt.node_id
     print(f"actant worker started: node_id={node_id}", file=sys.stderr)
     if args.data_dir:
         print(f"data_dir: {args.data_dir}", file=sys.stderr)
+    if metrics_port is not None:
+        print(
+            f"metrics: http://0.0.0.0:{metrics_port}/metrics",
+            file=sys.stderr,
+        )
     print("P2P auto-discovery active (no central server needed)", file=sys.stderr)
     print("press Ctrl+C to drain in-flight tasks and shutdown", file=sys.stderr)
 
@@ -312,6 +361,12 @@ def _add_worker_args(p: argparse.ArgumentParser) -> None:
         default=None,
         help="故障转移超时判定毫秒",
     )
+    p.add_argument(
+        "--metrics-port",
+        type=int,
+        default=None,
+        help="若指定，在该端口启动 Prometheus HTTP exporter（/metrics 端点）",
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -358,6 +413,24 @@ def main(argv: list[str] | None = None) -> int:
 
     p_version = sub.add_parser("version", help="显示版本号")
     p_version.set_defaults(func=cmd_version)
+
+    p_metrics = sub.add_parser(
+        "metrics",
+        help="启动独立的 Prometheus HTTP exporter（/metrics 端点）",
+    )
+    p_metrics.add_argument(
+        "--port",
+        type=int,
+        default=9100,
+        help="HTTP 监听端口（默认 9100）",
+    )
+    p_metrics.add_argument(
+        "--log-level",
+        default="info",
+        choices=["debug", "info", "warning", "error"],
+        help="Python 侧日志级别",
+    )
+    p_metrics.set_defaults(func=cmd_metrics)
 
     args = parser.parse_args(argv)
     if not hasattr(args, "func"):

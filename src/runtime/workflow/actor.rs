@@ -97,9 +97,11 @@ impl Actor for WorkflowActor {
 
     async fn on_stop(&mut self) -> Result<()> {
         if let Some(tx) = self.timeout_cancel.take() {
+            // send 失败仅当 receiver 已 drop（子任务已退出），无需通知。
             let _ = tx.send(true);
         }
         if let Some(tx) = self.persist_cancel.take() {
+            // 同上：子任务已退出时 send 返回 Err，丢弃合理。
             let _ = tx.send(true);
         }
         // 停止前同步落盘所有脏状态，确保 graceful shutdown 不丢数据。
@@ -276,7 +278,13 @@ pub mod scheduler_methods {
     pub const IS_CLOSED: &str = "is_closed";
 }
 
-enum InnerScheduler {
+/// 调度器内部队列状态。
+///
+/// `pub(crate)` 以允许 [`crate::runtime::workflow::ActorScheduler`] 通过
+/// `Arc<InnerScheduler>` 共享直接访问 `enqueue` 快路径，绕过 Actor 消息往返。
+/// `dequeue` / `close` 等仍由 `SchedulerActor` 通过消息协议处理，保证
+/// 单消费者语义与 Worker 唤醒协调。
+pub(crate) enum InnerScheduler {
     Fifo {
         queue: parking_lot::Mutex<std::collections::VecDeque<TaskDefinition>>,
         notify: tokio::sync::Notify,
@@ -311,7 +319,24 @@ impl InnerScheduler {
         }
     }
 
-    fn is_closed(&self) -> bool {
+    /// 原地将 FIFO 切换为优先级队列策略。
+    ///
+    /// 保留 `closed` 标志（若已关闭）和 `notify`（若有等待者）：
+    /// `with_priority` 在 Actor 构造阶段调用，此时无等待者、未关闭，
+    /// 因此直接重建为 Priority 变体是安全的。
+    fn switch_to_priority(&mut self) {
+        // 仅在当前为 Fifo 时切换；已是 Priority 则 no-op。
+        if matches!(self, Self::Priority { .. }) {
+            return;
+        }
+        *self = Self::Priority {
+            queues: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
+            notify: tokio::sync::Notify::new(),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        };
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
         use std::sync::atomic::Ordering;
         match self {
             Self::Fifo { closed, .. } | Self::Priority { closed, .. } => {
@@ -320,7 +345,7 @@ impl InnerScheduler {
         }
     }
 
-    fn close(&self) {
+    pub(crate) fn close(&self) {
         use std::sync::atomic::Ordering;
         match self {
             Self::Fifo { closed, notify, .. } | Self::Priority { closed, notify, .. } => {
@@ -339,7 +364,7 @@ impl InnerScheduler {
         Ok(())
     }
 
-    fn enqueue(&self, mut task: TaskDefinition) -> Result<()> {
+    pub(crate) fn enqueue(&self, mut task: TaskDefinition) -> Result<()> {
         self.check_closed()?;
         task.enqueued_at_ms = crate::common::epoch_millis();
         match self {
@@ -356,7 +381,7 @@ impl InnerScheduler {
         Ok(())
     }
 
-    fn enqueue_batch(&self, tasks: Vec<TaskDefinition>) -> Result<()> {
+    pub(crate) fn enqueue_batch(&self, tasks: Vec<TaskDefinition>) -> Result<()> {
         self.check_closed()?;
         if tasks.is_empty() {
             return Ok(());
@@ -504,10 +529,16 @@ impl InnerScheduler {
 }
 
 /// 调度状态完全内化的 Actor，负责任务队列的入队/出队与状态维护。
+///
+/// `inner` 以 `Arc` 持有，使得 [`crate::runtime::workflow::ActorScheduler`]
+/// 可获取共享引用实现 `enqueue` 快路径——直接调用 [`InnerScheduler::enqueue`]
+/// 的同步方法，绕过 Actor 消息往返（postcard 编解码 + 邮箱调度 + 响应通道）。
+/// 快路径在入队后仍通过 [`Self::notify_task_enqueued`] 的等价路径触发 Worker 唤醒：
+/// `InnerScheduler::enqueue` 内部调用 `notify.notify_one()`，与 Actor 路径一致。
 pub struct SchedulerActor {
-    inner: InnerScheduler,
-    /// 用于发布 `TaskEnqueued` 事件唤醒 Worker 的 EventBus。
-    /// `None` 时（如纯单元测试）退化为无事件发布，Worker 需自行轮询。
+    inner: Arc<InnerScheduler>,
+    /// 用于触发 `TaskEnqueued` 唤醒信号（`Notify`）的 EventBus。
+    /// `None` 时（如纯单元测试）退化为无信号触发，Worker 需自行轮询。
     /// 生产路径由 `init_worker` 注入与 Worker 共享的 EventBus。
     event_bus: Option<EventBus>,
 }
@@ -515,45 +546,72 @@ pub struct SchedulerActor {
 impl SchedulerActor {
     pub fn fifo() -> Self {
         Self {
-            inner: InnerScheduler::fifo(),
+            inner: Arc::new(InnerScheduler::fifo()),
             event_bus: None,
         }
     }
 
     pub fn priority() -> Self {
         Self {
-            inner: InnerScheduler::priority(),
+            inner: Arc::new(InnerScheduler::priority()),
             event_bus: None,
         }
     }
 
     /// 用给定的 EventBus 构造 FIFO SchedulerActor。
     ///
-    /// `enqueue` / `enqueue_batch` / `close` 后会向 EventBus 发布
-    /// `BusEvent::TaskEnqueued` 事件，使订阅 `Topic::TaskEnqueued` 的 Worker
-    /// 立即被唤醒。通过 EventBus 事件 + 非阻塞 `try_dequeue` 组合，
+    /// `enqueue` / `enqueue_batch` / `close` 后会调用
+    /// `notify_task_enqueued()` 触发 `Notify` 信号，使正在
+    /// `.notified().await` 的 Worker 立即被唤醒。
+    /// 通过 Notify 信号 + 非阻塞 `try_dequeue` 组合，
     /// 避免直接调用 `dequeue()` 阻塞 Actor 邮箱导致的死锁。
     pub fn with_event_bus(event_bus: EventBus) -> Self {
         Self {
-            inner: InnerScheduler::fifo(),
+            inner: Arc::new(InnerScheduler::fifo()),
             event_bus: Some(event_bus),
         }
     }
 
     /// 设置优先级调度策略并返回 self（builder 风格）。
+    ///
+    /// 必须在 Actor `spawn` 之前调用：此方法重建内部状态为优先级队列。
+    /// 若 `shared_inner()` 已被调用（Arc 已共享），重建会丢弃旧状态——
+    /// 因此调用顺序应为 `with_event_bus(...).with_priority()` → `shared_inner()` → `spawn`。
     pub fn with_priority(mut self) -> Self {
-        self.inner = InnerScheduler::priority();
+        // 链式调用约定：with_priority 在 shared_inner/spawn 之前调用，
+        // 此时 self.inner 是唯一 Arc 引用，Arc::get_mut 必然成功。
+        // 若因调用顺序错误导致 get_mut 失败，panic 以暴露误用
+        // （而非静默丢弃已共享状态）。
+        Arc::get_mut(&mut self.inner)
+            .expect("with_priority must be called before shared_inner/spawn")
+            .switch_to_priority();
         self
     }
 
-    /// 发布 `TaskEnqueued` 事件到 EventBus，唤醒等待的 Worker。
+    /// 返回内部调度状态的共享引用，供 [`ActorScheduler`] 实现 enqueue 快路径。
     ///
-    /// `TaskEnqueued` 是 `BestEffort` 事件：通道满时丢弃，不影响正确性——
-    /// Worker 下次 `try_dequeue` 仍会拉取已入队任务。
-    /// 无 EventBus（`None`）时为 no-op，仅单元测试路径会落入此分支。
-    async fn notify_task_enqueued(&self) {
+    /// 调用方（`init_worker`）在 `spawn` Actor 前调用此方法，将 `Arc` 传递给
+    /// `ActorScheduler::with_fast_path`。此后 `enqueue` / `enqueue_batch`
+    /// 直接操作共享状态，绕过 Actor 消息往返。
+    ///
+    /// # 安全性
+    ///
+    /// `InnerScheduler` 的所有可变状态均由 `parking_lot::Mutex` 保护，
+    /// `notify` 为 `tokio::sync::Notify`（内部线程安全），`closed` 为
+    /// `AtomicBool`。多线程并发访问 `enqueue` 安全——Mutex 保证队列操作互斥，
+    /// `notify_one` 唤醒一个等待 Worker，语义与 Actor 路径一致。
+    pub(crate) fn shared_inner(&self) -> Arc<InnerScheduler> {
+        Arc::clone(&self.inner)
+    }
+
+    /// 触发 `TaskEnqueued` 唤醒信号，唤醒等待的 Worker。
+    ///
+    /// 通过 `Notify::notify_waiters()` 唤醒所有正在 `.notified().await` 的 Worker。
+    /// 无队列容量限制、无事件丢弃。无 EventBus（`None`）时为 no-op，
+    /// 仅单元测试路径会落入此分支。
+    fn notify_task_enqueued(&self) {
         if let Some(ref bus) = self.event_bus {
-            bus.publish(BusEvent::TaskEnqueued).await;
+            bus.notify_task_enqueued();
         }
     }
 }
@@ -570,16 +628,17 @@ impl Actor for SchedulerActor {
             scheduler_methods::ENQUEUE => {
                 let task: TaskDefinition = decode(&msg.payload)?;
                 self.inner.enqueue(task)?;
-                // 事件驱动唤醒 Worker：通过 EventBus 发布 TaskEnqueued 事件，
-                // 订阅的 Worker 立即被唤醒拉取任务。BestEffort 投递——
-                // 丢弃不影响正确性，Worker 下次 try_dequeue 仍会拉取已入队任务。
-                self.notify_task_enqueued().await;
+                // 信号驱动唤醒 Worker：通过 Notify 触发唤醒信号，
+                // 正在 .notified().await 的 Worker 立即被唤醒拉取任务。
+                // notify_waiters() 无队列无丢弃——信号仅唤醒当前等待者，
+                // 无等待者时信号丢失但不影响正确性（Worker 下次 try_dequeue 仍会拉取）。
+                self.notify_task_enqueued();
                 Ok(ok_result(msg_id))
             }
             scheduler_methods::ENQUEUE_BATCH => {
                 let tasks: Vec<TaskDefinition> = decode(&msg.payload)?;
                 self.inner.enqueue_batch(tasks)?;
-                self.notify_task_enqueued().await;
+                self.notify_task_enqueued();
                 Ok(ok_result(msg_id))
             }
             scheduler_methods::DEQUEUE => {
@@ -593,6 +652,25 @@ impl Actor for SchedulerActor {
             }
             scheduler_methods::TRY_DEQUEUE => {
                 let task = self.inner.try_dequeue();
+                // 出队成功后发布 TaskDequeued 事件，供外部观测实际消费速率。
+                // 事件丢失可接受（BestEffort），仅为观测信号。
+                if let Some(ref t) = task {
+                    if let Some(ref bus) = self.event_bus {
+                        let bus = bus.clone();
+                        let workflow_id = t
+                            .workflow_id
+                            .clone()
+                            .unwrap_or_else(|| WorkflowId::from(""));
+                        let task_id = t.id.clone();
+                        tokio::spawn(async move {
+                            bus.publish(BusEvent::TaskDequeued {
+                                workflow_id,
+                                task_id,
+                            })
+                            .await;
+                        });
+                    }
+                }
                 Ok(payload_result(msg_id, encode(&task)?))
             }
             scheduler_methods::DRAIN_UNROUTED => {
@@ -611,7 +689,7 @@ impl Actor for SchedulerActor {
                 self.inner.close();
                 // close 后发布事件，唤醒等待的 Worker 使其 try_dequeue
                 // 得到 None 并退出主循环。
-                self.notify_task_enqueued().await;
+                self.notify_task_enqueued();
                 Ok(ok_result(msg_id))
             }
             scheduler_methods::IS_CLOSED => {
@@ -791,6 +869,7 @@ impl Actor for DagGossipActor {
 
     async fn on_stop(&mut self) -> Result<()> {
         if let Some(tx) = self.heads_broadcast_cancel.take() {
+            // send 失败仅当 broadcast task 已退出 drop 了 receiver。
             let _ = tx.send(true);
         }
         if let Some(handle) = self.heads_broadcast_handle.take() {

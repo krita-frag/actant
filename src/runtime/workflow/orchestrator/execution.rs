@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 
 use crate::common::serialization::serialize_rkyv;
+use crate::common::wire::TOPIC_CANCEL;
 use crate::common::{Result, TaskDefinition, TaskId, WorkflowId};
 use crate::runtime::workflow::{Dag, FailureScope, Phase, Terminal, WorkflowExecution};
 
@@ -524,10 +525,16 @@ impl Orchestrator {
 
     /// Spawns a background task that periodically checks for expired workflows
     /// and marks them failed. Returns a watch sender for shutdown signaling.
+    ///
+    /// B2：当 `network` 已注入时，超时处理路径会主动广播 `CancelBroadcast`
+    /// 给所有正在运行的任务，触发本地与远端 Worker 协作式取消。这确保
+    /// 即使任务自身没有超时（per-task timeout），工作流级硬超时也能及时
+    /// 释放资源。未注入 `network` 时（如单元测试）仅标记状态，不广播取消。
     pub fn start_timeout_watcher(&self) -> tokio::sync::watch::Sender<bool> {
         let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
         let state = self.state.clone();
         let store = self.store.clone();
+        let network = self.network.clone();
         let poll_interval =
             std::time::Duration::from_millis(self.config.workflow.state_poll_interval_ms);
 
@@ -542,6 +549,24 @@ impl Orchestrator {
                         // 避免在 expired 列表较长时产生 N 次独立 LMDB 事务。
                         let mut persist_batch: Vec<(String, Vec<u8>)> = Vec::new();
                         let mut to_fire: Vec<WorkflowId> = Vec::new();
+                        // B2：收集 (workflow_id, task_id) 对，统一在持久化后广播取消。
+                        // 先收集再 mark_workflow_failed，因为 mark 会将 Running 状态
+                        // 改为 Failed，导致 running_task_ids 在后续读取时为空。
+                        let mut cancels_to_broadcast: Vec<(WorkflowId, TaskId)> = Vec::new();
+                        for wf_id in &expired {
+                            if let Some(slot) = state.slots.get(wf_id) {
+                                if !slot.execution.is_terminal() {
+                                    for task_id in slot.execution.tasks.keys() {
+                                        if slot.execution.tasks.get(task_id)
+                                            .map(|ts| ts.state == Phase::Running)
+                                            .unwrap_or(false)
+                                        {
+                                            cancels_to_broadcast.push((wf_id.clone(), task_id.clone()));
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         for wf_id in expired {
                             if let Some(mut slot) = state.slots.get_mut(&wf_id) {
                                 if !slot.execution.is_terminal() {
@@ -563,6 +588,39 @@ impl Orchestrator {
                             if !persist_batch.is_empty() {
                                 if let Err(e) = store.put_batch(&persist_batch).await {
                                     tracing::error!("failed to persist timed-out workflows: {}", e);
+                                }
+                            }
+                        }
+                        // B2：广播取消消息。即使持久化失败也要尝试取消，否则运行中的
+                        // 任务会继续占用 Worker 槽位直到自身完成或超时。
+                        if let Some(ref network) = network {
+                            for (wf_id, task_id) in &cancels_to_broadcast {
+                                let msg = crate::common::wire::CancelBroadcast {
+                                    task_id: task_id.clone(),
+                                    workflow_id: wf_id.clone(),
+                                };
+                                match postcard::to_allocvec(&msg) {
+                                    Ok(bytes) => {
+                                        if let Err(e) = network
+                                            .broadcast(TOPIC_CANCEL, bytes)
+                                            .await
+                                        {
+                                            tracing::warn!(
+                                                workflow_id = %wf_id,
+                                                task_id = %task_id,
+                                                error = %e,
+                                                "failed to broadcast cancel for timed-out workflow task"
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            workflow_id = %wf_id,
+                                            task_id = %task_id,
+                                            error = %e,
+                                            "failed to encode CancelBroadcast for timed-out workflow task"
+                                        );
+                                    }
                                 }
                             }
                         }

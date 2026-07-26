@@ -196,15 +196,25 @@ pub struct PyNetworkConfig {
     pub listen_ip: String,
     #[pyo3(get)]
     pub capability_gossip_interval_ms: u64,
+    /// 跨节点 Actor 路由策略（A2）。内置值：`"random"` / `"round-robin"` / `"least-loaded"`。
+    #[pyo3(get)]
+    pub actor_router_strategy: String,
+    /// Actor 注册表 gossip 广播间隔（毫秒）。
+    #[pyo3(get)]
+    pub actor_registry_gossip_interval_ms: u64,
     #[pyo3(get)]
     pub event_channel_capacity: usize,
+    /// 自定义 DNS 起源域，仅当 `preset = "dns"` 时生效。
+    /// 空字符串表示使用 n0 默认 `iroh.link`。
+    #[pyo3(get)]
+    pub dns_origin_domain: String,
 }
 
 #[pymethods]
 impl PyNetworkConfig {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (preset=None, bootstrap_nodes=None, hlc_max_drift_ms=crate::common::NetworkConfig::DEFAULT_HLC_MAX_DRIFT_MS, max_pending_direct_requests=crate::common::NetworkConfig::DEFAULT_MAX_PENDING_DIRECT_REQUESTS, gossip_bootstrap_peers=None, max_message_size=crate::common::NetworkConfig::DEFAULT_MAX_MESSAGE_SIZE, allowed_peer_ids=None, direct_request_timeout_ms=crate::common::NetworkConfig::DEFAULT_DIRECT_REQUEST_TIMEOUT_MS, listen_port=0, listen_ip="", capability_gossip_interval_ms=crate::common::NetworkConfig::DEFAULT_CAPABILITY_GOSSIP_INTERVAL_MS, event_channel_capacity=crate::common::NetworkConfig::DEFAULT_EVENT_CHANNEL_CAPACITY))]
+    #[pyo3(signature = (preset=None, bootstrap_nodes=None, hlc_max_drift_ms=crate::common::NetworkConfig::DEFAULT_HLC_MAX_DRIFT_MS, max_pending_direct_requests=crate::common::NetworkConfig::DEFAULT_MAX_PENDING_DIRECT_REQUESTS, gossip_bootstrap_peers=None, max_message_size=crate::common::NetworkConfig::DEFAULT_MAX_MESSAGE_SIZE, allowed_peer_ids=None, direct_request_timeout_ms=crate::common::NetworkConfig::DEFAULT_DIRECT_REQUEST_TIMEOUT_MS, listen_port=0, listen_ip="", capability_gossip_interval_ms=crate::common::NetworkConfig::DEFAULT_CAPABILITY_GOSSIP_INTERVAL_MS, actor_router_strategy=crate::common::NetworkConfig::DEFAULT_ACTOR_ROUTER_STRATEGY, actor_registry_gossip_interval_ms=crate::common::NetworkConfig::DEFAULT_ACTOR_REGISTRY_GOSSIP_INTERVAL_MS, event_channel_capacity=crate::common::NetworkConfig::DEFAULT_EVENT_CHANNEL_CAPACITY, dns_origin_domain=""))]
     fn new(
         preset: Option<String>,
         bootstrap_nodes: Option<Vec<String>>,
@@ -217,7 +227,10 @@ impl PyNetworkConfig {
         listen_port: u16,
         listen_ip: &str,
         capability_gossip_interval_ms: u64,
+        actor_router_strategy: &str,
+        actor_registry_gossip_interval_ms: u64,
         event_channel_capacity: usize,
+        dns_origin_domain: &str,
     ) -> Self {
         Self {
             preset: preset.unwrap_or_else(|| "local".to_string()),
@@ -231,7 +244,10 @@ impl PyNetworkConfig {
             listen_port,
             listen_ip: listen_ip.to_string(),
             capability_gossip_interval_ms,
+            actor_router_strategy: actor_router_strategy.to_string(),
+            actor_registry_gossip_interval_ms,
             event_channel_capacity,
+            dns_origin_domain: dns_origin_domain.to_string(),
         }
     }
 }
@@ -253,7 +269,12 @@ impl Default for PyNetworkConfig {
             listen_ip: String::new(),
             capability_gossip_interval_ms:
                 crate::common::NetworkConfig::DEFAULT_CAPABILITY_GOSSIP_INTERVAL_MS,
+            actor_router_strategy: crate::common::NetworkConfig::DEFAULT_ACTOR_ROUTER_STRATEGY
+                .to_string(),
+            actor_registry_gossip_interval_ms:
+                crate::common::NetworkConfig::DEFAULT_ACTOR_REGISTRY_GOSSIP_INTERVAL_MS,
             event_channel_capacity: crate::common::NetworkConfig::DEFAULT_EVENT_CHANNEL_CAPACITY,
+            dns_origin_domain: String::new(),
         }
     }
 }
@@ -274,7 +295,10 @@ impl TryFrom<&PyNetworkConfig> for NetworkConfig {
             listen_port: c.listen_port,
             listen_ip: c.listen_ip.clone(),
             capability_gossip_interval_ms: c.capability_gossip_interval_ms,
+            actor_router_strategy: c.actor_router_strategy.clone(),
+            actor_registry_gossip_interval_ms: c.actor_registry_gossip_interval_ms,
             event_channel_capacity: c.event_channel_capacity,
+            dns_origin_domain: c.dns_origin_domain.clone(),
         })
     }
 }
@@ -436,12 +460,16 @@ pub struct PyActantConfig {
     /// Payload 签名密钥（必填）。所有任务 payload 使用 BLAKE3 keyed hash 签名。
     #[pyo3(get)]
     pub payload_signing_key: String,
+    /// 强制要求 payload 签名。`true` 时 `payload_signing_key` 为空启动直接报错。
+    /// 默认 `false`（向后兼容 0.2 行为，仅 warn 日志）。
+    #[pyo3(get)]
+    pub require_payload_signing: bool,
 }
 
 #[pymethods]
 impl PyActantConfig {
     #[new]
-    #[pyo3(signature = (payload_signing_key, network=None, failover=None, gossip=None, max_concurrent_tasks=None, default_task_timeout_ms=None, data_dir=None, drain_timeout_secs=None, remote_fallback_delay_ms=None, scheduler=None))]
+    #[pyo3(signature = (payload_signing_key, network=None, failover=None, gossip=None, max_concurrent_tasks=None, default_task_timeout_ms=None, data_dir=None, drain_timeout_secs=None, remote_fallback_delay_ms=None, scheduler=None, require_payload_signing=false))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         payload_signing_key: String,
@@ -454,6 +482,7 @@ impl PyActantConfig {
         drain_timeout_secs: Option<u64>,
         remote_fallback_delay_ms: Option<u64>,
         scheduler: Option<String>,
+        require_payload_signing: bool,
     ) -> Self {
         let default_worker = crate::common::WorkerConfig::default();
         Self {
@@ -461,7 +490,10 @@ impl PyActantConfig {
             network: network.unwrap_or_default(),
             failover: failover.unwrap_or_default(),
             gossip: gossip.unwrap_or_default(),
-            max_concurrent_tasks: max_concurrent_tasks.unwrap_or_else(num_cpus::get),
+            // 默认并发度 = num_cpus * 2：多数 Python 任务为 IO-bound，
+            // 2x CPU 核心能更好利用 IO 等待时间，提升吞吐。
+            // 用户可显式传 max_concurrent_tasks 覆盖。
+            max_concurrent_tasks: max_concurrent_tasks.unwrap_or_else(default_max_concurrent_tasks),
             default_task_timeout_ms: default_task_timeout_ms
                 .unwrap_or(default_worker.default_task_timeout_ms),
             data_dir,
@@ -469,8 +501,18 @@ impl PyActantConfig {
             remote_fallback_delay_ms: remote_fallback_delay_ms
                 .unwrap_or(default_worker.remote_fallback_delay_ms),
             scheduler: scheduler.unwrap_or_else(|| "priority".to_string()),
+            require_payload_signing,
         }
     }
+}
+
+/// 默认 Worker 并发度：``num_cpus * 2``。
+///
+/// Python 任务多为 IO-bound（网络/磁盘等待），2x CPU 核心使 Worker 在
+/// 等待 IO 时仍能调度其他任务，提升整体吞吐。CPU-bound 场景用户应显式
+/// 传 ``max_concurrent_tasks=num_cpus`` 以避免过度切换。
+fn default_max_concurrent_tasks() -> usize {
+    num_cpus::get().saturating_mul(2).max(2)
 }
 
 impl Default for PyActantConfig {
@@ -481,12 +523,13 @@ impl Default for PyActantConfig {
             network: PyNetworkConfig::default(),
             failover: PyFailoverConfig::default(),
             gossip: PyGossipConfig::default(),
-            max_concurrent_tasks: num_cpus::get(),
+            max_concurrent_tasks: default_max_concurrent_tasks(),
             default_task_timeout_ms: default_worker.default_task_timeout_ms,
             data_dir: None,
             drain_timeout_secs: default_worker.drain_timeout_secs,
             remote_fallback_delay_ms: default_worker.remote_fallback_delay_ms,
             scheduler: "priority".to_string(),
+            require_payload_signing: false,
         }
     }
 }
@@ -516,6 +559,7 @@ impl TryFrom<&PyActantConfig> for ActantConfig {
                 ..default.store
             },
             payload_signing_key: c.payload_signing_key.as_bytes().to_vec(),
+            require_payload_signing: c.require_payload_signing,
             ..default
         })
     }

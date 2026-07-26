@@ -34,6 +34,8 @@ fn init_tracing() {
         )
         .finish();
 
+    // set_global_default 在进程生命周期内只能成功一次；后续调用返回 Err 是
+    // 已被初始化的正常情况（如多 Runtime 实例依次调用 init_logger）。
     let _ = tracing::subscriber::set_global_default(subscriber);
 }
 
@@ -57,6 +59,8 @@ fn init_console_subscriber() {
     let console_layer = console_subscriber::spawn();
     let layered = subscriber.with(console_layer);
 
+    // set_global_default 在进程生命周期内只能成功一次；后续调用返回 Err 是
+    // 已被初始化的正常情况（如多 Runtime 实例依次调用 init_logger）。
     let _ = tracing::subscriber::set_global_default(layered);
 }
 
@@ -67,8 +71,7 @@ fn init_console_subscriber() {
 
 /// 关闭可观测性子系统。
 ///
-/// 当前实现为空操作：pprof 火焰图功能已移除（原依赖存在安全漏洞），
-/// tracing subscriber 的清理由运行时统一处理。
+/// 当前实现为空操作：tracing subscriber 的清理由运行时统一处理。
 pub fn shutdown() {}
 
 #[cfg(test)]

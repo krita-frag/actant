@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dashmap::DashMap;
+use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
@@ -26,20 +27,18 @@ use crate::common::{
     WorkflowId,
 };
 use crate::runtime::actor::SupervisionEvent;
-use crate::runtime::network::DirectRequest;
-use crate::runtime::network::DirectResponseChannel;
 
 /// 标识总线上的事件类别。
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
 pub enum Topic {
     /// 任务已在此 worker 上开始执行。
     TaskStarted,
-    /// 任务已入队到调度器（唤醒 Worker 拉取）。
+    /// 任务已从调度器出队（Worker 即将执行）。
     ///
-    /// 由 `SchedulerActor` 在 `enqueue` / `enqueue_batch` / `close` 后发布。
-    /// 事件本身不携带任务数据——仅为唤醒信号，Worker 收到后通过
-    /// `try_dequeue` 拉取实际任务。
-    TaskEnqueued,
+    /// 由 `SchedulerActor` 在 `try_dequeue` 成功返回任务后发布。
+    /// 用于外部观测：订阅者可统计实际出队速率，区分入队堆积与
+    /// 真正消费速度。事件携带 workflow_id 与 task_id 便于关联。
+    TaskDequeued,
     /// 任务成功完成。
     TaskCompleted,
     /// 任务失败。
@@ -50,8 +49,6 @@ pub enum Topic {
     TaskSkipped,
     /// 对端连接 / 断开。
     NetworkPeer,
-    /// 来自远端节点的直连请求。
-    NetworkDirect,
     /// 远端节点的集群心跳。
     ClusterHeartbeat,
     /// 编排器声明公告。
@@ -62,8 +59,38 @@ pub enum Topic {
     HeadsExchange,
     /// Actor 监管事件（启动、失败、停止）。
     Supervision,
+    /// Actor 生命周期中的不可恢复错误（与 `Supervision` 的区别：
+    /// 后者描述常规生命周期信号；本 topic 专门用于 Worker/Actor 系统
+    /// 拦截到 panic / 状态机非法转换 / 持久化失败等需要外部介入的错误）。
+    ActorLifecycleError,
+    /// WAL 压缩完成公告。订阅者可据此触发检查点清理、监控告警或
+    /// 外部一致性校验。
+    WalCompacted,
     /// Worker 生命周期事件（排空中、已排空、已停止）。
     WorkerLifecycle,
+}
+
+impl Topic {
+    /// 返回话题的字符串标识，用于指标标签。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Topic::TaskStarted => "TaskStarted",
+            Topic::TaskDequeued => "TaskDequeued",
+            Topic::TaskCompleted => "TaskCompleted",
+            Topic::TaskFailed => "TaskFailed",
+            Topic::TaskCancelled => "TaskCancelled",
+            Topic::TaskSkipped => "TaskSkipped",
+            Topic::NetworkPeer => "NetworkPeer",
+            Topic::ClusterHeartbeat => "ClusterHeartbeat",
+            Topic::ClusterClaim => "ClusterClaim",
+            Topic::DagUpdate => "DagUpdate",
+            Topic::HeadsExchange => "HeadsExchange",
+            Topic::Supervision => "Supervision",
+            Topic::ActorLifecycleError => "ActorLifecycleError",
+            Topic::WalCompacted => "WalCompacted",
+            Topic::WorkerLifecycle => "WorkerLifecycle",
+        }
+    }
 }
 
 /// 发布到总线的事件投递保证。
@@ -81,9 +108,10 @@ pub enum DeliveryGuarantee {
 
 /// 流经总线的统一事件类型。
 ///
-/// 事件分为两类：
-/// - **独占型**事件（含通道）只能投递给一个订阅者。
-/// - **可克隆型**事件广播到该话题的所有订阅者。
+/// 所有事件均可克隆并广播到该话题的所有订阅者。点对点请求-响应
+/// （如 `DirectRequest`）不走 EventBus，而是由 `NetworkEventRouter`
+/// 直接处理或回送 `DirectResponse::Error`，避免总线承载一次性通道
+/// 而引入独占投递分支。
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum BusEvent {
@@ -92,13 +120,15 @@ pub enum BusEvent {
         workflow_id: WorkflowId,
         task_id: TaskId,
     },
-    /// 任务已入队到调度器（仅作唤醒信号，不携带任务数据）。
+    /// 任务已从调度器出队。
     ///
-    /// 由 `SchedulerActor` 在 `enqueue` / `enqueue_batch` / `close` 后发布。
-    /// Worker 订阅 `Topic::TaskEnqueued` 后在此事件上 await。
-    /// 事件被丢弃（通道满）是安全的——Worker 已在前一次唤醒中
-    /// 处理任务，下次 `try_dequeue` 会拉取剩余任务。
-    TaskEnqueued,
+    /// 由 `SchedulerActor::try_dequeue` 在返回 Some(task) 后立即发布。
+    /// 携带 workflow_id 与 task_id 便于订阅者关联任务上下文（如统计
+    /// 出队速率、关联日志）。事件丢失不影响 Worker 主流程，仅为观测信号。
+    TaskDequeued {
+        workflow_id: WorkflowId,
+        task_id: TaskId,
+    },
     TaskCompleted(TaskCompletion),
     TaskFailed(TaskCompletion),
     TaskCancelled(TaskCompletion),
@@ -107,13 +137,6 @@ pub enum BusEvent {
     // -- 网络 --
     PeerConnected(NodeId),
     PeerDisconnected(NodeId),
-    /// 独占：包含无法克隆的响应通道。
-    /// 总是只投递给一个订阅者。
-    DirectRequest {
-        peer_id: String,
-        request: Box<DirectRequest>,
-        channel: DirectResponseChannel,
-    },
 
     // -- 集群管理（可克隆）--
     Heartbeat(NodeHeartbeat),
@@ -123,6 +146,25 @@ pub enum BusEvent {
 
     // -- Actor 监管（可克隆）--
     SupervisionEvent(SupervisionEvent),
+    /// Actor 生命周期中的不可恢复错误。
+    ///
+    /// 与 `SupervisionEvent::ActorFailed` 的区别：前者是常规失败信号
+    /// （驱动重启策略），本事件描述系统层拦截到的 panic / 状态机
+    /// 非法转换 / 持久化失败等需要外部介入的错误。携带 actor_id
+    /// 与错误描述，便于运维订阅并触发告警。
+    ActorLifecycleError {
+        actor_id: crate::common::ActorId,
+        error: String,
+    },
+
+    // -- 持久化公告 --
+    /// WAL 压缩完成。携带节点 id 与压缩后保留的事件序号上限，
+    /// 便于订阅者触发检查点清理或一致性校验。WAL 是 per-ActorSystem
+    /// 一个文件（非 per-actor），故载荷使用 node_id 而非 actor_id。
+    WalCompacted {
+        node_id: NodeId,
+        retained_events: u64,
+    },
 
     // -- Worker 生命周期（可克隆）--
     /// Worker 已进入排空模式 — 不再接受新任务。
@@ -144,40 +186,30 @@ impl BusEvent {
     pub fn topic(&self) -> Topic {
         match self {
             BusEvent::TaskStarted { .. } => Topic::TaskStarted,
-            BusEvent::TaskEnqueued => Topic::TaskEnqueued,
+            BusEvent::TaskDequeued { .. } => Topic::TaskDequeued,
             BusEvent::TaskCompleted(_) => Topic::TaskCompleted,
             BusEvent::TaskFailed(_) => Topic::TaskFailed,
             BusEvent::TaskCancelled(_) => Topic::TaskCancelled,
             BusEvent::TaskSkipped(_) => Topic::TaskSkipped,
             BusEvent::PeerConnected(_) | BusEvent::PeerDisconnected(_) => Topic::NetworkPeer,
-            BusEvent::DirectRequest { .. } => Topic::NetworkDirect,
             BusEvent::Heartbeat(_) => Topic::ClusterHeartbeat,
             BusEvent::Claim(_) => Topic::ClusterClaim,
             BusEvent::DagUpdate(_) => Topic::DagUpdate,
             BusEvent::HeadsExchange(_) => Topic::HeadsExchange,
             BusEvent::SupervisionEvent(_) => Topic::Supervision,
+            BusEvent::ActorLifecycleError { .. } => Topic::ActorLifecycleError,
+            BusEvent::WalCompacted { .. } => Topic::WalCompacted,
             BusEvent::WorkerDraining { .. }
             | BusEvent::WorkerDrained { .. }
             | BusEvent::WorkerStopped { .. } => Topic::WorkerLifecycle,
         }
     }
 
-    /// 返回此事件是否可克隆并广播给所有订阅者。
-    /// 仅 `DirectRequest` 是独占型（包含一次性通道）。
-    fn is_cloneable(&self) -> bool {
-        !matches!(self, BusEvent::DirectRequest { .. })
-    }
-
     /// 克隆此事件用于广播给多个订阅者。
     ///
-    /// 仅对可广播事件返回 `Some`。`DirectRequest` 包含一次性响应通道，
-    /// 无法克隆，返回 `None`。
-    ///
-    /// 通过将"独占事件不可克隆"这一不变式表达为类型安全的 `Option` 返回值，
-    /// 避免在 `DirectRequest` 上实现 `Clone` 引发运行时 panic。
-    /// 调用方（`broadcast_to_subscribers`）由 `is_cloneable()` 守卫，
-    /// 确保 `None` 分支在实践中不会触发；即便因 bug 触发，
-    /// 也会被防御性地跳过而非崩溃。
+    /// 所有 BusEvent 变体均可克隆；本方法返回 `Some`。保留 `Option` 返回值
+    /// 是为了未来可能引入不可克隆变体时的前向兼容，同时让 `broadcast_to_subscribers`
+    /// 在克隆失败时有明确的防御性跳过路径。
     fn clone_broadcast(&self) -> Option<BusEvent> {
         Some(match self {
             BusEvent::TaskStarted {
@@ -187,7 +219,13 @@ impl BusEvent {
                 workflow_id: workflow_id.clone(),
                 task_id: task_id.clone(),
             },
-            BusEvent::TaskEnqueued => BusEvent::TaskEnqueued,
+            BusEvent::TaskDequeued {
+                workflow_id,
+                task_id,
+            } => BusEvent::TaskDequeued {
+                workflow_id: workflow_id.clone(),
+                task_id: task_id.clone(),
+            },
             BusEvent::TaskCompleted(c) => BusEvent::TaskCompleted(c.clone()),
             BusEvent::TaskFailed(c) => BusEvent::TaskFailed(c.clone()),
             BusEvent::TaskCancelled(c) => BusEvent::TaskCancelled(c.clone()),
@@ -199,6 +237,17 @@ impl BusEvent {
             BusEvent::DagUpdate(u) => BusEvent::DagUpdate(u.clone()),
             BusEvent::HeadsExchange(e) => BusEvent::HeadsExchange(e.clone()),
             BusEvent::SupervisionEvent(e) => BusEvent::SupervisionEvent(e.clone()),
+            BusEvent::ActorLifecycleError { actor_id, error } => BusEvent::ActorLifecycleError {
+                actor_id: actor_id.clone(),
+                error: error.clone(),
+            },
+            BusEvent::WalCompacted {
+                node_id,
+                retained_events,
+            } => BusEvent::WalCompacted {
+                node_id: node_id.clone(),
+                retained_events: *retained_events,
+            },
             BusEvent::WorkerDraining { node_id } => BusEvent::WorkerDraining {
                 node_id: node_id.clone(),
             },
@@ -208,7 +257,6 @@ impl BusEvent {
             BusEvent::WorkerStopped { node_id } => BusEvent::WorkerStopped {
                 node_id: node_id.clone(),
             },
-            BusEvent::DirectRequest { .. } => return None,
         })
     }
 
@@ -220,20 +268,23 @@ impl BusEvent {
     pub fn delivery_guarantee(&self) -> DeliveryGuarantee {
         match self {
             // 关键：不可丢失 — 任务结果驱动 DAG 推进，声明驱动故障转移，
-            // DAG 更新驱动状态复制，DirectRequest 包含调用方等待的响应通道。
+            // DAG 更新驱动状态复制。ActorLifecycleError 与 WalCompacted
+            // 也归 Reliable：前者驱动外部告警/介入，后者驱动检查点清理，
+            // 丢失会导致运维盲区或检查点堆积。
             BusEvent::TaskStarted { .. }
             | BusEvent::TaskCompleted(_)
             | BusEvent::TaskFailed(_)
             | BusEvent::TaskCancelled(_)
             | BusEvent::TaskSkipped(_)
-            | BusEvent::DirectRequest { .. }
             | BusEvent::Claim(_)
-            | BusEvent::DagUpdate(_) => DeliveryGuarantee::Reliable,
+            | BusEvent::DagUpdate(_)
+            | BusEvent::ActorLifecycleError { .. }
+            | BusEvent::WalCompacted { .. } => DeliveryGuarantee::Reliable,
 
             // 周期性/被覆盖：下一次心跳或对端事件会覆盖当前事件，丢弃可接受。
-            // TaskEnqueued 同理——事件仅为唤醒信号，丢弃后 Worker 下次
+            // TaskDequeued 同理——事件仅为观测信号，丢弃后 Worker 下次
             // try_dequeue 仍会拉取已入队任务。
-            BusEvent::TaskEnqueued
+            BusEvent::TaskDequeued { .. }
             | BusEvent::PeerConnected(_)
             | BusEvent::PeerDisconnected(_)
             | BusEvent::Heartbeat(_)
@@ -254,16 +305,26 @@ impl BusEvent {
 /// 防止某个卡住的消费者拖累整个系统。
 struct SubscriberSlot {
     sender: mpsc::Sender<BusEvent>,
+    /// 通道的总容量（创建时确定），用于计算当前积压深度。
+    /// tokio mpsc 不暴露当前队列长度，需 `capacity - sender.capacity()` 间接求得。
+    capacity: usize,
     /// 共享的连续超时计数器。Arc 允许在 DashMap guard 释放后通过克隆的 slot 更新。
     consecutive_timeouts: Arc<AtomicU32>,
 }
 
 impl SubscriberSlot {
-    fn new(sender: mpsc::Sender<BusEvent>) -> Self {
+    fn new(sender: mpsc::Sender<BusEvent>, capacity: usize) -> Self {
         Self {
             sender,
+            capacity,
             consecutive_timeouts: Arc::new(AtomicU32::new(0)),
         }
+    }
+
+    /// 返回当前积压深度（已入队但未被消费的事件数）。
+    /// `sender.capacity()` 返回剩余可用容量，故 `capacity - capacity()` 即积压数。
+    fn depth(&self) -> usize {
+        self.capacity.saturating_sub(self.sender.capacity())
     }
 
     /// 记录成功投递 — 重置连续超时计数器。
@@ -286,6 +347,7 @@ impl Clone for SubscriberSlot {
     fn clone(&self) -> Self {
         Self {
             sender: self.sender.clone(),
+            capacity: self.capacity,
             consecutive_timeouts: self.consecutive_timeouts.clone(),
         }
     }
@@ -356,6 +418,11 @@ pub struct EventBus {
     publish_timeout: Duration,
     /// 修剪订阅者前的最大连续超时次数。
     max_subscriber_timeouts: u32,
+    /// `TaskEnqueued` 专用唤醒信号。
+    ///
+    /// `notify_waiters()` 无队列、无丢弃，所有等待的 Worker 立即唤醒。
+    /// `Arc` 允许 Worker 持有引用，无需 subscribe。
+    task_enqueued_notify: Arc<tokio::sync::Notify>,
 }
 
 impl Default for EventBus {
@@ -376,7 +443,25 @@ impl EventBus {
             default_capacity: config.subscriber_capacity,
             publish_timeout: Duration::from_millis(config.publish_timeout_ms),
             max_subscriber_timeouts: config.max_subscriber_timeouts,
+            task_enqueued_notify: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// 返回 `TaskEnqueued` 唤醒信号的 `Arc<Notify>` 引用。
+    ///
+    /// Worker 持有此引用并 `notify.notified().await` 等待任务入队信号。
+    /// `notify_waiters()` 唤醒所有等待者，支持多 Worker；无队列容量限制。
+    pub fn task_enqueued_notify(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.task_enqueued_notify)
+    }
+
+    /// 触发 `TaskEnqueued` 唤醒信号。
+    ///
+    /// 由 `SchedulerActor` 在 `enqueue` / `enqueue_batch` 后调用。
+    /// `notify_waiters()` 允许所有正在 `.notified().await` 的 Worker 继续，
+    /// 若无等待者则不存储信号（下次 `try_dequeue` 仍会拉取已入队任务）。
+    pub fn notify_task_enqueued(&self) {
+        self.task_enqueued_notify.notify_waiters();
     }
 
     /// 订阅话题。返回仅接收该话题 `BusEvent` 的接收器。
@@ -395,11 +480,11 @@ impl EventBus {
             .entry(topic)
             .or_default()
             .value_mut()
-            .push(SubscriberSlot::new(tx));
+            .push(SubscriberSlot::new(tx, capacity));
         rx
     }
 
-    /// 异步发布事件。可克隆事件广播给所有订阅者；独占事件只投递给一个。
+    /// 异步发布事件。所有事件均可克隆并广播给该话题的所有订阅者。
     ///
     /// 对于 [DeliveryGuarantee::Reliable] 事件，发布方为每个订阅者等待容量，
     /// 最长 `publish_timeout_ms`。对于 [DeliveryGuarantee::BestEffort] 事件，
@@ -407,27 +492,15 @@ impl EventBus {
     pub async fn publish(&self, event: BusEvent) {
         let topic = event.topic();
         let guarantee = event.delivery_guarantee();
-        if event.is_cloneable() {
-            Self::broadcast_to_subscribers(
-                &self.inner,
-                topic,
-                &event,
-                guarantee,
-                self.publish_timeout,
-                self.max_subscriber_timeouts,
-            )
-            .await;
-        } else {
-            Self::dispatch_exclusive(
-                &self.inner,
-                topic,
-                event,
-                guarantee,
-                self.publish_timeout,
-                self.max_subscriber_timeouts,
-            )
-            .await;
-        }
+        Self::broadcast_to_subscribers(
+            &self.inner,
+            topic,
+            &event,
+            guarantee,
+            self.publish_timeout,
+            self.max_subscriber_timeouts,
+        )
+        .await;
     }
 
     /// 将可克隆事件广播给话题的所有订阅者。
@@ -455,196 +528,93 @@ impl EventBus {
             return;
         }
 
-        let mut needs_prune = false;
-
-        for slot in &slots {
-            if slot.sender.is_closed() {
-                needs_prune = true;
-                continue;
-            }
-
-            match guarantee {
-                DeliveryGuarantee::Reliable => {
-                    // 由 publish() 中的 is_cloneable() 守卫，此处必为可广播事件；
-                    // clone_broadcast() 返回 None 仅在 DirectRequest 上发生，
-                    // 防御性跳过而非 panic。
-                    let Some(event) = event.clone_broadcast() else {
-                        tracing::error!(
-                            "EventBus: clone_broadcast returned None for {:?}; skipping subscriber",
-                            topic
-                        );
-                        continue;
-                    };
-                    match slot.sender.send_timeout(event, timeout).await {
-                        Ok(()) => {
-                            slot.record_success();
-                        }
-                        Err(mpsc::error::SendTimeoutError::Closed(_)) => {
-                            needs_prune = true;
-                        }
-                        Err(mpsc::error::SendTimeoutError::Timeout(_)) => {
-                            let count = slot.record_timeout();
-                            if max_subscriber_timeouts > 0 && count >= max_subscriber_timeouts {
-                                tracing::error!(
-                                    "EventBus: pruning {:?} subscriber after {} consecutive timeouts",
-                                    topic, count,
-                                );
-                                crate::metrics::inc_event_bus_subscriber_pruned();
-                                needs_prune = true;
-                            } else {
-                                tracing::error!(
-                                    "EventBus: timeout delivering reliable event to {:?} subscriber \
-                                     (waited {}ms, consecutive timeouts={}), subscriber may be stuck",
-                                    topic,
-                                    timeout.as_millis(),
-                                    count,
-                                );
-                            }
-                            crate::metrics::inc_event_bus_publish_timeout();
-                        }
-                    }
+        // 并发投递：所有订阅者的 send 同时进行。
+        // 串行实现下总耗时 = Σ(各订阅者)，并发后 = max(各订阅者)。
+        // 对 Reliable 事件尤为关键：一个慢订阅者不再阻塞其他订阅者的投递。
+        // 使用 FuturesUnordered 流式推进：结果一旦就绪即处理，无需一次性
+        // 分配 Vec<future> + Vec<result>，也便于后续按完成顺序触发修剪。
+        // 每个 future 返回 bool（true = 该订阅者需修剪）。
+        let mut futures = FuturesUnordered::new();
+        for slot in slots {
+            let event_ref = event;
+            futures.push(async move {
+                if slot.sender.is_closed() {
+                    return true;
                 }
-                DeliveryGuarantee::BestEffort => {
-                    let Some(event) = event.clone_broadcast() else {
-                        tracing::error!(
-                            "EventBus: clone_broadcast returned None for {:?}; skipping subscriber",
-                            topic
-                        );
-                        continue;
-                    };
-                    match slot.sender.try_send(event) {
-                        Ok(()) => {
-                            slot.record_success();
-                        }
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            tracing::warn!(
-                                "EventBus: subscriber for {:?} is full, dropping best-effort event",
+                match guarantee {
+                    DeliveryGuarantee::Reliable => {
+                        // 所有 BusEvent 变体均可克隆；clone_broadcast() 返回 None
+                        // 仅在防御性路径触发——日志后跳过该订阅者而非 panic。
+                        let Some(cloned) = event_ref.clone_broadcast() else {
+                            tracing::error!(
+                                "EventBus: clone_broadcast returned None for {:?}; skipping subscriber",
                                 topic
                             );
-                            crate::metrics::inc_event_bus_dropped_events();
+                            return false;
+                        };
+                        match slot.sender.send_timeout(cloned, timeout).await {
+                            Ok(()) => {
+                                slot.record_success();
+                                false
+                            }
+                            Err(mpsc::error::SendTimeoutError::Closed(_)) => true,
+                            Err(mpsc::error::SendTimeoutError::Timeout(_)) => {
+                                let count = slot.record_timeout();
+                                crate::metrics::inc_event_bus_publish_timeout();
+                                if max_subscriber_timeouts > 0
+                                    && count >= max_subscriber_timeouts
+                                {
+                                    tracing::error!(
+                                        "EventBus: pruning {:?} subscriber after {} consecutive timeouts",
+                                        topic, count,
+                                    );
+                                    crate::metrics::inc_event_bus_subscriber_pruned();
+                                    true
+                                } else {
+                                    tracing::error!(
+                                        "EventBus: timeout delivering reliable event to {:?} subscriber \
+                                         (waited {}ms, consecutive timeouts={}), subscriber may be stuck",
+                                        topic,
+                                        timeout.as_millis(),
+                                        count,
+                                    );
+                                    false
+                                }
+                            }
                         }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            needs_prune = true;
+                    }
+                    DeliveryGuarantee::BestEffort => {
+                        let Some(cloned) = event_ref.clone_broadcast() else {
+                            tracing::error!(
+                                "EventBus: clone_broadcast returned None for {:?}; skipping subscriber",
+                                topic
+                            );
+                            return false;
+                        };
+                        match slot.sender.try_send(cloned) {
+                            Ok(()) => {
+                                slot.record_success();
+                                false
+                            }
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                tracing::warn!(
+                                    "EventBus: subscriber for {:?} is full, dropping best-effort event",
+                                    topic
+                                );
+                                crate::metrics::inc_event_bus_dropped_events();
+                                false
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => true,
                         }
                     }
                 }
-            }
+            });
         }
 
-        if needs_prune {
-            if let Some(mut subs) = inner.get_mut(&topic) {
-                subs.value_mut().retain(|s| {
-                    if s.sender.is_closed() {
-                        return false;
-                    }
-                    if max_subscriber_timeouts > 0 && s.timeout_count() >= max_subscriber_timeouts {
-                        return false;
-                    }
-                    true
-                });
-            }
-        }
-    }
-
-    /// 将独占（不可克隆）事件投递给第一个有容量的订阅者。
-    ///
-    /// 对于可靠事件，使用 `send_timeout` 等待容量。
-    /// 若某个订阅者超时，尝试下一个订阅者。
-    /// 对于尽力投递事件，使用 `try_send`（非阻塞）。
-    async fn dispatch_exclusive(
-        inner: &DashMap<Topic, Vec<SubscriberSlot>>,
-        topic: Topic,
-        event: BusEvent,
-        guarantee: DeliveryGuarantee,
-        timeout: Duration,
-        max_subscriber_timeouts: u32,
-    ) {
-        let slots: Vec<SubscriberSlot> = inner
-            .get(&topic)
-            .map(|subs| subs.value().clone())
-            .unwrap_or_default();
-
-        if slots.is_empty() {
-            // 无订阅者：DirectRequest 必须主动回送错误响应，否则调用方永久阻塞。
-            if let BusEvent::DirectRequest {
-                peer_id, channel, ..
-            } = event
-            {
-                tracing::warn!(
-                    peer = %peer_id,
-                    "EventBus: no subscriber for DirectRequest on {:?}, returning error",
-                    topic,
-                );
-                crate::metrics::inc_event_bus_dropped_events();
-                channel
-                    .send_error(format!(
-                        "no subscriber registered on topic {:?} for DirectRequest",
-                        topic
-                    ))
-                    .await;
-            }
-            return;
-        }
-
-        let mut event_opt = Some(event);
         let mut needs_prune = false;
-
-        for slot in &slots {
-            if slot.sender.is_closed() {
+        while let Some(prune) = futures.next().await {
+            if prune {
                 needs_prune = true;
-                continue;
-            }
-
-            let Some(ev) = event_opt.take() else {
-                break;
-            };
-
-            match guarantee {
-                DeliveryGuarantee::Reliable => match slot.sender.send_timeout(ev, timeout).await {
-                    Ok(()) => {
-                        slot.record_success();
-                        break;
-                    }
-                    Err(mpsc::error::SendTimeoutError::Closed(ev)) => {
-                        event_opt = Some(ev);
-                        needs_prune = true;
-                    }
-                    Err(mpsc::error::SendTimeoutError::Timeout(ev)) => {
-                        event_opt = Some(ev);
-                        let count = slot.record_timeout();
-                        if max_subscriber_timeouts > 0 && count >= max_subscriber_timeouts {
-                            tracing::error!(
-                                "EventBus: pruning {:?} subscriber after {} consecutive timeouts",
-                                topic,
-                                count,
-                            );
-                            crate::metrics::inc_event_bus_subscriber_pruned();
-                            needs_prune = true;
-                        } else {
-                            tracing::error!(
-                                    "EventBus: timeout delivering exclusive reliable event on {:?} \
-                                     (waited {}ms, consecutive timeouts={}), trying next subscriber",
-                                    topic,
-                                    timeout.as_millis(),
-                                    count,
-                                );
-                        }
-                        crate::metrics::inc_event_bus_publish_timeout();
-                    }
-                },
-                DeliveryGuarantee::BestEffort => match slot.sender.try_send(ev) {
-                    Ok(()) => {
-                        slot.record_success();
-                        break;
-                    }
-                    Err(mpsc::error::TrySendError::Full(ev)) => {
-                        event_opt = Some(ev);
-                    }
-                    Err(mpsc::error::TrySendError::Closed(ev)) => {
-                        event_opt = Some(ev);
-                        needs_prune = true;
-                    }
-                },
             }
         }
 
@@ -662,31 +632,14 @@ impl EventBus {
             }
         }
 
-        if let Some(undelivered) = event_opt {
-            tracing::error!(
-                "EventBus: no subscriber could accept event on {:?}, event dropped",
-                topic
-            );
-            crate::metrics::inc_event_bus_dropped_events();
-            // DirectRequest 包含调用方等待的响应通道。若直接丢弃，调用方将永久
-            // 阻塞在 `await` 上等待响应。通过 channel 主动回送 `DirectResponse::Error`，
-            // 让调用方能立即收到明确错误并 fallback 到自身超时。
-            if let BusEvent::DirectRequest {
-                peer_id, channel, ..
-            } = undelivered
-            {
-                tracing::warn!(
-                    peer = %peer_id,
-                    "EventBus: returning DirectResponse::Error for undeliverable DirectRequest",
-                );
-                channel
-                    .send_error(format!(
-                        "no subscriber available on topic {:?} to handle DirectRequest",
-                        topic
-                    ))
-                    .await;
-            }
-        }
+        // 采样订阅者队列深度：取该 topic 所有订阅者当前积压深度的最大值。
+        // 每次 publish 后采样，记录到 metrics gauge，用于预警队列堆积。
+        // 采样时刻可能略晚于投递（订阅者已消费部分消息），但足以反映趋势。
+        let max_depth = inner
+            .get(&topic)
+            .map(|subs| subs.value().iter().map(|s| s.depth()).max().unwrap_or(0))
+            .unwrap_or(0) as u64;
+        crate::metrics::set_event_bus_subscriber_depth(topic.as_str(), max_depth);
     }
 }
 

@@ -45,6 +45,9 @@ class TaskContext:
         self._called: set[int] = set()
         self._callback_lock = threading.Lock()
         self._force_timer: threading.Timer | None = None
+        # 记录已设置的 force_after 秒数，用于 context 迁移时在新 context 上
+        # 重启定时器（避免旧 context 的定时器触发时回调已迁移走而漏执行）。
+        self._force_after: float | None = None
         self._callback_counter = 0
 
     @property
@@ -77,6 +80,8 @@ class TaskContext:
         """
         start_timer = False
         invoke_now = False
+        # 在锁内捕获具名值，使 mypy 跨锁收窄 force_after 类型（避免 float | None 传入）。
+        timer_after: float | None = None
         with self._callback_lock:
             callback_id = self._callback_counter
             self._callback_counter += 1
@@ -84,30 +89,35 @@ class TaskContext:
             invoke_now = self._cancelled.is_set()
             if force_after is not None and self._force_timer is None:
                 start_timer = True
+                timer_after = force_after
         if invoke_now:
             self._invoke_callbacks()
-        if start_timer:
-            assert force_after is not None  # guarded by start_timer condition
-            self._force_timer = threading.Timer(force_after, self._force_cleanup)
-            self._force_timer.daemon = True
-            self._force_timer.start()
+        if start_timer and timer_after is not None:
+            self._start_force_timer(timer_after)
 
     def _cancel(self, *, force_after: float | None = None) -> bool:
         """内部方法：标记取消并触发回调。返回是否成功设置（已为 True 返回 False）。"""
         if self._cancelled.is_set():
             # 已取消状态下仍可启动新的 force_after 定时器
             if force_after is not None and self._force_timer is None:
-                self._force_timer = threading.Timer(force_after, self._force_cleanup)
-                self._force_timer.daemon = True
-                self._force_timer.start()
+                self._start_force_timer(force_after)
             return False
         self._cancelled.set()
         self._invoke_callbacks()
         if force_after is not None and self._force_timer is None:
-            self._force_timer = threading.Timer(force_after, self._force_cleanup)
-            self._force_timer.daemon = True
-            self._force_timer.start()
+            self._start_force_timer(force_after)
         return True
+
+    def _start_force_timer(self, force_after: float) -> None:
+        """启动 force_after 定时器并记录秒数，供 context 迁移时重启。
+
+        必须在调用方确认 ``_force_timer is None`` 后调用（避免重复启动）。
+        """
+        self._force_after = force_after
+        timer = threading.Timer(force_after, self._force_cleanup)
+        timer.daemon = True
+        self._force_timer = timer
+        timer.start()
 
     def _invoke_callbacks(self) -> None:
         """顺序调用所有未执行过的清理钩子，错误被捕获并 log。
@@ -140,17 +150,24 @@ class TaskContext:
 
         已执行过的回调不会重复迁移；若本 context 已被取消，迁移后立即触发
         ``other`` 的回调（保证预取消阶段设置的回调仍然执行）。
+
+        force_after 定时器状态也一并迁移：若本 context 已启动 force_after
+        定时器，在 ``other`` 上以相同的 force_after 秒数重启定时器。这避免了
+        竞态场景下旧 context 的定时器触发时回调已迁移走而漏执行。
         """
         with self._callback_lock:
             callbacks = list(self._callbacks)
             cancelled = self._cancelled.is_set()
+            force_after = self._force_after
         if callbacks:
             with other._callback_lock:
                 for _, cb in callbacks:
                     other._callbacks.append((other._callback_counter, cb))
                     other._callback_counter += 1
         if cancelled:
-            other._cancel()
+            # 迁移取消状态：若旧 context 已设置 force_after，在新 context 上
+            # 也启动 force_after 定时器（_cancel 内部会检查 _force_timer is None）。
+            other._cancel(force_after=force_after)
 
     def _force_cleanup(self) -> None:
         """force_after 超时后强制调用所有未执行的清理钩子。"""

@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use crate::common::{ActantConfig, NodeId};
+use crate::runtime::network::Transport;
 use crate::runtime::state::event_log::EventLog;
 use crate::runtime::state::{HybridLogicalClock, Store};
 
@@ -22,6 +23,11 @@ pub struct Orchestrator {
     pub(crate) condition_evaluator: Option<Arc<dyn ConditionEvaluator>>,
     pub(crate) node_id: Option<NodeId>,
     pub(crate) hlc: Arc<HybridLogicalClock>,
+    /// 网络传输层。`None` 时（如单元测试或无网络场景）超时监控仅标记工作流
+    /// 失败，不广播取消消息；`Some` 时（生产运行时）超时监控通过 gossip
+    /// topic ``actant:cancel`` 广播 `CancelBroadcast`，触发所有相关节点
+    ///（包括本地与远端）取消运行中的任务。
+    pub(crate) network: Option<Arc<dyn Transport>>,
 }
 
 impl Drop for Orchestrator {
@@ -43,6 +49,7 @@ impl Clone for Orchestrator {
             condition_evaluator: self.condition_evaluator.clone(),
             node_id: self.node_id.clone(),
             hlc: self.hlc.clone(),
+            network: self.network.clone(),
         }
     }
 }
@@ -57,6 +64,7 @@ impl Orchestrator {
             condition_evaluator: None,
             node_id: None,
             hlc: Arc::new(HybridLogicalClock::new()),
+            network: None,
         }
     }
 
@@ -90,6 +98,16 @@ impl Orchestrator {
 
     pub fn with_condition_evaluator(mut self, evaluator: Arc<dyn ConditionEvaluator>) -> Self {
         self.condition_evaluator = Some(evaluator);
+        self
+    }
+
+    /// 注入网络传输层，启用工作流级硬超时的主动取消能力（B2）。
+    ///
+    /// 未注入时：超时监控仅将工作流标记为失败，运行中的任务继续执行至完成或自身超时。
+    /// 注入后：超时监控在标记失败前，对所有运行中任务广播 `CancelBroadcast`，
+    /// 触发本地与远端 Worker 协作式取消。
+    pub fn with_network(mut self, network: Arc<dyn Transport>) -> Self {
+        self.network = Some(network);
         self
     }
 

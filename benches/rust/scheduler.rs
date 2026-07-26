@@ -19,7 +19,8 @@ use tokio::runtime::Runtime;
 use actant::common::{ActorId, RetryPolicy, TaskDefinition, TaskId, WorkflowId};
 use actant::runtime::actor::ActorSystem;
 use actant::runtime::workflow::{
-    fifo_scheduler_actor, priority_scheduler_actor, ActorScheduler, Scheduler,
+    fifo_scheduler_actor, priority_scheduler_actor, spawn_fast_path_scheduler, ActorScheduler,
+    Scheduler,
 };
 
 fn make_task(idx: usize, priority: i32) -> TaskDefinition {
@@ -190,6 +191,116 @@ fn bench_dequeue_batch_priority(c: &mut Criterion) {
     group.finish();
 }
 
+// ── fast-path 基准测试 ────────────────────────────────────────────
+//
+// 对比 enqueue 快路径（直接操作共享 InnerScheduler）与慢路径（Actor 消息往返）。
+
+/// 启动 priority SchedulerActor 并返回启用 fast-path 的客户端。
+fn priority_client_fast(rt: &Runtime) -> Arc<dyn Scheduler> {
+    let actor_system = Arc::new(ActorSystem::new());
+    let actor_id = ActorId::new("sched-priority-fast-bench".to_string());
+    let sched = rt
+        .block_on(spawn_fast_path_scheduler(
+            actor_id,
+            actor_system,
+            priority_scheduler_actor(),
+        ))
+        .unwrap();
+    Arc::new(sched)
+}
+
+/// 单线程 enqueue fast-path：对比 `bench_enqueue_priority` 量化快路径收益。
+fn bench_enqueue_fast_path(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
+    let mut group = c.benchmark_group("scheduler/priority/enqueue_fast_path");
+    for &n in &[1_000usize, 10_000] {
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
+            b.iter(|| {
+                let sched = priority_client_fast(&rt);
+                rt.block_on(async {
+                    for i in 0..n {
+                        let _ = sched.enqueue(make_task(i, (i % 10) as i32 - 5)).await;
+                    }
+                    black_box(&sched);
+                });
+            });
+        });
+    }
+    group.finish();
+}
+
+/// 多生产者并发 enqueue fast-path：揭示 `InnerScheduler` 锁争用开销。
+fn bench_enqueue_multi_producer_fast_path(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
+    let mut group = c.benchmark_group("scheduler/priority/multi_producer_fast_path");
+    for &producers in &[2usize, 4, 8] {
+        let total = 10_000;
+        group.bench_with_input(
+            BenchmarkId::new("10k_total", producers),
+            &(producers, total),
+            |b, &(producers, total)| {
+                b.iter(|| {
+                    let sched = priority_client_fast(&rt);
+                    rt.block_on(async {
+                        let per_producer = total / producers;
+                        let mut handles = Vec::new();
+                        for p in 0..producers {
+                            let sched = sched.clone();
+                            handles.push(tokio::spawn(async move {
+                                let base = p * per_producer;
+                                for i in base..base + per_producer {
+                                    let _ = sched.enqueue(make_task(i, (i % 10) as i32 - 5)).await;
+                                }
+                            }));
+                        }
+                        for h in handles {
+                            let _ = h.await;
+                        }
+                        black_box(&sched);
+                    });
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+/// 多生产者并发 enqueue 慢路径（Actor 消息往返），与 fast-path 对比。
+fn bench_enqueue_multi_producer_actor(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
+    let mut group = c.benchmark_group("scheduler/priority/multi_producer_actor");
+    for &producers in &[2usize, 4, 8] {
+        let total = 10_000;
+        group.bench_with_input(
+            BenchmarkId::new("10k_total", producers),
+            &(producers, total),
+            |b, &(producers, total)| {
+                b.iter(|| {
+                    let sched = priority_client(&rt);
+                    rt.block_on(async {
+                        let per_producer = total / producers;
+                        let mut handles = Vec::new();
+                        for p in 0..producers {
+                            let sched = sched.clone();
+                            handles.push(tokio::spawn(async move {
+                                let base = p * per_producer;
+                                for i in base..base + per_producer {
+                                    let _ = sched.enqueue(make_task(i, (i % 10) as i32 - 5)).await;
+                                }
+                            }));
+                        }
+                        for h in handles {
+                            let _ = h.await;
+                        }
+                        black_box(&sched);
+                    });
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     scheduler_benches,
     bench_enqueue_priority,
@@ -197,5 +308,8 @@ criterion_group!(
     bench_enqueue_batch_priority,
     bench_enqueue_fifo,
     bench_dequeue_batch_priority,
+    bench_enqueue_fast_path,
+    bench_enqueue_multi_producer_fast_path,
+    bench_enqueue_multi_producer_actor,
 );
 criterion_main!(scheduler_benches);

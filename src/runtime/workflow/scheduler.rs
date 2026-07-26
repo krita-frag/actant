@@ -7,8 +7,8 @@
 //! ## 阻塞语义
 //!
 //! `dequeue()` 在队列为空时可以等待任务；`try_dequeue()` 必须立即返回。
-//! Worker 主循环通过订阅 `Topic::TaskEnqueued` 事件驱动 `try_dequeue()`，
-//! 而非 sleep 轮询——SchedulerActor 在 `enqueue` 后发布事件，Worker 立即被唤醒。
+//! Worker 主循环通过 `TaskEnqueued` 专用 `Notify` 信号驱动 `try_dequeue()`，
+//! 而非 sleep 轮询——SchedulerActor 在 `enqueue` 后触发 `notify_task_enqueued()`，Worker 立即被唤醒。
 //!
 //! ## 扩展点
 //!
@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use crate::common::scheduler_kind;
 use crate::common::{ActantError, ActorId, TaskDefinition};
 use crate::runtime::actor::ActorSystem;
-use crate::runtime::workflow::actor::scheduler_methods;
+use crate::runtime::workflow::actor::{scheduler_methods, InnerScheduler};
 use crate::runtime::workflow::messaging::{decode_result, encode, ok_or_error};
 
 /// 任务调度器抽象。
@@ -107,16 +107,54 @@ pub fn registered_names() -> Vec<String> {
     ]
 }
 
+/// 构造启用 enqueue fast-path 的 [`ActorScheduler`]（供 bench/test 使用）。
+///
+/// 生产代码用 [`crate::runtime::builder::init_worker`] 装配；此函数仅供
+/// 基准/测试直接构造 fast-path 客户端，避免依赖完整 `WorkerInitParams`。
+#[doc(hidden)]
+pub async fn spawn_fast_path_scheduler(
+    actor_id: ActorId,
+    actor_system: Arc<ActorSystem>,
+    actor: crate::runtime::workflow::SchedulerActor,
+) -> Result<ActorScheduler, ActantError> {
+    let inner = actor.shared_inner();
+    actor_system.spawn(actor_id.clone(), actor).await?;
+    Ok(ActorScheduler::with_fast_path(
+        actor_id,
+        actor_system,
+        inner,
+    ))
+}
+
 /// 通过 [`ActorSystem`] 调用 [`SchedulerActor`] 的客户端。
 ///
 /// 这是 `Worker` 迁移到 Actor 模型的桥接实现：调度状态由
 /// `SchedulerActor` 持有，本客户端仅负责序列化请求并通过 actor 消息
 /// 协议转发。
+///
+/// # enqueue 快路径
+///
+/// 当通过 [`Self::with_fast_path`] 构造时，`enqueue` / `enqueue_batch`
+/// 直接调用共享的 [`InnerScheduler::enqueue`] 同步方法，绕过 Actor 消息往返
+/// （postcard 编解码 + 邮箱调度 + 响应通道），将单任务入队延迟从 ~10µs
+/// 降至 ~100ns 量级。
+///
+/// 快路径安全性：`InnerScheduler` 的队列由 `parking_lot::Mutex` 保护，
+/// `notify` 为线程安全 `tokio::sync::Notify`，`closed` 为 `AtomicBool`。
+/// `enqueue` 的 `notify_one()` 唤醒语义与 Actor 路径的
+/// `notify_task_enqueued()` 一致（Worker 通过 `Notify` 信号驱动 `try_dequeue`）。
+///
+/// `dequeue` / `try_dequeue` / `close` 等仍走 Actor 消息协议——这些操作
+/// 涉及 Actor 侧协调（如 `dequeue` 的阻塞等待、`close` 的 drain 模式），
+/// 不适合直接共享状态。
 #[derive(Clone)]
 pub struct ActorScheduler {
     actor_id: ActorId,
     actor_system: Arc<ActorSystem>,
     closed: Arc<AtomicBool>,
+    /// enqueue 快路径共享状态。`None` 时退化为 Actor 消息往返。
+    /// 由 [`SchedulerActor::shared_inner`] 在 spawn 前注入。
+    fast_inner: Option<Arc<InnerScheduler>>,
 }
 
 impl ActorScheduler {
@@ -125,6 +163,25 @@ impl ActorScheduler {
             actor_id,
             actor_system,
             closed: Arc::new(AtomicBool::new(false)),
+            fast_inner: None,
+        }
+    }
+
+    /// 启用 enqueue 快路径：注入与 `SchedulerActor` 共享的内部状态。
+    ///
+    /// 调用方应在 `ActorSystem::spawn` **之前**调用 `SchedulerActor::shared_inner`
+    /// 获取 `Arc<InnerScheduler>`，再通过本方法构造客户端。典型用法见
+    /// [`crate::runtime::builder::init_worker`]。
+    pub(crate) fn with_fast_path(
+        actor_id: ActorId,
+        actor_system: Arc<ActorSystem>,
+        inner: Arc<InnerScheduler>,
+    ) -> Self {
+        Self {
+            actor_id,
+            actor_system,
+            closed: Arc::new(AtomicBool::new(false)),
+            fast_inner: Some(inner),
         }
     }
 
@@ -146,6 +203,15 @@ impl ActorScheduler {
 #[async_trait]
 impl Scheduler for ActorScheduler {
     async fn enqueue(&self, task: TaskDefinition) -> Result<(), ActantError> {
+        // 快路径：直接调用共享 InnerScheduler::enqueue，绕过 Actor 消息往返。
+        // 适用于高 QPS 单任务入队场景（如 mailbox 持久化后的任务派发）。
+        // Worker 唤醒由 InnerScheduler::enqueue 内部的 notify_one() 保证，
+        // 语义与 Actor 路径的 notify_task_enqueued() 一致。
+        if let Some(ref inner) = self.fast_inner {
+            return inner.enqueue(task);
+        }
+        // 慢路径：无共享状态（如纯单元测试构造的 ActorScheduler::new），
+        // 走完整 Actor 消息协议。
         let result = self
             .call(scheduler_methods::ENQUEUE, encode(&task)?)
             .await?;
@@ -153,6 +219,10 @@ impl Scheduler for ActorScheduler {
     }
 
     async fn enqueue_batch(&self, tasks: Vec<TaskDefinition>) -> Result<(), ActantError> {
+        // 快路径：批量入队同样直接操作共享状态。
+        if let Some(ref inner) = self.fast_inner {
+            return inner.enqueue_batch(tasks);
+        }
         let result = self
             .call(scheduler_methods::ENQUEUE_BATCH, encode(&tasks)?)
             .await?;
@@ -261,7 +331,14 @@ impl Scheduler for ActorScheduler {
     /// 本地 `closed` 标志已确保客户端不再接受新任务，调度器在 Actor 侧最终也会
     /// 通过其他路径（如 ActorSystem shutdown）停止。
     fn close(&self) {
+        // 本地 closed 标志：保证客户端侧 enqueue 立即被拒。
         self.closed.store(true, Ordering::Release);
+        // 快路径共享状态 closed 标志：保证直接调用 InnerScheduler::enqueue
+        // 的路径（绕过 ActorScheduler::enqueue 的 closed 检查）也被拒绝。
+        // InnerScheduler::check_closed 在 enqueue 入口检查此标志。
+        if let Some(ref inner) = self.fast_inner {
+            inner.close();
+        }
         let actor_id = self.actor_id.clone();
         let actor_system = self.actor_system.clone();
         tokio::spawn(async move {
@@ -275,7 +352,15 @@ impl Scheduler for ActorScheduler {
     }
 
     fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::Acquire)
+        // 本地 closed 标志优先：close() 调用后立即生效。
+        if self.closed.load(Ordering::Acquire) {
+            return true;
+        }
+        // 快路径共享状态标志：反映 Actor 侧或其他客户端触发的 close。
+        if let Some(ref inner) = self.fast_inner {
+            return inner.is_closed();
+        }
+        false
     }
 }
 

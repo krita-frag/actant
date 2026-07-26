@@ -1,9 +1,9 @@
 [package]
 name = "actant"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.75"
-description = "基于 Actor 模型的跨平台通用分布式任务编排引擎 — 0.2.0"
+description = "基于 Actor 模型的跨平台通用分布式任务编排引擎 — 0.3.0"
 
 [dependencies]
 async-trait = "0.1"
@@ -37,6 +37,12 @@ opentelemetry_sdk = { version = "0.32", features = ["metrics"] }
 opentelemetry-prometheus = "0.32"
 opentelemetry-appender-tracing = "0.32"
 opentelemetry-semantic-conventions = "0.32"
+# OTLP gRPC exporter（C1）：通过 `OTEL_EXPORTER_OTLP_ENDPOINT` 自动启用。
+# 使用 grpc-tonic 子 feature，遵循 OTel 规范默认传输协议。
+# 当不启用 OTLP 时不影响其他 exporter。
+# tonic 直接依赖：用于 metrics init() 中解析 headers 为 MetadataMap（避免依赖 opentelemetry-otlp 内部类型）。
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["metrics", "grpc-tonic"] }
+tonic = { version = "0.14", default-features = false }
 prometheus = "0.14"
 dhat = { version = "0.3.3", optional = true }
 console-subscriber = { version = "0.4", optional = true }
@@ -47,6 +53,10 @@ tempfile = "3.24.0"
 criterion = { version = "0.5", features = ["html_reports"] }
 serde_json = "1.0"
 proptest = "1.5"
+# auto-initialize：Rust 单元测试（cargo test，非 maturin/pytest 驱动）需自动初始化
+# Python 解释器才能调用 Python::attach。生产 cdylib 由 Python 解释器加载，已初始化，
+# 此 feature 不参与 release 构建（dev-dependencies 仅在 test/bench 时激活）。
+pyo3 = { version = "0.29", features = ["auto-initialize"] }
 
 [features]
 dhat-heap = ["dep:dhat"]
@@ -87,31 +97,37 @@ debug = true
 
 [[bench]]
 name = "scheduler"
+path = "benches/rust/scheduler.rs"
 harness = false
 required-features = []
 
 [[bench]]
 name = "serialization"
+path = "benches/rust/serialization.rs"
 harness = false
 required-features = []
 
 [[bench]]
 name = "store"
+path = "benches/rust/store.rs"
 harness = false
 required-features = []
 
 [[bench]]
 name = "actor_messaging"
+path = "benches/rust/actor_messaging.rs"
 harness = false
 required-features = []
 
 [[bench]]
 name = "capability_dispatch"
+path = "benches/rust/capability_dispatch.rs"
 harness = false
 required-features = []
 
 [[bench]]
 name = "event_bus"
+path = "benches/rust/event_bus.rs"
 harness = false
 required-features = []
 
@@ -119,6 +135,7 @@ required-features = []
 # 运行：cargo bench --bench orchestrator
 [[bench]]
 name = "orchestrator"
+path = "benches/rust/orchestrator.rs"
 harness = false
 required-features = []
 
@@ -126,6 +143,7 @@ required-features = []
 # 运行：cargo bench --bench network
 [[bench]]
 name = "network"
+path = "benches/rust/network.rs"
 harness = false
 required-features = []
 
@@ -133,6 +151,7 @@ required-features = []
 # 运行：cargo test --bench mem_profile --features dhat-heap -- --nocapture
 [[bench]]
 name = "mem_profile"
+path = "benches/rust/mem_profile.rs"
 harness = false
 required-features = ["dhat-heap"]
 

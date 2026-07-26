@@ -181,6 +181,7 @@ impl Orchestrator {
             hlc: Arc::new(HybridLogicalClock::with_max_drift_ms(
                 config.network.hlc_max_drift_ms,
             )),
+            network: None,
         };
 
         Ok(orchestrator)

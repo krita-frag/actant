@@ -412,3 +412,180 @@ async fn dispatch_with_empty_signing_key_skips_verification() {
         .unwrap();
     assert_eq!(result, b"ok");
 }
+
+// ───────────────────────── tx.send 失败路径测试（H1）─────────────────────────
+//
+// 以下测试覆盖 dispatcher.rs 中 `tx.send(...).is_err()` 三个分支：
+// 当 dispatch future 在 handler 完成前被 drop（例如上层 tokio 任务被 abort），
+// oneshot::Receiver 被释放，handler 完成时 `tx.send()` 返回 `Err`。
+// 此时 dispatcher 仅记录 warn 日志，不应 panic 或污染线程池。
+//
+// 实现策略：使用 `tokio::time::timeout` 在 handler 完成前 drop dispatch future
+// （释放 rx），然后等待足够长时间让 handler 完成（命中 tx.send().is_err() 路径），
+// 最后再次 dispatch 验证线程池仍然可用。
+// 注意：不能使用 `Barrier::wait()` 同步，因为验证性 dispatch 会再次调用 handler，
+// 导致 barrier 在无第二个参与者时永久阻塞。
+
+#[tokio::test]
+async fn dispatch_dropped_future_with_ok_handler_does_not_corrupt_registry() {
+    // 覆盖 `tx.send(Ok(value)).is_err()` 分支。
+    let registry = TaskRegistry::new(2, 8, TEST_KEY.to_vec()).unwrap();
+
+    registry.register("slow-ok", move |_payload, _flag| {
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        // future 被 drop 后，tx.send(Ok(..)) 返回 Err。
+        Ok(b"done".to_vec())
+    });
+
+    // timeout 在 20ms 时 drop dispatch future（rx 被释放）。
+    let timed_out = tokio::time::timeout(
+        std::time::Duration::from_millis(20),
+        registry.dispatch("slow-ok", signed(b""), new_cancel_flag()),
+    )
+    .await;
+    assert!(timed_out.is_err(), "dispatch should time out");
+
+    // 等待 handler 完成（80ms sleep + 余量），命中 tx.send().is_err() 路径。
+    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+
+    // 线程池应仍然可用——验证性 dispatch 不会阻塞。
+    let result = registry
+        .dispatch("slow-ok", signed(b""), new_cancel_flag())
+        .await
+        .unwrap();
+    assert_eq!(result, b"done");
+}
+
+#[tokio::test]
+async fn dispatch_dropped_future_with_err_handler_does_not_corrupt_registry() {
+    // 覆盖 `tx.send(Err(e)).is_err()` 分支。
+    let registry = TaskRegistry::new(2, 8, TEST_KEY.to_vec()).unwrap();
+
+    registry.register("slow-err", move |_payload, _flag| {
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        Err(ActantError::Worker("late error".into()))
+    });
+
+    let timed_out = tokio::time::timeout(
+        std::time::Duration::from_millis(20),
+        registry.dispatch("slow-err", signed(b""), new_cancel_flag()),
+    )
+    .await;
+    assert!(timed_out.is_err(), "dispatch should time out");
+
+    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+
+    // 线程池应仍然可用——handler 返回 Err 被正常传播给调用方。
+    let err = registry
+        .dispatch("slow-err", signed(b""), new_cancel_flag())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ActantError::Worker(_)));
+}
+
+#[tokio::test]
+async fn dispatch_dropped_future_with_panic_handler_does_not_kill_worker() {
+    // 覆盖 `tx.send(Err(panic)).is_err()` 分支。
+    // 关键断言：catch_unwind 捕获 panic 后 worker 线程应存活。
+    let registry = Arc::new(TaskRegistry::new(2, 8, TEST_KEY.to_vec()).unwrap());
+    let panicked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    registry.register("slow-panic", {
+        let panicked = panicked.clone();
+        move |_payload, _flag| {
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            panicked.store(true, std::sync::atomic::Ordering::SeqCst);
+            panic!("late panic after future drop");
+        }
+    });
+
+    let timed_out = tokio::time::timeout(
+        std::time::Duration::from_millis(20),
+        TaskDispatcher::dispatch(&*registry, "slow-panic", signed(b""), new_cancel_flag()),
+    )
+    .await;
+    assert!(timed_out.is_err(), "dispatch should time out");
+
+    // 等待 handler 完成（sleep + panic），catch_unwind 捕获 panic。
+    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+    assert!(
+        panicked.load(std::sync::atomic::Ordering::SeqCst),
+        "handler should have panicked"
+    );
+
+    // 注册一个独立 handler 验证 worker 线程仍然存活。
+    registry.register("healthy", |_p, _f| Ok(b"alive".to_vec()));
+    let result = registry
+        .dispatch("healthy", signed(b""), new_cancel_flag())
+        .await
+        .unwrap();
+    assert_eq!(result, b"alive");
+}
+
+// ───────────────────────── 线程池容量与签名禁用边界测试（H1）─────────────────────────
+
+#[tokio::test]
+async fn dispatch_when_pool_at_capacity_returns_error() {
+    // 覆盖 submit() 的 `TrySendError::Full` 分支。
+    // 线程池 1 worker + channel capacity 1：最多 2 个 in-flight 任务（1 运行 + 1 排队）。
+    let registry = TaskRegistry::new(1, 1, TEST_KEY.to_vec()).unwrap();
+
+    registry.register("blocking", |_payload, _flag| {
+        // 睡眠足够长以确保测试期间 worker 被占用。
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        Ok(b"done".to_vec())
+    });
+
+    let registry = Arc::new(registry);
+
+    // 第一次 dispatch：启动并占用 worker。
+    let r1 = registry.clone();
+    tokio::spawn(async move {
+        let _ = TaskDispatcher::dispatch(&*r1, "blocking", signed(b""), new_cancel_flag()).await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+    // 第二次 dispatch：应进入 channel 队列（capacity 1）。
+    let r2 = registry.clone();
+    tokio::spawn(async move {
+        let _ = TaskDispatcher::dispatch(&*r2, "blocking", signed(b""), new_cancel_flag()).await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+    // 第三次 dispatch：channel 已满，submit 应返回 Full 错误。
+    let err = registry
+        .dispatch("blocking", signed(b""), new_cancel_flag())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ActantError::Internal(ref m) if m.contains("at capacity")),
+        "expected capacity error, got: {:?}",
+        err
+    );
+
+    // 等待排队的任务完成，确保 worker 线程能干净退出。
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+}
+
+#[tokio::test]
+async fn dispatch_with_empty_key_rejects_signed_payload() {
+    // 覆盖 verify() 在空 key + MAC_PREFIX 数据时返回错误的路径。
+    // 空 key 禁用签名，但若 payload 看起来已被签名（以 MAC_PREFIX 开头），
+    // 应拒绝以避免在禁用签名的节点上误处理本应签名的 payload。
+    let registry = TaskRegistry::new(1, 8, Vec::new()).unwrap();
+    registry.register("echo", |_p, _f| Ok(b"ok".to_vec()));
+
+    // 用非空 key 签名一个 payload，然后用空 key 的 registry dispatch。
+    let signed_payload = crate::common::payload::sign(b"some-key", b"data").unwrap();
+
+    let err = registry
+        .dispatch("echo", signed_payload, new_cancel_flag())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ActantError::Internal(ref m)
+            if m.contains("signing disabled but payload appears signed")),
+        "expected signing-disabled rejection, got: {:?}",
+        err
+    );
+}

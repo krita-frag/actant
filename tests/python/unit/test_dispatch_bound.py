@@ -41,9 +41,11 @@ def test_bound_handler_success() -> None:
     handler = _bind_dispatch_handler(rt)
     payload = _payload_bytes(lambda x: x + 1, (1,), {}, {"task_id": "t1", "retries": 0})
     raw = handler(payload, _FakeToken())
-    success, result_bytes = cloudpickle.loads(raw)
+    # P2-9 优化后 _handler 返回 cloudpickle.dumps((success, payload_obj))，
+    # payload_obj 是对象本身（非 bytes），省去双层 dumps/loads。
+    success, result_obj = cloudpickle.loads(raw)
     assert success is True
-    assert cloudpickle.loads(result_bytes) == 2
+    assert result_obj == 2
 
 
 def test_bound_handler_failure() -> None:
@@ -55,10 +57,9 @@ def test_bound_handler_failure() -> None:
 
     payload = _payload_bytes(boom, (), {}, {"task_id": "t2", "retries": 0})
     raw = handler(payload, _FakeToken())
-    success, error_bytes = cloudpickle.loads(raw)
+    success, exc_obj = cloudpickle.loads(raw)
     assert success is False
-    exc = cloudpickle.loads(error_bytes)
-    assert isinstance(exc, ValueError)
+    assert isinstance(exc_obj, ValueError)
 
 
 def test_bound_handler_pre_cancelled() -> None:
@@ -66,29 +67,27 @@ def test_bound_handler_pre_cancelled() -> None:
     handler = _bind_dispatch_handler(rt)
     payload = _payload_bytes(lambda: 1, (), {}, {"task_id": "t3", "retries": 0})
     raw = handler(payload, _FakeToken())
-    success, error_bytes = cloudpickle.loads(raw)
+    success, exc_obj = cloudpickle.loads(raw)
     assert success is False
-    exc = cloudpickle.loads(error_bytes)
-    assert isinstance(exc, TaskCancelledError)
+    assert isinstance(exc_obj, TaskCancelledError)
 
 
 def test_bound_handler_deserialization_error() -> None:
     rt = _runtime_with_task("t4")
     handler = _bind_dispatch_handler(rt)
     raw = handler(b"bad-payload", _FakeToken())
-    success, error_bytes = cloudpickle.loads(raw)
+    success, exc_obj = cloudpickle.loads(raw)
     assert success is False
-    exc = cloudpickle.loads(error_bytes)
-    assert isinstance(exc, Exception)
+    assert isinstance(exc_obj, Exception)
 
 
 def test_bound_handler_runtime_none() -> None:
     handler = _bind_dispatch_handler(None)
     payload = _payload_bytes(lambda: 42, (), {}, {"task_id": "t5", "retries": 0})
     raw = handler(payload, _FakeToken())
-    success, result_bytes = cloudpickle.loads(raw)
+    success, result_obj = cloudpickle.loads(raw)
     assert success is True
-    assert cloudpickle.loads(result_bytes) == 42
+    assert result_obj == 42
 
 
 def test_bound_handler_cancel_token_during_execution() -> None:
@@ -117,7 +116,6 @@ def test_bound_handler_cancel_token_during_execution() -> None:
     threading.Thread(target=do_cancel, daemon=True).start()
     payload = _payload_bytes(check_cancel, (), {}, {"task_id": "t6", "retries": 0, "timeout_ms": 0})
     raw = handler(payload, token)
-    success, payload_bytes = cloudpickle.loads(raw)
+    success, exc_obj = cloudpickle.loads(raw)
     assert success is False
-    exc = cloudpickle.loads(payload_bytes)
-    assert isinstance(exc, TaskCancelledError)
+    assert isinstance(exc_obj, TaskCancelledError)

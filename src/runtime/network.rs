@@ -247,6 +247,59 @@ impl Discovery for MdnsDiscovery {
     }
 }
 
+/// DNS endpoint 发现策略。
+///
+/// 启用 iroh 的 `DnsAddressLookup` + `PkarrPublisher`，禁用 relay。
+/// 适合 K8s Headless Service 或自建 DNS 场景：节点通过 DNS TXT 记录
+/// `_iroh.<z32-endpoint-id>.<origin_domain>` 互相发现。
+///
+/// 若 `dns_origin_domain` 为空，使用 n0 默认域 `iroh.link`。
+#[derive(Debug, Clone, Default)]
+pub struct DnsDiscovery {
+    /// 自定义 DNS 起源域。空表示使用 n0 默认域。
+    pub origin_domain: String,
+}
+
+impl Discovery for DnsDiscovery {
+    #[tracing::instrument(name = "discovery.dns", level = "debug", skip_all, fields(origin = %self.origin_domain))]
+    fn apply(&self, builder: Builder) -> Builder {
+        let mut builder = iroh::endpoint::presets::Minimal.apply(builder);
+        let lookup = if self.origin_domain.is_empty() {
+            iroh::address_lookup::DnsAddressLookup::n0_dns()
+        } else {
+            iroh::address_lookup::DnsAddressLookup::builder(self.origin_domain.clone())
+        };
+        builder = builder
+            .address_lookup(iroh::address_lookup::PkarrPublisher::n0_dns())
+            .address_lookup(lookup)
+            .relay_mode(iroh::RelayMode::Disabled);
+        builder
+    }
+
+    fn name(&self) -> &'static str {
+        discovery_mode::DNS
+    }
+}
+
+/// 强制启用 iroh relay 中继的发现策略。
+///
+/// 等价于 n0 预设但显式启用 `RelayMode::Default`，确保 NAT 穿透场景下
+/// 节点可通过 n0 公共 relay 中继。若需使用自定义 relay 集群，请扩展
+/// `NetworkConfig` 增加自定义 relay map（暂未实现，0.4 计划）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RelayDiscovery;
+
+impl Discovery for RelayDiscovery {
+    #[tracing::instrument(name = "discovery.relay", level = "debug", skip_all)]
+    fn apply(&self, builder: Builder) -> Builder {
+        iroh::endpoint::presets::N0.apply(builder)
+    }
+
+    fn name(&self) -> &'static str {
+        discovery_mode::RELAY
+    }
+}
+
 /// 装箱的类型擦除发现策略。
 #[derive(Debug, Clone)]
 pub struct BoxedDiscovery(Arc<dyn Discovery>);
@@ -271,7 +324,11 @@ impl Discovery for BoxedDiscovery {
 pub fn is_registered(name: &str) -> bool {
     matches!(
         name,
-        discovery_mode::NONE | discovery_mode::LOCAL | discovery_mode::MDNS
+        discovery_mode::NONE
+            | discovery_mode::LOCAL
+            | discovery_mode::MDNS
+            | discovery_mode::DNS
+            | discovery_mode::RELAY
     )
 }
 
@@ -281,16 +338,28 @@ pub fn registered_names() -> Vec<String> {
         discovery_mode::NONE.to_string(),
         discovery_mode::LOCAL.to_string(),
         discovery_mode::MDNS.to_string(),
+        discovery_mode::DNS.to_string(),
+        discovery_mode::RELAY.to_string(),
     ]
 }
 
 /// 从字符串名创建发现策略。
-pub fn discovery_from_name(name: &str) -> Result<BoxedDiscovery, ActantError> {
+///
+/// `dns` 模式下 `config.dns_origin_domain` 非空时使用自定义 DNS 起源域，
+/// 否则回退到 n0 默认 `iroh.link`。
+pub fn discovery_from_name(
+    name: &str,
+    config: &NetworkConfig,
+) -> Result<BoxedDiscovery, ActantError> {
     let _span = tracing::debug_span!("discovery.resolve", name = name).entered();
     match name {
         discovery_mode::NONE => Ok(BoxedDiscovery::new(NoDiscovery)),
         discovery_mode::LOCAL => Ok(BoxedDiscovery::new(LocalDiscovery)),
         discovery_mode::MDNS => Ok(BoxedDiscovery::new(MdnsDiscovery)),
+        discovery_mode::DNS => Ok(BoxedDiscovery::new(DnsDiscovery {
+            origin_domain: config.dns_origin_domain.clone(),
+        })),
+        discovery_mode::RELAY => Ok(BoxedDiscovery::new(RelayDiscovery)),
         other => Err(ActantError::Config(format!(
             "unknown discovery mode '{}': expected one of {}",
             other,
@@ -322,6 +391,20 @@ pub enum DirectRequest {
     /// 远端 Actor 方法调用（点对点）。
     ActorCall {
         target: crate::common::ActorId,
+        method: String,
+        payload: Vec<u8>,
+        reply_to: RemoteReplyAddress,
+    },
+    /// 按 actor 类型发起的远端调用（A2 路由）。
+    ///
+    /// 与 [`DirectRequest::ActorCall`] 不同：调用方不指定具体 ActorId，
+    /// 而是按 actor 类型字符串由接收方在本节点上选择一个匹配实例。
+    ///
+    /// 由 [`crate::runtime::actor::ActorSystem::call_by_type`] 触发，
+    /// 接收方在 [`crate::runtime::workflow::runtime::network_router::NetworkEventRouter`]
+    /// 中通过 `ActorSystem::find_local_actor_by_type` 选择本地实例并调用。
+    ActorCallByType {
+        actor_type: String,
         method: String,
         payload: Vec<u8>,
         reply_to: RemoteReplyAddress,
@@ -398,7 +481,7 @@ impl NetworkManager {
             listen_port = config.listen_port,
             "network.new: enter"
         );
-        let discovery = discovery_from_name(config.discovery_mode.as_str())?;
+        let discovery = discovery_from_name(config.discovery_mode.as_str(), &config)?;
         tracing::info!("network.new: discovery resolved");
 
         let builder = Endpoint::builder(iroh::endpoint::presets::Minimal);
@@ -646,6 +729,11 @@ impl NetworkManager {
     }
 
     /// 接收下一条网络事件。
+    ///
+    /// 实现持 `tokio::Mutex` 跨 `recv().await`，串行化事件消费。
+    /// 当前为单消费者模型（Worker 仅启动一个 `start_network_event_loop`），
+    /// 故不会成为瓶颈。若未来改为多 worker 共享 `event_rx`，需重构为
+    /// `broadcast`/`mpsc` 分发，否则多消费者会在此互斥锁上排队。
     pub async fn recv_event(&self) -> Option<NetworkEvent> {
         let mut guard = self.event_rx.lock().await;
         guard.recv().await

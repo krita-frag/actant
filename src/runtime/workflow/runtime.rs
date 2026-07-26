@@ -10,8 +10,8 @@
 //!
 //! 1. 启动网络事件循环，订阅 task / heartbeat / DAG state / cancel 等 topic。
 //! 2. 启动远端结果重试循环和取消 TTL 清理循环。
-//! 3. 订阅 `Topic::TaskEnqueued` 事件，SchedulerActor 在 `enqueue` 后发布事件
-//!    唤醒 Worker 拉取任务。
+//! 3. 获取 `TaskEnqueued` 专用 `Notify` 信号，SchedulerActor 在 `enqueue` 后
+//!    触发 `notify_task_enqueued()` 唤醒 Worker 拉取任务。
 //! 4. 为每个任务获取 semaphore 槽位，注册 cancel flag，执行或转发任务。
 //! 5. 将任务结果投递回 origin 节点或本地 WorkflowActor。
 //!
@@ -26,7 +26,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::common::{
-    ActantError, NodeId, Result, TaskCompletion, TaskDefinition, Topic, WorkerConfig, WorkflowId,
+    format_error_kind, ActantError, NodeId, Result, TaskCompletion, TaskDefinition, Topic,
+    WorkerConfig, WorkflowId,
 };
 use crate::runtime::actor::ActorSystem;
 use crate::runtime::dispatcher::{new_cancel_flag, CancelFlag, TaskDispatcher};
@@ -46,11 +47,12 @@ use crate::common::TaskId;
 #[cfg(test)]
 use crate::runtime::network::DirectResponseChannel;
 
-/// 事件驱动的任务拉取。
+/// 信号驱动的任务拉取。
 ///
 /// 先 ``try_dequeue`` 拉取已入队任务；无任务时在 EventBus 的
-/// ``TaskEnqueued`` 订阅上 await，由 SchedulerActor 在 ``enqueue`` 后
-/// 发布事件唤醒。无 sleep、无固定延迟、无 CPU 浪费。
+/// ``TaskEnqueued`` 专用 ``Notify`` 信号上 await，由 SchedulerActor 在
+/// ``enqueue`` 后调用 ``notify_task_enqueued()`` 唤醒。
+/// 无 sleep、无固定延迟、无 CPU 浪费。
 ///
 /// # 为什么不直接调用 ``dequeue()``
 ///
@@ -58,27 +60,77 @@ use crate::runtime::network::DirectResponseChannel;
 /// SchedulerActor 的 ``handle_message`` 会调用 ``inner.dequeue().await``，
 /// 该方法在队列为空时阻塞。由于 Actor 单线程顺序处理消息，阻塞的
 /// DEQUEUE 会阻止后续 ENQUEUE 被处理，形成死锁。
-/// 通过 EventBus 事件 + 非阻塞 ``try_dequeue`` 组合，Actor 每条消息
+/// 通过 Notify 信号 + 非阻塞 ``try_dequeue`` 组合，Actor 每条消息
 /// 都能立即返回，Worker 也能在任务入队时立即被唤醒。
 ///
-/// # 事件丢失安全性
+/// # 信号丢失安全性
 ///
-/// ``TaskEnqueued`` 是 ``BestEffort`` 投递——通道满时丢弃。这不会导致
-/// 任务丢失：Worker 每次被唤醒后会循环 ``try_dequeue`` 直到队列空，
-/// 丢弃事件仅意味着"少唤醒一次"，下一次事件或下一次循环仍会拉取到任务。
+/// ``Notify::notify_waiters()`` 仅唤醒当前正在等待的 Future，不存储信号。
+/// 若 notify 时无等待者，信号丢失。但这不影响正确性：Worker 每次被唤醒后
+/// 会循环 ``try_dequeue`` 直到队列空。关键场景是 Worker 正在 ``notified().await``
+/// 时收到 notify——此时立即唤醒。Worker 在处理任务期间（未 await）收到的
+/// notify 会丢失，但 Worker 完成当前任务后会再次 ``try_dequeue``，拉取到
+/// 期间入队的任务。
+///
+/// # 订阅竞态安全性
+///
+/// ``Notify`` 引用在 ``run()`` 的 ``ready`` 信号前获取（见 ``run`` 注释），
+/// 因此 ``serve()`` 返回后 ``submit_task`` 触发的 notify 不会被错过——
+/// Worker 进入循环后立即在 notify 上 await。
 async fn wait_for_task(
     scheduler: &Arc<dyn Scheduler>,
-    event_rx: &mut tokio::sync::mpsc::Receiver<BusEvent>,
-) -> Option<TaskDefinition> {
+    notify: &Arc<tokio::sync::Notify>,
+) -> TaskDefinition {
     loop {
-        if let Some(task) = scheduler.try_dequeue().await {
-            return Some(task);
+        let dequeue_result = scheduler.try_dequeue().await;
+        if let Some(task) = dequeue_result {
+            return task;
         }
-        // 无任务时等待 EventBus 事件。事件由 SchedulerActor 在
-        // enqueue/enqueue_batch/close 后发布。recv() 返回 None 表示
-        // EventBus 已 drop（仅在 Runtime shutdown 时发生）——
-        // 此时 Worker 的 cancel 信号也会触发，select! 会取 cancel 分支。
-        event_rx.recv().await?;
+        // 无任务时等待 Notify 信号。信号由 SchedulerActor 在
+        // enqueue/enqueue_batch 后通过 notify_task_enqueued() 触发。
+        // notified().await 在收到 notify_waiters() 时返回，否则永久阻塞——
+        // shutdown 时 select! 的 cancel 分支会取消此 future。
+        //
+        // Notify 引用在 ready 信号前获取，不会因竞态错过信号。
+        // notify_waiters() 仅唤醒当前等待者，不存储许可——
+        // Worker 处理任务期间收到的 notify 会丢失，但下次 try_dequeue
+        // 仍会拉取已入队任务（见上方"信号丢失安全性"）。
+        notify.notified().await;
+    }
+}
+
+/// 批量 prefetch 任务：一次拉取最多 ``limit`` 个任务到本地 inflight 队列。
+///
+/// 与 ``wait_for_task`` 的单任务拉取相比，批量 prefetch 有两个性能优势：
+///
+/// 1. **减少 dequeue 调用次数**：每次 Actor 调用涉及消息编码/解码/通道往返，
+///    批量拉取将 N 次调用降为 1 次（当队列中有积压任务时）。
+/// 2. **解耦 dequeue 与 dispatch**：prefetch 后主循环可立即开始 dispatch，
+///    不必等待下一次 dequeue；同时 dispatcher 线程池能更快填满，提升并发度。
+///
+/// 队列空时退化为 ``wait_for_task`` 的等待语义：先 dequeue_batch 一次，
+/// 无任务则等待 Notify 信号唤醒。这避免了空队列时的忙轮询。
+///
+/// 返回值：始终返回非空 Vec（队列为空时阻塞直到有任务）。
+async fn prefetch_tasks(
+    scheduler: &Arc<dyn Scheduler>,
+    notify: &Arc<tokio::sync::Notify>,
+    limit: usize,
+) -> Vec<TaskDefinition> {
+    if limit == 0 {
+        // limit=0 退化为单任务模式：拉一个返回。
+        return vec![wait_for_task(scheduler, notify).await];
+    }
+    loop {
+        // 先尝试批量拉取：若队列有积压，一次拉满 limit。
+        // dequeue_batch 在队列为空时返回空 Vec（不阻塞），故需配合信号等待。
+        let batch = scheduler.dequeue_batch(limit).await;
+        if !batch.is_empty() {
+            return batch;
+        }
+        // 队列空：等待 Notify 信号唤醒，避免忙轮询。
+        // 收到信号后下一轮 loop 重新 dequeue_batch。
+        notify.notified().await;
     }
 }
 
@@ -121,6 +173,12 @@ pub struct Worker {
     workflow_actor_id: Option<crate::common::ActorId>,
     /// 本地 DagGossipActor 的 id。用于处理工作流状态请求/响应主题。
     dag_gossip_actor_id: Option<crate::common::ActorId>,
+    /// Actor 注册表 gossip 处理器（A2）。用于接收 `TOPIC_ACTOR_REGISTRY` 上的远端注册表广播，
+    /// 通过 `NetworkEventRouter` 路由到 `handle_gossip`。
+    actor_registry_gossip: Option<Arc<crate::runtime::actor::router::ActorRegistryGossipActor>>,
+    /// Capability gossip 处理器。用于接收 `TOPIC_CAPABILITY_GOSSIP` 上的远端 capability 广播，
+    /// 通过 `NetworkEventRouter` 路由到 `handle_gossip`。
+    capability_gossip: Option<Arc<crate::runtime::capability::gossip::CapabilityGossipActor>>,
     /// 远端 peer 容量视图，用于 unrouted task 的自动路由。
     failover: Option<Arc<crate::runtime::workflow::FailoverManager>>,
     /// 最大并发任务数。用 AtomicUsize 支持运行时扩容（`set_max_concurrent_tasks`）。
@@ -188,6 +246,8 @@ impl Worker {
             actor_system: None,
             workflow_actor_id: None,
             dag_gossip_actor_id: None,
+            actor_registry_gossip: None,
+            capability_gossip: None,
             failover: None,
             max_concurrent_tasks: Arc::new(std::sync::atomic::AtomicUsize::new(max_concurrent)),
             task_timeout: Duration::from_millis(config.default_task_timeout_ms),
@@ -279,6 +339,30 @@ impl Worker {
 
     pub(crate) fn with_dag_gossip_actor_id(mut self, id: crate::common::ActorId) -> Self {
         self.dag_gossip_actor_id = Some(id);
+        self
+    }
+
+    /// 注入 Actor 注册表 gossip 处理器（A2）。
+    ///
+    /// `NetworkEventRouter` 在收到 `TOPIC_ACTOR_REGISTRY` gossip 消息时，
+    /// 通过此 handler 的 `handle_gossip` 方法更新本地注册表。
+    pub(crate) fn with_actor_registry_gossip(
+        mut self,
+        gossip: Arc<crate::runtime::actor::router::ActorRegistryGossipActor>,
+    ) -> Self {
+        self.actor_registry_gossip = Some(gossip);
+        self
+    }
+
+    /// 注入 Capability gossip 处理器。
+    ///
+    /// `NetworkEventRouter` 在收到 `TOPIC_CAPABILITY_GOSSIP` gossip 消息时，
+    /// 通过此 handler 的 `handle_gossip` 方法更新本地 capability 视图。
+    pub(crate) fn with_capability_gossip(
+        mut self,
+        gossip: Arc<crate::runtime::capability::gossip::CapabilityGossipActor>,
+    ) -> Self {
+        self.capability_gossip = Some(gossip);
         self
     }
 
@@ -387,11 +471,20 @@ impl Worker {
         self.start_network_event_loop();
         self.start_cancelled_tasks_cleanup_loop();
         let pending_tx = self.start_pending_result_loop();
+        // 获取 TaskEnqueued 唤醒信号的 Arc<Notify> 引用。
+        // Notify 无队列、无丢弃：notify_waiters() 唤醒所有正在
+        // .notified().await 的 Worker。ready 信号前获取确保：
+        // serve() 返回后 Python submit() 触发的 notify 不会错过——
+        // Worker 进入 run_task_execution_loop 后立即在 notify 上 await。
+        let task_enqueued_notify = self.event_bus.task_enqueued_notify();
         // 进入任务执行循环前发送就绪信号：``serve()`` 据此返回。
         // ``send_replace`` 写入持久状态，即使等待者晚于 ``run()`` 启动
-        // 也能立即观察到 true。
+        // 也能立即观察到 true。返回的旧值无意义（始终是 false）。
         let _ = self.ready.send_replace(true);
-        self.run_task_execution_loop(&pending_tx).await
+        let result = self
+            .run_task_execution_loop(&pending_tx, &task_enqueued_notify)
+            .await;
+        result
     }
 
     /// 阻塞当前线程直到 Worker 进入任务执行循环（``run()`` 完成初始化）。
@@ -407,8 +500,15 @@ impl Worker {
             return Ok(());
         }
         // `changed()` 在 Sender 被关闭时返回 Err，自然解除阻塞。
+        // Err 路径表示 run() 在就绪前已退出（spawn 失败等），返回 Ok
+        // 让 serve() 完成；后续 submit 会因 worker 未就绪而显式失败。
         let _ = rx.changed().await;
         Ok(())
+    }
+
+    /// 诊断方法：检查 worker 是否已就绪（ready=true）。
+    pub fn is_ready(&self) -> bool {
+        *self.ready.borrow()
     }
 
     /// 在 tokio 后台 spawn P2P topic 订阅。非阻塞。
@@ -425,6 +525,10 @@ impl Worker {
                 Topic::workflow_state_req(&node_id),
                 Topic::workflow_state_resp(&node_id),
                 Topic::from(crate::common::wire::constants::TOPIC_CANCEL),
+                // A2：actor 注册表 gossip topic。builder 启动 gossip actor 前已订阅一次，
+                // 这里在 worker 的 subscribe_topics 中重复订阅是幂等的
+                // （iroh 对同一 topic 的多次 subscribe 不报错）。
+                Topic::from(crate::common::wire::constants::TOPIC_ACTOR_REGISTRY),
             ];
             for topic in &topics {
                 tracing::info!("subscribing to topic: {}", topic);
@@ -452,6 +556,8 @@ impl Worker {
             actor_system: self.actor_system.clone(),
             workflow_actor_id: self.workflow_actor_id.clone(),
             dag_gossip_actor_id: self.dag_gossip_actor_id.clone(),
+            actor_registry_gossip: self.actor_registry_gossip.clone(),
+            capability_gossip: self.capability_gossip.clone(),
             cancel_flags: self.cancel_flags.clone(),
             cancelled_tasks: self.cancelled_tasks.clone(),
         });
@@ -497,6 +603,7 @@ impl Worker {
     async fn run_task_execution_loop(
         &self,
         pending_tx: &tokio::sync::mpsc::Sender<PendingResult>,
+        task_enqueued_notify: &Arc<tokio::sync::Notify>,
     ) -> Result<()> {
         let node_id = self.node_id.clone();
         let network = self.network.clone();
@@ -510,10 +617,21 @@ impl Worker {
         let cancel_flags = self.cancel_flags.clone();
         let cancelled_tasks = self.cancelled_tasks.clone();
 
-        // 订阅 TaskEnqueued 事件：SchedulerActor 在 enqueue 后发布事件，
-        // Worker 在此事件上 await 唤醒。
-        // 订阅在循环外创建，整个 Worker 生命周期复用同一 receiver。
-        let mut task_enqueued_rx = self.event_bus.subscribe(crate::runtime::event_bus::Topic::TaskEnqueued);
+        // Prefetch 批量大小：取 max_concurrent_tasks 与 16 的较大值。
+        // 一次拉取多个任务到本地 inflight，避免每任务一次 dequeue 调用。
+        // 上限 64 防止过度 prefetch 占用调度器内存。
+        let prefetch_limit = {
+            let mc = self
+                .max_concurrent_tasks
+                .load(std::sync::atomic::Ordering::Acquire);
+            mc.clamp(16, 64)
+        };
+
+        // 本地 inflight 队列：prefetch 拉取的任务暂存于此，主循环从中取任务 dispatch。
+        // 当队列为空时触发下一次 prefetch。这使 dequeue 与 dispatch 解耦：
+        // dispatch 一个任务的同时，下一批任务已在 inflight 中等待。
+        let mut inflight: std::collections::VecDeque<TaskDefinition> =
+            std::collections::VecDeque::with_capacity(prefetch_limit);
 
         loop {
             if *self.state.subscribe().borrow() == WorkerState::Draining {
@@ -524,48 +642,67 @@ impl Worker {
                 while self.scheduler.try_dequeue().await.is_some() {}
                 // 通知子任务（network event loop、retry loop）退出。
                 // 否则 rt.shutdown_timeout 会等待完整的 5s。
+                // cancel.send 失败仅当所有 receiver 已 drop（子任务已退出）。
                 let _ = self.cancel.send(true);
                 self.publish_lifecycle(BusEvent::WorkerDrained {
                     node_id: self.node_id.clone(),
                 });
+                // state_sender.send_replace 返回旧值无意义。
                 let _ = state_sender.send_replace(WorkerState::Stopped);
                 return Ok(());
             }
 
-            let task = tokio::select! {
-                _ = task_cancel.changed() => {
-                    let _ = state_sender.send_replace(WorkerState::Draining);
-                    let running = self.running_task_count();
-                    tracing::info!(
-                        running_tasks = running,
-                        drain_timeout_ms = drain_timeout.as_millis(),
-                        "worker entering drain mode, waiting for running tasks"
-                    );
+            // 取下一个任务：优先从 inflight 队列取（避免 dequeue 调用）；
+            // inflight 空时触发 prefetch 批量拉取。
+            // 每次 select! 同时监听 cancel 信号，确保 drain 命令即时响应。
+            let task_opt: Option<TaskDefinition> = if let Some(t) = inflight.pop_front() {
+                Some(t)
+            } else {
+                let prefetch_result = tokio::select! {
+                    _ = task_cancel.changed() => {
+                        // state_sender.send_replace 返回旧值无意义。
+                        let _ = state_sender.send_replace(WorkerState::Draining);
+                        let running = self.running_task_count();
+                        tracing::info!(
+                            running_tasks = running,
+                            drain_timeout_ms = drain_timeout.as_millis(),
+                            "worker entering drain mode, waiting for running tasks"
+                        );
 
-                    let drain_result = tokio::time::timeout(
-                        drain_timeout,
-                        async {
-                            let sem = semaphore.clone();
-                            let permit = sem.acquire_many(self.max_concurrent_tasks.load(std::sync::atomic::Ordering::Acquire) as u32).await;
-                            drop(permit);
-                        },
-                    ).await;
+                        let drain_result = tokio::time::timeout(
+                            drain_timeout,
+                            async {
+                                let sem = semaphore.clone();
+                                let permit = sem.acquire_many(self.max_concurrent_tasks.load(std::sync::atomic::Ordering::Acquire) as u32).await;
+                                drop(permit);
+                            },
+                        ).await;
 
-                    if drain_result.is_err() {
-                        tracing::warn!("drain timeout exceeded, forcing shutdown");
-                    } else {
-                        tracing::info!("all running tasks completed, shutting down");
+                        if drain_result.is_err() {
+                            tracing::warn!("drain timeout exceeded, forcing shutdown");
+                        } else {
+                            tracing::info!("all running tasks completed, shutting down");
+                        }
+
+                        self.publish_lifecycle(BusEvent::WorkerDrained {
+                            node_id: self.node_id.clone(),
+                        });
+                        // state_sender.send_replace 返回旧值无意义。
+                        let _ = state_sender.send_replace(WorkerState::Stopped);
+                        return Ok(());
                     }
-
-                    self.publish_lifecycle(BusEvent::WorkerDrained {
-                        node_id: self.node_id.clone(),
-                    });
-                    let _ = state_sender.send_replace(WorkerState::Stopped);
-                    return Ok(());
+                    batch = prefetch_tasks(&self.scheduler, task_enqueued_notify, prefetch_limit) => batch,
+                };
+                // prefetch_tasks 返回非空 batch（内部保证）。
+                // 第一个任务作为当前任务，剩余入 inflight 供后续循环快速取用。
+                let mut batch = prefetch_result;
+                let first = batch.remove(0);
+                if !batch.is_empty() {
+                    inflight.extend(batch);
                 }
-                task = wait_for_task(&self.scheduler, &mut task_enqueued_rx) => task,
+                Some(first)
             };
-            let Some(task) = task else {
+            let Some(task) = task_opt else {
                 continue;
             };
 
@@ -626,13 +763,22 @@ impl Worker {
                                 target.as_str(),
                                 e
                             );
-                            let mut rerouted_task = task;
-                            rerouted_task.target_node = None;
-                            if let Err(e) = self.scheduler.enqueue(rerouted_task).await {
-                                tracing::warn!("failed to re-enqueue task for re-routing: {}", e);
-                            }
-                            // 退避阻塞主循环，避免转发失败时 busy-loop。
-                            tokio::time::sleep(self.remote_fallback_delay).await;
+                            // 退避由独立 spawn 触发：延迟 remote_fallback_delay 后
+                            // 再 enqueue，主循环不阻塞，可继续处理其他任务。
+                            // target_node 已清空，重新入队后由路由器选择新目标。
+                            let scheduler = self.scheduler.clone();
+                            let delay = self.remote_fallback_delay;
+                            tokio::spawn(async move {
+                                tokio::time::sleep(delay).await;
+                                let mut rerouted = task;
+                                rerouted.target_node = None;
+                                if let Err(e) = scheduler.enqueue(rerouted).await {
+                                    tracing::warn!(
+                                        "failed to re-enqueue task for re-routing: {}",
+                                        e
+                                    );
+                                }
+                            });
                             continue;
                         }
                     }
@@ -650,11 +796,15 @@ impl Worker {
                     "submit-only node cannot execute task {} locally, re-enqueueing for re-routing",
                     task.id.as_str()
                 );
-                if let Err(e) = self.scheduler.enqueue(task).await {
-                    tracing::warn!("failed to re-enqueue submit-only task: {}", e);
-                }
-                // 退避阻塞主循环，避免 submit-only 节点 busy-loop。
-                tokio::time::sleep(self.remote_fallback_delay).await;
+                // 同上：退避由独立 spawn 触发，延迟 enqueue 避免主循环阻塞。
+                let scheduler = self.scheduler.clone();
+                let delay = self.remote_fallback_delay;
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    if let Err(e) = scheduler.enqueue(task).await {
+                        tracing::warn!("failed to re-enqueue submit-only task: {}", e);
+                    }
+                });
                 continue;
             }
 
@@ -793,6 +943,7 @@ impl Worker {
     /// 此方法只广播取消信号，不等待任务完成。等待顺序由
     /// [`crate::runtime::Runtime::shutdown`] 统一处理。
     pub fn shutdown(&self) {
+        // state_sender.send_replace 返回旧值无意义。
         let _ = self.state.send_replace(WorkerState::Draining);
         if let Err(e) = self.cancel.send(true) {
             tracing::warn!("failed to send shutdown signal: {}", e);
@@ -807,10 +958,12 @@ impl Worker {
     /// 用于 `worker.run()` 异常退出（如 subscribe_topics 被 cancel）后，
     /// 确保 `Runtime::shutdown()` 中等待 `WorkerState::Stopped` 不会超时。
     pub fn notify_stopped(&self) {
+        // state_sender.send_replace 返回旧值无意义。
         let _ = self.state.send_replace(WorkerState::Stopped);
     }
 
     pub fn drain(&self) {
+        // state_sender.send_replace 返回旧值无意义。
         let _ = self.state.send_replace(WorkerState::Draining);
         self.scheduler.close();
         if let Some(ref cb) = self.capacity_callback {
@@ -969,7 +1122,7 @@ fn build_completion_from_dispatch_result(
                 workflow_id,
                 task_id: task.id.clone(),
                 task_name: task.name.clone(),
-                error: e.to_string(),
+                error: format_error_kind("task", &e.to_string()),
                 target_node: task.target_node.clone(),
             }
         }
@@ -1001,7 +1154,7 @@ fn build_completion_from_dispatch_result(
                 workflow_id,
                 task_id: task.id.clone(),
                 task_name: task.name.clone(),
-                error: format!("dispatcher panicked: {panic_msg}"),
+                error: format_error_kind("internal", &format!("dispatcher panicked: {panic_msg}")),
                 target_node: task.target_node.clone(),
             }
         }
@@ -1015,7 +1168,10 @@ fn build_completion_from_dispatch_result(
                 workflow_id,
                 task_id: task.id.clone(),
                 task_name: task.name.clone(),
-                error: format!("task timed out after {}ms", effective_timeout.as_millis()),
+                error: format_error_kind(
+                    "timeout",
+                    &format!("task timed out after {}ms", effective_timeout.as_millis()),
+                ),
                 target_node: task.target_node.clone(),
             }
         }
@@ -1087,9 +1243,12 @@ async fn publish_task_completion(
                             workflow_id: workflow_id.clone(),
                             task_id: task.id.clone(),
                             task_name: task.name.clone(),
-                            error: format!(
-                                "result delivery to orchestrator {} rejected and retry queue full",
-                                origin_addr
+                            error: format_error_kind(
+                                "network",
+                                &format!(
+                                    "result delivery to orchestrator {} rejected and retry queue full",
+                                    origin_addr
+                                ),
                             ),
                             target_node: task.target_node.clone(),
                         };
@@ -1114,9 +1273,12 @@ async fn publish_task_completion(
                             workflow_id: workflow_id.clone(),
                             task_id: task.id.clone(),
                             task_name: task.name.clone(),
-                            error: format!(
-                                "unexpected response from {} and retry queue full",
-                                origin_addr
+                            error: format_error_kind(
+                                "network",
+                                &format!(
+                                    "unexpected response from {} and retry queue full",
+                                    origin_addr
+                                ),
                             ),
                             target_node: task.target_node.clone(),
                         };
@@ -1142,9 +1304,12 @@ async fn publish_task_completion(
                             workflow_id: workflow_id.clone(),
                             task_id: task.id.clone(),
                             task_name: task.name.clone(),
-                            error: format!(
-                                "delivery to {} failed: {} and retry queue full",
-                                origin_addr, e
+                            error: format_error_kind(
+                                "network",
+                                &format!(
+                                    "delivery to {} failed: {} and retry queue full",
+                                    origin_addr, e
+                                ),
                             ),
                             target_node: task.target_node.clone(),
                         };

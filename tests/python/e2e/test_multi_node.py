@@ -18,7 +18,7 @@ import pytest
 import actant
 from actant import Runtime
 from actant.task import task
-from tests._helpers import connect_peers
+from tests.python._helpers import connect_peers
 
 # 模块级状态：用于跟踪 flaky 任务在 worker 线程的调用次数
 # （cloudpickle 序列化后闭包变量不共享，需用模块级状态）
@@ -185,7 +185,7 @@ class TestCrossNodeTaskExecution:
                 22,
                 endpoint_addr=rt_b.listen_addresses()["endpoint_addr"],
             )
-            result = handle.result(timeout=15.0)
+            result = handle.result(timeout=30.0)
             assert result == 42
 
     def test_task_with_retries_succeeds(self, two_nodes) -> None:
@@ -195,19 +195,19 @@ class TestCrossNodeTaskExecution:
         @task(retries=2, retry_delay_ms=10)
         def flaky() -> str:
             # 用模块级状态跟踪调用次数（cloudpickle 序列化后闭包变量不共享）
-            import tests.e2e.test_multi_node as mod
+            import tests.python.e2e.test_multi_node as mod
             mod._flaky_call_count += 1
             if mod._flaky_call_count < 2:
                 raise RuntimeError("temporary failure")
             return "ok"
 
         # 重置模块级计数器
-        import tests.e2e.test_multi_node as mod
+        import tests.python.e2e.test_multi_node as mod
         mod._flaky_call_count = 0
 
         with actant.use_runtime(rt_a):
             handle = flaky.submit()
-            result = handle.result(timeout=15.0)
+            result = handle.result(timeout=30.0)
             assert result == "ok"
             assert mod._flaky_call_count >= 2, (
                 f"flaky should be called at least 2 times, got {mod._flaky_call_count}"

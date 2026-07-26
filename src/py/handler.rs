@@ -48,19 +48,26 @@ where
     Codec: PyHandlerAskCodec<C> + Send + Sync + 'static,
 {
     async fn ask(&self, req: Arc<dyn Any + Send + Sync>) -> Option<Box<dyn Any + Send + Sync>> {
-        let req = req.downcast_ref::<C::Request>()?;
-        Python::attach(|py| {
-            let handler = self.handler.lock().clone_ref(py);
-            let py_req = Codec::encode_request(py, req).ok()?;
-            let t0 = Instant::now();
-            let py_resp = handler.call1(py, (&py_req,)).ok()?.into_bound(py);
-            crate::metrics::observe_python_handler_ms(t0.elapsed().as_millis() as u64);
-            if py_resp.is_none() {
-                return None;
-            }
-            let resp = Codec::decode_response(py, &py_resp).ok()??;
-            Some(Box::new(resp) as Box<dyn Any + Send + Sync>)
+        let req = req.downcast_ref::<C::Request>()?.clone();
+        // 在 GIL 下快速 clone handler 引用；后续 Python 调用放到 spawn_blocking，
+        // 避免阻塞 tokio worker 线程。
+        let handler = Python::attach(|py| self.handler.lock().clone_ref(py));
+
+        tokio::task::spawn_blocking(move || {
+            Python::attach(|py| {
+                let py_req = Codec::encode_request(py, &req).ok()?;
+                let t0 = Instant::now();
+                let py_resp = handler.call1(py, (&py_req,)).ok()?.into_bound(py);
+                crate::metrics::observe_python_handler_ms(t0.elapsed().as_millis() as u64);
+                if py_resp.is_none() {
+                    return None;
+                }
+                let resp = Codec::decode_response(py, &py_resp).ok()??;
+                Some(Box::new(resp) as Box<dyn Any + Send + Sync>)
+            })
         })
+        .await
+        .ok()?
     }
 
     async fn perform(
@@ -111,20 +118,28 @@ where
         let req = req.downcast_ref::<C::Request>().ok_or_else(|| {
             ActantError::Internal("python perform handler: request mismatch".into())
         })?;
-        let resp = Python::attach(|py| -> Result<C::Response, ActantError> {
-            let handler = self.handler.lock().clone_ref(py);
-            let py_req = Codec::encode_request(py, req)
-                .map_err(|e| ActantError::Internal(format!("encode request: {}", e)))?;
-            let t0 = Instant::now();
-            let py_resp = handler
-                .call1(py, (&py_req,))
-                .map_err(|e| ActantError::Internal(format!("python handler: {}", e)))?
-                .into_bound(py);
-            crate::metrics::observe_python_handler_ms(t0.elapsed().as_millis() as u64);
-            let resp = Codec::decode_response(py, &py_resp)
-                .map_err(|e| ActantError::Internal(format!("decode response: {}", e)))?;
-            Ok(resp)
-        })?;
+        let req = req.clone();
+        // 在 GIL 下快速 clone handler 引用；后续 Python 调用放到 spawn_blocking，
+        // 避免阻塞 tokio worker 线程。
+        let handler = Python::attach(|py| self.handler.lock().clone_ref(py));
+
+        let resp = tokio::task::spawn_blocking(move || {
+            Python::attach(|py| -> Result<C::Response, ActantError> {
+                let py_req = Codec::encode_request(py, &req)
+                    .map_err(|e| ActantError::Internal(format!("encode request: {}", e)))?;
+                let t0 = Instant::now();
+                let py_resp = handler
+                    .call1(py, (&py_req,))
+                    .map_err(|e| ActantError::Internal(format!("python handler: {}", e)))?
+                    .into_bound(py);
+                crate::metrics::observe_python_handler_ms(t0.elapsed().as_millis() as u64);
+                let resp = Codec::decode_response(py, &py_resp)
+                    .map_err(|e| ActantError::Internal(format!("decode response: {}", e)))?;
+                Ok(resp)
+            })
+        })
+        .await
+        .map_err(|e| ActantError::Internal(format!("python perform handler join: {}", e)))?;
         Ok(Box::new(resp) as Box<dyn Any + Send + Sync>)
     }
 
@@ -172,18 +187,26 @@ where
         let req = req
             .downcast_ref::<C::Request>()
             .ok_or_else(|| ActantError::Internal("python emit handler: request mismatch".into()))?;
-        Python::attach(|py| -> Result<(), ActantError> {
-            let handler = self.handler.lock().clone_ref(py);
-            let py_req = Codec::encode_request(py, req)
-                .map_err(|e| ActantError::Internal(format!("encode request: {}", e)))?;
-            let t0 = Instant::now();
-            match handler.call1(py, (&py_req,)) {
-                Ok(_) => (),
-                Err(e) => return Err(ActantError::Internal(format!("python handler: {}", e))),
-            }
-            crate::metrics::observe_python_handler_ms(t0.elapsed().as_millis() as u64);
-            Ok(())
+        let req = req.clone();
+        // 在 GIL 下快速 clone handler 引用；后续 Python 调用放到 spawn_blocking，
+        // 避免阻塞 tokio worker 线程。
+        let handler = Python::attach(|py| self.handler.lock().clone_ref(py));
+
+        tokio::task::spawn_blocking(move || {
+            Python::attach(|py| -> Result<(), ActantError> {
+                let py_req = Codec::encode_request(py, &req)
+                    .map_err(|e| ActantError::Internal(format!("encode request: {}", e)))?;
+                let t0 = Instant::now();
+                match handler.call1(py, (&py_req,)) {
+                    Ok(_) => (),
+                    Err(e) => return Err(ActantError::Internal(format!("python handler: {}", e))),
+                }
+                crate::metrics::observe_python_handler_ms(t0.elapsed().as_millis() as u64);
+                Ok(())
+            })
         })
+        .await
+        .map_err(|e| ActantError::Internal(format!("python emit handler join: {}", e)))?
     }
 }
 

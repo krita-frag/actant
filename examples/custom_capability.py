@@ -1,6 +1,6 @@
 """自定义 Capability 与 handler 链组合。
 
-演示 0.2.0 的扩展能力：
+演示扩展能力：
 
 - 用 ``rt.layer(name, kind)`` 直接注册自定义 capability（自动创建 meta）
 - 用 Protocol 约定 handler 签名（``RoutingHandler`` / ``StoreHandler`` 等）
@@ -28,11 +28,6 @@ from actant import (
 
 # Handler Protocol 类型从 capabilities 子模块导入（未在顶层 re-export）。
 
-# ---------------------------------------------------------------------------
-# 自定义请求类型：限流决策
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class ThrottleCtx:
     """``Throttle`` capability 的请求上下文。"""
@@ -44,11 +39,6 @@ class ThrottleCtx:
 
 # 自定义 capability 通过 ``rt.layer(name, kind)`` 直接注册，
 # layer() 会自动创建 CapabilityMeta 并存入 Runtime._metas，无需单独声明。
-
-
-# ---------------------------------------------------------------------------
-# 自定义 handler：实现内置 Protocol
-# ---------------------------------------------------------------------------
 
 
 class TagAwareRouter:
@@ -77,12 +67,6 @@ class PriorityScheduler:
             if task_id.startswith("P0:"):
                 return task_id
         return None
-
-
-# ---------------------------------------------------------------------------
-# 自定义 perform capability：内存 KV 存储
-# ---------------------------------------------------------------------------
-
 
 class InMemoryStore:
     """``KVStore`` capability 的 handler（perform 副作用型）。

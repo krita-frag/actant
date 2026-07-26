@@ -176,6 +176,14 @@ class WorkflowCancelledError(ActantError):
 
 
 # Rust ActantError variant → Python exception class
+#
+# 注意：以下三个 Python 异常类故意不在此表中，原因如下：
+# - PayloadTooLargeError (kind="payload_too_large")：无对应 Rust ActantError 变体，
+#   由 Python 层在序列化后直接检查大小并抛出。其构造签名为 (actual, limit) 而非
+#   (message)，与 raise_for_kind(kind, message) 接口不兼容。
+# - WorkflowFailedError (kind="workflow_failed")：workflow 终态异常，由
+#   raise_for_state() 根据 workflow 终态 "Failed" 映射，而非来自 Rust ActantError。
+# - WorkflowCancelledError (kind="workflow_cancelled")：同上，对应终态 "Cancelled"。
 _KIND_TO_EXCEPTION: dict[str, type[ActantError]] = {
     "storage": StorageError,
     "network": NetworkError,
@@ -208,6 +216,76 @@ def raise_for_kind(kind: str, message: str) -> None:
     if exc_cls is not None:
         raise exc_cls(message)
     raise ActantError(message, kind=kind)
+
+
+# 跨语言错误类型保留协议：
+#
+# Rust 端 ``TaskCompletion::Failed.error`` 是 ``String``，无法直接携带 Python
+# 异常类信息。为保留错误类型，约定在 error 字符串前缀编码 kind：
+#
+#     ``[actant:KIND] message``
+#
+# Python 侧 ``_decode_error_kind`` 解析前缀，调用 ``raise_for_kind`` 重建子类。
+# 无前缀的 error 字符串视为 ``task`` kind（任务执行失败的默认语义）。
+#
+# 编码格式选择 ``[actant:KIND] `` 而非 JSON：
+# - Rust 端只需 ``format!("[actant:{}] {}", kind, msg)``，零依赖。
+# - 前缀可被人类直接阅读（日志/trace 友好）。
+# - 解析只需一次字符串分割，O(1)。
+_ERROR_KIND_PREFIX = "[actant:"
+
+
+def encode_error_kind(kind: str, message: str) -> str:
+    """将 kind 编码到错误消息前缀，供跨语言传播。
+
+    格式：``[actant:KIND] message``。
+
+    与 ``_decode_error_kind`` 配对使用。Rust 端生成 ``TaskCompletion::Failed``
+    时应使用此格式（Rust 端直接 ``format!`` 即可，无需调用 Python）。
+    """
+    return f"{_ERROR_KIND_PREFIX}{kind}] {message}"
+
+
+def decode_error_kind(error_str: str) -> tuple[str, str]:
+    """解析 ``encode_error_kind`` 编码的错误字符串。
+
+    无前缀时返回 ``("task", error_str)``（任务执行失败的默认 kind）。
+
+    Returns:
+        ``(kind, message)`` 元组。
+    """
+    if not error_str:
+        return "task", error_str
+    if not error_str.startswith(_ERROR_KIND_PREFIX):
+        return "task", error_str
+    # 寻找闭合 ']'
+    end = error_str.find("]", len(_ERROR_KIND_PREFIX))
+    if end < 0:
+        return "task", error_str
+    kind = error_str[len(_ERROR_KIND_PREFIX):end]
+    # 跳过 "] "（若有）
+    message_start = end + 1
+    if message_start < len(error_str) and error_str[message_start] == " ":
+        message_start += 1
+    message = error_str[message_start:]
+    return kind, message
+
+
+def reconstruct_error(error_str: str) -> ActantError:
+    """从 error 字符串重建对应的 ActantError 子类。
+
+    用于 ``Runtime._on_task_result`` 处理 ``state == "Failed"`` 路径：
+    Rust 端 ``TaskCompletion::Failed.error`` 是字符串，通过此函数解析
+    kind 前缀并重建对应 Python 异常子类。
+
+    无 kind 前缀时返回 ``TaskError``（任务执行失败的默认语义）。
+    """
+    kind, message = decode_error_kind(error_str)
+    exc_cls = _KIND_TO_EXCEPTION.get(kind)
+    if exc_cls is not None:
+        # 各子类 __init__ 会添加 hint 后缀，这里直接调用。
+        return exc_cls(message)
+    return ActantError(message, kind=kind)
 
 
 def raise_for_state(state: str, error: str, *, failed_tasks: list[list[str]] | None = None) -> None:

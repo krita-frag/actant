@@ -1,6 +1,6 @@
 """顶层 pytest 配置：环境隔离、计时报告、分层标记。
 
-测试体系分层：
+测试体系分层（位于 ``tests/python/``）：
 - ``unit/``        纯单元测试，无网络无 I/O，零 Rust 运行时依赖
 - ``integration/`` 单进程集成测试，真实 Rust 运行时，单节点
 - ``e2e/``         多节点真实分布式，gossip 通信，故障注入
@@ -84,6 +84,94 @@ def _force_offline_discovery():
             os.environ.pop("ACTANT_DISCOVERY", None)
         else:
             os.environ["ACTANT_DISCOVERY"] = prev
+
+
+# ---------------------------------------------------------------------------
+# Runtime 隔离：每个测试后强制 GC + 等待 iroh/tokio 资源释放
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _isolate_runtime_between_tests():
+    """每个测试前后强制隔离 Runtime 资源。
+
+    问题：连续多个测试创建/销毁 Runtime 时，前一个 stop() 触发的 iroh endpoint
+    关闭与 tokio runtime drop 是异步的，下一个测试启动时若资源未完全释放
+    （socket TIME_WAIT、tokio worker thread 未退出），新 Runtime 的 Worker
+    启动会延迟，导致 TaskStarted 事件迟迟不到 → `_wait_for_state` 超时。
+
+    策略：
+    1. 测试前：清除 thread-local Runtime 引用，防止上一个测试泄漏。
+    2. 测试后：强制 ``gc.collect()`` 释放 Python 端引用 + 短暂 sleep
+       让 iroh/tokio 后台线程完成退出。
+    """
+    # 测试前：清除线程局部 Runtime 残留（防上一个测试 with 块异常退出泄漏）
+    try:
+        from actant._runtime import _runtime_local
+
+        if getattr(_runtime_local, "runtime", None) is not None:
+            _runtime_local.runtime = None
+    except Exception:
+        pass
+
+    yield
+
+    # 测试后：强制 GC + 轮询等待 tokio worker 线程退出 + socket 释放缓冲
+    import gc as _gc
+    import threading as _threading
+
+    # 多次 collect 处理循环引用（Runtime ↔ _RuntimeCore ↔ dispatch handler 闭包）。
+    # 单次 gc.collect() 不保证回收带 __del__ 的循环引用，两次确保彻底释放。
+    _gc.collect()
+    _gc.collect()
+
+    def _has_background_threads() -> bool:
+        return any(
+            "tokio" in t.name or "iroh" in t.name or "actant" in t.name
+            for t in _threading.enumerate()
+            if t is not _threading.main_thread()
+        )
+
+    # 诊断：记录测试后残留的后台线程（帮助定位资源泄漏）
+    _leaked = [
+        t.name for t in _threading.enumerate()
+        if t is not _threading.main_thread()
+        and ("tokio" in t.name or "iroh" in t.name or "actant" in t.name)
+    ]
+    if _leaked:
+        # 残留线程会在后续等待中退出；仅在等待超时时才警告。
+        pass
+
+    # iroh endpoint close 与 tokio runtime drop 在独立线程完成。
+    # Runtime.stop() 已通过 _RuntimeCore::shutdown 等待 network.shutdown()
+    # 完成（15s 软超时），正常情况下 stop() 返回时 endpoint 已关闭。
+    # 但 tokio worker 线程退出和 Python 端引用释放是异步的，仍需短暂等待。
+    # 纯单元测试无这些线程，立即跳过零开销。
+    if _has_background_threads():
+        _deadline = time.monotonic() + 2.0
+        while time.monotonic() < _deadline:
+            if not _has_background_threads():
+                break
+            time.sleep(0.02)
+        if _has_background_threads():
+            # 等待超时：后台线程未退出，可能影响下一个测试的 Runtime 启动。
+            # 打印警告帮助定位，但不 fail（某些场景 tokio worker 退出确实慢）。
+            import sys as _sys
+            _leaked_names = [
+                t.name for t in _threading.enumerate()
+                if t is not _threading.main_thread()
+                and ("tokio" in t.name or "iroh" in t.name or "actant" in t.name)
+            ]
+            print(
+                f"\n[conftest] WARNING: {len(_leaked_names)} background thread(s) "
+                f"still alive after 2s: {_leaked_names[:3]}",
+                file=_sys.stderr,
+            )
+        # 线程退出后 QUIC socket 仍有内核级 TIME_WAIT，短暂 sleep 让内核回收。
+        time.sleep(0.2)
+    # 无后台线程的纯单元测试：极短 sleep 让 Python 侧引用计数更新。
+    else:
+        time.sleep(0.02)
 
 
 # ---------------------------------------------------------------------------

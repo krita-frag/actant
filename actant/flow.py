@@ -175,6 +175,8 @@ def flow(
     retries: int = 0,
     retry_delay_ms: int = 0,
     timeout_ms: int = 0,
+    compiled: bool = False,
+    mode: str = "imperative",
 ) -> Any:
     """装饰器：将函数标记为工作流，提供生命周期事件、重试、超时与上下文校验。
 
@@ -186,6 +188,10 @@ def flow(
     3. 广播 ``WorkflowLifecycle`` 事件（submitted → started → completed/failed）。
     4. Flow 级重试（``retries``）：函数体抛异常时整体重试。
     5. Flow 级超时（``timeout_ms``）：函数体在子线程执行，超时抛 ``ActantTimeoutError``。
+    6. 可选 DAG 编译（``compiled=True`` 或 ``mode="dag"``）：首次执行时捕获
+       提交序列编译为静态 DAG，后续调用复用 DAG 调度，避免重复执行 flow
+       函数体的解释开销。仅适用于"纯提交"型 flow（不在体内调用 ``result()``
+       做条件分支）；检测到无法编译时自动回退命令式执行。
 
     Args:
         func: 被装饰的编排函数（无参装饰器时由 ``flow`` 自动填充）。
@@ -193,11 +199,22 @@ def flow(
         retries: 失败后的重试次数（0=不重试）。
         retry_delay_ms: 重试间隔毫秒。
         timeout_ms: flow 函数体的总执行超时毫秒（0=不限制）。
+        compiled: ``True`` 启用 DAG 编译（兼容旧参数）。首选 ``mode`` 参数。
+        mode: 执行模式，``"imperative"``（默认，命令式编排）或 ``"dag"``
+            （编译为静态 DAG 提交）。``mode="dag"`` 等价于 ``compiled=True``。
+            两者同时设置时以 ``mode`` 为准。
 
     Raises:
         InvalidStateError: 无活跃 Runtime。
         ActantTimeoutError: flow 执行超时。
+        ValueError: ``mode`` 不是合法值。
     """
+    # 统一 mode 参数到 compiled 布尔：mode 优先，compiled 兼容。
+    if mode not in ("imperative", "dag"):
+        raise ValueError(
+            f"flow: mode must be 'imperative' or 'dag', got {mode!r}"
+        )
+    use_compiled = compiled or (mode == "dag")
 
     def _make(f: Callable[P, R]) -> Callable[P, R]:
         if retries < 0:
@@ -226,6 +243,8 @@ def flow(
                     retry_delay_ms=retry_delay_ms,
                     timeout_ms=timeout_ms,
                     runtime=runtime,
+                    compiled=use_compiled,
+                    cache_target=wrapper,
                 )
             except BaseException as exc:
                 _safe_emit(workflow_id, "failed", error=f"{type(exc).__name__}: {exc}")
@@ -252,13 +271,24 @@ def _run_flow_with_retry(
     retry_delay_ms: int,
     timeout_ms: int,
     runtime: Any = None,
+    compiled: bool = False,
+    cache_target: Any = None,
 ) -> R:
-    """在 flow 上下文中执行函数体，支持重试与超时。"""
+    """在 flow 上下文中执行函数体，支持重试与超时。
+
+    Args:
+        compiled: ``True`` 启用 DAG 编译路径。首次执行 trace flow 体，
+            编译为静态 DAG 后缓存复用；后续调用按拓扑序并行 submit。
+            编译失败（体内调用 result() 等）自动回退命令式。
+        cache_target: DAG 缓存目标对象（通常是装饰器 wrapper），
+            传给 ``run_compiled_flow`` 使外部可通过 wrapper 访问缓存的 DAG。
+    """
     attempt = 0
     while True:
         try:
             return _run_with_timeout_in_context(
                 func, args, kwargs, workflow_id, timeout_ms, runtime,
+                compiled=compiled, cache_target=cache_target,
             )
         except Exception as exc:
             if attempt < retries:
@@ -283,6 +313,9 @@ def _run_with_timeout_in_context(
     workflow_id: str,
     timeout_ms: int,
     runtime: Any = None,
+    *,
+    compiled: bool = False,
+    cache_target: Any = None,
 ) -> R:
     """在 flow 上下文中执行 func，可选超时。
 
@@ -294,8 +327,25 @@ def _run_with_timeout_in_context(
     会检查该事件并抛出 ``ActantTimeoutError``，阻止 orphan 任务继续创建。
     注意：Python 无法强制中断线程，正在运行的同步代码不受影响，但新任务
     提交会被拦截。
+
+    Args:
+        compiled: ``True`` 启用 DAG 编译路径。无超时模式下，编译路径在
+            当前线程直接执行（DAG 调度本身不阻塞 submit）。超时模式下
+            编译路径在子线程执行（与命令式一致）。
+        cache_target: DAG 缓存目标对象，传给 ``run_compiled_flow``。
     """
     if timeout_ms <= 0:
+        # 无超时：当前线程执行。若启用 compiled，优先走编译路径。
+        # run_compiled_flow 内部已封装 FlowContext 设置（trace 期 + 运行期）。
+        if compiled:
+            from actant._flow_compiled import run_compiled_flow
+            used_compiled, compiled_result = run_compiled_flow(
+                func, args, kwargs, workflow_id,
+                cache_target=cache_target,
+            )
+            if used_compiled:
+                return cast("R", compiled_result)
+            # 编译失败：回退命令式。
         with _FlowContext(workflow_id):
             return func(*args, **kwargs)
 
@@ -313,6 +363,15 @@ def _run_with_timeout_in_context(
         rt_ctx = use_runtime(runtime) if runtime is not None else nullcontext()
         try:
             with rt_ctx, _FlowContext(workflow_id, cancel_event=cancel_event) as state:
+                if compiled:
+                    from actant._flow_compiled import run_compiled_flow
+                    used_compiled, compiled_result = run_compiled_flow(
+                        func, args, kwargs, workflow_id,
+                        cache_target=cache_target,
+                    )
+                    if used_compiled:
+                        result_box[0] = compiled_result
+                        return
                 result_box[0] = func(*args, **kwargs)
         except BaseException as e:
             # 若主线程已设置 cancel_event，将子线程异常替换为 ActantTimeoutError，

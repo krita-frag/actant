@@ -5,16 +5,22 @@
 //! # 架构
 //!
 //! ```text
-//! Rust 核心 ──(OTel API)──► SdkMeterProvider ──(PrometheusExporter)──► prometheus::Registry
-//!                                                                                    │
-//! Python HTTP 服务器 ◄──(prometheus_text())──────────────────────────────────────────┘
+//! Rust 核心 ──(OTel API)──► SdkMeterProvider ─┬─(PrometheusExporter)─► prometheus::Registry
+//!                                              │                            │
+//!                                              │                            ▼
+//!                                              │                  Python HTTP 服务器
+//!                                              │
+//!                                              └─(OTLP gRPC Exporter)─► OTel Collector / Tempo / Mimir
+//!                                                 (条件启用：环境变量
+//!                                                  OTEL_EXPORTER_OTLP_ENDPOINT 非空)
 //! ```
 //!
 //! 指标完全在 Rust 内流转，无 FFI 回调到 Python。
 
 use std::sync::Arc;
 
-use opentelemetry::metrics::{Counter, Histogram, UpDownCounter};
+use opentelemetry::metrics::{Counter, Gauge, Histogram, UpDownCounter};
+use opentelemetry::KeyValue;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use parking_lot::Mutex;
 use prometheus::{Registry, TextEncoder};
@@ -57,6 +63,9 @@ struct Instruments {
     event_bus_subscriber_pruned: Counter<u64>,
     event_bus_publish_timeout: Counter<u64>,
     event_bus_dropped_events: Counter<u64>,
+    /// 各 topic 订阅者通道当前积压深度（取该 topic 所有订阅者的最大 len）。
+    /// 每次 publish 后采样，带 `topic` 标签。用于预警队列堆积。
+    event_bus_subscriber_depth: Gauge<u64>,
 
     // -- 任务转发计数器 --
     task_forward_succeeded: Counter<u64>,
@@ -200,6 +209,12 @@ impl Instruments {
                 .u64_counter("actant.event_bus.events.dropped")
                 .with_description("Event bus events dropped due to full channel")
                 .build(),
+            event_bus_subscriber_depth: meter
+                .u64_gauge("actant.event_bus.subscriber.depth")
+                .with_description(
+                    "Current max channel depth across subscribers per topic (sampled after publish)",
+                )
+                .build(),
 
             // -- 任务转发计数器 --
             task_forward_succeeded: meter
@@ -316,7 +331,23 @@ fn instruments() -> Arc<Instruments> {
     }
 }
 
-/// 初始化带 Prometheus exporter 的 OpenTelemetry 指标管道。
+/// 初始化带 Prometheus exporter 的 OpenTelemetry 指标管道，可选启用 OTLP gRPC exporter。
+///
+/// # OTLP gRPC exporter 启用条件
+///
+/// 当环境变量 `OTEL_EXPORTER_OTLP_ENDPOINT` 非空时，自动挂载 OTLP gRPC
+/// exporter，将周期性 metric export 到指定 OTel Collector
+/// （例如 `http://localhost:4317` 或 `https://otel-collector:4317`）。
+/// 遵循 OTel 规范的环境变量约定，便于在 K8s 中通过 Sidecar 注入 Collector 地址。
+///
+/// 另支持 `OTEL_EXPORTER_OTLP_HEADERS`（`key=value,key=value` 格式）传递认证头。
+///
+/// 若环境变量未设置或为空，仅使用 Prometheus exporter（向后兼容 0.2 行为）。
+///
+/// # 多 reader 协同
+///
+/// `SdkMeterProvider` 支持同时挂载多个 reader：Prometheus exporter（pull 模型）
+/// 与 OTLP exporter（push 模型）共存，所有 instrument 都会同时报告到两端。
 ///
 /// 由 `PyRuntimeCore::start()` 调用。可多次调用 — 每次调用替换之前的管道
 /// （用于在一个进程中创建多个 `_Node` 实例的测试）。
@@ -325,14 +356,63 @@ fn instruments() -> Arc<Instruments> {
 /// 上报（映射为 `ActantError::Metrics` → `MetricsError`）。
 pub fn init() -> Result<(), crate::common::ActantError> {
     let registry = Registry::new();
-    let exporter = opentelemetry_prometheus::exporter()
+    let prom_exporter = opentelemetry_prometheus::exporter()
         .with_registry(registry.clone())
         .build()
         .map_err(|e| {
             crate::common::ActantError::Metrics(format!("failed to build Prometheus exporter: {e}"))
         })?;
 
-    let provider = SdkMeterProvider::builder().with_reader(exporter).build();
+    let mut provider_builder = SdkMeterProvider::builder().with_reader(prom_exporter);
+
+    // 条件启用 OTLP gRPC exporter：环境变量非空时挂载。
+    if let Ok(endpoint) = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT") {
+        if !endpoint.trim().is_empty() {
+            use opentelemetry_otlp::{MetricExporter, WithExportConfig, WithTonicConfig};
+
+            let mut builder = MetricExporter::builder().with_tonic();
+
+            // 设置 endpoint（HasExportConfig trait 提供）。
+            builder = builder.with_endpoint(endpoint.clone());
+
+            // 解析可选 headers：`key=value,key=value` 格式。
+            if let Ok(headers_str) = std::env::var("OTEL_EXPORTER_OTLP_HEADERS") {
+                use tonic::metadata::{Ascii, MetadataKey, MetadataMap as MdMap, MetadataValue};
+                let mut metadata = MdMap::new();
+                for pair in headers_str.split(',') {
+                    let pair = pair.trim();
+                    if let Some((k, v)) = pair.split_once('=') {
+                        // MetadataKey<Ascii> 和 MetadataValue<Ascii> 通过 str::parse 构造。
+                        // 无效的 header name/value 会被静默跳过——此时 Collector
+                        // 收不到该 header，不影响 exporter 启动。
+                        let name_res: Result<MetadataKey<Ascii>, _> = k.trim().parse();
+                        let val_res: Result<MetadataValue<Ascii>, _> = v.trim().parse();
+                        if let (Ok(name), Ok(val)) = (name_res, val_res) {
+                            metadata.insert(name, val);
+                        }
+                    }
+                }
+                if !metadata.is_empty() {
+                    builder = builder.with_metadata(metadata);
+                }
+            }
+
+            // 仅导出 metrics（traces 通过 tracing pipeline 单独处理）。
+            let exporter = builder.build().map_err(|e| {
+                crate::common::ActantError::Metrics(format!(
+                    "failed to build OTLP metric exporter for endpoint '{endpoint}': {e}"
+                ))
+            })?;
+            // 包装为 PeriodicReader：默认 60s 间隔，后台线程周期性 export。
+            // 间隔可通过 OTEL_METRIC_EXPORT_INTERVAL 环境变量覆盖（毫秒）。
+            let periodic_reader =
+                opentelemetry_sdk::metrics::PeriodicReader::builder(exporter).build();
+            tracing::info!(endpoint = %endpoint, "OTLP gRPC metric exporter enabled");
+            provider_builder = provider_builder.with_reader(periodic_reader);
+        }
+    }
+
+    let provider = provider_builder.build();
 
     opentelemetry::global::set_meter_provider(provider);
 
@@ -362,6 +442,14 @@ pub fn prometheus_text() -> String {
 
 pub fn inc_tasks_submitted() {
     instruments().tasks_submitted.add(1, &[]);
+}
+
+/// 批量 submit 时的计数器累加（避免循环调用 inc_tasks_submitted 的开销）。
+pub fn inc_tasks_submitted_by(n: u64) {
+    if n == 0 {
+        return;
+    }
+    instruments().tasks_submitted.add(n, &[]);
 }
 
 pub fn inc_tasks_completed() {
@@ -459,6 +547,16 @@ pub fn inc_event_bus_publish_timeout() {
 
 pub fn inc_event_bus_dropped_events() {
     instruments().event_bus_dropped_events.add(1, &[]);
+}
+
+/// 记录某 topic 的订阅者通道当前最大积压深度。
+///
+/// 每次 EventBus `publish` 后采样：遍历该 topic 的所有订阅者，取当前积压深度
+/// （`capacity - sender.capacity()`）的最大值。带 `topic` 标签，便于按话题告警。
+pub fn set_event_bus_subscriber_depth(topic: &str, depth: u64) {
+    instruments()
+        .event_bus_subscriber_depth
+        .record(depth, &[KeyValue::new("topic", topic.to_string())]);
 }
 
 pub fn inc_task_forward_succeeded() {

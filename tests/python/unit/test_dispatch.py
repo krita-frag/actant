@@ -25,7 +25,9 @@ def _deserialize_outcome(payload: bytes) -> tuple[bool, object]:
 
 
 def test_execute_with_retries_success() -> None:
-    payload = _execute_with_retries(
+    # P2-9 优化后 _execute_with_retries 直接返回 (success, payload_obj) 元组，
+    # 不再序列化。payload_obj 是 result 对象本身。
+    ok, result_obj = _execute_with_retries(
         lambda: 42,
         (),
         {},
@@ -36,14 +38,13 @@ def test_execute_with_retries_success() -> None:
         workflow_id="wf1",
         cancel_token=_FakeCancelToken(),
     )
-    ok, result_bytes = _deserialize_outcome(payload)
     assert ok is True
-    assert cloudpickle.loads(result_bytes) == 42
+    assert result_obj == 42
 
 
 def test_execute_with_retries_exhausted() -> None:
-    """重试次数耗尽后返回编码的异常。"""
-    payload = _execute_with_retries(
+    """重试次数耗尽后返回异常对象（P2-9：不再序列化为 bytes）。"""
+    ok, exc_obj = _execute_with_retries(
         lambda: (_ for _ in ()).throw(ValueError("boom")),
         (),
         {},
@@ -54,16 +55,14 @@ def test_execute_with_retries_exhausted() -> None:
         workflow_id="wf1",
         cancel_token=_FakeCancelToken(),
     )
-    ok, error_bytes = _deserialize_outcome(payload)
     assert ok is False
-    exc = cloudpickle.loads(error_bytes)
-    assert isinstance(exc, ValueError)
-    assert str(exc) == "boom"
+    assert isinstance(exc_obj, ValueError)
+    assert str(exc_obj) == "boom"
 
 
 def test_execute_with_retries_cancelled_before_attempt() -> None:
-    """cancel_token 已取消时直接返回 TaskCancelledError。"""
-    payload = _execute_with_retries(
+    """cancel_token 已取消时直接返回 TaskCancelledError 对象。"""
+    ok, exc_obj = _execute_with_retries(
         lambda: 42,
         (),
         {},
@@ -74,14 +73,12 @@ def test_execute_with_retries_cancelled_before_attempt() -> None:
         workflow_id="wf1",
         cancel_token=_FakeCancelToken(cancelled=True),
     )
-    ok, error_bytes = _deserialize_outcome(payload)
     assert ok is False
-    exc = cloudpickle.loads(error_bytes)
-    assert isinstance(exc, TaskCancelledError)
+    assert isinstance(exc_obj, TaskCancelledError)
 
 
 def test_execute_with_retries_cancel_during_retry() -> None:
-    """重试延迟期间被取消应返回 TaskCancelledError。"""
+    """重试延迟期间被取消应返回 TaskCancelledError 对象。"""
     token = _FakeCancelToken()
 
     def _cancel_after() -> None:
@@ -93,7 +90,7 @@ def test_execute_with_retries_cancel_during_retry() -> None:
     import threading
 
     threading.Thread(target=_cancel_after, daemon=True).start()
-    payload = _execute_with_retries(
+    ok, exc_obj = _execute_with_retries(
         lambda: (_ for _ in ()).throw(ValueError("boom")),
         (),
         {},
@@ -104,10 +101,8 @@ def test_execute_with_retries_cancel_during_retry() -> None:
         workflow_id="wf1",
         cancel_token=token,
     )
-    ok, error_bytes = _deserialize_outcome(payload)
     assert ok is False
-    exc = cloudpickle.loads(error_bytes)
-    assert isinstance(exc, TaskCancelledError)
+    assert isinstance(exc_obj, TaskCancelledError)
 
 
 def test_generic_execute_handler_deserialization_failure() -> None:

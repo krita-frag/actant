@@ -100,7 +100,9 @@ fn init_actor_system_without_data_dir_returns_in_memory_system() {
     let node_id = make_node("node-A");
     let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-A"));
     let event_bus = EventBus::new();
-    let system = init_actor_system(None, &node_id, &network, &event_bus).unwrap();
+    let config = crate::common::ActantConfig::default();
+    let (system, _registry, _router) =
+        init_actor_system(None, &node_id, &network, &event_bus, &config).unwrap();
     assert!(Arc::strong_count(&system) >= 1);
 }
 
@@ -110,11 +112,13 @@ fn init_actor_system_with_data_dir_creates_persistence_files() {
     let node_id = make_node("node-B");
     let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-B"));
     let event_bus = EventBus::new();
-    let system = init_actor_system(
+    let config = crate::common::ActantConfig::default();
+    let (system, _registry, _router) = init_actor_system(
         Some(dir.path().to_str().unwrap()),
         &node_id,
         &network,
         &event_bus,
+        &config,
     )
     .unwrap();
     // 验证 actor 子目录与 WAL 文件已创建。
@@ -128,8 +132,9 @@ fn init_actor_system_with_invalid_data_dir_returns_storage_io_error() {
     let node_id = make_node("node-C");
     let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-C"));
     let event_bus = EventBus::new();
+    let config = crate::common::ActantConfig::default();
     // /dev/null 是文件而非目录，create_dir_all 应失败。
-    let result = init_actor_system(Some("/dev/null"), &node_id, &network, &event_bus);
+    let result = init_actor_system(Some("/dev/null"), &node_id, &network, &event_bus, &config);
     assert!(matches!(result, Err(ActantError::StorageIo(_))));
 }
 
@@ -215,6 +220,8 @@ async fn init_worker_with_fifo_scheduler_spawns_actor_and_returns_worker() {
         tokio_handle: handle,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
+        actor_registry_gossip: None,
+        capability_gossip: None,
     })
     .await
     .expect("init_worker FIFO ok");
@@ -247,6 +254,8 @@ async fn init_worker_with_priority_scheduler_spawns_actor() {
         tokio_handle: handle,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
+        actor_registry_gossip: None,
+        capability_gossip: None,
     })
     .await
     .expect("init_worker PRIORITY ok");
@@ -278,6 +287,8 @@ async fn init_worker_with_unknown_scheduler_kind_returns_config_error() {
         tokio_handle: handle,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
+        actor_registry_gossip: None,
+        capability_gossip: None,
     })
     .await;
 
@@ -313,6 +324,8 @@ async fn init_worker_attaches_optional_actor_ids_when_provided() {
         tokio_handle: handle,
         workflow_actor_id: Some(workflow_actor_id.clone()),
         dag_gossip_actor_id: Some(dag_gossip_actor_id.clone()),
+        actor_registry_gossip: None,
+        capability_gossip: None,
     })
     .await
     .expect("init_worker with actor ids ok");

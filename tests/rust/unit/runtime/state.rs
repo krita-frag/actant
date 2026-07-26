@@ -40,6 +40,7 @@ fn store_custom_config() {
         data_dir: None,
         map_size: 64 * 1024 * 1024,
         max_dbs: 8,
+        ..Default::default()
     };
     let store = LmdbStore::open_with_config(dir.path(), &config).unwrap();
     store.put("key1", b"value1").unwrap();
@@ -214,6 +215,7 @@ async fn async_store_open_with_config() {
         data_dir: None,
         map_size: 32 * 1024 * 1024,
         max_dbs: 4,
+        ..Default::default()
     };
     let store = Store::open_with_config(dir.path(), config).await.unwrap();
     store.put("k", b"v").await.unwrap();

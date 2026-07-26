@@ -29,6 +29,8 @@ htmlcov/
 .coverage
 coverage.xml
 
+dhat-heap.json
+
 # Benchmarks
 .benchmarks/
 

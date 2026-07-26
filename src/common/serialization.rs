@@ -27,6 +27,18 @@ where
     postcard::from_bytes(bytes).map_err(|e| ActantError::Serialization(e.to_string()))
 }
 
+/// 将值序列化为 postcard 字节向量。
+///
+/// 与 [`decode_postcard`] 配对，集中处理 postcard 序列化错误。
+/// 用于 wire message 签名前的字节化（[`crate::common::WireEnvelope::wrap`]）
+/// 与发送方发送前的最终序列化。
+pub fn encode_postcard<T>(value: &T) -> Result<Vec<u8>>
+where
+    T: serde::Serialize,
+{
+    postcard::to_allocvec(value).map_err(|e| ActantError::Serialization(e.to_string()))
+}
+
 /// 将值序列化为 rkyv 字节向量。
 ///
 /// 公开以允许嵌入应用与基准测试直接测量序列化开销，

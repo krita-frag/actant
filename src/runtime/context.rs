@@ -164,6 +164,36 @@ impl Runtime {
             self.workflow_actor_id.clone(),
         ));
         let dag_gossip_actor_id = crate::common::ActorId::dag_gossip(&self.node_id);
+        // A2：构造 actor registry gossip actor 并订阅 topic，与 builder 路径保持一致。
+        // 注意此路径未注入 actor_registry 到 ActorSystem（context 的 ActorSystem
+        // 由外部传入，是否带 registry 由调用方决定）；此处仅启动 gossip 接收侧。
+        let actor_registry = Arc::new(
+            crate::runtime::actor::router::ActorRegistry::new()
+                .with_local_node_id(self.node_id.clone()),
+        );
+        let actor_registry_gossip = Arc::new(
+            crate::runtime::actor::router::ActorRegistryGossipActor::new(
+                self.node_id.clone(),
+                actor_registry,
+                self.network.clone(),
+            )
+            .with_broadcast_interval(std::time::Duration::from_millis(
+                self.config.network.actor_registry_gossip_interval_ms,
+            )),
+        );
+        self.network
+            .subscribe(crate::common::Topic::actor_registry().as_str())
+            .await
+            .map_err(|e| {
+                crate::common::ActantError::Network(format!(
+                    "failed to subscribe to actor registry topic: {}",
+                    e
+                ))
+            })?;
+        if let Err(e) = actor_registry_gossip.broadcast_registry().await {
+            tracing::warn!(error = %e, "initial actor registry broadcast failed");
+        }
+        self.register_background_loop_cancel(actor_registry_gossip.clone().start_background_loop());
         let worker = init_worker(WorkerInitParams {
             node_id: &self.node_id,
             network: &self.network,
@@ -176,6 +206,8 @@ impl Runtime {
             tokio_handle,
             workflow_actor_id: Some(self.workflow_actor_id.clone()),
             dag_gossip_actor_id: Some(dag_gossip_actor_id),
+            actor_registry_gossip: Some(actor_registry_gossip),
+            capability_gossip: None,
         })
         .await?;
         Ok(Arc::new(worker))
@@ -203,6 +235,7 @@ impl Runtime {
             .cloned()
             .collect();
         for tx in cancels {
+            // send 失败仅当子任务已退出 drop 了 cancel receiver，无需通知。
             let _ = tx.send(true);
         }
 
@@ -210,8 +243,10 @@ impl Runtime {
         if let Some(worker) = self.worker.as_ref() {
             worker.shutdown();
             // 等待 worker.run() 退出（状态→Stopped）。subscribe_topics 可能阻塞
-            // 导致 cancel 不被处理，故设短超时。
+            // 导致 cancel 不被处理，故设短超时。超时表示 worker 卡死，强行继续
+            // 关闭后续组件（网络/actor），由 shutdown_timeout 兜底 drop tokio。
             let mut state_rx = worker.subscribe_state();
+            // timeout Err 在此丢弃：卡死的 worker 最终由 tokio runtime drop 收尾。
             let _ = tokio::time::timeout(stop_timeout, async {
                 while *state_rx.borrow() != crate::runtime::workflow::WorkerState::Stopped {
                     if state_rx.changed().await.is_err() {
@@ -221,19 +256,23 @@ impl Runtime {
             })
             .await;
             if let Some(sched_id) = worker.scheduler_actor_id() {
+                // 同上：scheduler actor stop 超时由 tokio drop 兜底。
                 let _ = tokio::time::timeout(stop_timeout, self.actor_system.stop(sched_id)).await;
             }
         }
 
         // 2. 停止 FailoverActor（停止心跳/故障检测循环）。
+        // 超时丢弃：actor 内部 on_stop 已尝试 flush，超时表示卡死，由 tokio drop 收尾。
         let failover_id = ActorId::failover(&self.node_id);
         let _ = tokio::time::timeout(stop_timeout, self.actor_system.stop(&failover_id)).await;
 
         // 3. 停止 DagGossipActor。
+        // 超时丢弃：gossip actor 无持久化状态，卡死由 tokio drop 收尾。
         let dag_gossip_id = ActorId::dag_gossip(&self.node_id);
         let _ = tokio::time::timeout(stop_timeout, self.actor_system.stop(&dag_gossip_id)).await;
 
         // 4. 停止 WorkflowActor（on_stop 取消 timeout/persist 循环）。
+        // 超时丢弃：on_stop 已尝试 flush_dirty，超时表示 IO 卡死，由 tokio drop 收尾。
         let _ = tokio::time::timeout(
             stop_timeout,
             self.actor_system.stop(&self.workflow_actor_id),
@@ -241,10 +280,16 @@ impl Runtime {
         .await;
 
         // 5. 停止所有 CapabilityActor（按注册名）。
+        // 超时丢弃：capability actor 通常无副作用，卡死由 tokio drop 收尾。
         for meta in self.capability.capabilities() {
             let cap_id = ActorId::capability(meta.name);
             let _ = tokio::time::timeout(stop_timeout, self.actor_system.stop(&cap_id)).await;
         }
+
+        // 5.5 停止 WAL compaction 后台任务。
+        // 必须在 ActorSystem 其他 Actor 停止后、任务分发器关闭前执行，
+        // 避免 compaction 任务在 Actor 停止过程中访问已被 drop 的资源。
+        self.actor_system.stop_compaction_task();
 
         // 6. 关闭任务分发器线程池（等待在途任务完成或超时放弃 join）。
         //    必须在 Actor / 后台循环停止后、网络关闭前执行：线程池中的任务

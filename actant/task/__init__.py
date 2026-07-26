@@ -75,7 +75,7 @@ from actant.task._dispatch import (  # noqa: F401
     _execute_with_retries,
     _generic_execute_handler,
 )
-from actant.task._gather import gather
+from actant.task._gather import gather, gather_async
 from actant.task._helpers import (  # noqa: F401
     _emit_task_event,
     _interruptible_sleep,
@@ -92,6 +92,7 @@ __all__ = [
     "TaskContext",
     "TaskState",
     "gather",
+    "gather_async",
     "get_task_context",
     "task",
 ]

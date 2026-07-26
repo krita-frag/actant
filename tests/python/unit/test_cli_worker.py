@@ -41,6 +41,7 @@ def test_cmd_worker_starts_and_stops(monkeypatch: pytest.MonkeyPatch) -> None:
         bootstrap_nodes=None,
         listen_port=None,
         payload_signing_key=None,
+        metrics_port=None,
     )
 
     # 第一次 wait 返回后设置停止标志

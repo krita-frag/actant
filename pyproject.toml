@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "actant"
-version = "0.2.0"
+version = "0.3.0"
 description = "基于 Actor 模型的跨平台通用分布式任务编排引擎"
 readme = "README.md"
 authors = [{ name = "Actant Team" }]
@@ -90,9 +90,14 @@ known-first-party = ["actant"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["tests"]
+testpaths = ["tests/python"]
 timeout = 60
 timeout_method = "thread"
+# xdist 默认按模块分组分发到 worker 进程（loadscope）：
+# 同一测试模块的所有测试在同一 worker 进程内串行执行，
+# 减少 Runtime/iroh endpoint 在多进程间的并发创建/销毁竞争。
+# 命令行 `-n auto` 或 `-n N` 启用并行时自动生效。
+addopts = "--dist=loadscope"
 markers = [
     "unit: 纯单元测试，无网络无 I/O",
     "integration: 单进程集成测试，真实 Rust 运行时",
@@ -107,8 +112,7 @@ markers = [
 # 设计原则：
 #   - Rust 核心（src/）由 cargo-tarpaulin/llvm-cov 覆盖，目标 90%+
 #   - Python 公共 API（actant/__init__.py 导出）目标 85%+
-#   - 关键路径（序列化 / DAG / 调度）目标 95%+
-#   - CLI / _pidfile / _logging 等周边模块目标 70%+（难以自动化测试）
+#   - 关键路径（序列化 / DAG / 调度）目标 95%+）
 # CI 应在 `pytest --cov` 后运行 `coverage report --fail-under` 强制门禁。
 # 本地无 pytest-cov 时正常跳过覆盖率收集，测试仍可运行。
 
@@ -118,7 +122,6 @@ branch = true
 parallel = true  # 配合 pytest-xdist
 # 排除难以测试或非业务关键模块
 omit = [
-    "actant/cli/*",          # CLI 入口，手动测试
     "actant/actant.pyi",     # 类型存根
     "actant/py.typed",       # PEP 561 标记
     # Rust 扩展模块（PyO3 生成）覆盖率由 cargo 工具链负责

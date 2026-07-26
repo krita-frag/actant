@@ -73,10 +73,19 @@ proptest! {
     }
 
     /// 空 key 禁用签名：sign 返回原 payload，verify 返回原 data。
+    ///
+    /// 跳过以 MAC_PREFIX (`b"ACT1"`) 开头的 payload：空 key 模式下 verify 会
+    /// 拒绝此类数据（"signing disabled but payload appears signed"），这是
+    /// 防止在禁用签名的节点上误处理本应签名 payload 的安全防护。
     #[test]
     fn empty_key_disables_signing(
         payload in prop::collection::vec(any::<u8>(), 0..256)
     ) {
+        const MAC_PREFIX: &[u8] = b"ACT1";
+        prop_assume!(
+            payload.len() < MAC_PREFIX.len() || &payload[..MAC_PREFIX.len()] != MAC_PREFIX,
+            "payloads starting with MAC_PREFIX are rejected when signing is disabled"
+        );
         let signed = sign(&[], &payload).unwrap();
         prop_assert_eq!(&signed[..], &payload[..]);
         let verified = verify(&[], &payload).unwrap();

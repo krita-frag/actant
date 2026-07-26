@@ -197,3 +197,85 @@ def test_emit_task_event_on_error_collect_returns(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr("actant._effects.emit", _EmitFaker(exc))
     result = _emit_task_event("started", "t1", "wf1", on_error="collect")
     assert result is exc
+
+
+# ───────────────────────── EventBatcher.close() 显式 join 测试（H5）─────────────────────────
+
+
+def test_event_batcher_close_joins_flush_thread() -> None:
+    """close() 应显式 join 后台 flush 线程，避免线程泄漏。"""
+    from actant.task._helpers import _EventBatcher
+
+    batcher = _EventBatcher(flush_interval_ms=1, flush_threshold=100)
+    flush_thread = batcher._flush_thread
+    assert flush_thread is not None
+    assert flush_thread.is_alive()
+
+    batcher.close()
+
+    # flush 线程应已退出（不再是 alive）。
+    assert not flush_thread.is_alive(), "flush thread should be joined after close()"
+    # 重复 close 应为 no-op（不阻塞、不抛异常）。
+    batcher.close()
+    assert batcher._flush_thread is None
+
+
+def test_event_batcher_close_flushes_pending_events(monkeypatch: pytest.MonkeyPatch) -> None:
+    """close() 应派发 close 前入队但未被后台线程处理的事件。"""
+    from actant.task._helpers import _EventBatcher
+
+    emitted: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "actant._effects.emit",
+        lambda *args, **kwargs: emitted.append((args[0] if args else "", args[1] if len(args) > 1 else "")),
+    )
+
+    # 仅按 threshold flush（interval=0 不启动后台线程），确保事件滞留 buffer。
+    batcher = _EventBatcher(flush_interval_ms=0, flush_threshold=100)
+    batcher.add("started", "t1", "wf1")
+    batcher.add("completed", "t1", "wf1")
+    assert emitted == [], "no threshold flush should have fired yet"
+
+    batcher.close()
+    # close 应派发所有滞留事件。
+    assert len(emitted) == 2, f"expected 2 events flushed on close, got {len(emitted)}"
+
+
+def test_event_batcher_close_aborts_join_on_stuck_flush(monkeypatch: pytest.MonkeyPatch) -> None:
+    """close() 在 flush 线程卡死时应放弃 join 并记录 warning（按 join 超时）。"""
+    from actant.task import _helpers as helpers_module
+    from actant.task._helpers import _EventBatcher
+
+    # 缩短 join 超时到 0.3s，使测试快速验证超时分支。
+    monkeypatch.setattr(
+        helpers_module, "_EVENT_BATCHER_CLOSE_JOIN_TIMEOUT", 0.3
+    )
+
+    # 永久阻塞的 emit：flush 线程进入 emit 后不会自行退出，
+    # close 的 join 必然超时。
+    blocker = threading.Event()
+
+    def _stuck_emit(*args: object, **kwargs: object) -> None:
+        # 永久等待直到测试结束释放 blocker（或进程退出）。
+        blocker.wait(timeout=30.0)
+
+    monkeypatch.setattr("actant._effects.emit", _stuck_emit)
+
+    batcher = _EventBatcher(flush_interval_ms=1, flush_threshold=100)
+    flush_thread = batcher._flush_thread
+    assert flush_thread is not None
+    # 等待后台线程进入第一次 flush（卡在 emit 上）。
+    batcher.add("started", "t1", "wf1")
+    time.sleep(0.05)
+
+    # close 应在 ~0.3s 超时后放弃 join 并返回（不抛异常）。
+    start = time.monotonic()
+    batcher.close()
+    elapsed = time.monotonic() - start
+    # 实际等待应接近 0.3s（join 超时）；放宽下限避免抖动。
+    assert elapsed >= 0.25, f"close should wait ~0.3s for stuck flush, got {elapsed:.2f}s"
+    assert elapsed < 2.0, f"close should not block much longer than 0.3s, got {elapsed:.2f}s"
+
+    # 释放阻塞，让后台线程退出（避免泄漏到其他测试）。
+    blocker.set()
+    flush_thread.join(timeout=2.0)

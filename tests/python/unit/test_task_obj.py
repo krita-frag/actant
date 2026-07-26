@@ -79,11 +79,12 @@ def test_task_map_calls_submit(monkeypatch: pytest.MonkeyPatch) -> None:
 
     submitted: list[int] = []
 
-    def _submit(x: int) -> AsyncResult:
-        submitted.append(x)
-        return AsyncResult(f"h-{x}")
+    def _submit_batch(items, **kwargs):
+        for x in items:
+            submitted.append(x)
+        return [AsyncResult(f"h-{x}") for x in items]
 
-    monkeypatch.setattr(double, "submit", _submit)
+    monkeypatch.setattr(double, "submit_batch", _submit_batch)
     handles = double.map([1, 2, 3])
     assert submitted == [1, 2, 3]
     assert len(handles) == 3
@@ -96,11 +97,12 @@ def test_task_starmap_calls_submit(monkeypatch: pytest.MonkeyPatch) -> None:
 
     submitted: list[tuple[int, int]] = []
 
-    def _submit(a: int, b: int) -> AsyncResult:
-        submitted.append((a, b))
-        return AsyncResult(f"h-{a}-{b}")
+    def _submit_batch(items, *, unpack=False, **kwargs):
+        for item in items:
+            submitted.append(tuple(item))
+        return [AsyncResult(f"h-{a}-{b}") for a, b in items]
 
-    monkeypatch.setattr(add, "submit", _submit)
+    monkeypatch.setattr(add, "submit_batch", _submit_batch)
     handles = add.starmap([(1, 2), (3, 4)])
     assert submitted == [(1, 2), (3, 4)]
     assert len(handles) == 2

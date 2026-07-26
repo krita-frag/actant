@@ -180,7 +180,6 @@ fn cloneable_events_can_be_cloned() {
         workflow_id: WorkflowId::from("wf-1"),
         task_id: TaskId::from("t-1"),
     };
-    assert!(ev.is_cloneable());
     assert!(ev.clone_broadcast().is_some());
 }
 
@@ -307,6 +306,30 @@ fn bus_event_topic_all_variants() {
         .topic(),
         Topic::WorkerLifecycle
     );
+    assert_eq!(
+        BusEvent::TaskDequeued {
+            workflow_id: wf.clone(),
+            task_id: tid.clone(),
+        }
+        .topic(),
+        Topic::TaskDequeued
+    );
+    assert_eq!(
+        BusEvent::ActorLifecycleError {
+            actor_id: crate::common::ActorId::from("a"),
+            error: "boom".into(),
+        }
+        .topic(),
+        Topic::ActorLifecycleError
+    );
+    assert_eq!(
+        BusEvent::WalCompacted {
+            node_id: nid.clone(),
+            retained_events: 0,
+        }
+        .topic(),
+        Topic::WalCompacted
+    );
 }
 
 // ───────────────────────── delivery_guarantee() ─────────────────────────
@@ -333,6 +356,23 @@ fn delivery_guarantee_reliable_for_critical_events() {
     );
     assert_eq!(
         BusEvent::TaskCompleted(completion).delivery_guarantee(),
+        DeliveryGuarantee::Reliable
+    );
+    // 新增：ActorLifecycleError / WalCompacted 归 Reliable（驱动外部介入/检查点清理）。
+    assert_eq!(
+        BusEvent::ActorLifecycleError {
+            actor_id: crate::common::ActorId::from("a"),
+            error: "boom".into(),
+        }
+        .delivery_guarantee(),
+        DeliveryGuarantee::Reliable
+    );
+    assert_eq!(
+        BusEvent::WalCompacted {
+            node_id: NodeId::from("n"),
+            retained_events: 0,
+        }
+        .delivery_guarantee(),
         DeliveryGuarantee::Reliable
     );
 }
@@ -363,6 +403,15 @@ fn delivery_guarantee_best_effort_for_periodic_events() {
         .delivery_guarantee(),
         DeliveryGuarantee::BestEffort
     );
+    // 新增：TaskDequeued 归 BestEffort（仅为观测信号，丢失不影响正确性）。
+    assert_eq!(
+        BusEvent::TaskDequeued {
+            workflow_id: WorkflowId::from("wf"),
+            task_id: TaskId::from("t"),
+        }
+        .delivery_guarantee(),
+        DeliveryGuarantee::BestEffort
+    );
 }
 
 // ───────────────────────── clone_broadcast() ─────────────────────────
@@ -386,21 +435,6 @@ fn clone_broadcast_returns_some_for_cloneable_events() {
         node_id: nid.clone(),
     };
     assert!(ev.clone_broadcast().is_some());
-}
-
-#[test]
-fn clone_broadcast_returns_none_for_direct_request() {
-    let channel = crate::runtime::network::DirectResponseChannel::test_stub();
-    let ev = BusEvent::DirectRequest {
-        peer_id: "peer".to_string(),
-        request: Box::new(DirectRequest::QueryWorkflowState {
-            workflow_id: WorkflowId::from("wf"),
-            requesting_node: NodeId::from("n"),
-        }),
-        channel,
-    };
-    assert!(!ev.is_cloneable());
-    assert!(ev.clone_broadcast().is_none());
 }
 
 // ───────────────────────── subscribe_with_capacity ─────────────────────────
@@ -710,45 +744,10 @@ async fn event_bus_default_creates_valid_instance() {
 }
 
 // ───────────────────────── DirectRequest exclusive dispatch ─────────────────────────
-
-#[tokio::test]
-async fn direct_request_no_subscriber_sends_error_response() {
-    let bus = EventBus::new();
-    let channel = crate::runtime::network::DirectResponseChannel::test_stub();
-
-    bus.publish(BusEvent::DirectRequest {
-        peer_id: "peer-B".to_string(),
-        request: Box::new(DirectRequest::QueryWorkflowState {
-            workflow_id: WorkflowId::from("wf-1"),
-            requesting_node: NodeId::from("n-1"),
-        }),
-        channel,
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn direct_request_with_subscriber_dispatches_exclusively() {
-    let bus = EventBus::new();
-    let mut rx = bus.subscribe(Topic::NetworkDirect);
-    let channel = crate::runtime::network::DirectResponseChannel::test_stub();
-
-    bus.publish(BusEvent::DirectRequest {
-        peer_id: "peer-B".to_string(),
-        request: Box::new(DirectRequest::QueryWorkflowState {
-            workflow_id: WorkflowId::from("wf-1"),
-            requesting_node: NodeId::from("n-1"),
-        }),
-        channel,
-    })
-    .await;
-
-    let ev = tokio::time::timeout(Duration::from_millis(500), rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(matches!(ev, BusEvent::DirectRequest { .. }));
-}
+//
+// DirectRequest 不走 EventBus（参见 src/runtime/event_bus.rs 顶部注释与
+// `NetworkEventRouter::handle_direct_request` 的 `other` 分支）：点对点请求-响应
+// 由接收方直接处理或回送 Error，无独占投递路径，故此处无对应测试用例。
 
 #[tokio::test]
 async fn closed_subscriber_is_pruned_on_publish() {

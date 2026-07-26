@@ -59,6 +59,10 @@ pub(super) fn start_pending_result_loop(
         tokio::sync::mpsc::channel::<PendingResult>(pending_result_channel_capacity);
     let retry_tx = pending_tx.clone();
     let mut retry_cancel = cancel_rx;
+    let backoff = crate::common::backoff::ExponentialBackoff::new(
+        base_delay,
+        crate::common::REMOTE_CALL_MAX_RETRY_DELAY,
+    );
 
     tokio::spawn(async move {
         loop {
@@ -75,7 +79,7 @@ pub(super) fn start_pending_result_loop(
                         );
                         continue;
                     }
-                    let delay = base_delay * 2u32.saturating_pow(pending.attempts as u32);
+                    let delay = backoff.delay_for(pending.attempts as u32);
                     tokio::time::sleep(delay).await;
                     match network.send_direct_request(&pending.target, pending.request.clone()).await {
                         Ok(crate::runtime::network::DirectResponse::TaskResultAck { accepted: true }) => {
@@ -83,6 +87,9 @@ pub(super) fn start_pending_result_loop(
                         }
                         Ok(crate::runtime::network::DirectResponse::TaskResultAck { accepted: false }) => {
                             tracing::warn!("pending result rejected by {}, will retry", pending.target);
+                            // 入队失败仅当 retry channel 已满（容量耗尽）或 retry loop
+                            // 已退出。前者由 channel 容量限制保护，不再重试避免雪崩；
+                            // 后者属 shutdown 路径，结果丢弃可接受。
                             let _ = try_enqueue_pending_result(
                                 &retry_tx,
                                 pending.target,
@@ -93,6 +100,7 @@ pub(super) fn start_pending_result_loop(
                         }
                         Ok(_) | Err(_) => {
                             tracing::debug!("pending result delivery to {} failed, will retry (attempt {})", pending.target, pending.attempts + 1);
+                            // 同上：入队失败属容量耗尽或 shutdown 路径。
                             let _ = try_enqueue_pending_result(
                                 &retry_tx,
                                 pending.target,

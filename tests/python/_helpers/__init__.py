@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from tests._helpers.network import connect_peers, wait_for_peers, wait_until
+from tests.python._helpers.network import connect_peers, wait_for_peers, wait_until
 
 __all__ = [
     "connect_peers",

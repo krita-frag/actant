@@ -224,6 +224,8 @@ fn make_router(
         actor_system,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
+        actor_registry_gossip: None,
+        capability_gossip: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
     })
@@ -311,6 +313,8 @@ async fn handle_direct_task_result_without_actor_publishes_event() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
+        actor_registry_gossip: None,
+        capability_gossip: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
     });
@@ -353,6 +357,8 @@ async fn handle_peer_connected_publishes_event() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
+        actor_registry_gossip: None,
+        capability_gossip: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
     });
@@ -390,6 +396,8 @@ async fn handle_cancel_broadcast_sets_cancel_flag_and_publishes_event() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
+        actor_registry_gossip: None,
+        capability_gossip: None,
         cancel_flags,
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
     });
@@ -435,6 +443,8 @@ async fn handle_actor_topic_routes_to_actor_system() {
         actor_system: Some(actor_system.clone()),
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
+        actor_registry_gossip: None,
+        capability_gossip: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
     });
@@ -470,6 +480,8 @@ async fn handle_actor_reply_topic_delivers_reply() {
         actor_system: Some(actor_system.clone()),
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
+        actor_registry_gossip: None,
+        capability_gossip: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
     });
@@ -513,6 +525,8 @@ async fn handle_workflow_state_request_routes_to_dag_gossip_actor() {
         actor_system: Some(actor_system.clone()),
         workflow_actor_id: None,
         dag_gossip_actor_id: Some(dag_gossip_id.clone()),
+        actor_registry_gossip: None,
+        capability_gossip: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
     });
@@ -552,6 +566,8 @@ async fn handle_direct_task_result_routes_to_workflow_actor() {
         actor_system: Some(actor_system.clone()),
         workflow_actor_id: Some(workflow_actor_id.clone()),
         dag_gossip_actor_id: None,
+        actor_registry_gossip: None,
+        capability_gossip: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
     });
@@ -592,6 +608,8 @@ async fn handle_peer_disconnected_publishes_event() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
+        actor_registry_gossip: None,
+        capability_gossip: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
     });
@@ -622,6 +640,8 @@ async fn handle_dag_state_topic_publishes_update() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
+        actor_registry_gossip: None,
+        capability_gossip: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
     });
@@ -663,6 +683,8 @@ async fn handle_heartbeat_topic_publishes_heartbeat() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
+        actor_registry_gossip: None,
+        capability_gossip: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
     });
@@ -705,6 +727,8 @@ async fn handle_failover_topic_publishes_claim() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
+        actor_registry_gossip: None,
+        capability_gossip: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
     });
@@ -744,6 +768,8 @@ async fn handle_heads_topic_publishes_exchange() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
+        actor_registry_gossip: None,
+        capability_gossip: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
     });
@@ -770,18 +796,20 @@ async fn handle_heads_topic_publishes_exchange() {
 }
 
 #[tokio::test]
-async fn handle_direct_request_other_publishes_direct_request_event() {
+async fn handle_direct_request_other_returns_error_response() {
+    // 未识别的 DirectRequest 变体不再走 EventBus，而是直接回送 DirectResponse::Error。
     let transport = Arc::new(MockTransport::new("node-A", "peer-A"));
     let scheduler: Arc<dyn Scheduler> = Arc::new(MockScheduler::new());
     let event_bus = EventBus::new();
-    let mut rx = event_bus.subscribe(BusTopic::NetworkDirect);
     let router = NetworkEventRouter::new(NetworkEventRouterConfig {
-        network: transport,
+        network: transport.clone(),
         event_bus,
         scheduler,
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
+        actor_registry_gossip: None,
+        capability_gossip: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
     });
@@ -798,11 +826,14 @@ async fn handle_direct_request_other_publishes_direct_request_event() {
         })
         .await;
 
-    let event = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
-        .await
-        .expect("event should be published")
-        .expect("event bus should not be closed");
-    assert!(matches!(event, BusEvent::DirectRequest { .. }));
+    let responses = transport.take_responses();
+    assert_eq!(responses.len(), 1, "should send exactly one error response");
+    match &responses[0].1 {
+        DirectResponse::Error { message } => {
+            assert!(message.contains("no handler for DirectRequest variant"));
+        }
+        other => panic!("expected DirectResponse::Error, got {:?}", other),
+    }
 }
 
 #[tokio::test]
@@ -818,6 +849,8 @@ async fn handle_task_result_failed_publishes_event() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
+        actor_registry_gossip: None,
+        capability_gossip: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
     });
@@ -857,6 +890,8 @@ async fn handle_task_result_cancelled_publishes_event() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
+        actor_registry_gossip: None,
+        capability_gossip: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
     });
@@ -901,6 +936,8 @@ async fn handle_task_result_skipped_returns_false() {
         actor_system: Some(actor_system.clone()),
         workflow_actor_id: Some(workflow_actor_id.clone()),
         dag_gossip_actor_id: None,
+        actor_registry_gossip: None,
+        capability_gossip: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
     });

@@ -12,7 +12,7 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use tokio::runtime::Runtime;
 
-use actant::common::StoreConfig;
+use actant::common::{StoreConfig, SyncMode};
 use actant::runtime::state::Store;
 
 /// 创建临时 LMDB 目录，返回 (Store, 临时目录路径)。
@@ -21,6 +21,19 @@ fn open_temp_store(rt: &Runtime) -> (Store, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let store = rt
         .block_on(Store::open_with_config(dir.path(), StoreConfig::default()))
+        .unwrap();
+    (store, dir)
+}
+
+/// 创建启用 GroupCommit 的临时 Store。
+fn open_group_commit_store(rt: &Runtime, flush_interval_ms: u64) -> (Store, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let config = StoreConfig {
+        sync_mode: SyncMode::GroupCommit(flush_interval_ms),
+        ..StoreConfig::default()
+    };
+    let store = rt
+        .block_on(Store::open_with_config(dir.path(), config))
         .unwrap();
     (store, dir)
 }
@@ -129,11 +142,71 @@ fn bench_delete_single(c: &mut Criterion) {
     group.finish();
 }
 
+/// GroupCommit 模式单 key put 吞吐量，对比 `bench_put_single`（Sync 模式）。
+/// `flush` 确保每次迭代写入在测量窗口内持久化，不跨迭代累积。
+fn bench_put_group_commit(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
+    let mut group = c.benchmark_group("store/put_group_commit");
+    for &n in &[1_000usize, 10_000] {
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
+            let (store, _dir) = open_group_commit_store(&rt, 10);
+            let value = vec![0u8; 128];
+            b.iter(|| {
+                for i in 0..n {
+                    let key = format!("key-{i}");
+                    rt.block_on(store.put(black_box(&key), &value)).unwrap();
+                }
+                rt.block_on(store.flush()).unwrap();
+            });
+        });
+    }
+    group.finish();
+}
+
+/// 固定 1000 次 put，对比 Sync 与 GroupCommit 总耗时，量化 write coalescing 收益。
+fn bench_put_sync_vs_group_commit(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
+    let mut group = c.benchmark_group("store/put_sync_vs_group_commit");
+    group.sample_size(10);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.warm_up_time(std::time::Duration::from_secs(1));
+
+    const N: usize = 1_000;
+    let value = vec![0u8; 128];
+
+    // Sync 模式基线。
+    group.bench_function("sync_1000", |b| {
+        b.iter(|| {
+            let (store, _dir) = open_temp_store(&rt);
+            for i in 0..N {
+                let key = format!("key-{i}");
+                rt.block_on(store.put(black_box(&key), &value)).unwrap();
+            }
+        });
+    });
+
+    // GroupCommit 模式。
+    group.bench_function("group_commit_1000", |b| {
+        b.iter(|| {
+            let (store, _dir) = open_group_commit_store(&rt, 10);
+            for i in 0..N {
+                let key = format!("key-{i}");
+                rt.block_on(store.put(black_box(&key), &value)).unwrap();
+            }
+            rt.block_on(store.flush()).unwrap();
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     store_benches,
     bench_put_single,
     bench_get_single,
     bench_put_batch,
     bench_delete_single,
+    bench_put_group_commit,
+    bench_put_sync_vs_group_commit,
 );
 criterion_main!(store_benches);

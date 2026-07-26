@@ -3,6 +3,22 @@
 依赖 ``_context``（TaskContext / TaskState）与 ``_helpers``
 （``_suppress_pickle_errors``）。``_resolve_value`` 因紧耦合 ``AsyncResult``
 亦置于本模块，供 ``Task.submit`` / ``gather`` 使用。
+
+## Intrusively-linked Futures 设计
+
+为支持 ``gather`` 高效等待多个 handle，``AsyncResult`` 内部维护一个
+``_CompletionFuture``（基于 ``threading.Condition``）。所有等待同一 handle
+的消费者共享同一个 future 实例：
+
+- ``result()`` / ``wait()`` 通过 future 的 ``wait()`` 一次性阻塞等待，
+  避免轮询。
+- ``add_done_callback`` 注册的回调以 *intrusive linked-list* 形式串接
+  在 future 上，完成时仅触发一次链表遍历。这使 ``gather(N)`` 的总调度
+  开销从 O(N) 次独立 Event wait 降到 1 次 future wait + O(N) 次回调派发。
+
+跨 handle 等待（``gather``）则借助一个 *共享* future：将所有 handle
+的完成信号汇聚到单个 ``threading.Event``，``gather`` 仅等待该 event
+一次，避免 N 次 ``wait_for`` 累加延迟。
 """
 
 from __future__ import annotations
@@ -10,6 +26,7 @@ from __future__ import annotations
 import logging
 import pickle
 import threading
+import asyncio
 from collections.abc import Callable
 from contextlib import suppress
 from typing import Any, cast
@@ -29,18 +46,104 @@ from actant.task._helpers import (
 _logger = logging.getLogger("actant.task")
 
 
+class _CompletionFuture:
+    """``AsyncResult`` 的底层完成信号。
+
+    基于 ``threading.Condition`` 实现，支持：
+    - ``wait(timeout)``：阻塞直到完成或超时。
+    - ``set()``：标记完成并唤醒所有等待者。
+    - ``is_set()``：非阻塞查询。
+
+    与 ``threading.Event`` 的区别：``Condition`` 允许我们在同一锁下原子地
+    设置完成状态并触发 intrusive callback 链，避免 Event + Lock 两次锁切换。
+    所有 ``add_done_callback`` 注册的回调以 singly-linked list 形式 intrusive
+    串接在 future 上——节点本身持有 next 指针，避免维护单独的 list 容器。
+    """
+
+    __slots__ = ("_callback_head", "_cond", "_done", "_lock")
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
+        self._done = False
+        # Intrusive linked list head: 每个节点是 (callback, next_node)。
+        # None 表示链表为空。新回调插入头部（O(1)）。
+        self._callback_head: tuple[Callable[[], None], Any] | None = None
+
+    def is_set(self) -> bool:
+        with self._lock:
+            return self._done
+
+    def wait(self, timeout: float | None) -> bool:
+        """阻塞直到完成或超时。返回 ``True`` 若已完成。"""
+        with self._cond:
+            if self._done:
+                return True
+            self._cond.wait(timeout=timeout)
+            return self._done
+
+    def add_callback(self, cb: Callable[[], None]) -> None:
+        """注册一个完成回调。若已完成，立即同步调用。"""
+        invoke_now = False
+        with self._lock:
+            if self._done:
+                invoke_now = True
+            else:
+                # 头插法：intrusive linked list。
+                self._callback_head = (cb, self._callback_head)
+        if invoke_now:
+            cb()
+
+    def set(self) -> None:
+        """标记完成并唤醒所有等待者，触发 intrusive callback 链。"""
+        with self._lock:
+            if self._done:
+                return
+            self._done = True
+            head = self._callback_head
+            self._callback_head = None
+            self._cond.notify_all()
+        # 在锁外顺序触发回调，避免回调内再次获取锁导致死锁。
+        while head is not None:
+            cb, next_node = head
+            head = next_node
+            try:
+                cb()
+            except Exception:
+                _logger.debug(
+                    "CompletionFuture: callback %r raised",
+                    getattr(cb, "__name__", cb),
+                    exc_info=True,
+                )
+
+
 class AsyncResult:
     """异步任务结果句柄。
 
-    基于 ``threading.Event`` 实现，由 Rust event_bus 回调
+    基于 ``_CompletionFuture`` 实现，由 Rust event_bus 回调
     （``Runtime._on_task_result``）在任务完成时设置结果。
 
     分布式语义：任务由 Worker 执行，结果通过 P2P 网络回传后触发回调。
+
+    ## 性能特性
+
+    - ``result()`` / ``wait()``：通过 ``Condition`` 一次性等待，无轮询。
+    - ``add_done_callback``：intrusive linked-list 注册，O(1) 插入。
+    - ``gather`` 跨 handle 等待：所有 handle 完成信号汇聚到单个共享
+      ``threading.Event``，``gather`` 仅等待该 event 一次。
     """
 
     __slots__ = (
-        "_callbacks", "_context", "_error_payload", "_event", "_lock",
-        "_result_payload", "_state", "_workflow_id", "task_id",
+        "_callbacks",
+        "_context",
+        "_error_payload",
+        "_future",
+        "_lock",
+        "_result_is_obj",
+        "_result_payload",
+        "_state",
+        "_workflow_id",
+        "task_id",
     )
 
     def __init__(
@@ -53,8 +156,14 @@ class AsyncResult:
         self.task_id = task_id
         self._context = context
         self._workflow_id = workflow_id
-        self._event = threading.Event()
-        self._result_payload: bytes = b""
+        self._future = _CompletionFuture()
+        # _result_payload 存储成功结果：
+        # - bytes（跨节点传播路径，需 cloudpickle.loads）
+        # - 任意对象（本地 dispatch 路径，P2-9 优化，直接返回）
+        # _result_is_obj=True 明确标记直传对象路径，避免 bytes 返回值被误
+        # 当作序列化结果（如 echo(b"x") 返回 b"xxx" 不应被 loads）。
+        self._result_payload: Any = b""
+        self._result_is_obj: bool = False
         self._error_payload: bytes = b""
         self._state: TaskState = "pending"
         self._callbacks: list[Callable[[AsyncResult], None]] = []
@@ -79,7 +188,7 @@ class AsyncResult:
 
     def done(self) -> bool:
         """任务是否已完成（成功/失败/取消）。"""
-        return self._event.is_set()
+        return self._future.is_set()
 
     def result(self, timeout: float | None = None) -> Any:
         """阻塞等待任务结果。
@@ -88,21 +197,22 @@ class AsyncResult:
             timeout: 最大等待秒数，``None`` 表示无限等待。
 
         Returns:
-            任务的返回值（经 cloudpickle 反序列化）。
+            任务的返回值。若 ``_result_payload`` 是 bytes（跨节点传播路径），
+            先 ``cloudpickle.loads`` 反序列化；若是对象（本地 dispatch 路径），
+            直接返回，省去 1 次 loads。
 
         Raises:
             ActantTimeoutError: 等待超时。
             ActantError: 任务执行失败（重新抛出序列化的异常）。
             TaskCancelledError: 任务被取消。
         """
-        if not self._event.wait(timeout=timeout):
-            raise ActantTimeoutError(
-                f"task {self.task_id!r} did not complete within {timeout}s"
-            )
+        if not self._future.wait(timeout=timeout):
+            raise ActantTimeoutError(f"task {self.task_id!r} did not complete within {timeout}s")
         with self._lock:
             state = self._state
             error_payload = self._error_payload
             result_payload = self._result_payload
+            result_is_obj = self._result_is_obj
         if state == "cancelled":
             raise TaskCancelledError(f"task {self.task_id!r} was cancelled")
         if error_payload:
@@ -113,7 +223,15 @@ class AsyncResult:
                     f"task {self.task_id!r} failed (error payload undecodable)"
                 ) from e
             raise exc
-        return cloudpickle.loads(result_payload)
+        # _result_is_obj=True 表示 dispatch 直传对象（P2-9 优化路径），
+        # 直接返回，省去 cloudpickle.loads 往返。
+        # _result_is_obj=False 表示跨节点传播的 bytes，需 cloudpickle.loads。
+        # 这避免了 bytes 返回值（如 echo(b"x")）被误当作序列化结果。
+        if result_is_obj:
+            return result_payload
+        if isinstance(result_payload, (bytes, bytearray)):
+            return cloudpickle.loads(result_payload)
+        return result_payload
 
     def exception(self, timeout: float | None = None) -> BaseException | None:
         """阻塞等待并返回任务异常，无异常返回 ``None``。
@@ -129,10 +247,8 @@ class AsyncResult:
             ActantTimeoutError: 等待超时。
             TaskCancelledError: 任务被取消。
         """
-        if not self._event.wait(timeout=timeout):
-            raise ActantTimeoutError(
-                f"task {self.task_id!r} did not complete within {timeout}s"
-            )
+        if not self._future.wait(timeout=timeout):
+            raise ActantTimeoutError(f"task {self.task_id!r} did not complete within {timeout}s")
         with self._lock:
             error_payload = self._error_payload
             state = self._state
@@ -196,7 +312,9 @@ class AsyncResult:
                 except Exception:
                     # P2P 广播失败不应阻止本地级联取消，记录 warning 后继续。
                     _logger.warning(
-                        "task %s: broadcast_cancel failed", self.task_id, exc_info=True,
+                        "task %s: broadcast_cancel failed",
+                        self.task_id,
+                        exc_info=True,
                     )
 
         # 4. 级联传播到同一 workflow 的其他任务
@@ -223,7 +341,7 @@ class AsyncResult:
         Returns:
             ``True`` 若任务在超时前完成，``False`` 若超时。
         """
-        return self._event.wait(timeout=timeout)
+        return self._future.wait(timeout=timeout)
 
     def add_done_callback(self, fn: Callable[[AsyncResult], None]) -> None:
         """注册回调，任务完成（成功/失败/取消）后调用。
@@ -231,12 +349,13 @@ class AsyncResult:
         回调接收此 ``AsyncResult`` 作为参数。若任务已完成，回调立即同步调用。
         """
         with self._lock:
-            if not self._event.is_set():
+            if not self._future.is_set():
                 self._callbacks.append(fn)
                 return
         # 任务已完成，立即调用
         _invoke_callback(
-            fn, self,
+            fn,
+            self,
             label=f"AsyncResult {self.task_id}: done callback {getattr(fn, '__name__', fn)!r}",
         )
 
@@ -250,57 +369,156 @@ class AsyncResult:
             if self._state == "pending":
                 self._state = "running"
 
-    def _set_result(self, result_payload: bytes) -> None:
-        """设置任务成功结果并触发回调。"""
+    def _set_result(self, result_payload: Any) -> None:
+        """设置任务成功结果并触发回调。
+
+        Args:
+            result_payload: 成功结果。可为：
+                - ``bytes``：跨节点传播路径，result() 时需 cloudpickle.loads。
+                - 任意对象：测试或非 dispatch 路径，result() 时检查类型决定。
+        """
         with self._lock:
-            if self._event.is_set():
+            if self._future.is_set():
                 return
             self._result_payload = result_payload
+            self._result_is_obj = False
             self._state = "completed"
-            self._event.set()
             callbacks = list(self._callbacks)
             self._callbacks.clear()
+        # 在锁外触发 future.set()，使 Condition.notify_all 与 callback 链
+        # 在不持有 self._lock 的状态下执行（避免回调内调用 result() 死锁）。
+        self._future.set()
         _invoke_callbacks(
-            callbacks, self,
+            callbacks,
+            self,
             label=f"AsyncResult {self.task_id}: done callback",
         )
 
-    def _set_error(self, error_payload_or_msg: bytes | str) -> None:
-        """设置任务失败结果并触发回调。"""
+    def _set_result_obj(self, result_obj: Any) -> None:
+        """设置任务成功结果（dispatch 直传对象路径，P2-9 优化）。
+
+        与 ``_set_result`` 区别：标记 ``_result_is_obj=True``，``result()``
+        直接返回对象，跳过 ``cloudpickle.loads``。这避免了任务返回 bytes
+        时被误当作序列化结果（如 ``echo(b"x")`` 返回 ``b"xxx"``）。
+
+        Args:
+            result_obj: 任务返回值（任意类型，包括 bytes）。
+        """
         with self._lock:
-            if self._event.is_set():
+            if self._future.is_set():
+                return
+            self._result_payload = result_obj
+            self._result_is_obj = True
+            self._state = "completed"
+            callbacks = list(self._callbacks)
+            self._callbacks.clear()
+        self._future.set()
+        _invoke_callbacks(
+            callbacks,
+            self,
+            label=f"AsyncResult {self.task_id}: done callback",
+        )
+
+    def _set_error(self, error_payload_or_msg: bytes | str | BaseException) -> None:
+        """设置任务失败结果并触发回调。
+
+        Args:
+            error_payload_or_msg: 失败信息。可为：
+                - ``bytes``：已序列化的异常字节（跨节点传播路径）。
+                - ``str``：错误消息字符串，包装为 ``ActantError`` 再序列化。
+                - ``BaseException``：异常对象（P2-9 优化路径，本地 dispatch），
+                  序列化后存入 ``_error_payload`` 供 ``result()`` 重新抛出。
+        """
+        with self._lock:
+            if self._future.is_set():
                 return
             if isinstance(error_payload_or_msg, bytes):
                 self._error_payload = error_payload_or_msg
+            elif isinstance(error_payload_or_msg, BaseException):
+                self._error_payload = cloudpickle.dumps(error_payload_or_msg)
             else:
-                self._error_payload = cloudpickle.dumps(
-                    ActantError(error_payload_or_msg)
-                )
+                self._error_payload = cloudpickle.dumps(ActantError(error_payload_or_msg))
             self._state = "failed"
-            self._event.set()
             callbacks = list(self._callbacks)
             self._callbacks.clear()
+        self._future.set()
         _invoke_callbacks(
-            callbacks, self,
+            callbacks,
+            self,
             label=f"AsyncResult {self.task_id}: done callback",
         )
 
     def _set_cancelled(self) -> None:
         """标记任务为已取消并触发回调。"""
         with self._lock:
-            if self._event.is_set():
+            if self._future.is_set():
                 return
             self._state = "cancelled"
-            self._event.set()
             callbacks = list(self._callbacks)
             self._callbacks.clear()
+        self._future.set()
         _invoke_callbacks(
-            callbacks, self,
+            callbacks,
+            self,
             label=f"AsyncResult {self.task_id}: done callback",
         )
 
     def __repr__(self) -> str:
         return f"AsyncResult(task_id={self.task_id!r}, state={self.state!r})"
+
+    def __await__(self) -> Any:
+        """使 ``AsyncResult`` 可在 ``async def`` 中直接 ``await``。
+
+        在独立守护线程执行同步 ``result()``，通过 ``call_soon_threadsafe``
+        将结果投递回 event loop。线程在 ``Condition.wait()`` 中阻塞时释放
+        GIL，使 Rust worker 线程能获取 GIL 执行 dispatch handler。
+
+        用法::
+
+            async def my_flow():
+                handle = my_task.submit(x)
+                result = await handle  # 等价于 await handle.result()
+
+        Returns:
+            任务的返回值（与 ``result()`` 一致）。
+
+        Raises:
+            ActantTimeoutError: 任务未完成（无超时，无限等待）。
+            ActantError: 任务执行失败。
+            TaskCancelledError: 任务被取消。
+        """
+        loop = asyncio.get_running_loop()
+        aio_future: asyncio.Future[Any] = loop.create_future()
+
+        # Fast path：已完成则直接设置结果。
+        if self.done():
+            try:
+                aio_future.set_result(self.result(timeout=0))
+            except BaseException as exc:
+                aio_future.set_exception(exc)
+            return aio_future.__await__()
+
+        def _worker() -> None:
+            """在独立线程中等待任务完成，投递结果到 event loop。"""
+            try:
+                value = self.result()
+                loop.call_soon_threadsafe(_set_aio_result, aio_future, value, None)
+            except BaseException as exc:
+                loop.call_soon_threadsafe(_set_aio_result, aio_future, None, exc)
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+        return aio_future.__await__()
+
+
+def _set_aio_result(future: Any, value: Any, exc: Any) -> None:
+    """在 event loop 线程中安全设置 asyncio Future 的结果或异常。"""
+    if future.done():
+        return
+    if exc is not None:
+        future.set_exception(exc)
+    else:
+        future.set_result(value)
 
 
 def _resolve_value(value: Any) -> Any:

@@ -1,4 +1,4 @@
-//! Capability-Resource-Handler 统一扩展架构（ADR 0001）。
+//! Effect-Resource-Handler 统一扩展架构。
 //!
 //! 本模块定义了 actant 的统一扩展抽象：
 //! - [`Capability`]：能力的声明（"能做什么"），关联 Request/Response 类型
@@ -225,6 +225,10 @@ where
         let req_ref = req
             .downcast_ref::<C::Request>()
             .ok_or_else(|| ActantError::Internal("emit: request type mismatch".into()))?;
+        // emit 语义是 fire-and-forget 反应型：按 ERH 协议，emit handler 的错误
+        // 不应中断后续 handler 调用。此处单个 handler 的 Err 由 emit 调用方
+        // （CapabilityRuntime::emit）按错误策略统一处理，本 ErasedHandler
+        // 层级只负责调用，丢弃返回值符合 emit 语义。
         let _ = Handler::handle(&self.handler, req_ref.clone()).await;
         Ok(())
     }

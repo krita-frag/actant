@@ -31,6 +31,14 @@ pub(super) struct NetworkEventRouterConfig {
     pub(super) workflow_actor_id: Option<crate::common::ActorId>,
     /// 本地 DagGossipActor 的 id。若存在，工作流状态请求/响应会直接路由给它。
     pub(super) dag_gossip_actor_id: Option<crate::common::ActorId>,
+    /// Actor 注册表 gossip 处理器（A2）。若存在，`TOPIC_ACTOR_REGISTRY` 上的
+    /// gossip 消息会通过 `handle_gossip` 更新本地注册表。
+    pub(super) actor_registry_gossip:
+        Option<Arc<crate::runtime::actor::router::ActorRegistryGossipActor>>,
+    /// Capability gossip 处理器。若存在，`TOPIC_CAPABILITY_GOSSIP` 上的
+    /// gossip 消息会通过 `handle_gossip` 更新本地 capability 视图。
+    pub(super) capability_gossip:
+        Option<Arc<crate::runtime::capability::gossip::CapabilityGossipActor>>,
     pub(super) cancel_flags: Arc<parking_lot::Mutex<HashMap<String, CancelFlag>>>,
     pub(super) cancelled_tasks: Arc<parking_lot::Mutex<HashMap<String, Instant>>>,
 }
@@ -42,6 +50,8 @@ pub(super) struct NetworkEventRouter {
     actor_system: Option<Arc<ActorSystem>>,
     workflow_actor_id: Option<crate::common::ActorId>,
     dag_gossip_actor_id: Option<crate::common::ActorId>,
+    actor_registry_gossip: Option<Arc<crate::runtime::actor::router::ActorRegistryGossipActor>>,
+    capability_gossip: Option<Arc<crate::runtime::capability::gossip::CapabilityGossipActor>>,
     cancel_flags: Arc<parking_lot::Mutex<HashMap<String, CancelFlag>>>,
     cancelled_tasks: Arc<parking_lot::Mutex<HashMap<String, Instant>>>,
 }
@@ -55,6 +65,8 @@ impl NetworkEventRouter {
             actor_system: cfg.actor_system,
             workflow_actor_id: cfg.workflow_actor_id,
             dag_gossip_actor_id: cfg.dag_gossip_actor_id,
+            actor_registry_gossip: cfg.actor_registry_gossip,
+            capability_gossip: cfg.capability_gossip,
             cancel_flags: cfg.cancel_flags,
             cancelled_tasks: cfg.cancelled_tasks,
         }
@@ -94,19 +106,50 @@ impl NetworkEventRouter {
         let topic = Topic::from(topic_str);
         // 解码一次后在整个分发过程中复用。失败时直接返回（避免每个分支重复 decode）。
         let decoded = WireEnvelope::decode(payload);
-        let trace_id = decoded.as_ref().and_then(|(_, tid)| tid.clone());
-        // 为本次跨节点消息接收创建子 span，串联发送方的 trace context。
-        // 即使 trace_id 为 None（旧版本节点或 decode 失败），也创建一个无名 span
-        // 保持代码结构一致。
+        let traceparent = decoded.as_ref().and_then(|(_, tp)| tp.clone());
+        // C3：解析入站 W3C traceparent，若成功则：
+        //   1. 创建 `wire.recv` span，把 traceparent 字符串与解析出的 trace-id/span-id
+        //      记录为 span field，便于日志检索与 OTLP 桥接；
+        //   2. 通过 `current_trace_scope` 把入站 TraceContext 压入 thread-local，
+        //      使本 span 内（同步代码路径）调用的 `WireEnvelope::wrap()` 能生成
+        //      child traceparent（继承 trace-id、生成新 span-id），实现多跳链路
+        //      trace-id 延续。
+        //
+        // 失败时（旧版本节点、不支持 trace 传播或解析错误）创建独立 span，
+        // thread-local 保持空，wrap() 退化为生成 root trace。
+        let parsed_ctx = traceparent
+            .as_ref()
+            .and_then(|tp| crate::common::wire::TraceContext::parse(tp));
+
         let span = tracing::info_span!(
             "wire.recv",
             topic = %topic_str,
+            wire.traceparent = tracing::field::Empty,
             wire.trace_id = tracing::field::Empty,
+            wire.span_id = tracing::field::Empty,
         );
-        if let Some(ref tid) = trace_id {
-            span.record("wire.trace_id", tid);
+        if let Some(ref tp) = traceparent {
+            span.record("wire.traceparent", tp);
+        }
+        if let Some(ref ctx) = parsed_ctx {
+            span.record(
+                "wire.trace_id",
+                tracing::field::display(crate::common::wire::traceparent::HexDisplay(
+                    &ctx.trace_id,
+                )),
+            );
+            span.record(
+                "wire.span_id",
+                tracing::field::display(crate::common::wire::traceparent::HexDisplay(&ctx.span_id)),
+            );
         }
         let _enter = span.enter();
+        // 设置 thread-local scope：guard 在同步代码块结束时 drop，恢复前值。
+        // 注意：guard 不能跨 await，因此 await 必须发生在 guard 仍然活跃的同步
+        // 代码块内。当前实现：所有 await 都在 match 体内，guard 在 match 之前
+        // drop（因为 _scope 在 match 之前结束），因此多跳传播仅对同步代码路径
+        // 生效。这是当前实现的折中——若需跨 await 传播，应改用 tokio::task_local。
+        let _scope = parsed_ctx.map(crate::common::wire::current_trace_scope);
 
         match topic.classify() {
             crate::common::TopicRoute::Task(_) => {
@@ -213,6 +256,27 @@ impl NetworkEventRouter {
                         .await;
                 }
             }
+            crate::common::TopicRoute::ActorRegistry => {
+                // A2：跨节点 actor 注册表 gossip。注意 payload 是裸 postcard 编码的
+                // `ActorRegistryGossipMsg`，不包裹在 `WireEnvelope` 中
+                // （与 `CapabilityGossipActor` 一致，保持 gossip 消息轻量）。
+                if let Some(ref gossip) = self.actor_registry_gossip {
+                    gossip.handle_gossip(payload);
+                } else {
+                    tracing::debug!(
+                        "received actor registry gossip but no gossip handler configured"
+                    );
+                }
+            }
+            crate::common::TopicRoute::CapabilityGossip => {
+                // Capability 元信息 gossip。payload 是裸 postcard 编码的
+                // `CapabilityGossipMsg`，不包裹在 `WireEnvelope` 中。
+                if let Some(ref gossip) = self.capability_gossip {
+                    gossip.handle_gossip(payload);
+                } else {
+                    tracing::debug!("received capability gossip but no gossip handler configured");
+                }
+            }
             crate::common::TopicRoute::Unknown => {}
         }
     }
@@ -252,14 +316,109 @@ impl NetworkEventRouter {
                     tracing::warn!("failed to send TaskResultAck: {}", e);
                 }
             }
+            crate::runtime::network::DirectRequest::ActorCallByType {
+                actor_type,
+                method,
+                payload,
+                reply_to,
+            } => {
+                // A2：按 actor 类型在本节点选择 actor 实例并调用。
+                // 若本节点无此类型 actor，返回 Error 响应（避免调用方永久阻塞）。
+                let response = match self.actor_system.as_ref() {
+                    Some(sys) => match sys.find_local_actor_by_type(&actor_type) {
+                        Some(actor_id) => {
+                            self.handle_actor_call_by_type(sys, actor_id, method, payload, reply_to)
+                                .await
+                        }
+                        None => {
+                            tracing::warn!(
+                                actor_type = %actor_type,
+                                "no local actor of requested type"
+                            );
+                            crate::runtime::network::DirectResponse::Error {
+                                message: format!(
+                                    "no local actor of type '{}' on this node",
+                                    actor_type
+                                ),
+                            }
+                        }
+                    },
+                    None => crate::runtime::network::DirectResponse::Error {
+                        message: "no actor system configured".into(),
+                    },
+                };
+                if let Err(e) = self.network.send_direct_response(channel, response).await {
+                    tracing::warn!("failed to send ActorCallByType response: {}", e);
+                }
+            }
             other => {
-                self.event_bus
-                    .publish(BusEvent::DirectRequest {
-                        peer_id,
-                        request: Box::new(other),
-                        channel,
-                    })
-                    .await;
+                // 点对点请求-响应不走 EventBus：直接由接收方处理或回送 Error 响应，
+                // 避免独占投递分支在无订阅者时让调用方永久阻塞。
+                // 未识别的 DirectRequest 变体直接回送 Error，让调用方立即
+                // 收到明确错误，依赖其自身超时 fallback。
+                tracing::warn!(
+                    peer = %peer_id,
+                    request = ?other,
+                    "no handler for DirectRequest variant, returning DirectResponse::Error",
+                );
+                let response = crate::runtime::network::DirectResponse::Error {
+                    message: format!(
+                        "no handler for DirectRequest variant on this node: {:?}",
+                        other
+                    ),
+                };
+                if let Err(e) = self.network.send_direct_response(channel, response).await {
+                    tracing::warn!(
+                        peer = %peer_id,
+                        error = %e,
+                        "failed to send DirectResponse::Error for unhandled DirectRequest",
+                    );
+                }
+            }
+        }
+    }
+
+    /// 处理远端按 actor 类型发起的调用（A2 接收侧）。
+    ///
+    /// 在本地 ActorSystem 上调用选中的 actor 实例，将结果序列化为
+    /// `DirectResponse::ActorCallResult`。`reply_to` 参数当前未使用
+    /// （响应通过 DirectResponse channel 返回，与 `ActorCall` 一致），
+    /// 保留用于未来可能的异步通知路径。
+    async fn handle_actor_call_by_type(
+        &self,
+        actor_system: &Arc<ActorSystem>,
+        actor_id: crate::common::ActorId,
+        method: String,
+        payload: Vec<u8>,
+        _reply_to: crate::common::RemoteReplyAddress,
+    ) -> crate::runtime::network::DirectResponse {
+        match actor_system.call(&actor_id, &method, payload).await {
+            Ok(result) => match crate::common::encode_postcard(&result) {
+                Ok(bytes) => {
+                    crate::runtime::network::DirectResponse::ActorCallResult { result: bytes }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        actor_id = %actor_id.as_str(),
+                        method = %method,
+                        error = %e,
+                        "failed to encode ActorCallByType result"
+                    );
+                    crate::runtime::network::DirectResponse::Error {
+                        message: format!("failed to encode actor result: {}", e),
+                    }
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    actor_id = %actor_id.as_str(),
+                    method = %method,
+                    error = %e,
+                    "ActorCallByType local call failed"
+                );
+                crate::runtime::network::DirectResponse::Error {
+                    message: format!("actor call failed: {}", e),
+                }
             }
         }
     }

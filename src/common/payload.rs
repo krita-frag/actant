@@ -209,6 +209,52 @@ pub fn verify(key: &[u8], data: &[u8]) -> Result<Vec<u8>, String> {
     }
 }
 
+/// Wire message MAC 长度（与 payload MAC 一致，BLAKE3 输出 256 位 = 32 字节）。
+pub const WIRE_MAC_LEN: usize = 32;
+
+/// 使用共享密钥为 wire message 字节计算 BLAKE3 keyed MAC。
+///
+/// 返回固定 32 字节 MAC。空密钥返回 `None`（表示禁用 wire 签名）。
+///
+/// 与 [`sign`] 共享密钥派生逻辑，但语义独立：wire MAC 防止跨节点消息伪造，
+/// payload MAC 防止任务载荷篡改。两者可共用同一密钥（`payload_signing_key`）
+/// 也可分别配置。
+pub fn wire_mac(key: &[u8], bytes: &[u8]) -> Option<[u8; WIRE_MAC_LEN]> {
+    if key.is_empty() {
+        return None;
+    }
+    let derived = derive_key(key);
+    let mac = blake3::keyed_hash(&derived, bytes);
+    let mut out = [0u8; WIRE_MAC_LEN];
+    out.copy_from_slice(mac.as_bytes());
+    Some(out)
+}
+
+/// 恒定时间校验 wire message MAC。
+///
+/// `mac_bytes` 长度必须为 [`WIRE_MAC_LEN`]。空密钥返回 `Ok(())`（禁用签名时
+/// 一切通过，向后兼容）。MAC 不匹配返回 `Err`，调用方应丢弃该消息。
+pub fn verify_wire_mac(key: &[u8], bytes: &[u8], mac_bytes: &[u8]) -> Result<(), String> {
+    if key.is_empty() {
+        return Ok(());
+    }
+    let expected =
+        wire_mac(key, bytes).ok_or_else(|| "verify with non-empty key failed".to_string())?;
+    if mac_bytes.len() != WIRE_MAC_LEN {
+        return Err(format!(
+            "wire MAC length mismatch: expected {}, got {}",
+            WIRE_MAC_LEN,
+            mac_bytes.len()
+        ));
+    }
+    use subtle::ConstantTimeEq;
+    if mac_bytes.ct_eq(&expected).into() {
+        Ok(())
+    } else {
+        Err("wire MAC verification failed: signature mismatch".into())
+    }
+}
+
 #[cfg(test)]
 #[path = "../../tests/rust/unit/common/payload.rs"]
 mod tests;

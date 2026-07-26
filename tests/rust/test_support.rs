@@ -17,11 +17,14 @@ use crate::runtime::network::{
 
 // Mock transport 广播记录类型。
 type BroadcastLog = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+// Mock transport 直接响应记录类型：(channel, response)。
+type DirectResponseLog = Arc<Mutex<Vec<(DirectResponseChannel, DirectResponse)>>>;
 
 /// 记录所有 `broadcast` 调用的最小 `Transport` 桩。
 ///
 /// - `broadcasts`：按调用顺序记录 `(topic, data)`。
 /// - `subscribed`：记录 `subscribe` 调用过的 topic。
+/// - `direct_responses`：记录 `send_direct_response` 调用过的 `(channel, response)`。
 ///
 /// 其余方法返回默认值或 `None`；足以支撑不依赖真实网络的纯逻辑测试。
 #[derive(Clone)]
@@ -30,6 +33,7 @@ pub struct MockTransport {
     pub local_peer_id: String,
     pub broadcasts: BroadcastLog,
     pub subscribed: Arc<Mutex<Vec<String>>>,
+    pub direct_responses: DirectResponseLog,
 }
 
 #[allow(dead_code)]
@@ -40,6 +44,7 @@ impl MockTransport {
             local_peer_id: format!("peer-{}", node_id),
             broadcasts: Arc::new(Mutex::new(Vec::new())),
             subscribed: Arc::new(Mutex::new(Vec::new())),
+            direct_responses: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -56,6 +61,11 @@ impl MockTransport {
     /// 返回是否已订阅给定 topic。
     pub fn subscribed_to(&self, topic: &str) -> bool {
         self.subscribed.lock().iter().any(|t| t == topic)
+    }
+
+    /// 取走并返回所有记录到的 `send_direct_response` 调用。
+    pub fn take_responses(&self) -> Vec<(DirectResponseChannel, DirectResponse)> {
+        std::mem::take(&mut *self.direct_responses.lock())
     }
 }
 
@@ -112,9 +122,10 @@ impl Transport for MockTransport {
 
     async fn send_direct_response(
         &self,
-        _channel: DirectResponseChannel,
-        _response: DirectResponse,
+        channel: DirectResponseChannel,
+        response: DirectResponse,
     ) -> Result<()> {
+        self.direct_responses.lock().push((channel, response));
         Ok(())
     }
 

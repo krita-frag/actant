@@ -83,6 +83,26 @@ impl From<Arc<std::io::Error>> for ActantError {
     }
 }
 
+/// 跨语言错误类型保留协议：在 error 字符串前缀编码 kind。
+///
+/// Python 侧 ``actant.exceptions.decode_error_kind`` 解析此前缀重建对应
+/// Python 异常子类（如 ``timeout`` → ``ActantTimeoutError``）。
+///
+/// 格式：``[actant:KIND] message``
+///
+/// # 示例
+///
+/// ```
+/// # use actant::common::format_error_kind;
+/// assert_eq!(
+///     format_error_kind("timeout", "task timed out after 5000ms"),
+///     "[actant:timeout] task timed out after 5000ms",
+/// );
+/// ```
+pub fn format_error_kind(kind: &str, message: &str) -> String {
+    format!("[actant:{kind}] {message}")
+}
+
 #[cfg(test)]
 #[path = "../../tests/rust/unit/common/error.rs"]
 mod tests;

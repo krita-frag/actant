@@ -1,12 +1,16 @@
 use super::*;
 use crate::common::should_claim_workflow;
-use crate::common::{NodeId, RetryPolicy, TaskId, WorkflowId};
+use crate::common::{ActantConfig, ActantError, NodeId, Result, RetryPolicy, TaskId, WorkflowId};
+use crate::runtime::network::{
+    DirectRequest, DirectResponse, ListenAddresses, NetworkEvent, PeerId, Transport,
+};
 use crate::runtime::workflow::dag::Terminal;
 use crate::runtime::workflow::orchestrator::types::ConditionEvaluator;
 use crate::runtime::workflow::{Dag, DagNode, Phase};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 const TEST_SIGNING_KEY: &[u8] = b"test-key";
 
 fn make_node(id: &str, name: &str) -> DagNode {
@@ -442,6 +446,172 @@ async fn submit_with_timeout_sets_deadline() {
     assert!(state.deadline_ms().is_some());
 }
 
+// --- B2: 工作流级硬超时主动取消 ---
+
+/// 捕获所有 broadcast 调用的 mock transport，用于断言超时监控发出了取消广播。
+struct BroadcastCaptureTransport {
+    node_id: NodeId,
+    broadcasts: StdMutex<Vec<(String, Vec<u8>)>>,
+}
+
+impl BroadcastCaptureTransport {
+    fn new(node_id: &str) -> Self {
+        Self {
+            node_id: NodeId::from(node_id.to_string()),
+            broadcasts: StdMutex::new(Vec::new()),
+        }
+    }
+
+    fn take_broadcasts(&self) -> Vec<(String, Vec<u8>)> {
+        self.broadcasts.lock().unwrap().drain(..).collect()
+    }
+}
+
+#[async_trait::async_trait]
+impl Transport for BroadcastCaptureTransport {
+    fn node_id(&self) -> &NodeId {
+        &self.node_id
+    }
+    fn local_peer_id(&self) -> &str {
+        "capture-peer"
+    }
+    async fn broadcast(&self, topic: &str, data: Vec<u8>) -> Result<()> {
+        self.broadcasts
+            .lock()
+            .unwrap()
+            .push((topic.to_string(), data));
+        Ok(())
+    }
+    async fn subscribe(&self, _topic: &str) -> Result<()> {
+        Ok(())
+    }
+    async fn recv_event(&self) -> Option<NetworkEvent> {
+        None
+    }
+    async fn dial(&self, _addr: &str) -> Result<()> {
+        Ok(())
+    }
+    async fn add_gossip_peer(&self, _peer_id: &str) -> Result<()> {
+        Ok(())
+    }
+    fn listen_addresses(&self) -> Result<ListenAddresses> {
+        Ok(ListenAddresses {
+            endpoint_id: "capture".to_string(),
+            relay_url: None,
+            direct_addrs: Vec::new(),
+            endpoint_addr: "capture".to_string(),
+        })
+    }
+    async fn send_direct_request(
+        &self,
+        _peer_id_str: &str,
+        _request: DirectRequest,
+    ) -> Result<DirectResponse> {
+        Err(ActantError::Internal("not implemented".into()))
+    }
+    async fn send_direct_response(
+        &self,
+        _channel: crate::runtime::network::DirectResponseChannel,
+        _response: DirectResponse,
+    ) -> Result<()> {
+        Ok(())
+    }
+    async fn discover_peers(&self) -> Result<Vec<PeerId>> {
+        Ok(Vec::new())
+    }
+    async fn shutdown(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// B2 关键测试：注入网络后，工作流超时触发 CancelBroadcast 广播。
+#[tokio::test]
+async fn workflow_timeout_broadcasts_cancel_when_network_set() {
+    use crate::common::wire::{CancelBroadcast, TOPIC_CANCEL};
+
+    // 配置极短的轮询间隔与超时窗口，确保测试在 1s 内完成。
+    let mut config = ActantConfig::default();
+    config.workflow.state_poll_interval_ms = 20;
+    let transport = Arc::new(BroadcastCaptureTransport::new("n1"));
+    let orch = Orchestrator::new()
+        .with_signing_key(TEST_SIGNING_KEY.to_vec())
+        .with_config(config)
+        .with_network(transport.clone());
+
+    let wf = WorkflowId::from("wf-timeout");
+    // deadline=10ms：start 后立即进入超时。
+    orch.submit_with_timeout(wf.clone(), make_linear_dag(), 10)
+        .await
+        .unwrap();
+    // start 设置 started_at_ms，启动超时计时。
+    let roots = orch.start(&wf).unwrap();
+    // 将根任务标记为 Running，使其成为超时时需要取消的运行中任务。
+    orch.mark_task_running(&wf, &roots[0].id).unwrap();
+
+    // 启动超时监控。
+    let cancel_tx = orch.start_timeout_watcher();
+
+    // 轮询等待广播发生（最多 2s）。
+    let mut captured = Vec::new();
+    for _ in 0..200 {
+        captured = transport.take_broadcasts();
+        if !captured.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let _ = cancel_tx.send(true);
+
+    // 至少应有一条广播到 TOPIC_CANCEL 的消息。
+    let cancel_msgs: Vec<&(String, Vec<u8>)> =
+        captured.iter().filter(|(t, _)| t == TOPIC_CANCEL).collect();
+    assert!(
+        !cancel_msgs.is_empty(),
+        "timeout watcher should broadcast at least one CancelBroadcast, got: {:?}",
+        captured.iter().map(|(t, _)| t).collect::<Vec<_>>()
+    );
+
+    // 解码验证内容：task_id 与 workflow_id 必须匹配超时的工作流与运行中任务。
+    let decoded: CancelBroadcast = postcard::from_bytes(&cancel_msgs[0].1).unwrap();
+    assert_eq!(decoded.workflow_id, wf);
+    assert_eq!(decoded.task_id, roots[0].id);
+
+    // 工作流应已进入 Failed 终态。
+    let state = orch.get_state(&wf).unwrap();
+    assert_eq!(state.state, Phase::Failed);
+}
+
+/// B2 回归测试：未注入网络时，超时监控仍标记工作流失败但不广播取消。
+#[tokio::test]
+async fn workflow_timeout_without_network_marks_failed_without_broadcast() {
+    let mut config = ActantConfig::default();
+    config.workflow.state_poll_interval_ms = 20;
+    // 不调用 with_network，模拟无网络场景（单元测试）。
+    let orch = Orchestrator::new()
+        .with_signing_key(TEST_SIGNING_KEY.to_vec())
+        .with_config(config);
+
+    let wf = WorkflowId::from("wf-no-net");
+    orch.submit_with_timeout(wf.clone(), make_linear_dag(), 10)
+        .await
+        .unwrap();
+    let roots = orch.start(&wf).unwrap();
+    orch.mark_task_running(&wf, &roots[0].id).unwrap();
+
+    let cancel_tx = orch.start_timeout_watcher();
+
+    // 等待监控至少轮询一次（state_poll_interval_ms=20，等待 100ms 足够）。
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let _ = cancel_tx.send(true);
+
+    let state = orch.get_state(&wf).unwrap();
+    assert_eq!(
+        state.state,
+        Phase::Failed,
+        "workflow should be marked Failed even without network"
+    );
+}
+
 #[tokio::test]
 async fn get_dag_returns_submitted_dag() {
     let orch = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
@@ -557,19 +727,16 @@ async fn start_propagates_retry_policy_from_dag_node() {
     assert_eq!(policy.delay_ms, 1000);
 }
 
-// ---- 审查验证: should_claim_workflow 一致性哈希 vs claim_workflow 字典序退让 ----
+// ---- should_claim_workflow 一致性哈希 vs claim_workflow 退让逻辑对齐性 ----
 
-/// 验证审查发现 ST1: should_claim_workflow (一致性哈希) 与 claim_workflow 内部
-/// 字典序退让逻辑存在设计不一致。当 lease 过期边界情况发生时，
-/// 一致性哈希指定的认领者可能因字典序更大而退让给非指定节点。
-///
-/// 此测试验证 should_claim_workflow 的决策与 claim_workflow 内部
-/// 退让逻辑（existing.node_id < self.node_id 时退让）在特定场景下矛盾。
+/// 验证 `should_claim_workflow`（一致性哈希决策）与 `claim_workflow`（租约退让）
+/// 两条路径策略对齐：当租约仍有效且不属于本节点时直接退让，仅当租约过期或
+/// 归属本节点时才认领，避免一致性哈希指定的认领者因退让逻辑而让权给非指定节点。
 #[test]
 fn failover_claim_strategy_aligned_with_consistent_hash() {
     // should_claim_workflow 使用一致性哈希决定认领权。
-    // 修复后 claim_workflow 不再使用字典序退让，因此两种策略不会矛盾：
-    // 当租约仍有效且不属于本节点时直接退让，仅当租约过期或归属本节点时才认领。
+    // claim_workflow 与之一致：当租约仍有效且不属于本节点时直接退让，
+    // 仅当租约过期或归属本节点时才认领，两种策略不会矛盾。
     let candidates = vec!["node_a".to_string(), "node_b".to_string()];
 
     // 暴力搜索一个 key 使一致性哈希指向 node_b 而非 node_a

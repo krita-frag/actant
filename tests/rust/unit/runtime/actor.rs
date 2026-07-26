@@ -3,7 +3,19 @@
 
 use super::*;
 use async_trait::async_trait;
+use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use tokio::sync::mpsc;
+
+use crate::common::{
+    ActantError, ActorConfig, ActorId, ActorMessage, ActorMessageResult, ActorStatus, MessageId,
+    NodeId, RemoteActorReply, RemoteActorRequest, RemoteReplyAddress, Result,
+};
+use crate::runtime::event_bus::EventBus;
+use crate::runtime::network::Transport;
+use crate::runtime::state::{
+    ActorSnapshot, CheckpointManager, HybridLogicalClock, LmdbStore, Store, WalWriter,
+};
 
 struct EchoActor {
     received: Arc<StdMutex<Vec<String>>>,
@@ -243,57 +255,107 @@ async fn stop_unknown_actor_is_noop() {
 #[tokio::test]
 async fn spawn_emits_actor_started_supervision_event() {
     let system = ActorSystem::new();
-    let mut rx = system.supervision.event_tx.subscribe();
+    // 必须在 spawn 前订阅——emit() 通过 tokio::spawn 异步发布到 EventBus，
+    // 订阅者通过 mpsc 接收；如果在 spawn 后订阅，可能错过事件。
+    let mut rx = system.supervision.subscribe();
 
     let actor_id = ActorId::from("sup-1");
     let (actor, _) = EchoActor::new();
     system.spawn(actor_id.clone(), actor).await.unwrap();
 
-    let event = rx.try_recv().expect("should receive ActorStarted event");
+    let event = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+        .await
+        .expect("should receive ActorStarted event")
+        .expect("channel not closed");
     match event {
-        SupervisionEvent::ActorStarted { actor_id: id } => {
+        crate::runtime::event_bus::BusEvent::SupervisionEvent(SupervisionEvent::ActorStarted {
+            actor_id: id,
+        }) => {
             assert_eq!(id.as_str(), "sup-1");
         }
-        _ => panic!("expected ActorStarted, got {:?}", event),
+        other => panic!("expected ActorStarted, got {:?}", other),
     }
 }
 
 #[tokio::test]
 async fn stop_emits_actor_stopped_supervision_event() {
     let system = ActorSystem::new();
+    // 在 spawn 之前订阅——stop 时 emit ActorStopped 通过 EventBus 异步发布。
+    let mut rx = system.supervision.subscribe();
     let actor_id = ActorId::from("sup-2");
     let (actor, _) = EchoActor::new();
     system.spawn(actor_id.clone(), actor).await.unwrap();
 
-    let mut rx = system.supervision.event_tx.subscribe();
+    // 消费 spawn 触发的 ActorStarted。
+    let started = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+        .await
+        .expect("should receive ActorStarted first")
+        .expect("channel not closed");
+    assert!(matches!(
+        started,
+        crate::runtime::event_bus::BusEvent::SupervisionEvent(
+            SupervisionEvent::ActorStarted { .. }
+        )
+    ));
+
     system.stop(&actor_id).await.unwrap();
 
-    let event = rx.try_recv().expect("should receive ActorStopped event");
-    assert!(matches!(event, SupervisionEvent::ActorStopped { .. }));
+    let event = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+        .await
+        .expect("should receive ActorStopped event")
+        .expect("channel not closed");
+    assert!(
+        matches!(
+            event,
+            crate::runtime::event_bus::BusEvent::SupervisionEvent(
+                SupervisionEvent::ActorStopped { .. }
+            )
+        ),
+        "expected ActorStopped, got {:?}",
+        event
+    );
 }
 
 #[tokio::test]
 async fn actor_failure_emits_actor_failed_supervision_event() {
     let system = ActorSystem::new();
+    // spawn 之前订阅——ActorStarted/ActorFailed 都通过 EventBus 异步发布。
+    let mut rx = system.supervision.subscribe();
     let actor_id = ActorId::from("sup-3");
     let (actor, _) = EchoActor::with_fail("boom");
     system.spawn(actor_id.clone(), actor).await.unwrap();
 
-    let mut rx = system.supervision.event_tx.subscribe();
     let _ = system.call(&actor_id, "boom", vec![]).await;
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // 先消费 ActorStarted，再等待 ActorFailed。
+    let started = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+        .await
+        .expect("should receive first event")
+        .expect("channel not closed");
+    assert!(
+        matches!(
+            started,
+            crate::runtime::event_bus::BusEvent::SupervisionEvent(
+                SupervisionEvent::ActorStarted { .. }
+            )
+        ),
+        "expected ActorStarted first, got {:?}",
+        started
+    );
 
-    let event = rx.try_recv().expect("should receive ActorFailed event");
+    let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+        .await
+        .expect("should receive ActorFailed event")
+        .expect("channel not closed");
     match event {
-        SupervisionEvent::ActorFailed {
+        crate::runtime::event_bus::BusEvent::SupervisionEvent(SupervisionEvent::ActorFailed {
             actor_id: id,
             error,
-        } => {
+        }) => {
             assert_eq!(id.as_str(), "sup-3");
             assert!(error.contains("intentional failure"));
         }
-        _ => panic!("expected ActorFailed, got {:?}", event),
+        other => panic!("expected ActorFailed, got {:?}", other),
     }
 }
 
@@ -350,30 +412,37 @@ async fn with_node_id_stores_node_id() {
     assert_eq!(system.node_id().unwrap().as_str(), "node-1");
 }
 
-#[test]
-fn supervision_delivers_to_subscriber() {
-    let tree = SupervisionTree::with_capacity(16);
-    let mut rx = tree.event_tx.subscribe();
+#[tokio::test]
+async fn supervision_delivers_to_subscriber() {
+    let tree = SupervisionTree::with_event_bus(EventBus::new());
+    let mut rx = tree.subscribe();
 
     tree.emit(SupervisionEvent::ActorStarted {
         actor_id: ActorId("a1".into()),
     });
 
-    let event = rx.try_recv().expect("should receive emitted event");
+    let event = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+        .await
+        .expect("should receive emitted event")
+        .expect("channel not closed");
     match event {
-        SupervisionEvent::ActorStarted { actor_id } => {
+        crate::runtime::event_bus::BusEvent::SupervisionEvent(SupervisionEvent::ActorStarted {
+            actor_id,
+        }) => {
             assert_eq!(actor_id.0, "a1");
         }
-        _ => panic!("expected ActorStarted, got {:?}", event),
+        other => panic!("expected ActorStarted, got {:?}", other),
     }
 }
 
-#[test]
-fn supervision_without_subscribers_is_silent_noop() {
-    let tree = SupervisionTree::with_capacity(16);
+#[tokio::test]
+async fn supervision_without_subscribers_is_silent_noop() {
+    let tree = SupervisionTree::with_event_bus(EventBus::new());
     tree.emit(SupervisionEvent::ActorStarted {
         actor_id: ActorId("a1".into()),
     });
+    // 让 spawn 完成无订阅者的 publish（不会 panic）。
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 }
 
 #[tokio::test]

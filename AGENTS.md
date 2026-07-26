@@ -48,6 +48,7 @@ Actant 采用 **Rust + iroh** 构建核心运行时，通过 **PyO3** 暴露给 
 actant/
 ├── src/                          # Rust 核心（第 1 层）
 │   ├── common/                   # 共享类型与协议
+│   │   ├── backoff.rs            # 统一指数退避 ExponentialBackoff（remote_call / gossip 重试）
 │   │   ├── config.rs             # ActantConfig / NetworkConfig / FailoverConfig / GossipConfig / WorkerConfig
 │   │   ├── error.rs              # ActantError 枚举与 Result 别名
 │   │   ├── model.rs              # TaskId / WorkflowId / NodeId / RetryPolicy / TaskCompletion 等领域类型
@@ -55,7 +56,14 @@ actant/
 │   │   ├── serialization.rs      # rkyv 序列化与 postcard 编解码
 │   │   └── wire.rs               # Wire message / Topic / 跨节点协议
 │   ├── runtime/                  # 运行时四盒
-│   │   ├── actor.rs              # Actor 模型统一执行引擎：Actor trait、ActorSystem、监督、邮箱、持久化
+│   │   ├── actor/                # Actor 运行时（拆分为子模块）
+│   │   │   ├── mod.rs            # 入口 + 公共 re-export
+│   │   │   ├── runtime.rs        # Actor trait + ActorContext
+│   │   │   ├── supervision.rs    # SupervisionEvent + SupervisionTree（统一走 EventBus）
+│   │   │   ├── mailbox.rs        # MailboxRegistry + 持久化待发消息
+│   │   │   ├── persistence.rs    # ActorPersistence（检查点 + WAL + 定期压缩）
+│   │   │   ├── system.rs         # ActorSystem facade + RunningActor 执行循环
+│   │   │   └── router.rs         # 跨节点 Actor 路由：ActorRegistry / ActorRouter / Gossip
 │   │   ├── builder.rs            # RuntimeBuilder：按 network → store → actor → workflow → capability → worker 装配
 │   │   ├── capability.rs         # ERH 核心：Capability、Handler、Layer、Runtime、capability_registry!
 │   │   ├── context.rs            # Runtime 上下文：CapabilityRuntime + ActorSystem + State + Iroh + shutdown
@@ -134,17 +142,20 @@ actant/
 │       ├── models.py             # IssueRecord / RepoStats / AnalysisReport
 │       ├── handlers.py           # 10 个 capability handler（路由/调度/重试/限流/拉取/聚合/存储/指标/审计）
 │       └── pipeline.py           # 编排：限流→重试拉取→路由→优先级调度→聚合→持久化
-├── benches/                      # Rust 基准测试（criterion）：scheduler / event_bus / serialization / store / actor_messaging / capability_dispatch / mem_profile
-├── tests/                        # 测试套件
-│   ├── _helpers/                 # Python 测试公共辅助（network.py / payload.py）
-│   ├── e2e/test_multi_node.py    # 跨节点 P2P e2e 测试（真实 iroh）
-│   ├── integration/              # 集成测试（capability / runtime fallback / worker lifecycle）
-│   ├── unit/                     # Python 单元测试（task / flow / runtime / dispatch / cli 等）
-│   ├── rust/                     # Rust 测试（独立 cargo target）
-│   │   ├── test_support.rs       # Rust 测试辅助（src/lib.rs 通过 #[path] 引用）
-│   │   ├── property/             # 属性测试：dag 不变量、payload 签名/篡改
-│   │   └── unit/                 # Rust 单元测试（镜像 src/ 结构）
-│   └── conftest.py
+├── benches/                      # 基准测试
+│   ├── python/                   # Python 基准测试（pytest-benchmark）：task dispatch / flow / gather / events / payload / concurrency
+│   └── rust/                     # Rust 基准测试（criterion）：scheduler / event_bus / serialization / store / actor_messaging / capability_dispatch / orchestrator / network / mem_profile
+├── tests/                        # 测试套件（按语言分区）
+│   ├── python/                   # Python 测试
+│   │   ├── _helpers/             # Python 测试公共辅助（network.py / payload.py）
+│   │   ├── conftest.py           # pytest 全局配置（环境隔离、分层超时、计时报告）
+│   │   ├── e2e/test_multi_node.py# 跨节点 P2P e2e 测试（真实 iroh）
+│   │   ├── integration/          # 集成测试（capability / runtime fallback / worker lifecycle）
+│   │   └── unit/                 # Python 单元测试（task / flow / runtime / dispatch / cli 等）
+│   └── rust/                     # Rust 测试（独立 cargo target）
+│       ├── test_support.rs       # Rust 测试辅助（src/lib.rs 通过 #[path] 引用）
+│       ├── property/             # 属性测试：dag 不变量、payload 签名/篡改
+│       └── unit/                 # Rust 单元测试（镜像 src/ 结构）
 ├── Cargo.toml                    # Rust 依赖
 └── pyproject.toml                # Python 项目配置
 ```
@@ -161,7 +172,7 @@ Worker 行为由 `actant.actant._ActantConfig` 控制。高层 `Runtime`/`Runtim
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `max_concurrent_tasks` | 1 | 单节点最大并发任务数（与 `WorkerConfig::default` 一致；如需更高并发建议启动多个 Worker 进程或显式指定） |
+| `max_concurrent_tasks` | `num_cpus::get()` | 单节点最大并发任务数。Python 侧 `Runtime.with_defaults()` 不显式指定时，`_ActantConfig` 默认取 CPU 核数；Rust 侧 `WorkerConfig::default()` 为 1（单线程模型，用于纯 Rust 嵌入场景）。如需更低并发建议在 `config` 中显式指定或启动多个 Worker 进程 |
 | `default_task_timeout_ms` | 30000 | 任务默认超时（毫秒） |
 | `drain_timeout_secs` | 30 | 退出时等待在途任务的最长时间 |
 | `remote_fallback_delay_ms` | 500 | 本地无法执行的任务重新入队前的延迟 |
@@ -172,7 +183,7 @@ Worker 行为由 `actant.actant._ActantConfig` 控制。高层 `Runtime`/`Runtim
 ## 技术栈
 
 - **Rust**：tokio、iroh、heed/LMDB、rkyv、postcard、PyO3
-- **Python**：>=3.10、cloudpickle、prometheus_client
+- **Python**：>=3.10、cloudpickle
 
 ## 常用命令
 
@@ -180,15 +191,16 @@ Worker 行为由 `actant.actant._ActantConfig` 控制。高层 `Runtime`/`Runtim
 uv sync
 uv run maturin develop                    # 构建 Rust 核心 + 安装 Python 包
 
-uv run pytest tests/ -v                   # Python 测试
-uv run pytest tests/ -n 4 -v              # 并行 Python 测试
-cargo nextest run                         # Rust 测试（含计时）
-cargo clippy                              # Rust 静态检查
-cargo fmt                                 # Rust 格式化
-ruff check actant tests                   # Python 静态检查
+uv run pytest tests/python/ -v            # Python 测试
+uv run pytest tests/python/ -n 4 -v       # 并行 Python 测试
+cargo test                                # Rust 测试（默认含 PyO3 模块）
+cargo test --no-default-features          # Rust 测试（禁用 PyO3，CI 友好）
+cargo clippy --all-targets -- -D warnings # Rust 静态检查（零告警）
+cargo fmt --check                         # Rust 格式化检查
+ruff check actant tests/python            # Python 静态检查
 mypy actant                               # Python 类型检查
 
-cargo bench --bench scheduler              # Rust 基准测试
+cargo bench --bench scheduler             # Rust 基准测试
 cargo audit                               # 依赖漏洞扫描
 ```
 
@@ -224,7 +236,7 @@ cargo audit                               # 依赖漏洞扫描
 
 ## 测试
 
-- 每次改动后运行受影响测试：`uv run pytest tests/<module>/`
+- 每次改动后运行受影响测试：`uv run pytest tests/python/<module>/`
 - 测试必须确定性；外部依赖需 mock。
 - 端到端测试用 `threading.Event` 做就绪信号。
 - Rust 基准测试：`cargo bench --bench <name>`

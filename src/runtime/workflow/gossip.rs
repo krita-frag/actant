@@ -600,20 +600,26 @@ impl DagGossip {
     /// 以有限重试次数广播状态更新。
     /// 使用指数退避策略。
     async fn broadcast_with_retry(&self, topic: &str, data: Vec<u8>) -> crate::common::Result<()> {
+        let backoff = crate::common::backoff::ExponentialBackoff::new(
+            self.retry_base_delay,
+            crate::common::REMOTE_CALL_MAX_RETRY_DELAY,
+        );
         let mut last_err = None;
         for attempt in 0..self.retry_attempts {
             match self.network.broadcast(topic, data.clone()).await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     if attempt + 1 < self.retry_attempts {
+                        let delay = backoff.delay_for(attempt as u32);
                         tracing::warn!(
-                            "gossip broadcast to {} failed (attempt {}/{}): {}, retrying",
+                            "gossip broadcast to {} failed (attempt {}/{}): {}, retrying after {:?}",
                             topic,
                             attempt + 1,
                             self.retry_attempts,
-                            e
+                            e,
+                            delay
                         );
-                        tokio::time::sleep(self.retry_base_delay * (attempt as u32 + 1)).await;
+                        tokio::time::sleep(delay).await;
                     }
                     last_err = Some(e);
                 }

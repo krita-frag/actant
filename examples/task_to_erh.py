@@ -20,15 +20,9 @@
 
 from __future__ import annotations
 
-import actant
 from actant import Runtime, ask, emit
 from actant.capabilities import RetryCtx, RouteCtx
 from actant.task import task
-
-
-# ---------------------------------------------------------------------------
-# 阶段 1：@task 高层 API
-# ---------------------------------------------------------------------------
 
 
 def stage_1_task_api() -> None:
@@ -48,7 +42,7 @@ def stage_1_task_api() -> None:
         print(f"  [fetch_url] processing {url}")
         return 200
 
-    with Runtime.with_defaults() as rt:
+    with Runtime.with_defaults():
         # submit() 异步提交，返回 AsyncResult 句柄
         handle = fetch_url.submit("https://example.com")
         # result() 阻塞等待结果
@@ -60,11 +54,6 @@ def stage_1_task_api() -> None:
         print(f"  sync call -> {status_sync}")
 
     print()
-
-
-# ---------------------------------------------------------------------------
-# 阶段 2：自定义 Routing handler
-# ---------------------------------------------------------------------------
 
 
 def stage_2_custom_routing() -> None:
@@ -110,10 +99,6 @@ def stage_2_custom_routing() -> None:
 
     print()
 
-
-# ---------------------------------------------------------------------------
-# 阶段 3：自定义 RetryPolicy handler
-# ---------------------------------------------------------------------------
 
 
 def stage_3_custom_retry() -> None:
@@ -166,11 +151,6 @@ def stage_3_custom_retry() -> None:
     print()
 
 
-# ---------------------------------------------------------------------------
-# 阶段 4：自定义 emit capability
-# ---------------------------------------------------------------------------
-
-
 def stage_4_custom_emit() -> None:
     """``emit`` 是反应型 effect：所有 handler 按顺序被调用，无返回值。
 
@@ -208,11 +188,6 @@ def stage_4_custom_emit() -> None:
         print(f"  指标: {metrics}")
 
     print()
-
-
-# ---------------------------------------------------------------------------
-# 主入口
-# ---------------------------------------------------------------------------
 
 
 def main() -> None:

@@ -7,7 +7,11 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
+import asyncio
+import functools
+import inspect
 from collections.abc import Callable
 from typing import Any, Literal, cast
 
@@ -22,27 +26,366 @@ CallbackErrorPolicy = Literal["log", "raise", "collect"]
 _logger = logging.getLogger("actant.task")
 
 
+# ---------------------------------------------------------------------------
+# 事件 batching：累积 TaskLifecycle 事件，按时间窗口或数量阈值批量派发。
+#
+# 设计动机：每个 task 触发 started + completed 两次 emit，对 event_bus 形成
+# N×2 次独立 publish。在高吞吐场景（4 worker × 1000 tasks = 4000 events）
+# 下，emit 调用本身成为瓶颈。Batching 通过累积事件到 buffer，按 1ms 窗口
+# 或 100 个事件阈值触发一次批量派发，将 emit 次数降为 N/100。
+#
+# 使用方式：通过 ``_EventBatcherScope`` 上下文管理器在调用方作用域内
+# 启用 batching；未启用时 ``_emit_task_event`` 直接同步 emit，零开销。
+# ---------------------------------------------------------------------------
+
+# close() 时 join 后台 flush 线程的超时时间（秒）。
+# 暴露为模块常量便于测试覆盖超时分支（避免每次测试等待 5s）。
+_EVENT_BATCHER_CLOSE_JOIN_TIMEOUT: float = 5.0
+
+
+class _EventBatcher:
+    """累积 TaskLifecycle 事件并按窗口/阈值批量派发。
+
+    线程安全：内部 lock 保护 buffer。后台线程按 ``flush_interval_ms`` 周期
+    触发 flush；调用方也可显式调用 ``flush()`` 强制立即派发。
+
+    派发策略：每次 flush 将 buffer 中所有事件顺序 emit 到 ``TaskLifecycle``
+    capability。emit 失败按 ``on_error="log"`` 处理（单事件失败不阻塞其他）。
+    """
+
+    def __init__(
+        self,
+        *,
+        flush_interval_ms: int = 1,
+        flush_threshold: int = 100,
+    ) -> None:
+        if flush_interval_ms < 0:
+            raise ValueError(
+                f"flush_interval_ms must be >= 0, got {flush_interval_ms}"
+            )
+        if flush_threshold < 1:
+            raise ValueError(
+                f"flush_threshold must be >= 1, got {flush_threshold}"
+            )
+        self._flush_interval = flush_interval_ms / 1000.0
+        self._flush_threshold = flush_threshold
+        # (kind, task_id, workflow_id, kwargs) 四元组列表。
+        self._buffer: list[tuple[str, str, str, dict[str, Any]]] = []
+        self._lock = threading.Lock()
+        self._closed = False
+        # 后台 flush 线程：周期性触发 flush，避免低吞吐场景下事件滞留。
+        # 仅在 flush_interval > 0 时启动；interval=0 表示仅按 threshold flush。
+        self._flush_thread: threading.Thread | None = None
+        self._wakeup = threading.Event()
+        if self._flush_interval > 0:
+            self._flush_thread = threading.Thread(
+                target=self._flush_loop,
+                name="actant-event-batcher",
+                daemon=True,
+            )
+            self._flush_thread.start()
+
+    def _flush_loop(self) -> None:
+        """后台线程：按 flush_interval 周期触发 flush。"""
+        while not self._closed:
+            # 用 wait 而非 sleep，使 close() 能立即唤醒退出。
+            # 被 set() 唤醒且 _closed=True 时退出循环（close 信号）。
+            if self._wakeup.wait(timeout=self._flush_interval) and self._closed:
+                return
+            try:
+                self.flush()
+            except Exception:
+                _logger.debug(
+                    "EventBatcher: background flush raised", exc_info=True,
+                )
+
+    def add(
+        self,
+        kind: str,
+        task_id: str,
+        workflow_id: str,
+        **kwargs: Any,
+    ) -> None:
+        """添加一个事件到 buffer。若 buffer 达到 threshold，立即 flush。"""
+        do_flush = False
+        with self._lock:
+            if self._closed:
+                return
+            self._buffer.append((kind, task_id, workflow_id, kwargs))
+            if len(self._buffer) >= self._flush_threshold:
+                do_flush = True
+        if do_flush:
+            # 在锁外 flush，避免 flush 持有锁时间过长阻塞 add。
+            try:
+                self.flush()
+            except Exception:
+                _logger.debug(
+                    "EventBatcher: threshold flush raised", exc_info=True,
+                )
+
+    def flush(self) -> None:
+        """立即派发 buffer 中所有事件。"""
+        with self._lock:
+            if not self._buffer:
+                return
+            events = list(self._buffer)
+            self._buffer.clear()
+        # 在锁外派发，避免 emit 失败导致 buffer 锁死。
+        # _bypass_batcher=True 防止事件回环：flush 调用 _emit_task_event 时
+        # 若不绕过 batcher，事件会重新进 batcher.add（被 _closed 拒绝而丢失）。
+        for kind, task_id, workflow_id, kwargs in events:
+            try:
+                _emit_task_event(
+                    kind, task_id, workflow_id,
+                    on_error="log", _bypass_batcher=True, **kwargs,
+                )
+            except Exception:
+                _logger.debug(
+                    "EventBatcher: emit event kind=%s task=%s raised",
+                    kind, task_id, exc_info=True,
+                )
+
+    def close(self) -> None:
+        """关闭 batcher：停止后台线程并派发剩余事件。
+
+        显式 join 后台 flush 线程（带 5s 超时），确保：
+
+        - flush 线程不会在调用方返回后继续访问已释放的资源。
+        - 进程正常退出路径下，所有缓冲事件已被 flush 线程处理完毕。
+        - 异常场景（flush 线程卡在 emit 上）下，5s 超时避免无限阻塞调用方。
+
+        join 之后再执行一次 ``flush()``：flush 线程退出前可能已将事件从 buffer
+        取出但尚未完成 emit，此处的 flush 处理 flush 线程未来得及处理的新增事件
+        （close 期间若有 add 调用会被 ``_closed`` 拒绝，但 close 前已入队的
+        事件可能在 flush 线程退出与本次 flush 之间的竞争窗口中遗留）。
+        """
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        # 唤醒 flush 线程使其看到 _closed=True 并退出。
+        self._wakeup.set()
+        # 显式 join：带超时防止 flush 线程卡死导致调用方永久阻塞。
+        # 超时后放弃 join——daemon 线程会在主进程退出时由 OS 回收。
+        if self._flush_thread is not None and self._flush_thread.is_alive():
+            self._flush_thread.join(timeout=_EVENT_BATCHER_CLOSE_JOIN_TIMEOUT)
+            if self._flush_thread.is_alive():
+                _logger.warning(
+                    "EventBatcher: flush thread did not exit within %ss; "
+                    "abandoning join (daemon thread will be reaped on process exit)",
+                    _EVENT_BATCHER_CLOSE_JOIN_TIMEOUT,
+                )
+            self._flush_thread = None
+        # 派发剩余事件（包括 flush 线程未处理完的）。
+        self.flush()
+
+
+# 线程局部：当前活跃的 EventBatcher（由 _EventBatcherScope 设置）。
+# None 表示不启用 batching，_emit_task_event 走同步路径。
+_event_batcher_local = threading.local()
+
+
+def _get_event_batcher() -> _EventBatcher | None:
+    """返回当前线程活跃的 EventBatcher，未启用返回 None。"""
+    return getattr(_event_batcher_local, "batcher", None)
+
+
+class _EventBatcherScope:
+    """``with`` 上下文：在作用域内启用事件 batching。
+
+    进入时创建并设置线程局部 batcher；退出时关闭 batcher 并派发剩余事件。
+    可重入：嵌套 scope 重用外层 batcher（避免双重缓冲）。
+
+    用法::
+
+        with _EventBatcherScope(flush_interval_ms=1, flush_threshold=100):
+            for i in range(1000):
+                task.submit(i)  # 内部 emit 走 batcher
+        # 退出时自动 flush 剩余事件
+    """
+
+    def __init__(
+        self,
+        *,
+        flush_interval_ms: int = 1,
+        flush_threshold: int = 100,
+    ) -> None:
+        self._flush_interval_ms = flush_interval_ms
+        self._flush_threshold = flush_threshold
+        self._batcher: _EventBatcher | None = None
+        self._owns_batcher = False
+
+    def __enter__(self) -> _EventBatcher:
+        prev: _EventBatcher | None = getattr(_event_batcher_local, "batcher", None)
+        if prev is not None:
+            # 可重入：重用外层 batcher，避免双重缓冲。
+            self._batcher = prev
+            self._owns_batcher = False
+            return prev
+        batcher = _EventBatcher(
+            flush_interval_ms=self._flush_interval_ms,
+            flush_threshold=self._flush_threshold,
+        )
+        _event_batcher_local.batcher = batcher
+        self._batcher = batcher
+        self._owns_batcher = True
+        return batcher
+
+    def __exit__(self, *exc: object) -> None:
+        if self._owns_batcher and self._batcher is not None:
+            self._batcher.close()
+            _event_batcher_local.batcher = None
+        self._batcher = None
+        self._owns_batcher = False
+
+
+
+def _is_coroutine_function(func: Any) -> bool:
+    """检测 ``func`` 是否为 ``async def`` 函数。
+
+    使用 ``asyncio.iscoroutinefunction``，覆盖原生 coroutine 与
+    ``functools.partial`` 包裹的 coroutine（后者需手动 unwrap）。
+    """
+
+    # asyncio.iscoroutinefunction 检测原生 async def
+    if asyncio.iscoroutinefunction(func):
+        return True
+    # unwrap functools.partial / decorate 包装层
+    unwrapped = inspect.unwrap(func) if hasattr(func, "__wrapped__") else func
+    if unwrapped is not func and asyncio.iscoroutinefunction(unwrapped):
+        return True
+    # functools.partial 包装的 coroutine function
+    if isinstance(func, functools.partial):
+        return asyncio.iscoroutinefunction(func.func)
+    return False
+
+
+def _run_coroutine_on_worker_thread(coro: Any) -> Any:
+    """在 Worker 线程上同步执行 coroutine，返回结果或抛出异常。
+
+    Worker 线程是 Rust tokio 线程池中的线程，无运行中的 asyncio event loop。
+    因此可安全创建新 loop 并 ``run_until_complete``。
+
+    若当前线程已有运行中的 loop（不应在 Worker 线程发生，但防御性处理），
+    在独立线程中执行 coroutine，避免嵌套 ``run_until_complete`` 报错。
+
+    Args:
+        coro: 已创建的 coroutine 对象（如 ``async_func(*args)`` 的返回值）。
+
+    Returns:
+        coroutine 的 return 值。
+
+    Raises:
+        coroutine 内部抛出的任何异常原样向上传播。
+    """
+    # 检测当前线程是否已有运行中的 loop（如嵌套 dispatch 场景）
+    try:
+        running_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        running_loop = None
+
+    if running_loop is None:
+        # 标准路径：Worker 线程无运行 loop，直接创建临时 loop
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            # 取消所有挂起任务，避免资源泄漏警告
+            try:
+                pending = asyncio.all_tasks(loop)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            except Exception:
+                pass
+            loop.close()
+    else:
+        # 已有运行 loop：在独立线程中执行，避免嵌套 run_until_complete
+        # 此路径不应在 Worker 线程触发，仅为防御性处理
+        result_box: list[Any] = [None]
+        error_box: list[BaseException] = []
+
+        def _runner() -> None:
+            new_loop = asyncio.new_event_loop()
+            try:
+                result_box[0] = new_loop.run_until_complete(coro)
+            except BaseException as e:
+                error_box.append(e)
+            finally:
+                new_loop.close()
+
+        t = threading.Thread(target=_runner, name="actant-async-task-runner")
+        t.start()
+        t.join()
+        if error_box:
+            raise error_box[0]
+        return result_box[0]
+
+
 def _run_with_timeout(
     func: Callable[..., Any],
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
-    timeout_ms: int,
+    timeout_ms: int,  # 保留以兼容调用方签名；超时由 Rust 侧强制执行。
 ) -> Any:
-    """执行 func，超时由 Rust Worker 的 tokio 调度器强制取消。
+    """在当前线程执行 ``func``，配合 Rust 侧的 ``tokio::time::timeout`` 完成超时治理。
 
-    分布式模式下，dispatch handler 已在 Rust 线程池的独立线程中执行，
-    Rust Worker 通过 ``tokio::time::timeout`` 监控超时。超时后 Rust 设置
-    cancel_flag，dispatch handler 在下次协作检查点退出。
+    执行模型：
+      - 本函数 **不** 在 Python 侧创建子线程或 ThreadPoolExecutor，也 **不** 在
+        Python 侧实施任何超时。``func`` 直接在调用方线程（即 Rust 线程池的
+        worker 线程）中同步执行。
+      - 超时 **完全由 Rust Worker 强制执行**：``runtime/workflow/runtime.rs`` 中
+        ``tokio::time::timeout(effective_timeout, dispatched)`` 包裹 dispatch
+        future，``effective_timeout`` 取自 Task spec 的 ``timeout_ms`` 字段
+        （由 Rust 直接读取，不经过本函数）。超时后：
+          1. Rust 设置 ``cancel_flag.store(true, Release)``；
+          2. dispatch future 被 drop（oneshot rx 释放）；
+          3. handler 完成时 ``tx.send(...)`` 返回 ``Err``，仅记录 warn 日志。
+      - Python 无法被强制中断，因此 ``func`` 内部应在长循环处调用
+        ``get_task_context().is_cancelled()`` 或使用 ``_interruptible_sleep``
+        实现协作式取消。
 
-    Python 侧不再使用嵌套 ThreadPoolExecutor（会与 Rust 线程池竞争 GIL，
-    导致超时无法及时触发）。``timeout_ms`` 仍传入 options 供 Rust 侧使用。
+    本函数仅负责 **协作检查点**（不参与超时计时）：
+      1. 执行前检查取消标志——若已取消（例如 dispatch 启动前上层已超时），
+         立即抛出 ``TaskCancelledError``，避免无效工作。
+      2. 执行后再次检查——若 ``func`` 期间 Rust 已设置取消标志，将结果丢弃
+         并抛出 ``TaskCancelledError``，防止超时任务返回"成功"结果。
 
-    取消检查点：函数执行前检查 ``get_task_context().is_cancelled()``。
+    **async def 支持**：若 ``func`` 是 coroutine function（``async def``），
+    在当前 Worker 线程上创建临时 event loop 执行 coroutine。Worker 线程
+    无运行中的 asyncio loop，因此 ``run_until_complete`` 可安全使用。
+    临时 loop 在执行完毕后立即关闭，避免资源泄漏。coroutine 内部可
+    ``await`` 任意 awaitable（包括 ``actant.perform_async`` /
+    ``ask_async`` / ``perform_batch_async``），实现与现代 asyncio 生态
+    （httpx/aiohttp/asyncpg 等）的无缝集成。
+
+    Args:
+        func: 待执行的业务函数（已反序列化）。可以是普通函数或 ``async def``。
+        args: 位置参数。
+        kwargs: 关键字参数。
+        timeout_ms: **未使用**。超时由 Rust Worker 直接从 Task spec 读取并
+            通过 ``tokio::time::timeout`` 强制执行。此参数仅为保持调用方签名
+            稳定而保留，未来若引入 Python 侧的协同时钟可启用。
+
+    Returns:
+        ``func`` 的返回值（对于 ``async def``，是 coroutine 的 return 值，
+        而非 coroutine 对象本身）。
+
+    Raises:
+        TaskCancelledError: 执行前或执行后检测到取消标志。
+        Exception: ``func`` 自身抛出的任何异常原样向上传播。
     """
     ctx = get_task_context()
     if ctx is not None and ctx.is_cancelled():
         raise TaskCancelledError(f"task {ctx.task_id!r} was cancelled before start")
-    result = func(*args, **kwargs)
+    if _is_coroutine_function(func):
+        # async def 函数：在当前 Worker 线程上创建临时 event loop 执行。
+        # Worker 线程无运行中的 asyncio loop，因此 run_until_complete 安全。
+        coro = func(*args, **kwargs)
+        result = _run_coroutine_on_worker_thread(coro)
+    else:
+        result = func(*args, **kwargs)
     if ctx is not None and ctx.is_cancelled():
         raise TaskCancelledError(f"task {ctx.task_id!r} was cancelled during execution")
     return result
@@ -123,6 +466,21 @@ def _pickle_exception(exc: BaseException) -> bytes:
         return cast(bytes, cloudpickle.dumps(RuntimeError(f"{type(exc).__name__}: {exc}")))
 
 
+def _ensure_picklable(exc: BaseException) -> BaseException:
+    """确保异常可序列化，不可序列化时退化为携带类型与消息的 RuntimeError。
+
+    与 ``_pickle_exception`` 配套：``_pickle_exception`` 返回 bytes（用于
+    直接存入 _error_payload），``_ensure_picklable`` 返回对象（用于
+    ``_execute_with_retries`` 的 ``(False, exc_obj)`` 返回值，由调用方
+    统一序列化跨 Rust 边界）。
+    """
+    try:
+        cloudpickle.dumps(exc)
+        return exc
+    except Exception:
+        return RuntimeError(f"{type(exc).__name__}: {exc}")
+
+
 def _invoke_callback(
     fn: Callable[..., Any],
     *args: Any,
@@ -194,6 +552,8 @@ def _emit_task_event(
     next_attempt: int = 0,
     error: str = "",
     on_error: CallbackErrorPolicy = "log",
+    silent: bool = False,
+    _bypass_batcher: bool = False,
 ) -> Exception | None:
     """广播 ``TaskLifecycle`` 事件，失败时按 ``on_error`` 策略处理。
 
@@ -205,10 +565,29 @@ def _emit_task_event(
     Args:
         on_error: ``log``（默认）仅记录 warning；``raise`` 立即抛出；
             ``collect`` 记录并返回异常。
+        silent: ``True`` 时跳过事件发布（既不进 batcher 也不直接 emit）。
+            用于 ``@task(silent=True)`` 等场景，避免每个 task 产生
+            started/completed 事件造成 event_bus 噪声。批量提交/低优先级
+            任务可启用此选项以提升吞吐。
+        _bypass_batcher: 内部参数。``True`` 时绕过当前线程的 batcher 直接 emit，
+            用于 batcher.flush() 避免事件回环（flush 调用 emit 时若不绕过，
+            事件会重新进 batcher.add 被 _closed 拒绝而丢失）。
 
     Returns:
         捕获到的异常（仅当 ``on_error="collect"`` 时）。
     """
+    if silent:
+        return None
+    # 若当前线程启用了 EventBatcher，路由到 batcher 而非直接 emit。
+    # batcher 内部最终会回调本函数（_bypass_batcher=True）走直接 emit。
+    if not _bypass_batcher:
+        batcher = _get_event_batcher()
+        if batcher is not None:
+            batcher.add(
+                kind, task_id, workflow_id,
+                attempt=attempt, next_attempt=next_attempt, error=error,
+            )
+            return None
     try:
         from actant._effects import emit as _emit
         from actant.capabilities import TASK_LIFECYCLE, TaskEvent
@@ -239,6 +618,8 @@ __all__ = [
     "CallbackErrorPolicy",
     "ExecuteCtx",
     "ExecuteOutcome",
+    "_EventBatcher",
+    "_EventBatcherScope",
     "_emit_task_event",
     "_interruptible_sleep",
     "_invoke_callback",

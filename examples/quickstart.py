@@ -1,6 +1,6 @@
-"""快速开始：Actant 0.2 ERH（Effect-Resource-Handler）架构。
+"""快速开始：Actant ERH（Effect-Resource-Handler）架构。
 
-本示例演示 0.2.0 的统一扩展语法：
+本示例演示统一扩展语法：
 
 - ``Runtime`` / ``Runtime.with_defaults()``：运行时入口
 - ``rt.layer(name).chain(handler)``：向 capability 注册 handler

@@ -204,3 +204,45 @@ class TestRuntimeCleanup:
             assert os.path.exists(data_dir)
         finally:
             shutil.rmtree(data_dir, ignore_errors=True)
+
+
+class TestRuntimeProduction:
+    """生产级 Runtime 工厂的契约测试。"""
+
+    def test_production_rejects_empty_signing_key(self):
+        with pytest.raises(ValueError, match="payload_signing_key"):
+            Runtime.production(payload_signing_key="", data_dir="/tmp/unused")
+
+    def test_production_rejects_empty_data_dir(self):
+        with pytest.raises(ValueError, match="data_dir"):
+            Runtime.production(payload_signing_key="secret", data_dir="")
+
+    def test_production_enforces_require_payload_signing(self):
+        """production() 必须设置 require_payload_signing=True。"""
+        data_dir = tempfile.mkdtemp()
+        try:
+            rt = Runtime.production(
+                payload_signing_key="cluster-shared-secret",
+                data_dir=data_dir,
+            )
+            assert rt._config is not None
+            assert rt._config.require_payload_signing is True
+            assert rt._config.payload_signing_key == "cluster-shared-secret"
+        finally:
+            shutil.rmtree(data_dir, ignore_errors=True)
+
+    def test_production_starts_and_stops_cleanly(self):
+        """production() 创建的 Runtime 应能正常 start/stop。"""
+        data_dir = tempfile.mkdtemp()
+        try:
+            with Runtime.production(
+                payload_signing_key="cluster-shared-secret",
+                data_dir=data_dir,
+            ) as rt:
+                assert rt._started
+                assert get_current_runtime() is rt
+            assert get_current_runtime() is None
+            # 用户显式 data_dir 不应被清理
+            assert os.path.exists(data_dir)
+        finally:
+            shutil.rmtree(data_dir, ignore_errors=True)

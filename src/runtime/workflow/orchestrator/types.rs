@@ -191,6 +191,7 @@ impl TerminalWaiterRegistry {
     /// 若无注册等待者，此操作为 no-op。
     fn fire(&self, workflow_id: &WorkflowId) {
         if let Some((_, tx)) = self.waiters.remove(workflow_id) {
+            // send 失败仅当等待者已超时放弃（receiver drop），通知无人接收。
             let _ = tx.send(());
         }
     }

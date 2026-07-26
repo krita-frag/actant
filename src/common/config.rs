@@ -59,8 +59,12 @@ impl std::fmt::Display for DiscoveryMode {
 
 /// 内置发现模式常量。
 ///
-/// 当前仅实现 `none` / `local` / `mdns` 三种策略。`dns` / `relay` 等策略
-/// 属于 0.2 预留，待实现后再加入常量，避免用户引用未支持的模式。
+/// - `none`：无自动发现，仅靠 `bootstrap_nodes` 显式拨号。
+/// - `local`：n0 预设（DNS + Pkarr 发布 + relay 兜底），适合互联网节点。
+/// - `mdns`：局域网（n0 预设但禁用 relay）。
+/// - `dns`：仅 DNS endpoint 发现（`DnsAddressLookup` + `PkarrPublisher`），无 relay。
+///   适合 K8s Headless Service / 自建 DNS 场景：通过 `dns_origin_domain` 指定起源域。
+/// - `relay`：强制启用 iroh relay（`RelayMode::Default` + DNS），适合 NAT 穿透场景。
 pub mod discovery_mode {
     /// 无自动发现。须通过 `bootstrap_nodes` 或 `dial()` 显式拨号。用于测试和 CI。
     pub const NONE: &str = "none";
@@ -68,6 +72,10 @@ pub mod discovery_mode {
     pub const LOCAL: &str = "local";
     /// 仅局域网：n0 预设但禁用 relay。
     pub const MDNS: &str = "mdns";
+    /// 仅 DNS endpoint 发现（无 relay）。配合 `dns_origin_domain` 使用。
+    pub const DNS: &str = "dns";
+    /// 强制启用 iroh relay 中继，适合 NAT 穿透场景。
+    pub const RELAY: &str = "relay";
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -86,17 +94,63 @@ pub struct ActantConfig {
     ///   防止恶意节点投递篡改 payload（生产环境推荐）。
     /// - 空时：禁用签名验证，payload 直接透传（仅用于开发/测试）。
     pub payload_signing_key: Vec<u8>,
+    /// 强制要求 payload 签名。生产环境硬约束。
+    ///
+    /// - `false`（默认）：`payload_signing_key` 为空时仅 `warn` 日志，不阻止启动
+    ///   （向后兼容 0.2 行为，用于开发/测试）。
+    /// - `true`：`payload_signing_key` 为空时启动直接返回
+    ///   [`crate::common::ActantError::Config`]，防止生产环境静默运行无签名模式。
+    ///
+    /// 由 `ActantConfig::validate` 在启动时强制检查，RuntimeBuilder 在 build 前
+    /// 调用 validate，因此无法绕过。
+    #[serde(default)]
+    pub require_payload_signing: bool,
 }
 
 impl ActantConfig {
     /// 校验所有策略名称字段是否在对应注册表中。
     ///
     /// 在启动时、反序列化或 PyConfig 转换后调用，以明确的错误拒绝未知发现模式
-    /// 和调度器类型。payload 签名密钥允许为空，表示禁用签名验证。
+    /// 和调度器类型。
+    ///
+    /// # Payload 签名约束
+    ///
+    /// 当 `require_payload_signing = true` 时，`payload_signing_key` 必须非空，
+    /// 否则返回 [`crate::common::ActantError::Config`]。这为生产环境提供硬失败
+    /// 语义，避免依赖运行时 `warn` 日志被忽视。
     pub fn validate(&self) -> Result<(), crate::common::ActantError> {
         self.worker.scheduler_kind.validate()?;
         self.network.discovery_mode.validate()?;
         self.failover.validate()?;
+        if self.require_payload_signing && self.payload_signing_key.is_empty() {
+            return Err(crate::common::ActantError::Config(
+                "require_payload_signing=true but payload_signing_key is empty; \
+                 configure a non-empty shared secret or set require_payload_signing=false \
+                 for development"
+                    .into(),
+            ));
+        }
+        // A2：校验 actor_router_strategy 是已知值，避免运行时静默回退默认策略。
+        match self
+            .network
+            .actor_router_strategy
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "random" | "round-robin" | "roundrobin" | "least-loaded" | "leastloaded" => {}
+            other => {
+                return Err(crate::common::ActantError::Config(format!(
+                    "network.actor_router_strategy '{}': expected one of: random, round-robin, least-loaded",
+                    other
+                )));
+            }
+        }
+        if self.network.actor_registry_gossip_interval_ms == 0 {
+            return Err(crate::common::ActantError::Config(format!(
+                "network.actor_registry_gossip_interval_ms must be > 0, got {}",
+                self.network.actor_registry_gossip_interval_ms
+            )));
+        }
         Ok(())
     }
 }
@@ -268,7 +322,7 @@ pub struct NetworkConfig {
     ///
     /// EndpointId 由 iroh 在 QUIC/TLS 握手层基于对端密钥对认证，不可伪造，
     /// 因此本字段构成对**入站直连请求**的认证白名单。gossip 广播不在本白名单
-    /// 管辖范围（gossip 话题成员由 iroh-gossip 管理，0.1.0 不在此强制）。
+    /// 管辖范围（gossip 话题成员由 iroh-gossip 管理，不由此字段控制）。
     #[serde(default)]
     pub allowed_peer_ids: Vec<String>,
     /// 单次直连请求-响应调用的超时（毫秒）。覆盖 connect + open_bi + 读写全过程。
@@ -284,6 +338,19 @@ pub struct NetworkConfig {
     /// Capability gossip 广播间隔（毫秒）。默认 60 秒。
     #[serde(default = "default_capability_gossip_interval_ms")]
     pub capability_gossip_interval_ms: u64,
+    /// 跨节点 Actor 路由策略（A2）。
+    ///
+    /// 内置值：`"random"` / `"round-robin"`（默认）/ `"least-loaded"`。
+    /// 未知值在启动时返回 `ActantError::Config`，而非静默回退默认值。
+    /// 详见 [`crate::runtime::actor::router::RouterStrategy`]。
+    #[serde(default = "default_actor_router_strategy")]
+    pub actor_router_strategy: String,
+    /// Actor 注册表 gossip 广播间隔（毫秒）。默认 30 秒。
+    ///
+    /// 控制 [`crate::runtime::actor::router::ActorRegistryGossipActor`] 广播
+    /// 本地 actor 类型注册表的频率。较短间隔加快新节点发现，但增加网络流量。
+    #[serde(default = "default_actor_registry_gossip_interval_ms")]
+    pub actor_registry_gossip_interval_ms: u64,
     /// 网络事件有界通道容量。
     ///
     /// `NetworkManager` 内部使用此容量的 `mpsc::channel` 缓冲 `NetworkEvent`。
@@ -291,6 +358,16 @@ pub struct NetworkConfig {
     /// 高吞吐场景下应适当增大此值。默认 1024。
     #[serde(default = "default_event_channel_capacity")]
     pub event_channel_capacity: usize,
+    /// 自定义 DNS 起源域名，仅当 `discovery_mode = "dns"` 时生效。
+    ///
+    /// - 空字符串（默认）：使用 n0 公共 DNS 服务（`iroh.link`）。
+    /// - 非空：使用此域名作为 DNS endpoint 发现的起源域，例如自建 DNS 服务时
+    ///   填入 `actant.internal.example.com`。
+    ///
+    /// 节点会向此域发布 `_iroh.<z32-endpoint-id>.<origin_domain>` TXT 记录，
+    /// 其他节点通过相同域查询。
+    #[serde(default)]
+    pub dns_origin_domain: String,
 }
 
 fn default_capability_gossip_interval_ms() -> u64 {
@@ -299,6 +376,14 @@ fn default_capability_gossip_interval_ms() -> u64 {
 
 fn default_event_channel_capacity() -> usize {
     NetworkConfig::DEFAULT_EVENT_CHANNEL_CAPACITY
+}
+
+fn default_actor_router_strategy() -> String {
+    NetworkConfig::DEFAULT_ACTOR_ROUTER_STRATEGY.to_string()
+}
+
+fn default_actor_registry_gossip_interval_ms() -> u64 {
+    NetworkConfig::DEFAULT_ACTOR_REGISTRY_GOSSIP_INTERVAL_MS
 }
 
 impl NetworkConfig {
@@ -314,6 +399,10 @@ impl NetworkConfig {
     pub const DEFAULT_CAPABILITY_GOSSIP_INTERVAL_MS: u64 = 60_000;
     /// 默认网络事件通道容量。
     pub const DEFAULT_EVENT_CHANNEL_CAPACITY: usize = 1024;
+    /// 默认 Actor 路由策略。
+    pub const DEFAULT_ACTOR_ROUTER_STRATEGY: &'static str = "round-robin";
+    /// 默认 Actor 注册表 gossip 广播间隔（30s）。
+    pub const DEFAULT_ACTOR_REGISTRY_GOSSIP_INTERVAL_MS: u64 = 30_000;
 }
 
 fn default_direct_request_timeout_ms() -> u64 {
@@ -342,7 +431,10 @@ impl Default for NetworkConfig {
             listen_port: 0,
             listen_ip: String::new(),
             capability_gossip_interval_ms: default_capability_gossip_interval_ms(),
+            actor_router_strategy: default_actor_router_strategy(),
+            actor_registry_gossip_interval_ms: default_actor_registry_gossip_interval_ms(),
             event_channel_capacity: default_event_channel_capacity(),
+            dns_origin_domain: String::new(),
         }
     }
 }
@@ -369,11 +461,61 @@ impl Default for WorkflowConfig {
     }
 }
 
+/// Store 持久化同步策略。
+///
+/// 控制单 key 写入路径（`Store::put` / `Store::delete`）的 fsync 行为。
+/// 批量写入路径（`Store::put_batch`）始终单事务提交，不受此配置影响。
+///
+/// # 模式对比
+///
+/// | 模式 | 单 key 写延迟 | 数据丢失窗口 | 适用场景 |
+/// |------|---------------|--------------|----------|
+/// | `Sync` | ~2.9 ms（含 fsync） | 0（提交即持久） | 关键状态、低写入速率 |
+/// | `GroupCommit(ms)` | ~1-10 µs（仅入队） | `ms` 毫秒 | 高吞吐 mailbox/event_log |
+/// | `NoSync` | ~10-50 µs（mmap 写入） | 进程崩溃时未 fsync 部分 | 可重建的缓存型数据 |
+///
+/// # `GroupCommit` 语义
+///
+/// `GroupCommit(ms)` 启用 [`crate::runtime::state::WriteBatcher`]：单 key 写入
+/// 进入有界通道，后台任务每 `ms` 毫秒或满 `BATCH_FLUSH_THRESHOLD` 条时
+/// 合并为单次 LMDB 事务提交（一次 fsync）。崩溃时丢失最近 `ms` 毫秒内的写入。
+///
+/// 这对 mailbox 持久化（`MailboxRegistry::send` 的 write-then-delete 模式）
+/// 尤为关键：原实现每次 `send` 触发 2 次 fsync（写入 + 删除），高 QPS 时
+/// 成为瓶颈；GroupCommit 将 N 次 send 的 2N 次 fsync 合并为 1 次。
+///
+/// # `NoSync` 语义
+///
+/// `NoSync` 在 LMDB 打开时设置 `MDB_NOSYNC`：写事务 commit 时跳过 fsync，
+/// 由 OS page cache 异步刷盘。进程崩溃但 OS 正常运行时数据不丢失；
+/// OS 崩溃或断电时丢失最近未刷盘的写入。需配合周期性
+/// [`crate::runtime::state::Store::sync`] 显式刷盘。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "mode", content = "flush_interval_ms")]
+pub enum SyncMode {
+    /// 每次写事务 commit 即 fsync（默认，最强持久性）。
+    #[default]
+    Sync,
+    /// 后台合并提交：单 key 写入入队，每 `flush_interval_ms` 毫秒合并提交一次。
+    ///
+    /// 单位：毫秒。建议 1-10ms；过小退化为 Sync，过大增加丢失窗口。
+    GroupCommit(u64),
+    /// 跳过 fsync，依赖 OS page cache 异步刷盘。
+    ///
+    /// 调用方需周期性调用 [`crate::runtime::state::Store::sync`] 显式持久化。
+    NoSync,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoreConfig {
     pub data_dir: Option<String>,
     pub map_size: usize,
     pub max_dbs: u32,
+    /// 单 key 写入路径的同步策略。默认 [`SyncMode::Sync`]。
+    ///
+    /// 详见 [`SyncMode`] 文档对三种模式语义与权衡的说明。
+    #[serde(default)]
+    pub sync_mode: SyncMode,
 }
 
 impl Default for StoreConfig {
@@ -383,6 +525,7 @@ impl Default for StoreConfig {
             // LMDB mmap 上限（2 GiB）。须足够支撑生产负载，但不会预分配磁盘空间。
             map_size: 2 * 1024 * 1024 * 1024,
             max_dbs: 16,
+            sync_mode: SyncMode::default(),
         }
     }
 }
@@ -511,7 +654,7 @@ pub struct GossipConfig {
     pub dedup_ttl_secs: u64,
     /// 终态更新（Completed/Failed）的广播最大重试次数。非终态更新（Running）仅发送一次不重试。
     pub retry_attempts: usize,
-    /// 重试间隔基数（毫秒）。实际延迟采用指数退避：`retry_base_delay_ms * attempt_number`。
+    /// 重试间隔基数（毫秒）。实际延迟采用指数退避：`base * 2^attempt`，上限 30s。
     pub retry_base_delay_ms: u64,
     /// 周期性广播 DAG heads 的间隔（毫秒）。默认 30 秒。
     pub heads_broadcast_interval_ms: u64,

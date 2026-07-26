@@ -10,7 +10,8 @@ use crate::common::{ActantError, ActorMessageResult, Result};
 /// 将值序列化为 postcard 字节。
 pub(crate) fn encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>> {
     let t0 = Instant::now();
-    let result = postcard::to_allocvec(value).map_err(|e| ActantError::Serialization(e.to_string()));
+    let result =
+        postcard::to_allocvec(value).map_err(|e| ActantError::Serialization(e.to_string()));
     crate::metrics::observe_payload_serialize_ms(t0.elapsed().as_millis() as u64);
     result
 }
