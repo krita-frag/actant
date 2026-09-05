@@ -2,9 +2,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use super::model::{
-    ActorId, ActorMessageResult, MessageId, NodeId, TaskDefinition, TaskId, WorkflowId,
-};
+use super::model::{NodeId, TaskDefinition, TaskId, WorkflowId};
 use crate::runtime::state::HlcTimestamp;
 
 /// 网络协议常量 — 所有魔法字符串与数值限制的唯一真相来源。
@@ -21,17 +19,10 @@ pub mod constants {
     pub const TOPIC_HEARTBEAT: &str = "actant:heartbeat";
     pub const TOPIC_FAILOVER: &str = "actant:failover";
     pub const TOPIC_HEADS: &str = "actant:heads";
-    pub const TOPIC_ACTOR_PREFIX: &str = "actant:actor:";
-    pub const TOPIC_ACTOR_REPLY_PREFIX: &str = "actant:actor-reply:";
     pub const TOPIC_WORKFLOW_STATE_REQ: &str = "actant:wf-state-req:";
     pub const TOPIC_WORKFLOW_STATE_RESP_PREFIX: &str = "actant:wf-state-resp:";
     /// 跨节点任务取消广播话题。
     pub const TOPIC_CANCEL: &str = "actant:cancel";
-    /// Actor 注册表 gossip 话题：广播节点承载的 actor 类型集合。
-    ///
-    /// 接收方通过 [`crate::runtime::actor::router::ActorRegistryGossipActor::handle_gossip`]
-    /// 更新本地注册表，供 [`crate::runtime::actor::router::ActorRouter`] 选择目标节点。
-    pub const TOPIC_ACTOR_REGISTRY: &str = "actant:actor-registry";
     /// Capability gossip 话题。
     ///
     /// 注意：与其他 `actant:` 前缀的 gossip topic 不同，此 topic 使用 `actant://` 前缀。
@@ -364,7 +355,7 @@ pub use traceparent::TraceContext;
 
 // 在模块根重新导出常量，供单名导入使用（`crate::common::WIRE_PROTOCOL_VERSION` 等）。
 // 仅重新导出在 `wire.rs` 外部实际使用的常量。话题前缀常量保持内部可见：
-// 所有话题构造必须通过 `Topic::task(...)`、`Topic::actor(...)` 等构造器进行。
+// 所有话题构造必须通过 `Topic::task(...)` 等构造器进行。
 pub use constants::{
     store_keys::{
         DAG as STORE_KEY_DAG, EXEC as STORE_KEY_EXEC, LEASE as STORE_KEY_LEASE,
@@ -377,7 +368,7 @@ pub use constants::{
 /// Gossip 话题标识符。
 ///
 /// 包装 `String` 的新类型，集中话题构造，避免调用方手工拼接话题字符串。
-/// 使用 `Topic::task(node)`、`Topic::actor(node)` 等构造器，而非 `format!(...)`。
+/// 使用 `Topic::task(node)` 等构造器，而非 `format!(...)`。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Topic(pub String);
@@ -386,24 +377,6 @@ impl Topic {
     /// 构造节点作用域的任务话题：`actant:task:<node>`。
     pub fn task(node: &NodeId) -> Self {
         Self(format!("{}{}", constants::TOPIC_TASK_PREFIX, node.as_str()))
-    }
-
-    /// 构造节点作用域的 Actor 话题：`actant:actor:<node>`。
-    pub fn actor(node: &NodeId) -> Self {
-        Self(format!(
-            "{}{}",
-            constants::TOPIC_ACTOR_PREFIX,
-            node.as_str()
-        ))
-    }
-
-    /// 构造节点作用域的 Actor 回复话题：`actant:actor-reply:<node>`。
-    pub fn actor_reply(node: &NodeId) -> Self {
-        Self(format!(
-            "{}{}",
-            constants::TOPIC_ACTOR_REPLY_PREFIX,
-            node.as_str()
-        ))
     }
 
     /// 构造 DAG 状态话题：`actant:dag-state`。
@@ -444,15 +417,6 @@ impl Topic {
         ))
     }
 
-    /// 构造 Actor 注册表 gossip 话题：`actant:actor-registry`。
-    ///
-    /// 此话题广播全局共享的 actor 类型注册表，与节点作用域的 `Topic::actor`
-    ///（单 actor 实例消息）不同：actor-registry 同步的是 *哪些节点承载哪些 actor 类型*，
-    /// 供路由器选择目标节点。
-    pub fn actor_registry() -> Self {
-        Self(constants::TOPIC_ACTOR_REGISTRY.to_string())
-    }
-
     /// 判断此话题是否以给定前缀开头。
     pub fn starts_with(&self, prefix: &str) -> bool {
         self.0.starts_with(prefix)
@@ -471,10 +435,6 @@ impl Topic {
         let s = self.as_str();
         if let Some(node) = s.strip_prefix(constants::TOPIC_TASK_PREFIX) {
             TopicRoute::Task(node.to_string())
-        } else if let Some(node) = s.strip_prefix(constants::TOPIC_ACTOR_PREFIX) {
-            TopicRoute::Actor(node.to_string())
-        } else if let Some(node) = s.strip_prefix(constants::TOPIC_ACTOR_REPLY_PREFIX) {
-            TopicRoute::ActorReply(node.to_string())
         } else if let Some(node) = s.strip_prefix(constants::TOPIC_WORKFLOW_STATE_REQ) {
             TopicRoute::WorkflowStateReq(node.to_string())
         } else if let Some(node) = s.strip_prefix(constants::TOPIC_WORKFLOW_STATE_RESP_PREFIX) {
@@ -486,7 +446,6 @@ impl Topic {
                 constants::TOPIC_FAILOVER => TopicRoute::Failover,
                 constants::TOPIC_HEADS => TopicRoute::Heads,
                 constants::TOPIC_CANCEL => TopicRoute::Cancel,
-                constants::TOPIC_ACTOR_REGISTRY => TopicRoute::ActorRegistry,
                 constants::TOPIC_CAPABILITY_GOSSIP => TopicRoute::CapabilityGossip,
                 _ => TopicRoute::Unknown,
             }
@@ -537,10 +496,6 @@ impl From<&str> for Topic {
 pub enum TopicRoute {
     /// 节点作用域的任务分发话题。
     Task(String),
-    /// 节点作用域的 Actor 请求话题。
-    Actor(String),
-    /// 节点作用域的 Actor 回复话题。
-    ActorReply(String),
     /// 节点作用域的工作流状态请求话题。
     WorkflowStateReq(String),
     /// 节点作用域的工作流状态响应话题。
@@ -555,17 +510,11 @@ pub enum TopicRoute {
     Heads,
     /// 跨节点任务取消广播话题。
     Cancel,
-    /// Actor 注册表 gossip 话题（广播节点 → actor 类型映射）。
-    ActorRegistry,
     /// Capability 元信息 gossip 话题（广播节点 → capability 元信息）。
     CapabilityGossip,
     /// 未识别话题 — 记录日志后丢弃。
     Unknown,
 }
-
-/// 远程 Actor 回复路由共享注册表。以 correlation_id（MessageId）为键，值为 oneshot 发送端。
-pub type ReplyRegistry =
-    dashmap::DashMap<MessageId, tokio::sync::oneshot::Sender<ActorMessageResult>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WireEnvelope {
@@ -590,9 +539,9 @@ pub struct WireEnvelope {
     /// 由 [`WireEnvelope::wrap`] 在序列化 message 后计算并填入；
     /// [`WireEnvelope::decode`] 恒定时间校验，签名不匹配则丢弃消息。
     ///
-    /// - 集群共享密钥非空（[`set_wire_signing_key`] 已设置）：所有节点入站消息
-    ///   必须携带正确 MAC；伪造者即使持有合法 iroh EndpointId（TLS 层认证通过）
-    ///   也无法伪造 wire message，实现端到端集群身份认证。
+    /// - 集群共享密钥非空（已注册，见 [`register_wire_signing_key`] / [`set_wire_signing_key`]）：
+    ///   所有节点入站消息必须携带正确 MAC；伪造者即使持有合法 iroh EndpointId
+    ///   （TLS 层认证通过）也无法伪造 wire message，实现端到端集群身份认证。
     /// - 集群共享密钥为空：MAC 字段为 `None`，decode 时跳过验证（向后兼容 0.2）。
     ///
     /// MAC 覆盖范围：`version` + `message` + `trace_id` 三字段序列化后的字节，
@@ -602,16 +551,45 @@ pub struct WireEnvelope {
     pub mac: Option<[u8; crate::common::payload::WIRE_MAC_LEN]>,
 }
 
-/// 全局 wire message 签名密钥。
+/// 进程级 wire message 签名密钥注册表。
 ///
 /// 由 `RuntimeBuilder::build` 在构造 NetworkManager 前调用
-/// [`set_wire_signing_key`] 设置。空密钥（默认）= 禁用 wire 签名验证，
-/// 保持 0.2 行为；非空密钥 = 集群内所有节点必须共享同一密钥，否则
-/// 跨节点消息被对端丢弃。
+/// [`register_wire_signing_key`]（按 node 注册）或 [`set_wire_signing_key`]
+/// （无 node 作用域的 primary，测试用）写入。注册表为空（默认）= 禁用 wire
+/// 签名验证，保持 0.2 行为；存在密钥 = 入站消息必须携带有效 MAC。
 ///
-/// 使用 `parking_lot::Mutex` 而非 `std::sync::Mutex`：避免 poison，
-/// 且 `set` 后只读路径无锁竞争。
-static WIRE_SIGNING_KEY: parking_lot::Mutex<Option<Vec<u8>>> = parking_lot::Mutex::new(None);
+/// ## 同进程多 Runtime 不同密钥的行为
+///
+/// 调用链说明：`WireEnvelope::wrap` / `decode` 的全部生产调用点位于
+/// `src/runtime/workflow/`（failover / gossip / network_router），密钥无法
+/// 作为参数穿透到这些冻结中的调用点，故密钥保留进程级注册表并按 node 隔离：
+///
+/// - **发送侧**：`wrap` 从消息的来源节点字段（heartbeat/claim/heads 的
+///   `node_id`、DAG 更新的 `origin_node`、状态请求的 `requesting_node`）
+///   查找该节点的密钥签名——后构建的 Runtime 注册新密钥**不会**影响先构建
+///   Runtime 的出站签名；
+/// - **接收侧**：`decode` 依次尝试注册表中全部去重后的密钥，任一验证通过
+///   即接受。单个 Runtime 自身集群的收发不受其他 Runtime 密钥影响。
+///
+/// **已知局限**（进程级注册表共享的固有折衷）：
+/// - 无来源节点字段的消息（`WorkflowStateResponse`、`TaskDispatch`）以
+///   `primary`（最近一次注册的密钥）签名——同进程存在多个不同密钥 Runtime
+///   时，该类消息跨进程投递可能使用错误密钥而被对端拒绝；
+/// - 接收侧尝试全部已注册密钥，意味着同进程多个不同"集群"的入站消息彼此
+///   可被对端解码（同密钥多 Runtime 场景则与单密钥行为完全一致）。
+struct WireSigningKeys {
+    /// node → 该节点 Runtime 的集群共享密钥。
+    per_node: Vec<(NodeId, std::sync::Arc<Vec<u8>>)>,
+    /// 最近一次注册的密钥。用于无来源节点字段的消息及未按 node 注册的
+    /// 旧接口（[`set_wire_signing_key`]）。
+    primary: Option<std::sync::Arc<Vec<u8>>>,
+}
+
+static WIRE_SIGNING_KEYS: parking_lot::RwLock<WireSigningKeys> =
+    parking_lot::RwLock::new(WireSigningKeys {
+        per_node: Vec::new(),
+        primary: None,
+    });
 
 // C3：当前线程的入站 trace 上下文。
 //
@@ -628,32 +606,44 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// 设置当前线程的入站 trace 上下文，返回 guard 在 drop 时清除。
+/// 设置当前线程的入站 trace 上下文，返回 guard 在 drop 时恢复前值。
 ///
 /// 用于 `wire.recv` span 进入时把发送方 traceparent 解析结果压入 thread-local，
 /// 使该 span 内的 outgoing `WireEnvelope::wrap()` 能生成 child traceparent，
 /// 实现"接收 → 处理 → 转发"链路的 trace-id 延续。
 ///
-/// 嵌套调用（理论上不会发生，但允许）会覆盖前值并按 LIFO 恢复。
+/// 嵌套调用会覆盖前值，guard 退出（显式 `restore` 或 drop）时按 LIFO 恢复
+/// 进入前的旧值。
 pub fn current_trace_scope(ctx: TraceContext) -> TraceScopeGuard {
-    CURRENT_INBOUND_TRACE.with(|c| *c.borrow_mut() = Some(ctx));
-    TraceScopeGuard { restored: false }
+    let prev = CURRENT_INBOUND_TRACE.with(|c| c.borrow_mut().replace(ctx));
+    TraceScopeGuard {
+        prev,
+        restored: false,
+    }
 }
 
-/// [`current_trace_scope`] 返回的 RAII guard，drop 时恢复 thread-local 前值。
+/// [`current_trace_scope`] 返回的 RAII guard，退出时恢复 thread-local 前值。
 ///
 /// 显式 drop 而非依赖 `Drop` trait：在 async 上下文中 guard 跨 await 会失效，
 /// 调用方应在同步代码块内使用。当前 `handle_message` 实现：进入 span → 设置 scope →
 /// 同步处理 → 退出 span 前 guard drop，符合此约束。
 pub struct TraceScopeGuard {
+    /// 进入 scope 前 thread-local 持有的上下文，退出时恢复。
+    prev: Option<TraceContext>,
     restored: bool,
 }
 
 impl TraceScopeGuard {
     /// 显式释放 scope，恢复 thread-local 前值。
     pub fn restore(mut self) {
+        self.restore_prev();
+    }
+
+    /// 恢复 thread-local 前值；幂等（`restored` 防止 drop 重复执行）。
+    fn restore_prev(&mut self) {
         if !self.restored {
-            CURRENT_INBOUND_TRACE.with(|c| *c.borrow_mut() = None);
+            let prev = self.prev.take();
+            CURRENT_INBOUND_TRACE.with(|c| *c.borrow_mut() = prev);
             self.restored = true;
         }
     }
@@ -661,18 +651,95 @@ impl TraceScopeGuard {
 
 impl Drop for TraceScopeGuard {
     fn drop(&mut self) {
-        if !self.restored {
-            CURRENT_INBOUND_TRACE.with(|c| *c.borrow_mut() = None);
-        }
+        self.restore_prev();
     }
 }
 
-/// 设置全局 wire message 签名密钥。
+/// 注册指定节点的 wire message 签名密钥（`RuntimeBuilder::build` 每次构建调用）。
 ///
-/// 在 `RuntimeBuilder::build` 调用一次即可。重复调用覆盖前值（用于一个进程
-/// 构造多个 Runtime 的测试场景）。传入空 `Vec` 等价于禁用签名。
+/// 同进程多 Runtime 的密钥隔离语义见 [`WireSigningKeys`] 文档。重复注册同一
+/// node 覆盖前值；传入空 `Vec` 表示该节点禁用签名（仅移除该节点条目，
+/// 不影响其他节点与 primary）。
+pub fn register_wire_signing_key(node: &NodeId, key: Vec<u8>) {
+    let mut reg = WIRE_SIGNING_KEYS.write();
+    if key.is_empty() {
+        reg.per_node.retain(|(n, _)| n != node);
+        return;
+    }
+    let key = std::sync::Arc::new(key);
+    match reg.per_node.iter_mut().find(|(n, _)| n == node) {
+        Some(entry) => entry.1 = key.clone(),
+        None => reg.per_node.push((node.clone(), key.clone())),
+    }
+    reg.primary = Some(key);
+}
+
+/// 设置进程级 primary 签名密钥（无 node 作用域的旧接口）。
+///
+/// 仅替换 `primary`，不影响按 [`register_wire_signing_key`] 注册的节点条目。
+/// 生产路径必须使用 [`register_wire_signing_key`]；本函数保留给无节点上下文
+/// 的单元测试。重复调用覆盖前值；传入空 `Vec` 等价于清除 primary
+/// （禁用 primary 侧签名）。
 pub fn set_wire_signing_key(key: Vec<u8>) {
-    *WIRE_SIGNING_KEY.lock() = if key.is_empty() { None } else { Some(key) };
+    WIRE_SIGNING_KEYS.write().primary = if key.is_empty() {
+        None
+    } else {
+        Some(std::sync::Arc::new(key))
+    };
+}
+
+/// 读取当前生效的签名密钥：优先按消息来源节点查找，退化到 primary。
+///
+/// 返回 `None` 表示签名禁用（无任何已注册密钥）。
+fn signing_key_for(msg: &WireMessage) -> Option<std::sync::Arc<Vec<u8>>> {
+    let reg = WIRE_SIGNING_KEYS.read();
+    message_origin_node(msg)
+        .and_then(|node| {
+            reg.per_node
+                .iter()
+                .find(|(n, _)| n == node)
+                .map(|(_, k)| k.clone())
+        })
+        .or_else(|| reg.primary.clone())
+}
+
+/// 从消息中推导来源节点（发送侧据此选择签名密钥）。
+///
+/// `WorkflowStateResponse` 与 `TaskDispatch` 不携带来源节点字段，返回 `None`
+/// （由调用方退化到 primary 密钥，见 [`WireSigningKeys`] 已知局限）。
+fn message_origin_node(msg: &WireMessage) -> Option<&NodeId> {
+    match msg {
+        WireMessage::NodeHeartbeat(m) => Some(&m.node_id),
+        WireMessage::OrchestratorClaim(m) => Some(&m.node_id),
+        WireMessage::HeadsExchange(m) => Some(&m.node_id),
+        WireMessage::DagStateUpdate(m) => Some(&m.origin_node),
+        WireMessage::WorkflowStateRequest(m) => Some(&m.requesting_node),
+        WireMessage::WorkflowStateResponse(_) | WireMessage::TaskDispatch(_) => None,
+    }
+}
+
+/// 组装 wire MAC 的覆盖字节：`version + message + traceparent` 的 postcard 编码
+/// 按字段声明序拼接，尾随 `mac: None` 的单字节编码（postcard `Option::None` =
+/// 变体索引 0）。
+///
+/// postcard 结构体序列化为各字段编码的**顺序拼接**（无分隔符、无对齐填充），
+/// 枚举/Option 各自独立编码后再嵌入父结构，因此该分段拼接与「序列化整个
+/// `mac: None` 的 unsigned [`WireEnvelope`]」逐字节一致——MAC 覆盖的字节内容
+/// 与顺序保持不变（跨节点兼容红线）。借引用编码使 decode 校验路径无需为
+/// 验证 MAC 克隆整个 message。
+fn mac_input_bytes(
+    version: u8,
+    message: &WireMessage,
+    traceparent: &Option<String>,
+) -> crate::common::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    // u8 的 postcard 编码即原字节。
+    buf.push(version);
+    buf.extend_from_slice(&crate::common::encode_postcard(message)?);
+    buf.extend_from_slice(&crate::common::encode_postcard(traceparent)?);
+    // Option<[u8; 32]> 的 None 编码为单字节变体索引 0。
+    buf.push(0x00);
+    Ok(buf)
 }
 
 impl WireEnvelope {
@@ -688,9 +755,10 @@ impl WireEnvelope {
     /// 记录到发送方当前 span 的 `wire.traceparent` field，便于在发送方日志
     /// 中通过该字符串检索关联的接收方 span。
     ///
-    /// 若全局签名密钥非空（[`set_wire_signing_key`] 已设置），计算 MAC 并填入
-    /// `mac` 字段。MAC 覆盖 `version` + `message` + `traceparent` 三字段序列化字节，
-    /// 不含 `mac` 字段自身——通过对一个不含 mac 的临时结构序列化来计算。
+    /// 若已注册签名密钥（按消息来源节点选择，见 [`WireSigningKeys`]），
+    /// 计算 MAC 并填入 `mac` 字段。MAC 覆盖 `version` + `message` +
+    /// `traceparent` 三字段序列化字节，不含 `mac` 字段自身（见
+    /// [`mac_input_bytes`]）。
     pub fn wrap(msg: WireMessage) -> Self {
         // C3：生成 W3C traceparent。
         //
@@ -719,16 +787,23 @@ impl WireEnvelope {
             mac: None,
         };
 
-        // 计算可选 MAC：仅当全局签名密钥非空时。
-        let mac = {
-            let guard = WIRE_SIGNING_KEY.lock();
-            guard.as_ref().and_then(|key| {
-                // 序列化 unsigned envelope（mac=None），对字节计算 MAC。
-                // 这里使用临时变量避免 borrow guard 跨 await（parking_lot::Mutex 非 async）。
-                let bytes = crate::common::encode_postcard(&unsigned).ok()?;
-                crate::common::payload::wire_mac(key, &bytes)
-            })
-        };
+        // 计算可选 MAC：仅当按消息来源节点（或 primary 退化）找到已注册密钥时。
+        let mac = signing_key_for(&unsigned.message).and_then(|key| {
+            // 分段组装 MAC 覆盖字节（见 [`mac_input_bytes`]），与序列化整个
+            // unsigned envelope 逐字节一致。parking_lot::RwLock 非 async，
+            // 读锁不跨 await（signing_key_for 返回前已释放）。
+            match mac_input_bytes(unsigned.version, &unsigned.message, &unsigned.traceparent) {
+                Ok(bytes) => crate::common::payload::wire_mac(&key, &bytes),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "encode_postcard for MAC computation failed; \
+                         message will be sent without integrity protection"
+                    );
+                    None
+                }
+            }
+        });
 
         Self { mac, ..unsigned }
     }
@@ -740,6 +815,10 @@ impl WireEnvelope {
     ///
     /// 反序列化失败、协议版本不兼容或 MAC 验证失败时返回 `None`（并记录告警）。
     /// MAC 验证失败时记录 `warn` 并计数到 `actant_wire_messages_failed_total{reason="mac"}`。
+    ///
+    /// MAC 验证依次尝试注册表中全部去重密钥（同进程多 Runtime 各自集群的
+    /// 消息均可验证，见 [`WireSigningKeys`]）；注册表为空 = 跳过验证
+    /// （向后兼容 0.2）。
     ///
     /// 返回的元组包含消息本体与可选的跨节点 trace 上下文字符串（W3C `traceparent`）；
     /// 调用方应使用该字符串创建 `wire.recv` 子 span 以串联跨节点日志与 OTLP span 树。
@@ -765,32 +844,43 @@ impl WireEnvelope {
             return None;
         }
 
-        // MAC 校验：若全局签名密钥非空，所有入站消息必须携带有效 MAC。
-        // 验证方式：从 envelope 中剥离 mac 字段得到 unsigned 视图，重新序列化后比对。
-        // 注意：postcard 序列化为定长紧凑格式，相同字段值的结构序列化结果一致，
-        // 因此剥离 mac 后重新序列化可与发送方计算的 unsigned 字节流匹配。
+        // MAC 校验：若注册表中存在密钥，所有入站消息必须携带有效 MAC。
+        // 验证方式：分段重组 unsigned 字节（见 [`mac_input_bytes`]，借引用编码、
+        // 不克隆 message），与发送方计算的覆盖字节逐字节一致后比对 MAC。
+        // 接收侧尝试全部已注册密钥（去重）：单个 Runtime 自身集群的收发不受
+        // 其他 Runtime 密钥影响（语义见 [`WireSigningKeys`] 文档）。
         let mac_ok: bool = {
-            let guard = WIRE_SIGNING_KEY.lock();
-            match guard.as_ref() {
-                None => true, // 禁用签名验证
-                Some(key) => {
-                    let mac = match &envelope.mac {
-                        Some(m) => m,
-                        None => {
-                            tracing::warn!(
-                                "dropping message: wire MAC required (cluster signing key set) but missing"
-                            );
-                            return None;
-                        }
-                    };
-                    // 构造 unsigned 视图：克隆 envelope 但置 mac=None，序列化后验证。
-                    let unsigned_view = WireEnvelope {
-                        version: envelope.version,
-                        message: envelope.message.clone(),
-                        traceparent: envelope.traceparent.clone(),
-                        mac: None,
-                    };
-                    match crate::common::encode_postcard(&unsigned_view) {
+            let reg = WIRE_SIGNING_KEYS.read();
+            let mut candidates: Vec<std::sync::Arc<Vec<u8>>> = Vec::new();
+            for key in reg
+                .per_node
+                .iter()
+                .map(|(_, k)| k)
+                .chain(reg.primary.iter())
+            {
+                if !candidates.iter().any(|k| k.as_slice() == key.as_slice()) {
+                    candidates.push(key.clone());
+                }
+            }
+            drop(reg);
+            if candidates.is_empty() {
+                true // 禁用签名验证
+            } else {
+                let mac = match &envelope.mac {
+                    Some(m) => m,
+                    None => {
+                        tracing::warn!(
+                            "dropping message: wire MAC required (cluster signing key set) but missing"
+                        );
+                        return None;
+                    }
+                };
+                candidates.iter().any(|key| {
+                    match mac_input_bytes(
+                        envelope.version,
+                        &envelope.message,
+                        &envelope.traceparent,
+                    ) {
                         Ok(unsigned_bytes) => {
                             crate::common::payload::verify_wire_mac(key, &unsigned_bytes, mac)
                                 .is_ok()
@@ -798,12 +888,12 @@ impl WireEnvelope {
                         Err(e) => {
                             tracing::warn!(
                                 error = %e,
-                                "dropping message: failed to serialize unsigned view for MAC verification"
+                                "dropping message: failed to assemble unsigned bytes for MAC verification"
                             );
                             false
                         }
                     }
-                }
+                })
             }
         };
         if !mac_ok {
@@ -824,7 +914,6 @@ pub enum WireMessage {
     NodeHeartbeat(NodeHeartbeat),
     OrchestratorClaim(OrchestratorClaim),
     HeadsExchange(HeadsExchange),
-    RemoteActorReply(RemoteActorReply),
     WorkflowStateRequest(WorkflowStateRequest),
     WorkflowStateResponse(WorkflowStateResponse),
 }
@@ -965,28 +1054,6 @@ impl WireTaskOutcome {
             WireTaskOutcome::Skipped => state_str::SKIPPED,
         }
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RemoteActorRequest {
-    pub target: ActorId,
-    pub method: String,
-    pub payload: Vec<u8>,
-    /// 若存在，源节点应通过 `actant:actor-reply:{origin_node}` 话题接收回复，
-    /// 并以此 correlation_id 关联。
-    pub reply_to: Option<RemoteReplyAddress>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RemoteReplyAddress {
-    pub node_id: NodeId,
-    pub correlation_id: MessageId,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RemoteActorReply {
-    pub correlation_id: MessageId,
-    pub result: ActorMessageResult,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

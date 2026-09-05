@@ -1,7 +1,6 @@
 //! 指数退避策略的统一实现。
 //!
 //! 项目中多处需要"失败后重试 + 退避"语义：
-//! - 远程 Actor 调用（`ActorSystem::call_remote` / `call_by_type`）
 //! - 远端任务结果投递重试（`result_delivery`）
 //! - Gossip 广播重试（`workflow/gossip.rs::broadcast_with_retry`）
 //!
@@ -39,13 +38,10 @@ pub struct ExponentialBackoff {
 impl ExponentialBackoff {
     /// 创建指数退避策略。
     ///
-    /// # Panics
-    ///
-    /// 仅在 `base` 为 0 时 panic——0 基础延迟意味着"立即重试"，会形成 busy-loop，
-    /// 不符合退避语义。若需要"无延迟重试"，调用方应直接 `loop` 而非使用本类型。
+    /// `base` 为 0 是合法输入：[`Self::delay_for`] 对其直接返回
+    /// [`Duration::ZERO`]，等价于"无延迟重试"，不会 panic。若需要真正的
+    /// 退避语义，调用方应传入非零 `base`。
     pub const fn new(base: Duration, max_delay: Duration) -> Self {
-        // const fn 中无法用 assert!，因此在 `delay_for` 中做运行时校验。
-        // 构造时若 base 为 0，后续 delay_for 会返回 0——调用方应自行避免。
         Self { base, max_delay }
     }
 
@@ -77,9 +73,8 @@ impl ExponentialBackoff {
     }
 }
 
-/// 远程 Actor 调用重试的默认最大延迟（30s）。
+/// 跨节点重试类操作的默认最大延迟（30s）。
 ///
-/// 抽出此常量避免散落在 `actor.rs::call_remote` 与 `call_by_type` 两处。
 /// 30s 是 P2P 网络下"对端临时不可达但应允许重试"的合理上限：
 /// 超过此值通常意味着对端已下线，重试无意义，应让上层超时接管。
 pub const REMOTE_CALL_MAX_RETRY_DELAY: Duration = Duration::from_secs(30);

@@ -19,7 +19,6 @@
 
 from __future__ import annotations
 
-import threading
 import time
 from typing import Any
 
@@ -36,14 +35,11 @@ from actant.exceptions import ActantError, InvalidStateError, TaskCancelledError
 # "_echo_fn") 找到原函数，走 by-reference 模式，共享模块级状态。
 # ============================================================================
 
+# 重试计数以模块级 dict 在（子进程内）任务函数【尝试间】共享；跨进程观测改为
+# 临时文件标记（见 ``_append_marker`` / ``_wait_for_marker``）。取消钩子的执行
+# 观测同样通过临时文件，无法用 threading.Event / 进程内 list 跨进程共享。
 _retry_counter = {"count": 0}
 _no_retry_counter = {"count": 0}
-_cancel_hook_log: list[str] = []
-# 信号：_cancel_hook_fn 注册 on_cancel 钩子后 set，供测试等待"钩子已注册"
-# 而非仅"任务已 running"（running 状态在 func 执行前由 TaskStarted 设置，
-# 此时 on_cancel 可能尚未注册，cancel 会触发 _run_with_timeout 前置取消检查
-# 抛异常，func 不执行，钩子永不注册）。
-_cancel_hook_registered = threading.Event()
 
 def _wait_for_state(handle: AsyncResult[Any], state: str, timeout: float = 30.0) -> None:
     """轮询等待 AsyncResult 进入目标状态（如 ``running`` / ``completed``）。
@@ -58,6 +54,31 @@ def _wait_for_state(handle: AsyncResult[Any], state: str, timeout: float = 30.0)
     assert handle.state == state, (
         f"expected state {state!r} within {timeout}s, got {handle.state!r}"
     )
+
+
+# 进程池后端下任务在 worker 子进程执行，父进程无法读取子进程的模块级全局变量。
+# 需要跨进程观测副作用（重试次数、清理钩子是否执行）时，任务函数把标记写入
+# 临时文件（`path` 参数传入），父进程轮询读取。
+def _append_marker(path: str, tag: str) -> None:
+    with open(path, "a") as f:
+        f.write(tag + "\n")
+        f.flush()
+
+
+def _read_markers(path: str) -> str:
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        return ""
+
+
+def _wait_for_marker(path: str, tag: str, timeout: float = 5.0) -> None:
+    """轮询等待文件中出现 ``tag`` 标记（跨进程就绪信号）。"""
+    deadline = time.monotonic() + timeout
+    while tag not in _read_markers(path) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert tag in _read_markers(path), f"marker {tag!r} not found in {path} within {timeout}s"
 
 
 def _echo_fn(x: int) -> int:
@@ -92,9 +113,12 @@ def _fail_runtime_error_fn() -> None:
     raise RuntimeError("kaboom")
 
 
-def _flaky_fn() -> str:
+def _flaky_fn(result_file: str, fail_until: int = 3) -> str:
+    # 重试在同一个 worker 子进程内进行，模块级 _retry_counter 在尝试间共享；
+    # 每次尝试写入临时文件标记，供父进程统计尝试次数。
     _retry_counter["count"] += 1
-    if _retry_counter["count"] < 3:
+    _append_marker(result_file, "attempt")
+    if _retry_counter["count"] < fail_until:
         raise RuntimeError("not yet")
     return "ok"
 
@@ -103,8 +127,9 @@ def _always_fail_fn() -> None:
     raise ValueError("always")
 
 
-def _fail_once_fn() -> None:
+def _fail_once_fn(result_file: str) -> None:
     _no_retry_counter["count"] += 1
+    _append_marker(result_file, "attempt")
     raise RuntimeError("fail")
 
 
@@ -182,29 +207,24 @@ def _cancel_check_fn() -> str:
     return "completed"
 
 
-def _cancel_hook_fn() -> str:
-    """注册取消清理钩子并协作式等待。"""
-    import sys as _sys
+def _cancel_hook_fn(marker_file: str, *, force_after: float | None = None) -> str:
+    """注册取消清理钩子并协作式等待。
 
+    就绪与清理信号写入 ``marker_file``（跨进程可靠观测）：
+    - 钩子注册后写 ``registered``，供测试确认任务已在执行并绑定钩子。
+    - ``on_cancel`` 清理钩子执行时写 ``cleanup``。
+    """
     ctx = get_task_context()
     if ctx is not None:
-        # cloudpickle 序列化任务到 worker 线程后，闭包变量会复制到新线程。
-        # 通过 sys.modules[__name__] 重新查找当前模块，确保修改的是主线程的
-        # _cancel_hook_log（pytest 可能以短名导入测试模块）。
         def _record_cleanup() -> None:
-            mod = _sys.modules[__name__]
-            mod._cancel_hook_log.append(f"cleanup:{ctx.task_id}")
+            _append_marker(marker_file, "cleanup")
 
-        ctx.on_cancel(_record_cleanup)
-        # 通知测试：on_cancel 钩子已注册，可以安全 cancel。
-        # 若不等待此信号而仅等 state=="running"，cancel 可能在 func 执行前
-        # 触发 _run_with_timeout 前置取消检查，func 不执行，钩子永不注册。
-        mod = _sys.modules[__name__]
-        mod._cancel_hook_registered.set()
-    for _ in range(100):
+        ctx.on_cancel(_record_cleanup, force_after=force_after)
+        _append_marker(marker_file, "registered")
+    for _ in range(200):
         if ctx is not None and ctx.is_cancelled():
             return "cancelled"
-        time.sleep(0.05)
+        time.sleep(0.01)
     return "completed"
 
 
@@ -446,12 +466,14 @@ class TestDependencyResolution:
 
 
 class TestRetry:
-    def test_retry_succeeds_after_failures(self):
+    def test_retry_succeeds_after_failures(self, tmp_path):
         _retry_counter["count"] = 0
+        marker = tmp_path / "retry_attempts.txt"
         with Runtime.with_defaults():
-            handle = _flaky.submit()
+            handle = _flaky.submit(str(marker))
             assert handle.result(timeout=30) == "ok"
-            assert _retry_counter["count"] == 3
+        # worker 子进程在重试期间把每次尝试写入标记文件；父进程据此断言尝试次数。
+        assert _read_markers(str(marker)).count("attempt") == 3
 
     def test_retry_exhausted_returns_failure(self):
         with Runtime.with_defaults():
@@ -459,13 +481,14 @@ class TestRetry:
             with pytest.raises(ValueError, match="always"):
                 handle.result(timeout=30)
 
-    def test_no_retry_by_default(self):
+    def test_no_retry_by_default(self, tmp_path):
         _no_retry_counter["count"] = 0
+        marker = tmp_path / "no_retry_attempts.txt"
         with Runtime.with_defaults():
-            handle = _fail_once.submit()
+            handle = _fail_once.submit(str(marker))
             with pytest.raises(RuntimeError, match=r"^fail$"):
                 handle.result(timeout=30)
-            assert _no_retry_counter["count"] == 1
+        assert _read_markers(str(marker)).count("attempt") == 1
 
 
 # ============================================================================
@@ -651,34 +674,28 @@ class TestCancellation:
         assert "started" in kinds, f"missing 'started' event; got {events!r}"
         assert "failed" in kinds, f"missing 'failed' event; got {events!r}"
 
-    def test_on_cancel_hook_invoked(self):
-        _cancel_hook_log.clear()
-        _cancel_hook_registered.clear()
+    def test_on_cancel_hook_invoked(self, tmp_path):
+        marker = tmp_path / "cancel_hook.txt"
         # 使用 max_concurrent_tasks=2 让 _cancel_hook 立即开始执行并注册钩子；
-        # 然后 cancel，钩子应被调用。
+        # 通过 marker 文件中的 ``registered`` 确认钩子已注册，然后 cancel。
         with Runtime.with_defaults(max_concurrent_tasks=2) as rt:
-            handle = _cancel_hook.submit()
-            # 等待 on_cancel 钩子已注册（而非仅 state=="running"），
-            # 避免 cancel 在 func 执行前触发前置取消检查导致 func 不执行。
-            assert _cancel_hook_registered.wait(timeout=5), "on_cancel hook not registered in time"
+            handle = _cancel_hook.submit(str(marker))
+            _wait_for_marker(str(marker), "registered", timeout=5)
             rt.cancel_task(handle.task_id)
             with pytest.raises(TaskCancelledError):
                 handle.result(timeout=30)
 
-        assert any(handle.task_id in entry for entry in _cancel_hook_log)
+        assert "cleanup" in _read_markers(str(marker))
 
-    def test_force_after_invokes_cleanup(self):
-        _cancel_hook_log.clear()
-        _cancel_hook_registered.clear()
+    def test_force_after_invokes_cleanup(self, tmp_path):
+        marker = tmp_path / "force_cleanup.txt"
         with Runtime.with_defaults(max_concurrent_tasks=2):
-            handle = _cancel_hook.submit()
-            # 等待 on_cancel 钩子已注册（而非仅 state=="running"），
-            # 避免 cancel 在 func 执行前触发前置取消检查导致 func 不执行。
-            assert _cancel_hook_registered.wait(timeout=5), "on_cancel hook not registered in time"
+            handle = _cancel_hook.submit(str(marker))
+            _wait_for_marker(str(marker), "registered", timeout=5)
             handle.cancel(force_after=0.1)
-            # force_after 超时后清理钩子应被调用
-            time.sleep(0.3)
-            assert any(handle.task_id in entry for entry in _cancel_hook_log)
+            # 取消信号经 Rust 派发到 worker 子进程，子进程协作式检测到取消后
+            # 触发 on_cancel 清理钩子、写入 cleanup 标记；轮询等待其落盘。
+            _wait_for_marker(str(marker), "cleanup", timeout=5)
 
     def test_propagate_cancels_same_workflow_tasks(self):
         events: list[str] = []

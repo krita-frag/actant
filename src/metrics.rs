@@ -60,9 +60,7 @@ struct Instruments {
 
     // -- 网络 / 事件总线计数器 --
     direct_requests_capacity_exceeded: Counter<u64>,
-    event_bus_subscriber_pruned: Counter<u64>,
-    event_bus_publish_timeout: Counter<u64>,
-    event_bus_dropped_events: Counter<u64>,
+    event_bus_publish_dropped: Counter<u64>,
     /// 各 topic 订阅者通道当前积压深度（取该 topic 所有订阅者的最大 len）。
     /// 每次 publish 后采样，带 `topic` 标签。用于预警队列堆积。
     event_bus_subscriber_depth: Gauge<u64>,
@@ -197,17 +195,9 @@ impl Instruments {
                 .u64_counter("actant.network.direct_requests.capacity_exceeded")
                 .with_description("Direct requests rejected due to capacity limit")
                 .build(),
-            event_bus_subscriber_pruned: meter
-                .u64_counter("actant.event_bus.subscriber.pruned")
-                .with_description("Event bus subscribers pruned due to slow consumption")
-                .build(),
-            event_bus_publish_timeout: meter
-                .u64_counter("actant.event_bus.publish.timeout")
-                .with_description("Event bus publish attempts that timed out")
-                .build(),
-            event_bus_dropped_events: meter
-                .u64_counter("actant.event_bus.events.dropped")
-                .with_description("Event bus events dropped due to full channel")
+            event_bus_publish_dropped: meter
+                .u64_counter("actant.event_bus.publish.dropped")
+                .with_description("Event bus events dropped due to full subscriber channel")
                 .build(),
             event_bus_subscriber_depth: meter
                 .u64_gauge("actant.event_bus.subscriber.depth")
@@ -537,16 +527,8 @@ pub fn inc_direct_requests_capacity_exceeded() {
     instruments().direct_requests_capacity_exceeded.add(1, &[]);
 }
 
-pub fn inc_event_bus_subscriber_pruned() {
-    instruments().event_bus_subscriber_pruned.add(1, &[]);
-}
-
-pub fn inc_event_bus_publish_timeout() {
-    instruments().event_bus_publish_timeout.add(1, &[]);
-}
-
-pub fn inc_event_bus_dropped_events() {
-    instruments().event_bus_dropped_events.add(1, &[]);
+pub fn inc_event_bus_publish_dropped() {
+    instruments().event_bus_publish_dropped.add(1, &[]);
 }
 
 /// 记录某 topic 的订阅者通道当前最大积压深度。

@@ -1,0 +1,96 @@
+# 全量门禁 CI：每次 push/PR 在 Linux 跑完整门禁，Windows 跑编译 + pipe 路径冒烟。
+#
+# 设计取舍：
+# - Linux 单 job 串行全量门禁（fmt → clippy → test → no-default-features → ruff →
+#   mypy → pytest）：clippy/test 共享编译产物，避免按检查项拆 job 导致的重复编译；
+#   失败定位靠 step 名称。
+# - Windows 只做「编译 + pipe 路径冒烟」而非全量 e2e：跨节点 e2e 的稳定性尚未在
+#   Windows 验证；冒烟集覆盖帧协议与 @task 单元路径。
+# - 两平台均 continue-on-error: false：平台差异以显式 skip 标注（见
+#   tests/python/unit/test_worker_frames.py 的 _windows_skip），不做静默容忍。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux 全量门禁
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Sync Python 依赖
+        run: uv sync
+
+      - name: 构建 PyO3 扩展（maturin develop）
+        run: uv run maturin develop
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo clippy（零告警）
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test（默认特性，含 PyO3）
+        run: cargo test
+
+      - name: cargo test --no-default-features（CI 友好路径）
+        run: cargo test --no-default-features
+
+      - name: ruff
+        run: uv run ruff check actant tests/python benches/
+
+      - name: mypy
+        run: uv run mypy actant
+
+      - name: pytest（并行，全量含 e2e）
+        run: uv run pytest tests/python/ -n 4
+
+  windows:
+    name: Windows 编译 + pipe 路径冒烟
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: cargo check --all-targets（编译门禁）
+        run: cargo check --all-targets
+
+      - name: cargo test --lib --no-default-features
+        run: cargo test --lib --no-default-features
+
+      - name: Sync Python 依赖
+        run: uv sync
+
+      - name: 构建 PyO3 扩展（maturin develop）
+        run: uv run maturin develop
+
+      # Windows 平台差异：os.writev 为 POSIX 语义，test_worker_frames.py 中依赖
+      # 它的用例已用 _windows_skip 显式标注；冒烟集覆盖帧协议与 @task 单元路径。
+      - name: Python pipe 路径冒烟
+        run: >
+          uv run pytest
+          tests/python/unit/test_worker_frames.py
+          tests/python/unit/test_task.py

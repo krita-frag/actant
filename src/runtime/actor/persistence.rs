@@ -54,14 +54,40 @@ impl ActorPersistence {
     /// 加载最新检查点状态（若存在）。返回 `(state_bytes, wal_offset)`。
     pub async fn load_latest(&self, actor_id: ActorId) -> Option<(Vec<u8>, u64)> {
         let persistence = self.clone();
-        tokio::task::spawn_blocking(move || {
+        // spawn_blocking 要求 'static，actor_id 必须移入闭包；保留一份克隆
+        // 供外层 JoinError 路径的日志使用，避免 borrow of moved value。
+        let actor_id_for_log = actor_id.clone();
+        let result = tokio::task::spawn_blocking(move || {
             let checkpoint = persistence.checkpoint.lock();
             let checkpoint = checkpoint.as_ref()?;
-            let snapshot = checkpoint.load_latest(&actor_id).ok()??;
-            Some((snapshot.state, snapshot.wal_offset))
+            // checkpoint.load_latest 失败（如 LMDB 损坏）需记录 warning，
+            // 而非静默返回 None——后者会让 Actor 以 "无状态" 启动，
+            // 丢失已持久化的进度。
+            match checkpoint.load_latest(&actor_id) {
+                Ok(Some(s)) => Some((s.state, s.wal_offset)),
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::warn!(
+                        actor_id = %actor_id.0,
+                        "checkpoint load_latest failed: {}",
+                        e
+                    );
+                    None
+                }
+            }
         })
-        .await
-        .ok()?
+        .await;
+        match result {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(
+                    actor_id = %actor_id_for_log.0,
+                    "load_latest spawn_blocking panicked: {}",
+                    e
+                );
+                None
+            }
+        }
     }
 
     /// 重放检查点之后的全部 WAL 事件，返回该 Actor 的最终状态字节。
@@ -70,11 +96,36 @@ impl ActorPersistence {
     /// 匹配事件即可得到最新状态；若未来改为增量事件，可在此依次应用。
     pub async fn replay_after(&self, actor_id: ActorId, wal_offset: u64) -> Option<Vec<u8>> {
         let persistence = self.clone();
-        tokio::task::spawn_blocking(move || {
+        // 同 load_latest：保留克隆供外层日志使用。
+        let actor_id_for_log = actor_id.clone();
+        let result = tokio::task::spawn_blocking(move || {
             let wal_guard = persistence.wal_writer.read();
             let wal = wal_guard.as_ref()?;
-            let reader = WalReader::open(wal.path().to_path_buf()).ok()?;
-            let events = reader.recover_events(wal_offset).ok()?;
+            // WalReader::open / recover_events 失败（如文件损坏）需记录 warning，
+            // 而非静默返回 None——后者会让 Actor 丢弃 WAL 中尚未 checkpoint 的进度。
+            let reader = match WalReader::open(wal.path().to_path_buf()) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(
+                        actor_id = %actor_id.0,
+                        "WalReader::open failed: {}",
+                        e
+                    );
+                    return None;
+                }
+            };
+            let events = match reader.recover_events(wal_offset) {
+                Ok(ev) => ev,
+                Err(e) => {
+                    tracing::warn!(
+                        actor_id = %actor_id.0,
+                        "WAL recover_events from offset {} failed: {}",
+                        wal_offset,
+                        e
+                    );
+                    return None;
+                }
+            };
             let mut latest: Option<Vec<u8>> = None;
             for (_, event) in events {
                 if event.actor_id == actor_id {
@@ -83,8 +134,18 @@ impl ActorPersistence {
             }
             latest
         })
-        .await
-        .ok()?
+        .await;
+        match result {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(
+                    actor_id = %actor_id_for_log.0,
+                    "replay_after spawn_blocking panicked: {}",
+                    e
+                );
+                None
+            }
+        }
     }
 
     /// 持久化 Actor 状态：先写检查点，再追加 WAL 事件。
@@ -178,12 +239,9 @@ impl ActorPersistence {
                                 // 压缩成功后公告 WalCompacted——retained_events
                                 // 取压缩后的 WAL 起始 offset（旧事件已被清理）。
                                 if let (Some(bus), Some(node)) = (event_bus, node_id) {
-                                    let retained = writer.current_offset();
-                                    tokio::spawn(async move {
-                                        bus.publish(BusEvent::WalCompacted {
-                                            node_id: node,
-                                            retained_events: retained,
-                                        }).await;
+                                    bus.publish(BusEvent::WalCompacted {
+                                        node_id: node,
+                                        retained_events: writer.current_offset(),
                                     });
                                 }
                             }

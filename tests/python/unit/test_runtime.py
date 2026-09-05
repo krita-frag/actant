@@ -246,3 +246,60 @@ class TestRuntimeProduction:
             assert os.path.exists(data_dir)
         finally:
             shutil.rmtree(data_dir, ignore_errors=True)
+
+
+class TestNetworkPresetSelection:
+    """网络 preset 选择：仅内部自动生成的临时 data_dir 才禁用 P2P。"""
+
+    def test_auto_data_dir_uses_none_preset(self):
+        rt = Runtime()
+        assert rt._owns_data_dir is True
+        assert rt._config is not None
+        assert rt._config.network.preset == "none"
+
+    def test_explicit_temp_data_dir_keeps_local_preset(self, tmp_path):
+        """显式传入系统临时目录下的 data_dir 不再被嗅探改写为 preset="none"。"""
+        data_dir = tmp_path / "actant-data"
+        rt = Runtime(data_dir=str(data_dir))
+        assert rt._owns_data_dir is False
+        assert rt._config is not None
+        assert rt._config.network.preset == "local"
+
+    def test_explicit_data_dir_outside_tempdir_keeps_local_preset(self, tmp_path):
+        rt = Runtime(data_dir=str(tmp_path / "prod-data"))
+        assert rt._config is not None
+        assert rt._config.network.preset == "local"
+
+
+class TestCancelTaskErrorLogging:
+    """cancel_task 关键路径的 Rust 侧取消失败必须记录告警而非静默吞掉。"""
+
+    def test_cancel_task_logs_warning_when_rust_cancel_fails(self, caplog):
+        import logging
+
+        class _BoomCore:
+            def cancel_task(self, task_id: str) -> None:
+                raise RuntimeError("rust cancel exploded")
+
+        class _FakeHandle:
+            def __init__(self) -> None:
+                self._state = "pending"
+
+            @property
+            def state(self) -> str:
+                return self._state
+
+            def cancel(self) -> bool:
+                return True
+
+            def _set_cancelled(self) -> None:
+                self._state = "cancelled"
+
+        rt = Runtime()
+        rt._rust_core = _BoomCore()
+        rt._tasks["t-1"] = _FakeHandle()  # type: ignore[assignment]
+        with caplog.at_level(logging.WARNING, logger="actant.runtime"):
+            assert rt.cancel_task("t-1") is True
+        assert any(
+            "rust core cancel_task failed" in rec.message for rec in caplog.records
+        )

@@ -23,12 +23,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import pickle
 import threading
-import asyncio
 from collections.abc import Callable
-from contextlib import suppress
 from typing import Any, cast
 
 import cloudpickle
@@ -44,6 +43,18 @@ from actant.task._helpers import (
 )
 
 _logger = logging.getLogger("actant.task")
+
+# 任务终态集合：完成协议在持锁时先置终态、锁外才 set future，因此判断"是否
+# 已完成"必须以 _state 终态为准而非 _future.is_set()（后者存在窗口）。
+_TERMINAL_STATES = frozenset(("completed", "failed", "cancelled"))
+
+# 并发阻塞等待线程数上限：``__await__`` 与 ``gather_async`` 每次等待派生一个
+# daemon 线程，无界并发会随挂起的 await 数放大线程总量；32 远超典型事件循环
+# 中同时挂起的任务等待数。不用共享 ``ThreadPoolExecutor``：其工作线程非
+# daemon，阻塞在 ``result()`` 上的等待会阻止解释器退出，改变现有 daemon 线程
+# 随进程即时回收的语义。
+_AWAIT_CONCURRENCY_LIMIT = 32
+_await_slots = threading.BoundedSemaphore(_AWAIT_CONCURRENCY_LIMIT)
 
 
 class _CompletionFuture:
@@ -296,8 +307,15 @@ class AsyncResult:
         if runtime is not None:
             runtime._mark_task_cancelled(self.task_id)
             if runtime._rust_core is not None:
-                with suppress(Exception):
+                # 取消请求是尽力而为语义：失败不阻止本地级联取消，但不可静默。
+                try:
                     runtime._rust_core.cancel_task(self.task_id)
+                except Exception:
+                    _logger.warning(
+                        "cancel_task failed for %s",
+                        self.task_id,
+                        exc_info=True,
+                    )
 
         # 2. 本地广播：emit TaskLifecycle cancelled
         if self._context is not None and self._context.is_cancelled():
@@ -347,9 +365,14 @@ class AsyncResult:
         """注册回调，任务完成（成功/失败/取消）后调用。
 
         回调接收此 ``AsyncResult`` 作为参数。若任务已完成，回调立即同步调用。
+
+        完成判定以锁内 ``_state`` 终态为准（而非 ``_future.is_set()``）：
+        ``_set_*`` 在持锁时先置终态、释放锁后才 ``set`` future，若检查
+        ``is_set()`` 会在该窗口内把回调 append 进已被清空的 ``_callbacks``
+        而永久丢失（docs/CODE_QUALITY_REPORT.md P0-6）。
         """
         with self._lock:
-            if not self._future.is_set():
+            if self._state not in _TERMINAL_STATES:
                 self._callbacks.append(fn)
                 return
         # 任务已完成，立即调用
@@ -463,6 +486,48 @@ class AsyncResult:
             label=f"AsyncResult {self.task_id}: done callback",
         )
 
+    def _export_outcome(self) -> tuple[bool, bytes]:
+        """导出任务终态结果字节，供 Orchestrator 状态回灌（``complete_workflow``）。
+
+        Returns:
+            ``(success, result_bytes)``：
+            - 成功：``(True, cloudpickle.dumps(返回值))``（与跨节点传播路径一致）。
+            - 失败：``(False, 错误消息 UTF-8 字节)``——Orchestrator ``FAIL_TASK``
+              期望错误字符串，而非序列化异常。
+            - 取消/其他非成功终态：``(False, b"task cancelled")``。
+
+        由 ``FlowDAG.record_outcome`` 的完成回调调用；调用方保证任务已终态。
+        """
+        with self._lock:
+            state = self._state
+            if state == "completed":
+                result_payload = self._result_payload
+                result_is_obj = self._result_is_obj
+            elif state == "failed":
+                error_payload = self._error_payload
+            else:
+                # cancelled / 其它非成功终态：以失败回灌（Phase 1 近似，任务级
+                # Cancelled 状态回灌由后续阶段细化）。
+                return False, b"task cancelled"
+        if state == "completed":
+            if result_is_obj:
+                return True, cloudpickle.dumps(result_payload)
+            if isinstance(result_payload, (bytes, bytearray)):
+                return True, bytes(result_payload)
+            return True, cloudpickle.dumps(result_payload)
+        # failed：错误负载是序列化异常，提取消息字符串（解码失败时给通用错误）。
+        try:
+            exc = cloudpickle.loads(error_payload)
+            msg = str(exc)
+        except Exception:
+            _logger.warning(
+                "task %s: failed to decode error payload for outcome export",
+                self.task_id,
+                exc_info=True,
+            )
+            msg = "unknown task failure"
+        return False, msg.encode("utf-8")
+
     def __repr__(self) -> str:
         return f"AsyncResult(task_id={self.task_id!r}, state={self.state!r})"
 
@@ -505,9 +570,21 @@ class AsyncResult:
                 loop.call_soon_threadsafe(_set_aio_result, aio_future, value, None)
             except BaseException as exc:
                 loop.call_soon_threadsafe(_set_aio_result, aio_future, None, exc)
+            finally:
+                _await_slots.release()
 
-        t = threading.Thread(target=_worker, daemon=True)
-        t.start()
+        # 有界信号量限制并发等待线程数（见模块级 _await_slots 注释）。极端情况下
+        # （> _AWAIT_CONCURRENCY_LIMIT 个挂起等待）本调用会短暂阻塞 event loop
+        # 线程直至有空闲槽位；槽位由等待线程完成后释放，不依赖 loop 推进，无死锁。
+        _await_slots.acquire()
+        try:
+            t = threading.Thread(target=_worker, daemon=True, name="actant-await")
+            t.start()
+        except BaseException:
+            # 线程创建失败（资源耗尽等）：释放槽位，否则泄漏的槽位会让
+            # 后续 await 永久阻塞在 acquire 上。
+            _await_slots.release()
+            raise
         return aio_future.__await__()
 
 
@@ -519,6 +596,50 @@ def _set_aio_result(future: Any, value: Any, exc: Any) -> None:
         future.set_exception(exc)
     else:
         future.set_result(value)
+
+
+def _collect_dep_ids(value: Any, seen: set[str], ids: list[str]) -> Any:
+    """单遍遍历 value：解析 ``AsyncResult`` 为其结果值，同时去重保序收集上游 task_id。
+
+    遍历规则与 ``_resolve_value`` 一致（list / tuple / dict 递归），但把"解析
+    结果"与"收集依赖 id"合并到一次遍历，避免两遍遍历的重复递归与规则漂移。
+    ``seen``/``ids`` 由调用方持有，保证跨 ``args``/``kwargs`` 全局去重。
+    """
+    if isinstance(value, AsyncResult):
+        if value.task_id not in seen:
+            seen.add(value.task_id)
+            ids.append(value.task_id)
+        return value.result()
+    if isinstance(value, list):
+        return [_collect_dep_ids(v, seen, ids) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_collect_dep_ids(v, seen, ids) for v in value)
+    if isinstance(value, dict):
+        return {k: _collect_dep_ids(v, seen, ids) for k, v in value.items()}
+    return value
+
+
+def _resolve_args_with_deps(
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> tuple[tuple[Any, ...], dict[str, Any], list[str]]:
+    """单遍解析 ``submit`` 参数：解析上游 ``AsyncResult`` 并收集依赖 id。
+
+    供 ``Task.submit`` / ``submit_batch`` 在构建 ``FlowDAG`` 依赖边时使用。
+    相比"先 ``_collect_async_result_ids`` 再 ``_resolve_value``"两遍遍历，
+    这里合并为一遍，同一规则不外泄、不漂移。
+
+    Returns:
+        ``(resolved_args, resolved_kwargs, upstream_ids)``：
+        - resolved_args / resolved_kwargs：参数中 ``AsyncResult`` 已替换为
+          其结果值（嵌套容器递归处理）。
+        - upstream_ids：本批参数中所有上游 ``task_id``，保持出现顺序并去重。
+    """
+    seen: set[str] = set()
+    ids: list[str] = []
+    resolved_args = tuple(_collect_dep_ids(a, seen, ids) for a in args)
+    resolved_kwargs = {k: _collect_dep_ids(v, seen, ids) for k, v in kwargs.items()}
+    return resolved_args, resolved_kwargs, ids
 
 
 def _resolve_value(value: Any) -> Any:

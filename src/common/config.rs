@@ -130,27 +130,6 @@ impl ActantConfig {
                     .into(),
             ));
         }
-        // A2：校验 actor_router_strategy 是已知值，避免运行时静默回退默认策略。
-        match self
-            .network
-            .actor_router_strategy
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "random" | "round-robin" | "roundrobin" | "least-loaded" | "leastloaded" => {}
-            other => {
-                return Err(crate::common::ActantError::Config(format!(
-                    "network.actor_router_strategy '{}': expected one of: random, round-robin, least-loaded",
-                    other
-                )));
-            }
-        }
-        if self.network.actor_registry_gossip_interval_ms == 0 {
-            return Err(crate::common::ActantError::Config(format!(
-                "network.actor_registry_gossip_interval_ms must be > 0, got {}",
-                self.network.actor_registry_gossip_interval_ms
-            )));
-        }
         Ok(())
     }
 }
@@ -158,13 +137,7 @@ impl ActantConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActorConfig {
     pub mailbox_capacity: usize,
-    pub remote_call_timeout_ms: u64,
-    /// 远程 Actor 调用最大重试次数。初次尝试不计入重试（0=不重试，1=重试一次）。
-    pub remote_call_max_retries: u32,
-    /// 远程调用重试间隔（毫秒）。
-    pub remote_call_retry_delay_ms: u64,
     pub wal_compaction_interval_secs: u64,
-    pub supervision_event_capacity: usize,
     /// WAL 压缩后每个 Actor 保留的最新检查点数量。旧检查点将被清理。默认为 1。
     pub checkpoint_retention_count: usize,
     /// 单个 Actor stop 超时（毫秒）。超时后放弃等待，使 shutdown 路径总能完成
@@ -176,11 +149,7 @@ impl Default for ActorConfig {
     fn default() -> Self {
         Self {
             mailbox_capacity: 1024,
-            remote_call_timeout_ms: 30_000,
-            remote_call_max_retries: 2,
-            remote_call_retry_delay_ms: 500,
             wal_compaction_interval_secs: 60,
-            supervision_event_capacity: 256,
             checkpoint_retention_count: 1,
             stop_timeout_ms: 500,
         }
@@ -252,6 +221,10 @@ pub struct WorkerConfig {
     pub scheduler_kind: SchedulerKind,
     pub timeout_check_interval_ms: u64,
     pub default_task_timeout_ms: u64,
+    /// 本地最大并发任务数（信号量背压 + 远端转发判断）。
+    ///
+    /// 进程池后端的有效本地并发由 worker 子进程数决定；此值应等于
+    /// `num_worker_processes`，保持信号量与进程池容量一致。
     pub max_concurrent_tasks: usize,
     pub completion_channel_capacity: usize,
     pub broadcast_retry_attempts: usize,
@@ -259,39 +232,81 @@ pub struct WorkerConfig {
     pub drain_timeout_secs: u64,
     /// 本地无法执行的任务（仅提交节点或远程转发失败）重新入队前的延迟（毫秒）。
     pub remote_fallback_delay_ms: u64,
-    /// 任务执行线程池的工作线程数。默认 `max(4, num_cpus)`。
-    pub task_thread_pool_workers: usize,
-    /// 任务执行线程池的通道容量。默认 `task_thread_pool_workers * 16`。
-    pub task_thread_pool_channel_capacity: usize,
+    /// worker 子进程数（进程池大小）。每个 worker 进程同一时刻执行一个任务，
+    /// 杀进程即精确终止一个任务。默认 `num_cpus`。
+    pub num_worker_processes: usize,
+    /// 拉起 worker 子进程的解释器路径（如 Python 的 `sys.executable`）。
+    /// 进程池以 `[worker_program, -m, actant.task._worker]` 启动 worker。
+    /// 仅 Rust 纯嵌入场景由嵌入方显式配置；Python 层始终注入 `sys.executable`。
+    #[serde(default)]
+    pub worker_program: String,
+    /// worker 进程崩溃后任务重新入队重路由的最大执行次数（含首次执行）。
+    ///
+    /// 进程崩溃（`ActantError::Worker`，worker 进程异常退出）属于基础设施级失败，
+    /// 与业务失败、超时不同：任务会被清空 `target_node` 重新入队，由路由器重选
+    /// 本地或远端节点重试。该次数即为上限，防止持久性崩溃在无退路时无限重路由。
+    /// 默认 3（首次 + 最多 2 次转移）；超时与业务失败不参与此上限，保持原有失败语义。
+    pub crash_failover_max_attempts: u32,
+    /// worker 子进程的 `PYTHONPATH`，继承父解释器的 `sys.path`。
+    ///
+    /// 进程隔离下，模块级任务函数（cloudpickle by-reference 序列化）需在
+    /// worker 子进程内被再次导入；将父进程 `sys.path` 透传为 `PYTHONPATH`
+    /// 保证用户/测试模块在子进程内可导入。空 = 继承父进程环境变量。
+    #[serde(default)]
+    pub python_path: Vec<String>,
+    /// 取消/硬超时触发后，向 worker 发送 `Cancel` 帧等待其协作退出的宽限期（毫秒）。
+    /// 宽限期过后仍未退出则强杀进程。默认 2000ms。
+    pub worker_cancel_grace_ms: u64,
     /// 待处理结果重试队列的通道容量。首次投递失败的结果将入队异步重试。
     pub pending_result_channel_capacity: usize,
+    /// Worker 主循环批量 prefetch 的最小批量。
+    ///
+    /// `max_concurrent_tasks` 低于此值时，prefetch 批量大小仍取此值，
+    /// 保证低并发节点也能一次拉取一批任务，减少 dequeue 调用次数。
+    #[serde(default = "default_prefetch_min")]
+    pub prefetch_min: usize,
+    /// Worker 主循环批量 prefetch 的最大批量。
+    ///
+    /// 上限防止过度 prefetch 占用调度器内存。须 >= `prefetch_min`
+    /// （构造时由 `Worker::new` 归一化，避免 `clamp` panic）。
+    #[serde(default = "default_prefetch_max")]
+    pub prefetch_max: usize,
+}
+
+fn default_prefetch_min() -> usize {
+    16
+}
+
+fn default_prefetch_max() -> usize {
+    64
 }
 
 fn default_scheduler_kind() -> SchedulerKind {
     SchedulerKind::default()
 }
 
-/// 默认每个 Worker 节点仅并发执行一个任务（单线程模型）。
-/// 需要更高并发时，在同一机器上启动多个 Worker 进程。
-const DEFAULT_MAX_CONCURRENT_TASKS: usize = 1;
-
 impl Default for WorkerConfig {
     fn default() -> Self {
-        // 单线程模型：每个 Worker 节点仅一个任务执行线程。
-        const POOL_WORKERS: usize = 1;
+        // 进程池模型：worker 进程数与并发度默认取 CPU 核数。
+        let proc_count = num_cpus::get().max(1);
         Self {
             scheduler_kind: default_scheduler_kind(),
             timeout_check_interval_ms: 10,
             default_task_timeout_ms: 30000,
-            max_concurrent_tasks: DEFAULT_MAX_CONCURRENT_TASKS,
+            max_concurrent_tasks: proc_count,
             completion_channel_capacity: 256,
             broadcast_retry_attempts: 3,
             broadcast_retry_base_delay_ms: 100,
             drain_timeout_secs: 30,
             remote_fallback_delay_ms: 500,
-            task_thread_pool_workers: POOL_WORKERS,
-            task_thread_pool_channel_capacity: POOL_WORKERS * 16,
+            num_worker_processes: proc_count,
+            crash_failover_max_attempts: 3,
+            worker_program: String::new(),
+            python_path: Vec::new(),
+            worker_cancel_grace_ms: 2000,
             pending_result_channel_capacity: 256,
+            prefetch_min: default_prefetch_min(),
+            prefetch_max: default_prefetch_max(),
         }
     }
 }
@@ -338,19 +353,6 @@ pub struct NetworkConfig {
     /// Capability gossip 广播间隔（毫秒）。默认 60 秒。
     #[serde(default = "default_capability_gossip_interval_ms")]
     pub capability_gossip_interval_ms: u64,
-    /// 跨节点 Actor 路由策略（A2）。
-    ///
-    /// 内置值：`"random"` / `"round-robin"`（默认）/ `"least-loaded"`。
-    /// 未知值在启动时返回 `ActantError::Config`，而非静默回退默认值。
-    /// 详见 [`crate::runtime::actor::router::RouterStrategy`]。
-    #[serde(default = "default_actor_router_strategy")]
-    pub actor_router_strategy: String,
-    /// Actor 注册表 gossip 广播间隔（毫秒）。默认 30 秒。
-    ///
-    /// 控制 [`crate::runtime::actor::router::ActorRegistryGossipActor`] 广播
-    /// 本地 actor 类型注册表的频率。较短间隔加快新节点发现，但增加网络流量。
-    #[serde(default = "default_actor_registry_gossip_interval_ms")]
-    pub actor_registry_gossip_interval_ms: u64,
     /// 网络事件有界通道容量。
     ///
     /// `NetworkManager` 内部使用此容量的 `mpsc::channel` 缓冲 `NetworkEvent`。
@@ -378,14 +380,6 @@ fn default_event_channel_capacity() -> usize {
     NetworkConfig::DEFAULT_EVENT_CHANNEL_CAPACITY
 }
 
-fn default_actor_router_strategy() -> String {
-    NetworkConfig::DEFAULT_ACTOR_ROUTER_STRATEGY.to_string()
-}
-
-fn default_actor_registry_gossip_interval_ms() -> u64 {
-    NetworkConfig::DEFAULT_ACTOR_REGISTRY_GOSSIP_INTERVAL_MS
-}
-
 impl NetworkConfig {
     /// 默认 HLC 最大时钟漂移（毫秒）。
     pub const DEFAULT_HLC_MAX_DRIFT_MS: u64 = 500;
@@ -399,10 +393,6 @@ impl NetworkConfig {
     pub const DEFAULT_CAPABILITY_GOSSIP_INTERVAL_MS: u64 = 60_000;
     /// 默认网络事件通道容量。
     pub const DEFAULT_EVENT_CHANNEL_CAPACITY: usize = 1024;
-    /// 默认 Actor 路由策略。
-    pub const DEFAULT_ACTOR_ROUTER_STRATEGY: &'static str = "round-robin";
-    /// 默认 Actor 注册表 gossip 广播间隔（30s）。
-    pub const DEFAULT_ACTOR_REGISTRY_GOSSIP_INTERVAL_MS: u64 = 30_000;
 }
 
 fn default_direct_request_timeout_ms() -> u64 {
@@ -431,8 +421,6 @@ impl Default for NetworkConfig {
             listen_port: 0,
             listen_ip: String::new(),
             capability_gossip_interval_ms: default_capability_gossip_interval_ms(),
-            actor_router_strategy: default_actor_router_strategy(),
-            actor_registry_gossip_interval_ms: default_actor_registry_gossip_interval_ms(),
             event_channel_capacity: default_event_channel_capacity(),
             dns_origin_domain: String::new(),
         }

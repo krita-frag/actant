@@ -15,9 +15,14 @@ from typing import Any
 
 from actant._runtime import get_current_runtime
 from actant.exceptions import InvalidStateError
-from actant.task._async_result import AsyncResult, _resolve_value
+from actant.task._async_result import AsyncResult, _resolve_args_with_deps
 from actant.task._context import TaskContext
-from actant.task._helpers import _safe_serialize, _is_coroutine_function, _run_coroutine_on_worker_thread
+from actant.task._helpers import (
+    _is_coroutine_function,
+    _run_coroutine_on_worker_thread,
+    _safe_serialize,
+)
+
 _logger = logging.getLogger("actant.task")
 
 
@@ -79,11 +84,22 @@ class Task:
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         """本地同步调用（等价于原函数）。
 
+        .. warning::
+            **此路径不经过分布式调度**：不进入 Worker 队列、不应用 ``retries`` /
+            ``timeout_ms`` / ``priority`` / ``tags`` / ``silent`` 等任务配置，
+            不发布 ``TaskLifecycle`` 事件，也不参与 ``cancel_task`` 协作取消。
+            参数中的 ``AsyncResult`` **不会**自动解析（直接传入会导致
+            cloudpickle 序列化失败或类型错误）。
+
+            分布式执行请使用 :meth:`submit`。``__call__`` 仅适用于：
+            - 本地纯函数求值（如 flow 内部已通过 ``submit`` 拿到结果后的
+              后处理）；
+            - 调试 / 单元测试场景下复用 task 包装的函数体。
+
         对于 ``async def`` 函数，在临时 event loop 中同步执行 coroutine
         并返回其结果，而非返回 coroutine 对象。这使用户可以直接
         ``result = task(x)`` 调用 async task，无需手动 ``asyncio.run``。
         """
-        
         if _is_coroutine_function(self._func):
             coro = self._func(*args, **kwargs)
             return _run_coroutine_on_worker_thread(coro)
@@ -140,11 +156,11 @@ class Task:
                 "wrap your code in `with actant.Runtime() as rt:`"
             )
 
-        # 自动解析参数中的 AsyncResult（阻塞等待其结果），表达任务依赖。
-        resolved_args = tuple(_resolve_value(a) for a in args)
-        resolved_kwargs = {k: _resolve_value(v) for k, v in kwargs.items()}
+        # 单遍解析参数：把上游 AsyncResult 解析为其结果值，同时收集其 task_id
+        # 作为 FlowDAG 依赖边（解析与收集合并一次遍历，避免两遍重复递归）。
+        resolved_args, resolved_kwargs, deps = _resolve_args_with_deps(args, kwargs)
 
-        task_id, _workflow_id, _payload, _task_ctx, handle, task_def = self._prepare_task_def(
+        task_id, _workflow_id, payload, _task_ctx, handle, task_def = self._prepare_task_def(
             resolved_args, resolved_kwargs,
             target_node=target_node, target_endpoint_addr=target_endpoint_addr,
             runtime=runtime,
@@ -158,7 +174,44 @@ class Task:
         except Exception:
             runtime.unregister_task(task_id)
             raise
+        # 提交成功后记录节点（含上游依赖边）到当前 flow 的 FlowDAG。
+        self._record_dag_node(task_id=task_id, payload=payload, deps=deps, handle=handle)
         return handle
+
+    def _record_dag_node(
+        self,
+        *,
+        task_id: str,
+        payload: bytes,
+        deps: list[str],
+        handle: AsyncResult,
+    ) -> None:
+        """把已提交任务作为节点记录到当前 flow 的 ``FlowDAG``（若在 flow 上下文中）。
+
+        由 ``_submit`` / ``submit_batch`` 在任务提交成功后调用，同时为任务句柄
+        注册完成回调：任务终态时把结果写入 ``FlowDAG``，供 ``complete_workflow``
+        回灌 Orchestrator。不在 flow 上下文（``current_flow_dag()`` 返回
+        ``None``）时为空操作，保持普通 ``task.submit`` 语义不变。
+        """
+        from actant.flow import current_flow_dag
+
+        dag = current_flow_dag()
+        if dag is None:
+            return
+        dag.add_task(
+            task_id=task_id,
+            name=self._name,
+            payload=payload,
+            deps=deps,
+            timeout_ms=self._timeout_ms if self._timeout_ms > 0 else None,
+            priority=self._priority,
+            retries=self._retries,
+            retry_delay_ms=self._retry_delay_ms,
+        )
+        def _record_outcome(h: AsyncResult) -> None:
+            dag.record_outcome(task_id, h._export_outcome())
+
+        handle.add_done_callback(_record_outcome)
 
     def _prepare_task_def(
         self,
@@ -247,6 +300,17 @@ class Task:
 
         适合高吞吐场景（如 ``gather(*handles)`` 前的批量提交）。
 
+        .. note::
+            **依赖解析行为**：``items`` 中的 ``AsyncResult`` 会**逐个阻塞解析**
+            （与 :meth:`submit` 一致），意味着批量提交的总耗时包含上游任务
+            的串行等待时间。若需并行解析上游依赖，应先用 :func:`gather` 等待
+            所有上游 handle 完成，再将结果列表传入 ``submit_batch``。
+
+            例：``b.submit_batch([a.submit(x) for x in xs])`` 会按顺序等待
+            每个 ``a.submit(x)`` 完成后再提交 ``b``，无法并行化 ``a`` 的执行。
+            改写为 ``a_handles = [a.submit(x) for x in xs]; a_results = gather(*a_handles);
+            b.submit_batch(a_results)`` 可让 ``a`` 并行执行。
+
         Args:
             items: 可迭代对象，每个元素作为 ``submit`` 的唯一位置参数。
                 与 ``map`` 一致。
@@ -288,7 +352,7 @@ class Task:
             raise InvalidStateError("Runtime not started: rust_core is None")
 
         # 准备所有 task_def + handle。任一失败则回滚已注册的 task_id。
-        prepared: list[tuple[str, AsyncResult, Any]] = []
+        prepared: list[tuple[str, bytes, list[str], AsyncResult, Any]] = []
         registered_ids: list[str] = []
         try:
             for item in items:
@@ -303,20 +367,20 @@ class Task:
                     else:
                         raw_args = tuple(item)
                         raw_kwargs = {}
-                    resolved_args = tuple(_resolve_value(a) for a in raw_args)
-                    resolved_kwargs = {
-                        k: _resolve_value(v) for k, v in raw_kwargs.items()
-                    }
                 else:
-                    resolved_args = (_resolve_value(item),)
-                    resolved_kwargs = {}
-                task_id, _wf, _payload, _ctx, handle, task_def = self._prepare_task_def(
+                    raw_args = (item,)
+                    raw_kwargs = {}
+                # 单遍解析本项参数：解析上游 AsyncResult 并收集 task_id 作为依赖边。
+                resolved_args, resolved_kwargs, deps = _resolve_args_with_deps(
+                    raw_args, raw_kwargs
+                )
+                task_id, _wf, payload, _ctx, handle, task_def = self._prepare_task_def(
                     resolved_args, resolved_kwargs,
                     target_node=target_node,
                     target_endpoint_addr=target_endpoint_addr,
                     runtime=runtime,
                 )
-                prepared.append((task_id, handle, task_def))
+                prepared.append((task_id, payload, deps, handle, task_def))
                 registered_ids.append(task_id)
         except Exception:
             # 序列化或 flow 取消检查失败：清理已注册的 task_id。
@@ -325,7 +389,7 @@ class Task:
             raise
 
         # 一次性提交到 Rust scheduler。
-        task_defs = [td for _, _, td in prepared]
+        task_defs = [td for _, _, _, _, td in prepared]
         try:
             core.submit_tasks_batch(task_defs)
         except Exception:
@@ -333,7 +397,11 @@ class Task:
                 runtime.unregister_task(tid)
             raise
 
-        return [handle for _, handle, _ in prepared]
+        # 全部提交成功后记录节点到当前 flow 的 FlowDAG（含各自的上游依赖边）。
+        for task_id, payload, deps, handle, _td in prepared:
+            self._record_dag_node(task_id=task_id, payload=payload, deps=deps, handle=handle)
+
+        return [handle for _, _, _, handle, _ in prepared]
 
     def delay(self, *args: Any, **kwargs: Any) -> AsyncResult:
         """``submit`` 的别名（Celery 风格）。"""

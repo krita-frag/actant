@@ -264,6 +264,14 @@ impl Actor for WorkflowActor {
 
 pub const SCHEDULER_ACTOR_TYPE: &str = "SchedulerActor";
 
+/// SchedulerActor 内阻塞式 `DEQUEUE` 的最大等待时间。
+///
+/// Actor 消息处理是单线程顺序执行：若 `DEQUEUE` 在空队列上无限期阻塞，
+/// 后续 `ENQUEUE` / `CLOSE` 等消息全部滞留邮箱，调度器假死。超时后返回
+/// `None`，消费方（Worker 主循环）由 `TaskEnqueued` Notify 信号驱动
+/// `try_dequeue`，不依赖阻塞式 dequeue 的长等待语义。
+const DEQUEUE_ACTOR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// SchedulerActor 支持的方法名。
 pub mod scheduler_methods {
     pub const ENQUEUE: &str = "enqueue";
@@ -287,7 +295,7 @@ pub mod scheduler_methods {
 pub(crate) enum InnerScheduler {
     Fifo {
         queue: parking_lot::Mutex<std::collections::VecDeque<TaskDefinition>>,
-        notify: tokio::sync::Notify,
+        notify: Arc<tokio::sync::Notify>,
         closed: std::sync::atomic::AtomicBool,
     },
     Priority {
@@ -297,42 +305,60 @@ pub(crate) enum InnerScheduler {
                 std::collections::VecDeque<TaskDefinition>,
             >,
         >,
-        notify: tokio::sync::Notify,
+        notify: Arc<tokio::sync::Notify>,
         closed: std::sync::atomic::AtomicBool,
     },
 }
 
 impl InnerScheduler {
     fn fifo() -> Self {
+        Self::fifo_with_notify(Arc::new(tokio::sync::Notify::new()))
+    }
+
+    /// 使用共享的唤醒信号构造 FIFO 调度器。
+    ///
+    /// `notify` 与 Worker 等待的 `EventBus::task_enqueued_notify` 是同一
+    /// `Arc<Notify>`，确保快路径 `enqueue` 的信号能唤醒 Worker。
+    fn fifo_with_notify(notify: Arc<tokio::sync::Notify>) -> Self {
         Self::Fifo {
             queue: parking_lot::Mutex::new(std::collections::VecDeque::new()),
-            notify: tokio::sync::Notify::new(),
+            notify,
             closed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     fn priority() -> Self {
+        Self::priority_with_notify(Arc::new(tokio::sync::Notify::new()))
+    }
+
+    fn priority_with_notify(notify: Arc<tokio::sync::Notify>) -> Self {
         Self::Priority {
             queues: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
-            notify: tokio::sync::Notify::new(),
+            notify,
             closed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     /// 原地将 FIFO 切换为优先级队列策略。
     ///
-    /// 保留 `closed` 标志（若已关闭）和 `notify`（若有等待者）：
-    /// `with_priority` 在 Actor 构造阶段调用，此时无等待者、未关闭，
-    /// 因此直接重建为 Priority 变体是安全的。
+    /// 保留 `closed` 标志（若已关闭）和 `notify` 引用（若有等待者），
+    /// 避免丢失与 `EventBus::task_enqueued_notify` 共享的唤醒信号，
+    /// 也避免重置 `closed` 导致 drain 状态被静默撤销。
     fn switch_to_priority(&mut self) {
         // 仅在当前为 Fifo 时切换；已是 Priority 则 no-op。
         if matches!(self, Self::Priority { .. }) {
             return;
         }
+        let (notify, closed) = match self {
+            Self::Fifo { notify, closed, .. } => (Arc::clone(notify), closed),
+            Self::Priority { notify, closed, .. } => (Arc::clone(notify), closed),
+        };
+        let closed =
+            std::sync::atomic::AtomicBool::new(closed.load(std::sync::atomic::Ordering::Acquire));
         *self = Self::Priority {
             queues: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
-            notify: tokio::sync::Notify::new(),
-            closed: std::sync::atomic::AtomicBool::new(false),
+            notify,
+            closed,
         };
     }
 
@@ -411,6 +437,15 @@ impl InnerScheduler {
         Ok(())
     }
 
+    /// 阻塞式出队：队列空时等待 Notify 信号。
+    ///
+    /// # Actor 分发约定
+    ///
+    /// 本方法**不得**在 Actor 消息处理内无限期调用：`SchedulerActor` 的邮箱
+    /// 单线程顺序处理，阻塞的 DEQUEUE 会阻止 ENQUEUE/CLOSE 被处理。
+    /// `SchedulerActor` 对本方法套用 [`DEQUEUE_ACTOR_TIMEOUT`] 超时保护；
+    /// 生产消费路径（Worker 主循环）应使用 [`Self::try_dequeue`] + Notify
+    /// 信号驱动，而非依赖本方法的长等待。
     async fn dequeue(&self) -> Option<TaskDefinition> {
         loop {
             let task = match self {
@@ -566,8 +601,11 @@ impl SchedulerActor {
     /// 通过 Notify 信号 + 非阻塞 `try_dequeue` 组合，
     /// 避免直接调用 `dequeue()` 阻塞 Actor 邮箱导致的死锁。
     pub fn with_event_bus(event_bus: EventBus) -> Self {
+        // 用 EventBus 的唤醒信号构造内部调度器：使快路径 enqueue 与 Worker
+        // 等待的是同一 Arc<Notify>，保证任务一经入队即唤醒 Worker。
+        let notify = event_bus.task_enqueued_notify();
         Self {
-            inner: Arc::new(InnerScheduler::fifo()),
+            inner: Arc::new(InnerScheduler::fifo_with_notify(notify)),
             event_bus: Some(event_bus),
         }
     }
@@ -577,15 +615,24 @@ impl SchedulerActor {
     /// 必须在 Actor `spawn` 之前调用：此方法重建内部状态为优先级队列。
     /// 若 `shared_inner()` 已被调用（Arc 已共享），重建会丢弃旧状态——
     /// 因此调用顺序应为 `with_event_bus(...).with_priority()` → `shared_inner()` → `spawn`。
-    pub fn with_priority(mut self) -> Self {
+    ///
+    /// 返回 `Err` 当 `self.inner` 已被共享（`Arc::get_mut` 返回 `None`），
+    /// 即调用顺序违反上述约定。调用方应通过 `?` 传播此错误而非 panic，
+    /// 以符合"库代码不 panic"的约定。
+    pub fn with_priority(mut self) -> Result<Self> {
         // 链式调用约定：with_priority 在 shared_inner/spawn 之前调用，
         // 此时 self.inner 是唯一 Arc 引用，Arc::get_mut 必然成功。
-        // 若因调用顺序错误导致 get_mut 失败，panic 以暴露误用
-        // （而非静默丢弃已共享状态）。
-        Arc::get_mut(&mut self.inner)
-            .expect("with_priority must be called before shared_inner/spawn")
-            .switch_to_priority();
-        self
+        // 若因调用顺序错误导致 get_mut 失败，返回 Err 以暴露误用，
+        // 而非 panic 或静默丢弃已共享状态。
+        let inner = Arc::get_mut(&mut self.inner).ok_or_else(|| {
+            ActantError::Internal(
+                "with_priority must be called before shared_inner/spawn \
+                 (inner Arc already shared)"
+                    .into(),
+            )
+        })?;
+        inner.switch_to_priority();
+        Ok(self)
     }
 
     /// 返回内部调度状态的共享引用，供 [`ActorScheduler`] 实现 enqueue 快路径。
@@ -642,7 +689,13 @@ impl Actor for SchedulerActor {
                 Ok(ok_result(msg_id))
             }
             scheduler_methods::DEQUEUE => {
-                let task = self.inner.dequeue().await;
+                // 超时保护：不允许 DEQUEUE 在 Actor 消息处理内无限期阻塞
+                // （会卡住整个邮箱，见 `DEQUEUE_ACTOR_TIMEOUT` 文档）。
+                // Scheduler trait 的实现约定同样如此：经 Actor 分发的阻塞式
+                // dequeue 必须有界，生产消费路径应使用 try_dequeue + 唤醒信号。
+                let task = tokio::time::timeout(DEQUEUE_ACTOR_TIMEOUT, self.inner.dequeue())
+                    .await
+                    .unwrap_or(None);
                 Ok(payload_result(msg_id, encode(&task)?))
             }
             scheduler_methods::DEQUEUE_BATCH => {
@@ -653,21 +706,16 @@ impl Actor for SchedulerActor {
             scheduler_methods::TRY_DEQUEUE => {
                 let task = self.inner.try_dequeue();
                 // 出队成功后发布 TaskDequeued 事件，供外部观测实际消费速率。
-                // 事件丢失可接受（BestEffort），仅为观测信号。
+                // 事件丢失可接受（观测 tap），仅为观测信号。
                 if let Some(ref t) = task {
                     if let Some(ref bus) = self.event_bus {
-                        let bus = bus.clone();
                         let workflow_id = t
                             .workflow_id
                             .clone()
                             .unwrap_or_else(|| WorkflowId::from(""));
-                        let task_id = t.id.clone();
-                        tokio::spawn(async move {
-                            bus.publish(BusEvent::TaskDequeued {
-                                workflow_id,
-                                task_id,
-                            })
-                            .await;
+                        bus.publish(BusEvent::TaskDequeued {
+                            workflow_id,
+                            task_id: t.id.clone(),
                         });
                     }
                 }

@@ -116,12 +116,38 @@ impl Actor for CapabilityActor {
                 }
             }
             EffectKind::Emit => {
+                // emit 反应型语义：顺序调用所有 handler，单个失败不中断后续；
+                // 全部调用完成后聚合失败信息，统一回给调用方（按 msg_id）。
+                let mut failures: Vec<String> = Vec::new();
+                // 首个失败 handler 的 kind：聚合错误据此编码 kind 前缀，
+                // 供 Python 侧 decode_error_kind 重建对应异常类型。
+                let mut first_kind: Option<&'static str> = None;
                 for handler in &self.handlers {
                     if let Err(e) = handler.emit(req.clone()).await {
-                        return Ok(Self::error(msg_id, e));
+                        if first_kind.is_none() {
+                            first_kind = Some(e.kind_str());
+                        }
+                        failures.push(e.to_string());
                     }
                 }
-                Ok(Self::ok(msg_id))
+                if failures.is_empty() {
+                    Ok(Self::ok(msg_id))
+                } else {
+                    // kind 保真：聚合错误携带首个失败 handler 的 kind 前缀
+                    // （而非统一 internal），跨语言异常类型不丢失。
+                    Ok(Self::error(
+                        msg_id,
+                        crate::common::ActantError::Internal(crate::common::format_error_kind(
+                            first_kind.unwrap_or("internal"),
+                            &format!(
+                                "emit: {}/{} handlers failed: {}",
+                                failures.len(),
+                                self.handlers.len(),
+                                failures.join("; ")
+                            ),
+                        )),
+                    ))
+                }
             }
         }
     }

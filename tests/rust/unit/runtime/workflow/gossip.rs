@@ -389,8 +389,8 @@ async fn broadcast_update_same_key_supersedes_with_higher_hlc() {
 
 #[tokio::test]
 async fn apply_remote_update_accepts_new_key() {
-    // 新的 (wf, task) 没有已存在条目 → 应被接受并插入 seen 表。
-    let g = make_gossip("node-A", GossipConfig::default());
+    // 新的 (wf, task) 没有已存在条目 → 落地（NotFound 视为已处理）后插入 seen 表。
+    let g = make_gossip_with_actor("node-A", GossipConfig::default());
     let update = WireDagStateUpdate {
         workflow_id: WorkflowId("wf-new".to_string()),
         task_id: TaskId::from("t-new".to_string()),
@@ -399,13 +399,10 @@ async fn apply_remote_update_accepts_new_key() {
         origin_node: NodeId::from("node-B".to_string()),
     };
 
-    // apply_remote_update 会尝试调用 WorkflowActor，但本地没有注册该 actor，
-    // call_workflow 会返回错误。我们仅验证 seen 表被更新。
     let result = g.apply_remote_update(update.clone()).await;
-    // 由于没有注册 WorkflowActor，调用会失败
-    assert!(result.is_err(), "should fail without WorkflowActor");
-
-    // 但 seen 表应已被更新（dedup 检查在 actor 调用之前）
+    // 本节点未托管该 workflow → NotFound 视为已处理，返回 Ok。
+    assert!(result.is_ok(), "NotFound should be treated as processed");
+    // 落地成功后 seen 表被登记。
     assert_eq!(g.seen_count(), 1);
 }
 
@@ -448,7 +445,7 @@ async fn apply_remote_update_drops_stale_update() {
 
 #[tokio::test]
 async fn apply_remote_update_accepts_higher_hlc() {
-    let g = make_gossip("node-A", GossipConfig::default());
+    let g = make_gossip_with_actor("node-A", GossipConfig::default());
     let wf = WorkflowId("wf-accept".to_string());
     let task = TaskId::from("t-accept".to_string());
     let key = SeenKey(wf.clone(), task.clone());
@@ -472,8 +469,8 @@ async fn apply_remote_update_accepts_higher_hlc() {
         origin_node: NodeId::from("node-B".to_string()),
     };
 
-    // apply_remote_update 会更新 seen 但 actor 调用会失败
-    let _ = g.apply_remote_update(update).await;
+    // apply 落地成功（NotFound 视为已处理）后 seen 被更新。
+    g.apply_remote_update(update).await.unwrap();
 
     // seen 表应被更新
     let entry = g.seen.get(&key).unwrap();
@@ -1211,4 +1208,116 @@ fn clone_shares_seen_and_clock() {
     let t1 = g.clock().tick();
     let t2 = g2.clock().tick();
     assert!(t2 > t1, "shared clock should be monotonic");
+}
+
+// ───────────────────────── 去重登记先于落地（apply 成功后才登记 seen）─────────────────────────
+
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+/// 前 N 次 `complete_task` 调用返回错误的 WorkflowActor 桩。
+struct FlakyCompleteActor {
+    fails_left: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl crate::runtime::actor::Actor for FlakyCompleteActor {
+    fn actor_type(&self) -> &str {
+        "WorkflowActor"
+    }
+
+    async fn handle_message(
+        &mut self,
+        msg: crate::common::ActorMessage,
+    ) -> crate::common::Result<crate::common::ActorMessageResult> {
+        let fail = msg.method == "complete_task"
+            && self
+                .fails_left
+                .fetch_update(AtomicOrdering::SeqCst, AtomicOrdering::SeqCst, |n| {
+                    if n > 0 {
+                        Some(n - 1)
+                    } else {
+                        None
+                    }
+                })
+                .is_ok();
+        let error = if fail {
+            Some(crate::common::ActorErrorEnvelope {
+                kind: crate::common::ActorErrorKind::Internal,
+                message: "transient failure".to_string(),
+            })
+        } else {
+            None
+        };
+        Ok(crate::common::ActorMessageResult {
+            message_id: msg.id,
+            payload: vec![],
+            error,
+        })
+    }
+}
+
+async fn make_gossip_with_flaky_actor(node_id: &str, fails: usize) -> DagGossip {
+    let network: Arc<dyn Transport> = Arc::new(MockTransport::new(node_id));
+    let actor_system = Arc::new(ActorSystem::new());
+    let wf_id = ActorId::workflow(&NodeId::from(node_id.to_string()));
+    actor_system
+        .spawn(
+            wf_id.clone(),
+            FlakyCompleteActor {
+                fails_left: AtomicUsize::new(fails),
+            },
+        )
+        .await
+        .unwrap();
+    DagGossip::new(network, actor_system, wf_id, GossipConfig::default())
+}
+
+/// apply 失败时不登记 seen：更新不丢，重传可重放。
+#[tokio::test]
+async fn apply_remote_update_failure_does_not_register_seen() {
+    let g = make_gossip_with_flaky_actor("node-dedup-1", 1).await;
+    let update = WireDagStateUpdate {
+        workflow_id: WorkflowId("wf-dedup".to_string()),
+        task_id: TaskId::from("t-1".to_string()),
+        task_state: WireTaskState::Completed { result: vec![1] },
+        hlc_timestamp: HlcTimestamp::from_parts(10, 0),
+        origin_node: NodeId::from("node-B".to_string()),
+    };
+
+    let result = g.apply_remote_update(update.clone()).await;
+    assert!(result.is_err(), "apply failure should propagate");
+    assert_eq!(
+        g.seen_count(),
+        0,
+        "failed apply must NOT register the dedup entry"
+    );
+
+    // 重传同一更新（此时桩已恢复）：应被重新落地而非判为重复丢弃。
+    let retried = g.apply_remote_update(update).await;
+    assert!(retried.is_ok(), "retry after failure should re-apply");
+    assert_eq!(g.seen_count(), 1, "successful apply registers seen");
+}
+
+/// apply 成功后登记 seen：同一更新重放会被判为重复丢弃。
+#[tokio::test]
+async fn apply_remote_update_registers_seen_after_success() {
+    let g = make_gossip_with_flaky_actor("node-dedup-2", 0).await;
+    let update = WireDagStateUpdate {
+        workflow_id: WorkflowId("wf-dedup-ok".to_string()),
+        task_id: TaskId::from("t-1".to_string()),
+        task_state: WireTaskState::Completed { result: vec![2] },
+        hlc_timestamp: HlcTimestamp::from_parts(10, 0),
+        origin_node: NodeId::from("node-B".to_string()),
+    };
+
+    g.apply_remote_update(update.clone()).await.unwrap();
+    assert_eq!(g.seen_count(), 1);
+
+    // 同一更新重放：HLC 相同、priority 相同 → 不被 superseded → 丢弃。
+    g.apply_remote_update(update).await.unwrap();
+    assert_eq!(
+        g.seen_count(),
+        1,
+        "duplicate replay after success must not grow seen"
+    );
 }

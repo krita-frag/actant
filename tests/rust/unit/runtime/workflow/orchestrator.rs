@@ -4,13 +4,15 @@ use crate::common::{ActantConfig, ActantError, NodeId, Result, RetryPolicy, Task
 use crate::runtime::network::{
     DirectRequest, DirectResponse, ListenAddresses, NetworkEvent, PeerId, Transport,
 };
+use crate::runtime::state::Store;
 use crate::runtime::workflow::dag::Terminal;
 use crate::runtime::workflow::orchestrator::types::ConditionEvaluator;
-use crate::runtime::workflow::{Dag, DagNode, Phase};
+use crate::runtime::workflow::{Dag, DagNode, FailureScope, Phase};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use tempfile::tempdir;
 const TEST_SIGNING_KEY: &[u8] = b"test-key";
 
 fn make_node(id: &str, name: &str) -> DagNode {
@@ -648,7 +650,10 @@ async fn get_result_returns_packed_group_after_completion() {
 
     // get_result 返回 pack_group 编码的字节（与 store 路径一致）。
     let packed = orch.get_result(&wf).await.expect("should have result");
-    assert_eq!(packed, crate::common::pack_group(&[b"final".to_vec()]));
+    assert_eq!(
+        packed,
+        crate::common::pack_group(&[b"final".to_vec()]).unwrap()
+    );
 
     // get_results 解包得到原始任务结果列表。
     let results = orch.get_results(&wf).await.expect("should have results");
@@ -827,4 +832,473 @@ async fn high_fanout_dag_completes_correctly() {
             "fanout={fanout}: workflow completed"
         );
     }
+}
+
+// ---- 持久化恢复（重建 Orchestrator 内存状态 + 运行中任务重置为 Pending）----
+
+/// 恢复需要与提交时一致的有效负载签名密钥，否则重建的 ready 任务会因
+/// "signing disabled but payload appears signed" 而失败。
+fn recover_config() -> ActantConfig {
+    ActantConfig {
+        payload_signing_key: TEST_SIGNING_KEY.to_vec(),
+        ..ActantConfig::default()
+    }
+}
+
+/// 进程崩溃后从 Store 恢复：DAG/exec/pending 被重建，已完成任务保留，
+/// 运行中任务被重置为 Pending，恢复后的 Orchestrator 可继续推进至终态。
+///
+/// 模拟时间线：submit → start → 完成 t1 → t2 变为 Running → 未落盘时崩溃。
+/// 恢复后 t2 应被重置为 Pending（可重新调度），t1 保持 Completed。
+#[tokio::test]
+async fn recover_reconstructs_workflow_and_resumes_to_terminal() {
+    let dir = tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+
+    // 写入并推进到"崩溃点"：t1 完成、t2 Running。
+    let wf = WorkflowId::from("wf-recover-1");
+    let orch = Orchestrator::new()
+        .with_signing_key(TEST_SIGNING_KEY.to_vec())
+        .with_store(store.clone());
+    orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
+    let roots = orch.start(&wf).unwrap();
+    assert_eq!(roots.len(), 1);
+    orch.mark_task_running(&wf, &roots[0].id).unwrap();
+    let (ready, _, _) = orch
+        .on_task_completed(&wf, &TaskId::from("t1"), b"r1".to_vec())
+        .await
+        .unwrap();
+    assert_eq!(ready.len(), 1);
+    orch.mark_task_running(&wf, &TaskId::from("t2")).unwrap();
+    // 显式落盘非终态进度（模拟后台 flush），相当于崩溃前的最后检查点。
+    orch.flush_dirty().await.unwrap();
+    drop(orch);
+
+    // 模拟重启：从同一 Store 恢复 Orchestrator 内存状态。
+    let recovered = Orchestrator::recover(store, recover_config(), None)
+        .await
+        .unwrap();
+    assert!(recovered.has_workflow(&wf));
+
+    let state = recovered.get_state(&wf).unwrap();
+    assert!(
+        !state.is_terminal(),
+        "recovered workflow must not be terminal"
+    );
+    assert_eq!(state.state, Phase::Running);
+    // t1 已完成 → 保留 Completed；t2 曾 Running → 重置为 Pending。
+    assert_eq!(state.tasks[&TaskId::from("t1")].state, Phase::Completed);
+    assert_eq!(state.tasks[&TaskId::from("t2")].state, Phase::Pending);
+    assert_eq!(state.tasks[&TaskId::from("t3")].state, Phase::Pending);
+
+    // 待调度任务重新浮出为 ready：仅 state == Pending 且 pending == 0 的任务
+    // 会被重建派发。t1 已 Completed，绝不能被重跑（副作用重复执行）；
+    // t2 曾 Running，恢复时被重置为 Pending，是唯一应重新派发的任务。
+    let mut ready_ids: Vec<String> = recovered
+        .recover_ready_tasks()
+        .into_iter()
+        .map(|t| t.id.to_string())
+        .collect();
+    ready_ids.sort();
+    assert_eq!(ready_ids, vec!["t2".to_string()]);
+
+    // 恢复后的 Orchestrator 可继续推进：完成 t2、t3 后工作流进入 Completed。
+    recovered
+        .on_task_completed(&wf, &TaskId::from("t2"), b"r2".to_vec())
+        .await
+        .unwrap();
+    let (_, _, terminal) = recovered
+        .on_task_completed(&wf, &TaskId::from("t3"), b"r3".to_vec())
+        .await
+        .unwrap();
+    assert!(terminal);
+    assert_eq!(recovered.get_state(&wf).unwrap().state, Phase::Completed);
+}
+
+/// 崩溃发生在 `submit` 之后、任何进度落盘之前：恢复后所有任务仍为 Pending，
+/// 可从根任务重新 start 并走完全程（验证"仅提交即崩溃"也能被恢复）。
+#[tokio::test]
+async fn recover_resumes_workflow_submitted_before_progress_flush() {
+    let dir = tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+
+    let wf = WorkflowId::from("wf-recover-2");
+    let orch = Orchestrator::new()
+        .with_signing_key(TEST_SIGNING_KEY.to_vec())
+        .with_store(store.clone());
+    // submit 已同步持久化 dag/exec/pending；此后再无任何改动（模拟刚提交即崩溃）。
+    orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
+    drop(orch);
+
+    let recovered = Orchestrator::recover(store, recover_config(), None)
+        .await
+        .unwrap();
+    assert!(recovered.has_workflow(&wf));
+    let state = recovered.get_state(&wf).unwrap();
+    assert!(!state.is_terminal());
+    for ts in state.tasks.values() {
+        assert_eq!(ts.state, Phase::Pending);
+    }
+
+    // 重新 start → 返回根任务 t1，随后可走完整个线性 DAG。
+    let roots = recovered.start(&wf).unwrap();
+    assert_eq!(roots.len(), 1);
+    assert_eq!(roots[0].id, TaskId::from("t1"));
+    recovered
+        .on_task_completed(&wf, &TaskId::from("t1"), b"r1".to_vec())
+        .await
+        .unwrap();
+    recovered
+        .on_task_completed(&wf, &TaskId::from("t2"), b"r2".to_vec())
+        .await
+        .unwrap();
+    let (_, _, terminal) = recovered
+        .on_task_completed(&wf, &TaskId::from("t3"), b"r3".to_vec())
+        .await
+        .unwrap();
+    assert!(terminal);
+    assert_eq!(recovered.get_state(&wf).unwrap().state, Phase::Completed);
+}
+
+// ---- P0-2：终态守卫（迟到完成不得复活终态工作流）----
+
+/// 取消后 worker 迟到回传完成：`on_task_completed` 应被守卫拒绝——
+/// 工作流保持 Cancelled，任务状态与结果不被改写，不返回任何 ready 后继。
+#[tokio::test]
+async fn late_completion_after_cancel_does_not_change_terminal_state() {
+    let orch = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
+    let wf = WorkflowId::from("wf-late-cancel");
+    orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
+    orch.start(&wf).unwrap();
+    orch.mark_task_running(&wf, &TaskId::from("t1")).unwrap();
+    orch.cancel(&wf).await.unwrap();
+
+    let (ready, conditional, terminal) = orch
+        .on_task_completed(&wf, &TaskId::from("t1"), b"late".to_vec())
+        .await
+        .unwrap();
+
+    assert!(ready.is_empty(), "no ready successors may be returned");
+    assert!(conditional.is_empty());
+    assert!(
+        !terminal,
+        "skipped late completion must not report a fresh terminal transition"
+    );
+
+    let state = orch.get_state(&wf).unwrap();
+    assert_eq!(
+        state.state,
+        Phase::Cancelled,
+        "workflow must stay Cancelled"
+    );
+    let t1 = state.tasks.get(&TaskId::from("t1")).unwrap();
+    assert_eq!(t1.state, Phase::Cancelled, "task must stay Cancelled");
+    assert!(t1.result.is_none(), "late result must not be attached");
+    assert_eq!(state.succeeded_count(), 0);
+}
+
+/// 失败（FailFast）后迟到的完成结果不得把 Failed 工作流复活为 Completed。
+#[tokio::test]
+async fn late_completion_after_failure_does_not_revive_workflow() {
+    let orch = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
+    let wf = WorkflowId::from("wf-late-fail");
+    orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
+    orch.start(&wf).unwrap();
+    orch.fail_task(
+        &wf,
+        &TaskId::from("t1"),
+        "boom".to_string(),
+        FailureScope::WorkflowLevel,
+    )
+    .await
+    .unwrap();
+    assert_eq!(orch.get_state(&wf).unwrap().state, Phase::Failed);
+
+    let (ready, _, terminal) = orch
+        .on_task_completed(&wf, &TaskId::from("t1"), b"late".to_vec())
+        .await
+        .unwrap();
+
+    assert!(ready.is_empty());
+    assert!(!terminal);
+    let state = orch.get_state(&wf).unwrap();
+    assert_eq!(state.state, Phase::Failed, "workflow must stay Failed");
+    let t1 = state.tasks.get(&TaskId::from("t1")).unwrap();
+    assert_eq!(t1.state, Phase::Failed);
+    assert!(t1.result.is_none());
+}
+
+// ---- P1：submit_with_timeout 的 deadline 持久化 ----
+
+/// 设置 deadline 后经 flush 落盘，重启 recover 后 deadline 仍在。
+#[tokio::test]
+async fn submit_with_timeout_persists_deadline_across_recover() {
+    let dir = tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let wf = WorkflowId::from("wf-deadline");
+
+    let orch = Orchestrator::new()
+        .with_signing_key(TEST_SIGNING_KEY.to_vec())
+        .with_store(store.clone());
+    orch.submit_with_timeout(wf.clone(), make_linear_dag(), 5000)
+        .await
+        .unwrap();
+    // deadline 设置晚于 submit 的同步落盘，必须经脏标记随 flush 落盘。
+    orch.flush_dirty().await.unwrap();
+    drop(orch);
+
+    let recovered = Orchestrator::recover(store, recover_config(), None)
+        .await
+        .unwrap();
+    assert!(recovered.has_workflow(&wf));
+    let state = recovered.get_state(&wf).unwrap();
+    assert_eq!(
+        state.deadline_ms(),
+        Some(5000),
+        "deadline must survive persist + recover"
+    );
+}
+
+// ---- P1：条件边求值失败不得丢弃 ready 后继 ----
+
+/// 求值器返回 Err 时：`on_task_completed` 不应整体失败，已就绪的普通后继
+/// 照常返回，求值失败的条件边原样交还调用方外部处理（重试同一完成消息
+/// 不会因任务已终态被守卫拒绝而永久卡死）。
+#[tokio::test]
+async fn condition_evaluator_error_defers_edge_and_keeps_ready() {
+    struct AlwaysErr;
+    #[async_trait]
+    impl ConditionEvaluator for AlwaysErr {
+        async fn evaluate(
+            &self,
+            _workflow_id: &WorkflowId,
+            _task_id: &TaskId,
+            _condition: &str,
+        ) -> crate::common::Result<bool> {
+            Err(ActantError::Internal("evaluator down".into()))
+        }
+    }
+
+    let orch = Orchestrator::new()
+        .with_signing_key(TEST_SIGNING_KEY.to_vec())
+        .with_condition_evaluator(Arc::new(AlwaysErr));
+    let wf = WorkflowId::from("wf-cond-err");
+
+    // t1 ──普通──→ t3
+    // t1 ──条件──→ t2
+    let mut dag = Dag::new();
+    dag.add_node(make_node("t1", "root")).unwrap();
+    dag.add_node(make_node("t2", "cond_succ")).unwrap();
+    dag.add_node(make_node("t3", "plain_succ")).unwrap();
+    dag.add_edge(TaskId::from("t1"), TaskId::from("t3"))
+        .unwrap();
+    dag.add_conditional_edge(TaskId::from("t1"), TaskId::from("t2"), "maybe".to_string())
+        .unwrap();
+
+    orch.submit(wf.clone(), dag).await.unwrap();
+    orch.start(&wf).unwrap();
+
+    let (ready, conditional, terminal) = orch
+        .on_task_completed(&wf, &TaskId::from("t1"), b"r1".to_vec())
+        .await
+        .unwrap();
+
+    assert!(
+        !terminal,
+        "workflow must not be terminal with t2/t3 still outstanding"
+    );
+    // 普通后继 t3 照常就绪并被返回。
+    assert_eq!(ready.len(), 1, "ready successor must not be dropped");
+    assert_eq!(ready[0].id, TaskId::from("t3"));
+    // 求值失败的条件边原样交还调用方。
+    assert_eq!(
+        conditional,
+        vec![(TaskId::from("t2"), "maybe".to_string())],
+        "failed conditional edge must be deferred to the caller"
+    );
+
+    // t2 仍是 Pending（未被跳过也未被激活）。
+    let state = orch.get_state(&wf).unwrap();
+    assert_eq!(state.tasks[&TaskId::from("t2")].state, Phase::Pending);
+}
+
+// ---- P1：超时失败的工作流写入 Failed 事件 ----
+
+/// 工作流级硬超时触发后，除状态翻转外还应向 `workflow:{id}` topic 写入
+/// `WorkflowEventPayload::Failed` 事件（对齐 fail_task 路径）。
+#[tokio::test]
+async fn workflow_timeout_writes_failed_event_to_event_log() {
+    use crate::runtime::state::event_log::{EventLog, MemoryEventLog};
+    use crate::runtime::workflow::orchestrator::types::WorkflowEventPayload;
+
+    let mut config = ActantConfig::default();
+    config.workflow.state_poll_interval_ms = 20;
+    let event_log = Arc::new(MemoryEventLog::default());
+    let orch = Orchestrator::new()
+        .with_signing_key(TEST_SIGNING_KEY.to_vec())
+        .with_config(config)
+        .with_event_log(event_log.clone());
+
+    let wf = WorkflowId::from("wf-timeout-event");
+    orch.submit_with_timeout(wf.clone(), make_linear_dag(), 10)
+        .await
+        .unwrap();
+    let roots = orch.start(&wf).unwrap();
+    orch.mark_task_running(&wf, &roots[0].id).unwrap();
+
+    let cancel_tx = orch.start_timeout_watcher();
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let _ = cancel_tx.send(true);
+
+    let state = orch.get_state(&wf).unwrap();
+    assert_eq!(state.state, Phase::Failed);
+
+    let topic = format!("workflow:{}", wf.as_str());
+    let entries = event_log.read_after(&topic, None).unwrap();
+    let has_failed_event = entries.iter().any(|entry| {
+        postcard::from_bytes::<WorkflowEventPayload>(&entry.payload)
+            .is_ok_and(|p| matches!(p, WorkflowEventPayload::Failed { .. }))
+    });
+    assert!(
+        has_failed_event,
+        "timeout must append a Failed event to topic {topic}"
+    );
+}
+
+// ───────────────────────── 派发代数（attempt）递增测试 ─────────────────────────
+
+/// 首次派发 attempt = 0，任务完成后重试路径递增 attempt 并随新派发携带。
+#[tokio::test]
+async fn prepare_task_retry_increments_attempt_and_carries_it_on_dispatch() {
+    let orch = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
+    let wf = WorkflowId::from("wf-attempt-retry");
+    orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
+
+    let roots = orch.start(&wf).unwrap();
+    assert_eq!(roots[0].attempt, 0, "first dispatch must carry attempt 0");
+
+    // t1 失败（TaskOnly，workflow 保持非终态）后重试。
+    orch.fail_task(
+        &wf,
+        &TaskId::from("t1"),
+        "boom".into(),
+        FailureScope::TaskOnly,
+    )
+    .await
+    .unwrap();
+
+    let task_def = orch
+        .prepare_task_retry(&wf, &TaskId::from("t1"))
+        .unwrap()
+        .expect("failed task should be retryable");
+    assert_eq!(
+        task_def.attempt, 1,
+        "retry dispatch must carry the incremented attempt"
+    );
+
+    let state = orch.get_state(&wf).unwrap();
+    assert_eq!(
+        state.tasks[&TaskId::from("t1")].attempt(),
+        1,
+        "TaskState.attempt must record the new dispatch generation"
+    );
+}
+
+/// 故障转移重派发：Running 任务重置 Pending 时 attempt 递增并随新派发携带。
+#[tokio::test]
+async fn reschedule_running_tasks_increments_attempt_and_carries_it_on_dispatch() {
+    let orch = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
+    let wf = WorkflowId::from("wf-attempt-resched");
+    orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
+    orch.start(&wf).unwrap();
+    orch.mark_task_running(&wf, &TaskId::from("t1")).unwrap();
+
+    let rescheduled = orch.reschedule_running_tasks(&wf).unwrap();
+    assert_eq!(rescheduled.len(), 1);
+    assert_eq!(
+        rescheduled[0].id,
+        TaskId::from("t1"),
+        "only the running task should be rescheduled"
+    );
+    assert_eq!(
+        rescheduled[0].attempt, 1,
+        "failover redispatch must carry the incremented attempt"
+    );
+
+    // 再次重派发（新一轮故障转移）继续递增。
+    orch.mark_task_running(&wf, &TaskId::from("t1")).unwrap();
+    let rescheduled = orch.reschedule_running_tasks(&wf).unwrap();
+    assert_eq!(rescheduled[0].attempt, 2);
+}
+
+// ───────────────────────── complete_task 入口 attempt fencing 测试 ─────────────────────────
+
+/// 故障转移重派发后（attempt=1），旧代（attempt=0）在途执行的迟到完成结果在
+/// `complete_task` 入口被丢弃：任务保持 Pending、后继不被调度、无终态推进；
+/// 当代（attempt=1）结果正常接受并调度后继。
+#[tokio::test]
+async fn complete_task_drops_stale_attempt_result_and_accepts_current() {
+    let orch = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
+    let wf = WorkflowId::from("wf-fencing-complete");
+    orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
+    orch.start(&wf).unwrap();
+    orch.mark_task_running(&wf, &TaskId::from("t1")).unwrap();
+
+    // 故障转移：t1 重置 Pending，attempt 0 → 1
+    let rescheduled = orch.reschedule_running_tasks(&wf).unwrap();
+    assert_eq!(rescheduled[0].attempt, 1);
+
+    // 旧代（attempt 0）迟到完成 → 丢弃：t1 保持 Pending，t2 不 ready。
+    let info = orch
+        .complete_task(&wf, &TaskId::from("t1"), b"stale".to_vec(), Some(0))
+        .await
+        .unwrap();
+    assert!(
+        info.ready_successors.is_empty(),
+        "stale result must not schedule successors"
+    );
+    assert!(!info.workflow_terminal);
+    let state = orch.get_state(&wf).unwrap();
+    assert_eq!(state.tasks[&TaskId::from("t1")].state, Phase::Pending);
+    assert!(state.tasks[&TaskId::from("t1")].result.is_none());
+
+    // 当代（attempt 1）完成 → 接受：t2 ready。
+    let info = orch
+        .complete_task(&wf, &TaskId::from("t1"), b"fresh".to_vec(), Some(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        info.ready_successors.len(),
+        1,
+        "current-generation result must schedule the successor"
+    );
+    assert_eq!(
+        info.ready_successors[0],
+        TaskId::from("t2"),
+        "current-generation result must schedule the successor"
+    );
+    let state = orch.get_state(&wf).unwrap();
+    assert_eq!(state.tasks[&TaskId::from("t1")].state, Phase::Completed);
+    assert_eq!(
+        state.tasks[&TaskId::from("t1")].result.as_deref(),
+        Some(b"fresh".as_slice())
+    );
+}
+
+/// `on_task_completed`（公共入口）在结果通路未携带 attempt 时传 `None`：
+/// fencing 放行，行为与协议扩展前一致（向后兼容）。
+#[tokio::test]
+async fn on_task_completed_without_attempt_info_still_accepts_results() {
+    let orch = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
+    let wf = WorkflowId::from("wf-fencing-compat");
+    orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
+    orch.start(&wf).unwrap();
+
+    let (ready, _, terminal) = orch
+        .on_task_completed(&wf, &TaskId::from("t1"), b"r1".to_vec())
+        .await
+        .unwrap();
+    assert!(!terminal);
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].id, TaskId::from("t2"));
 }

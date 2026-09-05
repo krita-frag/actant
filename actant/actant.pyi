@@ -8,7 +8,9 @@ def refresh_logger() -> None: ...
 def prometheus_text() -> str: ...
 
 # Rust-exposed exceptions (register_exceptions in src/py/error.rs)
-class ActantError(RuntimeError): ...
+# 从 actant.exceptions 导入的 Python 端异常类，与 Rust ActantError 一一对应。
+class ActantError(RuntimeError):
+    kind: str
 class StorageError(ActantError): ...
 class NetworkError(ActantError): ...
 class SerializationError(ActantError): ...
@@ -20,10 +22,17 @@ class ConfigError(ActantError): ...
 class MetricsError(ActantError): ...
 class NotFoundError(ActantError): ...
 class AlreadyExistsError(ActantError): ...
-class TimeoutError(ActantError): ...
-class CancelledError(ActantError): ...
+class ActantTimeoutError(ActantError): ...
+class TaskCancelledError(ActantError): ...
 class InvalidStateError(ActantError): ...
 class InternalError(ActantError): ...
+class PayloadTooLargeError(ActantError):
+    actual: int
+    limit: int
+class WorkflowFailedError(ActantError):
+    task_name: str | None
+    task_error: str | None
+class WorkflowCancelledError(ActantError): ...
 
 @final
 class CancelToken:
@@ -75,9 +84,8 @@ class _NetworkConfig:
         listen_port: int = 0,
         listen_ip: str = "",
         capability_gossip_interval_ms: int = 5000,
-        actor_router_strategy: str = "round-robin",
-        actor_registry_gossip_interval_ms: int = 30000,
         event_channel_capacity: int = 256,
+        dns_origin_domain: str = "",
     ) -> _NetworkConfig: ...
     @property
     def preset(self) -> str: ...
@@ -102,11 +110,10 @@ class _NetworkConfig:
     @property
     def capability_gossip_interval_ms(self) -> int: ...
     @property
-    def actor_router_strategy(self) -> str: ...
-    @property
-    def actor_registry_gossip_interval_ms(self) -> int: ...
-    @property
     def event_channel_capacity(self) -> int: ...
+    @property
+    def dns_origin_domain(self) -> str:
+        """自定义 DNS 起源域，仅当 ``preset = "dns"`` 时生效；空 = n0 默认 ``iroh.link``。"""
 
 @final
 class _FailoverConfig:
@@ -128,13 +135,15 @@ class _FailoverConfig:
 
 @final
 class _GossipConfig:
+    """Gossip 同步配置。所有字段的默认值取自 Rust ``GossipConfig::default()``（单一来源）。"""
+
     def __new__(
         cls,
-        dedup_window_size: int = 1024,
-        dedup_ttl_secs: int = 300,
-        retry_attempts: int = 3,
-        retry_base_delay_ms: int = 100,
-        heads_broadcast_interval_ms: int = 30000,
+        dedup_window_size: int | None = None,
+        dedup_ttl_secs: int | None = None,
+        retry_attempts: int | None = None,
+        retry_base_delay_ms: int | None = None,
+        heads_broadcast_interval_ms: int | None = None,
     ) -> _GossipConfig: ...
     @property
     def dedup_window_size(self) -> int: ...
@@ -149,6 +158,16 @@ class _GossipConfig:
 
 @final
 class _ActantConfig:
+    """Rust ``ActantConfig`` 的 PyO3 桥。
+
+    Worker 相关默认值（均取自 Rust 侧默认值）：
+    - ``max_concurrent_tasks`` 默认 ``num_cpus``；
+    - ``num_worker_processes`` 默认跟随 ``max_concurrent_tasks``（保持并发
+      信号量与进程池容量一致）；
+    - ``crash_failover_max_attempts`` 默认 3；
+    - ``workflow_default_timeout_ms`` 默认 3_600_000（``WorkflowConfig``）。
+    """
+
     def __new__(
         cls,
         payload_signing_key: str,
@@ -162,6 +181,9 @@ class _ActantConfig:
         remote_fallback_delay_ms: int | None = None,
         scheduler: str | None = None,
         require_payload_signing: bool = False,
+        num_worker_processes: int | None = None,
+        crash_failover_max_attempts: int | None = None,
+        workflow_default_timeout_ms: int | None = None,
     ) -> _ActantConfig: ...
     @property
     def payload_signing_key(self) -> str: ...
@@ -175,6 +197,15 @@ class _ActantConfig:
     def gossip(self) -> _GossipConfig: ...
     @property
     def max_concurrent_tasks(self) -> int: ...
+    @property
+    def num_worker_processes(self) -> int:
+        """worker 子进程数（进程池大小）；``None`` 构造时跟随 ``max_concurrent_tasks``。"""
+    @property
+    def crash_failover_max_attempts(self) -> int:
+        """worker 崩溃后任务重路由的最大执行次数（含首次）。"""
+    @property
+    def workflow_default_timeout_ms(self) -> int:
+        """工作流默认超时（毫秒）。"""
     @property
     def default_task_timeout_ms(self) -> int: ...
     @property
@@ -202,13 +233,9 @@ class PyAsyncAwaitable:
 @final
 class _Event:
     @property
-    def kind(self) -> str: ...  # "completion" | "orchestration" | "supervision"
+    def kind(self) -> str: ...  # "completion"
     @property
     def completion(self) -> _TaskCompletion | None: ...
-    @property
-    def orchestration(self) -> _OrchestrationEvent | None: ...
-    @property
-    def supervision(self) -> _SupervisionEventData | None: ...
 
 @final
 class _TaskCompletion:
@@ -228,33 +255,15 @@ class _TaskCompletion:
     def target_node(self) -> str | None: ...
 
 @final
-class _OrchestrationEvent:
-    @property
-    def event_type(self) -> str: ...
-    @property
-    def workflow_id(self) -> str | None: ...
-    @property
-    def task_id(self) -> str | None: ...
-    @property
-    def node_id(self) -> str | None: ...
-    @property
-    def active_workflows(self) -> list[str] | None: ...
-    @property
-    def data(self) -> bytes | None: ...
-    @property
-    def state(self) -> str: ...
-    @property
-    def available_capacity(self) -> int | None: ...
-    @property
-    def max_capacity(self) -> int | None: ...
-
-@final
 class _DagNode:
     """DAG 节点定义，由 Python 层构造后通过 `submit_dag` 提交。
 
+    `task_id` 是节点在 DAG 中的唯一标识（对应 Orchestrator 侧 TaskId），
+    由 FlowDAG 记录器设为被提交任务的 task_id；`name` 为人类可读名称。
     `priority` 为有符号整数；语义由 Python 层定义。
     `metadata` 为不透明 key-value 映射，Rust 透传不解释。
     """
+    task_id: str
     name: str
     payload: bytes
     retry: _RetryPolicy | None
@@ -264,6 +273,7 @@ class _DagNode:
 
     def __new__(
         cls,
+        task_id: str,
         name: str,
         payload: bytes,
         retry: _RetryPolicy | None = None,
@@ -327,15 +337,6 @@ class _CapabilityRuntime:
     def perform_batch_async(self, items: list[tuple[str, Any]]) -> Any: ...
 
 @final
-class _SupervisionEventData:
-    @property
-    def event_type(self) -> str: ...
-    @property
-    def actor_id(self) -> str: ...
-    @property
-    def error(self) -> str | None: ...
-
-@final
 class _ListenAddresses:
     """本节点监听地址信息，由 ``_RuntimeCore.listen_addresses()`` 返回。"""
 
@@ -347,28 +348,6 @@ class _ListenAddresses:
     def direct_addrs(self) -> list[str]: ...
     @property
     def endpoint_addr(self) -> str: ...
-
-@final
-class _ActorCore:
-    async def call_method(
-        self,
-        actor_id: str,
-        method: str,
-        payload: bytes,
-    ) -> bytes: ...
-    async def call_method_by_type(
-        self,
-        actor_type: str,
-        method: str,
-        payload: bytes,
-    ) -> bytes: ...
-    def stop_actor(self, actor_id: str) -> None: ...
-    def kill_actor(self, actor_id: str) -> None: ...
-    def restart_actor(self, actor_id: str, actor_type: str) -> None: ...
-    def actor_status(self, actor_id: str) -> str: ...
-    def list_actors(self) -> list[str]: ...
-    def local_actor_types(self) -> list[str]: ...
-    def known_actor_types(self) -> list[str]: ...
 
 @final
 class _RuntimeCore:
@@ -401,5 +380,20 @@ class _RuntimeCore:
     def max_concurrent_tasks(self) -> int: ...
     def broadcast_cancel(self, task_id: str, workflow_id: str) -> None: ...
     def submit_task(self, task: _TaskDef) -> None: ...
+    def submit_tasks_batch(self, tasks: list[_TaskDef]) -> None:
+        """批量提交任务（性能优化路径）：比循环调用 ``submit_task`` 快 10-50x。
+
+        仅在批量场景使用（如 ``gather``）；要求已调用 ``serve()``。
+        """
+    def submit_dag(
+        self,
+        workflow_id: str,
+        nodes: list[_DagNode],
+        edges: list[tuple[str, str]],
+        failure_strategy: str | None = None,
+        default_retry_policy: _RetryPolicy | None = None,
+    ) -> None: ...
+    def complete_workflow(self, workflow_id: str, outcomes: list[tuple[str, bool, bytes]]) -> None: ...
+    def get_workflow_state(self, workflow_id: str) -> dict[str, Any] | None: ...
+    def list_workflows(self) -> list[str]: ...
     def register_task_result_callback(self, callback: Callable[[_TaskCompletion], None]) -> None: ...
-    def register_python_dispatch_handler(self, handler: Callable[[bytes, CancelToken], bytes]) -> None: ...

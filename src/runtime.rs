@@ -21,6 +21,8 @@ pub mod context;
 pub mod dispatcher;
 pub mod event_bus;
 pub mod network;
+#[cfg(feature = "spike-blobs")]
+pub mod spike_blobs;
 pub mod state;
 pub mod workflow;
 

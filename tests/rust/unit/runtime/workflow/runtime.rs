@@ -60,9 +60,16 @@ fn make_worker(node_id: &str) -> Worker {
     let network: Arc<dyn Transport> = Arc::new(MockTransport::new(node_id));
     let scheduler: Arc<dyn Scheduler> = Arc::new(MockScheduler::new());
     let event_bus = EventBus::new();
-    let dispatcher = crate::runtime::dispatcher::TaskRegistry::new(1, 8, Vec::new())
-        .expect("TaskRegistry init")
-        .into_dispatcher();
+    let dispatcher = Arc::new(
+        crate::runtime::dispatcher::ProcessTaskDispatcher::new(
+            0,
+            "python3".to_string(),
+            1,
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("ProcessTaskDispatcher init"),
+    );
     let handle = tokio::runtime::Handle::current();
     Worker::new(
         NodeId::from(node_id.to_string()),
@@ -88,7 +95,10 @@ async fn worker_getters_return_configured_values() {
     assert_eq!(worker.node_id().as_str(), "node-A");
     assert_eq!(worker.network().node_id().as_str(), "node-A");
     assert_eq!(worker.state(), WorkerState::Running);
-    assert_eq!(worker.max_concurrent_tasks(), 1); // WorkerConfig::default
+    assert_eq!(
+        worker.max_concurrent_tasks(),
+        WorkerConfig::default().max_concurrent_tasks
+    ); // 进程池模型默认并发度 = num_cpus
     assert_eq!(worker.running_task_count(), 0);
     assert!(worker.scheduler_actor_id().is_none());
 }
@@ -200,8 +210,8 @@ async fn router_handle_peer_connected_publishes_event() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
-        actor_registry_gossip: None,
         capability_gossip: None,
+        failover: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
     });
@@ -236,8 +246,8 @@ async fn router_handle_peer_disconnected_publishes_event() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
-        actor_registry_gossip: None,
         capability_gossip: None,
+        failover: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
     });
@@ -271,8 +281,8 @@ async fn router_handle_message_unknown_topic_is_noop() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
-        actor_registry_gossip: None,
         capability_gossip: None,
+        failover: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
     });
@@ -285,19 +295,25 @@ async fn router_handle_message_unknown_topic_is_noop() {
 }
 
 #[tokio::test]
-async fn router_handle_message_heartbeat_publishes_to_event_bus() {
+async fn router_handle_message_heartbeat_dispatches_to_failover() {
     let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-A"));
-    let event_bus = EventBus::new();
     let scheduler: Arc<dyn Scheduler> = Arc::new(MockScheduler::new());
+    let node_id = NodeId::from("node-A".to_string());
+    let failover = Arc::new(crate::runtime::workflow::FailoverManager::new(
+        node_id.clone(),
+        network.clone(),
+        Arc::new(crate::runtime::actor::ActorSystem::new()),
+        crate::common::ActorId::workflow(&node_id),
+    ));
     let router = NetworkEventRouter::new(NetworkEventRouterConfig {
         network,
-        event_bus: event_bus.clone(),
+        event_bus: EventBus::new(),
         scheduler,
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
-        actor_registry_gossip: None,
         capability_gossip: None,
+        failover: Some(failover.clone()),
         cancel_flags: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
     });
@@ -316,17 +332,16 @@ async fn router_handle_message_heartbeat_publishes_to_event_bus() {
     let topic = crate::common::Topic::heartbeat().to_string();
     let payload = crate::runtime::workflow::messaging::encode(&envelope).expect("encode envelope");
 
-    let mut sub = event_bus.subscribe(BusTopic::ClusterHeartbeat);
     router.handle_message(&topic, &payload).await;
 
-    let event = tokio::time::timeout(Duration::from_millis(500), sub.recv())
-        .await
-        .expect("event published in time")
-        .expect("event present");
-    match event {
-        BusEvent::Heartbeat(received) => assert_eq!(received.node_id, hb.node_id),
-        other => panic!("expected Heartbeat, got {:?}", other),
-    }
+    // 直连分发：FailoverManager 应登记 peer 及其容量视图。
+    let peers = failover.get_peer_infos();
+    let peer = peers
+        .get(&hb.node_id)
+        .expect("peer should be registered from heartbeat");
+    assert_eq!(peer.available_slots, 4);
+    assert_eq!(peer.max_slots, 8);
+    assert_eq!(peer.endpoint_addr.as_deref(), Some("peer-node-HB"));
 }
 
 #[tokio::test]
@@ -342,8 +357,8 @@ async fn router_handle_task_result_returns_false_without_actor_system() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
-        actor_registry_gossip: None,
         capability_gossip: None,
+        failover: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
     });
@@ -367,8 +382,8 @@ async fn router_handle_task_result_returns_false_without_actor_system() {
 
 #[tokio::test]
 async fn worker_set_max_concurrent_tasks_expands_capacity() {
-    let worker = make_worker("node-expand");
-    assert_eq!(worker.max_concurrent_tasks(), 1);
+    let worker = make_worker("node-expand").with_max_concurrent_tasks(2);
+    assert_eq!(worker.max_concurrent_tasks(), 2);
     worker.set_max_concurrent_tasks(4);
     assert_eq!(worker.max_concurrent_tasks(), 4);
     assert_eq!(worker.running_task_count(), 0);
@@ -403,8 +418,10 @@ async fn worker_capacity_callback_invoked_on_notify() {
     let cb: Arc<dyn Fn(u32, u32) + Send + Sync> = Arc::new(move |avail, max| {
         calls_clone.lock().unwrap().push((avail, max));
     });
-    let worker = make_worker("node-cb").with_capacity_callback(cb);
-    worker.set_max_concurrent_tasks(4);
+    let worker = make_worker("node-cb")
+        .with_capacity_callback(cb)
+        .with_max_concurrent_tasks(2);
+    worker.set_max_concurrent_tasks(4); // 扩张，回调应触发
     let recorded = calls.lock().unwrap().clone();
     assert!(
         recorded.iter().any(|(avail, max)| *max == 4 && *avail > 0),
@@ -451,9 +468,16 @@ async fn worker_schedule_task_with_real_scheduler() {
 
     let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-sched"));
     let event_bus = EventBus::new();
-    let dispatcher = crate::runtime::dispatcher::TaskRegistry::new(1, 8, Vec::new())
-        .expect("TaskRegistry init")
-        .into_dispatcher();
+    let dispatcher = Arc::new(
+        crate::runtime::dispatcher::ProcessTaskDispatcher::new(
+            0,
+            "python3".to_string(),
+            1,
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("ProcessTaskDispatcher init"),
+    );
     let handle = tokio::runtime::Handle::current();
     let worker = Worker::new(
         NodeId::from("node-sched".to_string()),
@@ -488,6 +512,52 @@ async fn worker_schedule_task_with_real_scheduler() {
 
 // ───────────────────────── NetworkEventRouter 扩展测试 ─────────────────────────
 
+/// 全部方法返回 ok 的 WorkflowActor 桩：使 DagGossip 的落地调用成功返回，
+/// 从而验证直连分发路径（不关心 workflow 状态本身）。
+struct OkWorkflowActor;
+
+#[async_trait::async_trait]
+impl crate::runtime::actor::Actor for OkWorkflowActor {
+    fn actor_type(&self) -> &str {
+        "WorkflowActor"
+    }
+
+    async fn handle_message(
+        &mut self,
+        msg: crate::common::ActorMessage,
+    ) -> crate::common::Result<crate::common::ActorMessageResult> {
+        Ok(crate::common::ActorMessageResult {
+            message_id: msg.id,
+            payload: vec![],
+            error: None,
+        })
+    }
+}
+
+/// 记录到达方法的 Actor 桩：验证 wire 消息直连分发到了目标 actor 方法。
+struct RecordingActor {
+    methods: Arc<parking_lot::Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl crate::runtime::actor::Actor for RecordingActor {
+    fn actor_type(&self) -> &str {
+        "recording"
+    }
+
+    async fn handle_message(
+        &mut self,
+        msg: crate::common::ActorMessage,
+    ) -> crate::common::Result<crate::common::ActorMessageResult> {
+        self.methods.lock().push(msg.method);
+        Ok(crate::common::ActorMessageResult {
+            message_id: msg.id,
+            payload: vec![],
+            error: None,
+        })
+    }
+}
+
 fn make_router(node_id: &str) -> (NetworkEventRouter, EventBus, Arc<MockTransport>) {
     let network = Arc::new(MockTransport::new(node_id));
     let event_bus = EventBus::new();
@@ -499,8 +569,8 @@ fn make_router(node_id: &str) -> (NetworkEventRouter, EventBus, Arc<MockTranspor
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
-        actor_registry_gossip: None,
         capability_gossip: None,
+        failover: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
     });
@@ -528,8 +598,8 @@ async fn router_handle_message_cancel_broadcast_sets_cancel_flag() {
             actor_system: None,
             workflow_actor_id: None,
             dag_gossip_actor_id: None,
-            actor_registry_gossip: None,
             capability_gossip: None,
+            failover: None,
             cancel_flags: cancel_flags.clone(),
             cancelled_tasks: cancelled_tasks.clone(),
         });
@@ -584,8 +654,42 @@ async fn router_handle_message_task_dispatch_enqueues_to_scheduler() {
 }
 
 #[tokio::test]
-async fn router_handle_message_dag_state_update_publishes_event() {
-    let (router, event_bus, _network) = make_router("node-dag");
+async fn router_handle_message_dag_state_update_dispatches_to_dag_gossip_actor() {
+    let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-dag"));
+    let node_id = NodeId::from("node-dag".to_string());
+    let actor_system = Arc::new(crate::runtime::actor::ActorSystem::new());
+    let workflow_actor_id = crate::common::ActorId::workflow(&node_id);
+    actor_system
+        .spawn(workflow_actor_id.clone(), OkWorkflowActor)
+        .await
+        .unwrap();
+    let gossip = crate::runtime::workflow::DagGossip::new(
+        network.clone(),
+        actor_system.clone(),
+        workflow_actor_id,
+        crate::common::GossipConfig::default(),
+    );
+    let dag_gossip_actor_id = crate::common::ActorId::dag_gossip(&node_id);
+    actor_system
+        .spawn(
+            dag_gossip_actor_id.clone(),
+            crate::runtime::workflow::DagGossipActor::new(gossip.clone()),
+        )
+        .await
+        .unwrap();
+
+    let router = NetworkEventRouter::new(NetworkEventRouterConfig {
+        network,
+        event_bus: EventBus::new(),
+        scheduler: Arc::new(MockScheduler::new()) as Arc<dyn Scheduler>,
+        actor_system: Some(actor_system),
+        workflow_actor_id: None,
+        dag_gossip_actor_id: Some(dag_gossip_actor_id),
+        capability_gossip: None,
+        failover: None,
+        cancel_flags: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+        cancelled_tasks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+    });
 
     let update =
         crate::common::WireMessage::DagStateUpdate(crate::common::wire::WireDagStateUpdate {
@@ -599,19 +703,41 @@ async fn router_handle_message_dag_state_update_publishes_event() {
     let topic = crate::common::Topic::dag_state().to_string();
     let payload = crate::runtime::workflow::messaging::encode(&envelope).expect("encode");
 
-    let mut sub = event_bus.subscribe(BusTopic::DagUpdate);
     router.handle_message(&topic, &payload).await;
 
-    let event = tokio::time::timeout(Duration::from_millis(500), sub.recv())
-        .await
-        .expect("event published in time")
-        .expect("event present");
-    assert!(matches!(event, BusEvent::DagUpdate(_)));
+    // 直连分发：DagGossipActor 应登记远端更新（gossip seen）。
+    for _ in 0..50 {
+        if gossip.seen_count() >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(gossip.seen_count(), 1, "remote update should be applied");
 }
 
 #[tokio::test]
-async fn router_handle_message_failover_claim_publishes_event() {
-    let (router, event_bus, _network) = make_router("node-failover");
+async fn router_handle_message_failover_claim_dispatches_to_failover() {
+    let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-failover"));
+    let node_id = NodeId::from("node-failover".to_string());
+    let failover = Arc::new(crate::runtime::workflow::FailoverManager::new(
+        node_id.clone(),
+        network.clone(),
+        Arc::new(crate::runtime::actor::ActorSystem::new()),
+        crate::common::ActorId::workflow(&node_id),
+    ));
+
+    let router = NetworkEventRouter::new(NetworkEventRouterConfig {
+        network,
+        event_bus: EventBus::new(),
+        scheduler: Arc::new(MockScheduler::new()) as Arc<dyn Scheduler>,
+        actor_system: None,
+        workflow_actor_id: None,
+        dag_gossip_actor_id: None,
+        capability_gossip: None,
+        failover: Some(failover.clone()),
+        cancel_flags: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+        cancelled_tasks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+    });
 
     let claim = crate::common::wire::OrchestratorClaim {
         node_id: NodeId::from("node-claimer".to_string()),
@@ -623,14 +749,16 @@ async fn router_handle_message_failover_claim_publishes_event() {
     let topic = crate::common::Topic::failover().to_string();
     let payload = crate::runtime::workflow::messaging::encode(&envelope).expect("encode");
 
-    let mut sub = event_bus.subscribe(BusTopic::ClusterClaim);
     router.handle_message(&topic, &payload).await;
 
-    let event = tokio::time::timeout(Duration::from_millis(500), sub.recv())
-        .await
-        .expect("event published in time")
-        .expect("event present");
-    assert!(matches!(event, BusEvent::Claim(_)));
+    // 直连分发：远端 claim 应记录到本地租约表。
+    let leases = failover.active_leases();
+    assert!(
+        leases
+            .iter()
+            .any(|(w, n, _, _)| w == "wf-claim" && n == "node-claimer"),
+        "remote claim should be recorded: {leases:?}"
+    );
 }
 
 #[tokio::test]
@@ -880,8 +1008,8 @@ async fn router_handle_direct_request_dispatch_task_ack_rejected() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
-        actor_registry_gossip: None,
         capability_gossip: None,
+        failover: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
     });
@@ -900,8 +1028,34 @@ async fn router_handle_direct_request_dispatch_task_ack_rejected() {
 }
 
 #[tokio::test]
-async fn router_handle_message_heads_exchange_publishes_event() {
-    let (router, event_bus, _network) = make_router("node-heads");
+async fn router_handle_message_heads_exchange_dispatches_to_dag_gossip_actor() {
+    let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-heads"));
+    let node_id = NodeId::from("node-heads".to_string());
+    let actor_system = Arc::new(crate::runtime::actor::ActorSystem::new());
+    let dag_gossip_actor_id = crate::common::ActorId::dag_gossip(&node_id);
+    let methods = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    actor_system
+        .spawn(
+            dag_gossip_actor_id.clone(),
+            RecordingActor {
+                methods: methods.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let router = NetworkEventRouter::new(NetworkEventRouterConfig {
+        network,
+        event_bus: EventBus::new(),
+        scheduler: Arc::new(MockScheduler::new()) as Arc<dyn Scheduler>,
+        actor_system: Some(actor_system),
+        workflow_actor_id: None,
+        dag_gossip_actor_id: Some(dag_gossip_actor_id),
+        capability_gossip: None,
+        failover: None,
+        cancel_flags: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+        cancelled_tasks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+    });
 
     let exchange = crate::common::wire::HeadsExchange {
         node_id: NodeId::from("node-peer".to_string()),
@@ -912,14 +1066,20 @@ async fn router_handle_message_heads_exchange_publishes_event() {
     let topic = crate::common::Topic::heads().to_string();
     let payload = crate::runtime::workflow::messaging::encode(&envelope).expect("encode");
 
-    let mut sub = event_bus.subscribe(BusTopic::HeadsExchange);
     router.handle_message(&topic, &payload).await;
 
-    let event = tokio::time::timeout(Duration::from_millis(500), sub.recv())
-        .await
-        .expect("event published in time")
-        .expect("event present");
-    assert!(matches!(event, BusEvent::HeadsExchange(_)));
+    // 直连分发：HANDLE_HEADS_EXCHANGE 方法应被调用。
+    for _ in 0..50 {
+        if !methods.lock().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        *methods.lock(),
+        vec![crate::runtime::workflow::gossip_methods::HANDLE_HEADS_EXCHANGE.to_string()],
+        "heads exchange should be dispatched directly to the dag gossip actor"
+    );
 }
 
 // ───────────────────────── result_delivery::start_pending_result_loop ─────────────────────────
@@ -929,7 +1089,14 @@ async fn start_pending_result_loop_returns_sendable_channel() {
     let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-delivery"));
     let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
-    let tx = start_pending_result_loop(network, cancel_rx, 3, Duration::from_millis(1), 16);
+    let tx = start_pending_result_loop(
+        network,
+        cancel_rx,
+        3,
+        Duration::from_millis(1),
+        16,
+        EventBus::new(),
+    );
 
     // 通道应可用
     assert!(
@@ -951,6 +1118,7 @@ async fn start_pending_result_loop_drops_after_max_attempts() {
         1, // max_attempts = 1，第一次重试后即达到上限
         Duration::from_millis(1),
         16,
+        EventBus::new(),
     );
 
     let req = crate::runtime::network::DirectRequest::QueryWorkflowState {
@@ -976,7 +1144,14 @@ async fn start_pending_result_loop_shutdown_on_cancel() {
     let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-shutdown"));
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
-    let tx = start_pending_result_loop(network, cancel_rx, 5, Duration::from_millis(100), 16);
+    let tx = start_pending_result_loop(
+        network,
+        cancel_rx,
+        5,
+        Duration::from_millis(100),
+        16,
+        EventBus::new(),
+    );
 
     // 发送取消信号
     let _ = cancel_tx.send(true);
@@ -1177,9 +1352,16 @@ impl Transport for ConfigurableMockTransport {
 fn make_worker_with_transport(node_id: &str, transport: Arc<dyn Transport>) -> Worker {
     let scheduler: Arc<dyn Scheduler> = Arc::new(MockScheduler::new());
     let event_bus = EventBus::new();
-    let dispatcher = crate::runtime::dispatcher::TaskRegistry::new(1, 8, Vec::new())
-        .expect("TaskRegistry init")
-        .into_dispatcher();
+    let dispatcher = Arc::new(
+        crate::runtime::dispatcher::ProcessTaskDispatcher::new(
+            0,
+            "python3".to_string(),
+            1,
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("ProcessTaskDispatcher init"),
+    );
     let handle = tokio::runtime::Handle::current();
     Worker::new(
         NodeId::from(node_id.to_string()),
@@ -1285,13 +1467,15 @@ async fn select_remote_target_skips_stale_heartbeat() {
     let hb = NodeHeartbeat {
         node_id: NodeId::from("node-B".to_string()),
         active_workflows: Vec::new(),
-        // 很久之前的心跳
-        timestamp_ms: crate::common::epoch_millis().saturating_sub(10_000),
+        timestamp_ms: crate::common::epoch_millis(),
         available_slots: 8,
         max_slots: 8,
         endpoint_addr: Some("node-B-addr".to_string()),
     };
     failover.handle_heartbeat(&hb);
+    // last_heartbeat_ms 由接收方本地时钟记录；真实等待超过
+    // failure_timeout_ms（100ms）使其失联。
+    tokio::time::sleep(Duration::from_millis(150)).await;
 
     assert!(worker.select_remote_target().is_none());
 }
@@ -1690,7 +1874,7 @@ fn make_task_for_completion(id: &str, name: &str) -> TaskDefinition {
 #[test]
 fn build_completion_from_ok_result_returns_completed() {
     let task = make_task_for_completion("t-ok", "ok_task");
-    let result: DispatchResult = Ok(Ok(Ok(vec![1, 2, 3])));
+    let result: DispatchResult = Ok(Ok(vec![1, 2, 3]));
     let completion = build_completion_from_dispatch_result(
         result,
         &task,
@@ -1706,7 +1890,7 @@ fn build_completion_from_ok_result_returns_completed() {
 #[test]
 fn build_completion_from_dispatch_error_returns_failed() {
     let task = make_task_for_completion("t-err", "err_task");
-    let result: DispatchResult = Ok(Ok(Err(ActantError::Task("dispatch failed".into()))));
+    let result: DispatchResult = Ok(Err(ActantError::Task("dispatch failed".into())));
     let completion = build_completion_from_dispatch_result(
         result,
         &task,
@@ -1725,7 +1909,7 @@ fn build_completion_from_dispatch_error_returns_failed() {
 fn build_completion_from_static_str_panic_returns_failed() {
     let task = make_task_for_completion("t-panic", "panic_task");
     let payload: Box<dyn std::any::Any + Send> = Box::new("static panic msg");
-    let result: DispatchResult = Ok(Err(payload));
+    let result: DispatchResult = Err(payload);
     let completion = build_completion_from_dispatch_result(
         result,
         &task,
@@ -1734,7 +1918,16 @@ fn build_completion_from_static_str_panic_returns_failed() {
     );
     match completion {
         TaskCompletion::Failed { error, .. } => {
-            assert!(error.contains("dispatcher panicked: static panic msg"));
+            // panic 原文不透传到 wire（TaskCompletion::Failed.error 会被序列化
+            // 发往 orchestrator 节点），仅保留通用 "dispatcher panicked" 标记。
+            assert!(
+                error.contains("dispatcher panicked"),
+                "error should contain generic 'dispatcher panicked', got: {error}"
+            );
+            assert!(
+                !error.contains("static panic msg"),
+                "panic message must NOT leak to wire-bound error field, got: {error}"
+            );
         }
         other => panic!("expected Failed, got {:?}", other),
     }
@@ -1744,7 +1937,7 @@ fn build_completion_from_static_str_panic_returns_failed() {
 fn build_completion_from_string_panic_returns_failed() {
     let task = make_task_for_completion("t-panic-string", "panic_string_task");
     let payload: Box<dyn std::any::Any + Send> = Box::new("owned panic msg".to_string());
-    let result: DispatchResult = Ok(Err(payload));
+    let result: DispatchResult = Err(payload);
     let completion = build_completion_from_dispatch_result(
         result,
         &task,
@@ -1753,7 +1946,14 @@ fn build_completion_from_string_panic_returns_failed() {
     );
     match completion {
         TaskCompletion::Failed { error, .. } => {
-            assert!(error.contains("dispatcher panicked: owned panic msg"));
+            assert!(
+                error.contains("dispatcher panicked"),
+                "error should contain generic 'dispatcher panicked', got: {error}"
+            );
+            assert!(
+                !error.contains("owned panic msg"),
+                "panic message must NOT leak to wire-bound error field, got: {error}"
+            );
         }
         other => panic!("expected Failed, got {:?}", other),
     }
@@ -1763,7 +1963,7 @@ fn build_completion_from_string_panic_returns_failed() {
 fn build_completion_from_non_string_panic_returns_failed() {
     let task = make_task_for_completion("t-panic-nonstring", "panic_nonstring_task");
     let payload: Box<dyn std::any::Any + Send> = Box::new(42i32);
-    let result: DispatchResult = Ok(Err(payload));
+    let result: DispatchResult = Err(payload);
     let completion = build_completion_from_dispatch_result(
         result,
         &task,
@@ -1772,7 +1972,14 @@ fn build_completion_from_non_string_panic_returns_failed() {
     );
     match completion {
         TaskCompletion::Failed { error, .. } => {
-            assert!(error.contains("dispatcher panicked: <non-string panic>"));
+            assert!(
+                error.contains("dispatcher panicked"),
+                "error should contain generic 'dispatcher panicked', got: {error}"
+            );
+            assert!(
+                !error.contains("<non-string panic>"),
+                "non-string panic placeholder must NOT leak to wire-bound error field, got: {error}"
+            );
         }
         other => panic!("expected Failed, got {:?}", other),
     }
@@ -1781,12 +1988,8 @@ fn build_completion_from_non_string_panic_returns_failed() {
 #[tokio::test]
 async fn build_completion_from_timeout_returns_failed() {
     let task = make_task_for_completion("t-timeout", "timeout_task");
-    // 构造一个已经超时的 tokio::time::error::Elapsed
-    let result: DispatchResult = Err(tokio::time::timeout(Duration::from_nanos(1), async {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    })
-    .await
-    .unwrap_err());
+    // 硬超时由 dispatcher 内部强杀 worker 后返回 `ActantError::Timeout`。
+    let result: DispatchResult = Ok(Err(ActantError::Timeout("timed out".into())));
     let completion = build_completion_from_dispatch_result(
         result,
         &task,
@@ -1799,6 +2002,36 @@ async fn build_completion_from_timeout_returns_failed() {
         }
         other => panic!("expected Failed, got {:?}", other),
     }
+}
+
+// ───────────────────────── is_worker_crash ─────────────────────────
+
+#[test]
+fn worker_crash_classifies_only_worker_error_as_crash() {
+    // 仅 `ActantError::Worker`（worker 子进程异常退出）被视为"进程崩溃"，触发故障转移。
+    assert!(is_worker_crash(&Ok(Err(ActantError::Worker(
+        "worker process crashed while executing task".into(),
+    )))));
+
+    // 业务失败、硬超时、成功、panic 均不视为进程崩溃。
+    assert!(!is_worker_crash(&Ok(Err(ActantError::Task(
+        "dispatch failed".into(),
+    )))));
+    assert!(!is_worker_crash(&Ok(Err(ActantError::Timeout(
+        "task timed out".into(),
+    )))));
+    assert!(!is_worker_crash(&Ok(Ok(vec![1, 2, 3]))));
+    let panic_payload: Box<dyn std::any::Any + Send> = Box::new("boom".to_string());
+    assert!(!is_worker_crash(&Err(panic_payload)));
+}
+
+#[tokio::test]
+async fn workspace_crash_failover_config_defaults() {
+    // 崩溃故障转移默认上限为 3（首次执行 + 最多 2 次转移），并在 Worker 构造时生效。
+    let worker = make_worker("node-A");
+    let cfg = WorkerConfig::default();
+    assert_eq!(cfg.crash_failover_max_attempts, 3);
+    assert_eq!(worker.crash_failover_max_attempts, 3);
 }
 
 // ───────────────────────── wait_for_task ─────────────────────────
@@ -1915,6 +2148,172 @@ async fn start_network_event_loop_runs_and_shuts_down_on_cancel() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 }
 
+// ───────────────────────── 崩溃故障转移重入队 ─────────────────────────
+
+/// 记录入队任务的调度器：既能出队预置任务，也能捕获每次 `enqueue`（含崩溃重入队）。
+struct RecordingScheduler {
+    queue: parking_lot::Mutex<std::collections::VecDeque<TaskDefinition>>,
+    recorded: Arc<parking_lot::Mutex<Vec<TaskDefinition>>>,
+}
+
+impl RecordingScheduler {
+    fn new() -> Self {
+        Self {
+            queue: parking_lot::Mutex::new(std::collections::VecDeque::new()),
+            recorded: Arc::new(parking_lot::Mutex::new(Vec::new())),
+        }
+    }
+
+    fn seed(&self, task: TaskDefinition) {
+        self.queue.lock().push_back(task);
+    }
+}
+
+#[async_trait::async_trait]
+impl Scheduler for RecordingScheduler {
+    async fn enqueue(&self, task: TaskDefinition) -> crate::common::Result<()> {
+        self.recorded.lock().push(task.clone());
+        self.queue.lock().push_back(task);
+        Ok(())
+    }
+
+    async fn enqueue_batch(&self, tasks: Vec<TaskDefinition>) -> crate::common::Result<()> {
+        for t in tasks {
+            let _ = self.enqueue(t).await;
+        }
+        Ok(())
+    }
+
+    async fn dequeue(&self) -> Option<TaskDefinition> {
+        self.queue.lock().pop_front()
+    }
+
+    async fn try_dequeue(&self) -> Option<TaskDefinition> {
+        self.queue.lock().pop_front()
+    }
+
+    async fn dequeue_batch(&self, limit: usize) -> Vec<TaskDefinition> {
+        let mut out = Vec::new();
+        let mut q = self.queue.lock();
+        for _ in 0..limit {
+            match q.pop_front() {
+                Some(t) => out.push(t),
+                None => break,
+            }
+        }
+        out
+    }
+
+    async fn drain_unrouted(&self) -> Vec<TaskDefinition> {
+        Vec::new()
+    }
+
+    async fn is_empty(&self) -> bool {
+        self.queue.lock().is_empty()
+    }
+
+    async fn len(&self) -> usize {
+        self.queue.lock().len()
+    }
+}
+
+/// 模拟 worker 子进程崩溃的分发器：立即返回 `ActantError::Worker`。
+struct CrashDispatcher;
+
+#[async_trait::async_trait]
+impl crate::runtime::dispatcher::TaskDispatcher for CrashDispatcher {
+    async fn dispatch(
+        &self,
+        _name: &str,
+        _payload: Vec<u8>,
+        _cancel_flag: crate::runtime::dispatcher::CancelFlag,
+        _timeout: Duration,
+    ) -> crate::common::Result<Vec<u8>> {
+        Err(ActantError::Worker(
+            "worker process crashed while executing task".into(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn worker_crash_reenqueues_task_for_failover() {
+    let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-A"));
+    let scheduler = Arc::new(RecordingScheduler::new());
+    let scheduler_trait: Arc<dyn Scheduler> = scheduler.clone();
+    let event_bus = EventBus::new();
+    let dispatcher: Arc<dyn crate::runtime::dispatcher::TaskDispatcher> = Arc::new(CrashDispatcher);
+    let handle = tokio::runtime::Handle::current();
+
+    let worker = Worker::new(
+        NodeId::from("node-A".to_string()),
+        network,
+        event_bus.clone(),
+        scheduler_trait,
+        dispatcher,
+        &WorkerConfig::default(),
+        handle,
+    );
+
+    scheduler.seed(TaskDefinition {
+        id: TaskId::from("t-crash".to_string()),
+        name: "crash_task".to_string(),
+        payload: Vec::new(),
+        workflow_id: Some(WorkflowId::from("wf-crash".to_string())),
+        target_node: None,
+        origin_node: None,
+        retry_policy: None,
+        priority: 0,
+        timeout_ms: None,
+        attempt: 0,
+        enqueued_at_ms: 0,
+        target_endpoint_addr: None,
+        origin_endpoint_addr: None,
+    });
+
+    let pending_tx = worker.start_pending_result_loop();
+    let notify = event_bus.task_enqueued_notify();
+    let loop_fut = worker.run_task_execution_loop(&pending_tx, &notify);
+    tokio::pin!(loop_fut);
+
+    // 轮询等待崩溃重入队（remote_fallback_delay 默认 500ms）完成，总超时 5s，
+    // 轮询断言不依赖固定时序窗口（固定窗口在慢机上有边界 flake）。每 20ms 检查一次
+    // 重入队条件；执行循环若提前退出视为失败。
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if !scheduler.recorded.lock().is_empty() {
+            break;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => {
+                panic!("crash-failover re-enqueue did not happen within 5s");
+            }
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+            result = &mut loop_fut => {
+                result.unwrap();
+                panic!("task execution loop exited before crash-failover re-enqueue");
+            }
+        }
+    }
+
+    let recorded = scheduler.recorded.lock().clone();
+    // 首次重入队（attempt 1）与下一次（attempt 2）之间至少间隔
+    // remote_fallback_delay（500ms），检测到首次后立即快照，恰好捕获一次。
+    // attempt 递增、target_node 清空（交由路由器重选），且保留原 task_id。
+    assert_eq!(recorded.len(), 1, "expected one crash-failover re-enqueue");
+    let rerouted = &recorded[0];
+    assert_eq!(rerouted.id.as_str(), "t-crash");
+    assert_eq!(
+        rerouted.attempt, 1,
+        "attempt should be incremented on failover"
+    );
+    assert_eq!(
+        rerouted.target_node, None,
+        "target should be cleared for re-route"
+    );
+
+    worker.shutdown();
+}
+
 #[tokio::test]
 async fn run_task_execution_loop_enters_drain_and_stops() {
     let worker = make_worker("node-run-loop");
@@ -2023,4 +2422,158 @@ async fn forward_remote_task_network_error_returns_error() {
         .forward_remote_task(&task, &NodeId::from("node-B".to_string()))
         .await;
     assert!(result.is_err());
+}
+
+// ───────────────────────── P1：重入队弹跳上限 ─────────────────────────
+
+#[tokio::test]
+async fn record_reroute_bounce_fails_task_after_limit() {
+    let worker = make_worker("node-bounce");
+    for _ in 0..MAX_REROUTE_BOUNCES {
+        assert!(
+            !worker.record_reroute_bounce("task-bounce"),
+            "bounces within the limit must not fail the task"
+        );
+    }
+    assert!(
+        worker.record_reroute_bounce("task-bounce"),
+        "bounce {MAX_REROUTE_BOUNCES}+1 must fail the task"
+    );
+    // 超限时计数已清零：新任务同名 id 重新从 1 计。
+    assert!(!worker.record_reroute_bounce("task-bounce"));
+}
+
+// ───────────────────────── P1：drain 丢任务补偿 ─────────────────────────
+
+#[tokio::test]
+async fn publish_drained_task_cancellation_publishes_local_cancelled_event() {
+    let event_bus = EventBus::new();
+    let mut cancelled_rx = event_bus.subscribe(crate::runtime::event_bus::Topic::TaskCancelled);
+    let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-drain-local"));
+    let (pending_tx, _pending_rx) = tokio::sync::mpsc::channel::<PendingResult>(4);
+
+    let task = TaskDefinition {
+        id: TaskId::from("t-drain-local".to_string()),
+        name: "drain-local".to_string(),
+        payload: vec![],
+        workflow_id: Some(WorkflowId::from("wf-drain")),
+        target_node: None,
+        origin_node: None,
+        retry_policy: None,
+        priority: 0,
+        timeout_ms: None,
+        attempt: 0,
+        enqueued_at_ms: 0,
+        target_endpoint_addr: None,
+        origin_endpoint_addr: None,
+    };
+
+    publish_drained_task_cancellation(
+        task,
+        &NodeId::from("node-drain-local".to_string()),
+        network.as_ref(),
+        &event_bus,
+        &pending_tx,
+        4,
+    )
+    .await;
+
+    let event = cancelled_rx.recv().await.expect("event published");
+    match event {
+        BusEvent::TaskCancelled(completion) => {
+            assert_eq!(completion.task_id().to_string(), "t-drain-local");
+            assert_eq!(completion.workflow_id().as_str(), "wf-drain");
+        }
+        other => panic!("expected TaskCancelled, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn publish_drained_task_cancellation_enqueues_remote_result_for_origin() {
+    // 远端任务（origin != 本节点）：Cancelled 完成经 publish_task_completion
+    // 走直连回传；MockTransport 直连失败时结果进入重试队列（不静默丢失）。
+    let event_bus = EventBus::new();
+    let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-drain-remote"));
+    let (pending_tx, mut pending_rx) = tokio::sync::mpsc::channel::<PendingResult>(4);
+
+    let task = TaskDefinition {
+        id: TaskId::from("t-drain-remote".to_string()),
+        name: "drain-remote".to_string(),
+        payload: vec![],
+        workflow_id: Some(WorkflowId::from("wf-drain-remote")),
+        target_node: None,
+        origin_node: Some(NodeId::from("node-origin".to_string())),
+        retry_policy: None,
+        priority: 0,
+        timeout_ms: None,
+        attempt: 0,
+        enqueued_at_ms: 0,
+        target_endpoint_addr: None,
+        origin_endpoint_addr: None,
+    };
+
+    publish_drained_task_cancellation(
+        task,
+        &NodeId::from("node-drain-remote".to_string()),
+        network.as_ref(),
+        &event_bus,
+        &pending_tx,
+        4,
+    )
+    .await;
+
+    // test_support::MockTransport 的 send_direct_request 返回 Err →
+    // 结果应进入 pending retry queue 而非被丢弃。
+    let pending = tokio::time::timeout(Duration::from_secs(1), pending_rx.recv())
+        .await
+        .expect("result should be enqueued for retry")
+        .expect("channel open");
+    assert_eq!(pending.target, "node-origin");
+}
+
+// ───────────────────────── P1：result_delivery 超限补偿事件 ─────────────────────────
+
+#[tokio::test]
+async fn pending_result_loop_publishes_compensation_event_on_max_attempts() {
+    let transport = Arc::new(MockTransport::new("node-comp"));
+    let event_bus = EventBus::new();
+    let mut failed_rx = event_bus.subscribe(crate::runtime::event_bus::Topic::TaskFailed);
+    let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let pending_tx = start_pending_result_loop(
+        transport,
+        cancel_rx,
+        1, // max_attempts = 1：attempts=1 的结果直接超限
+        Duration::from_millis(1),
+        10,
+        event_bus,
+    );
+
+    let req = crate::runtime::network::DirectRequest::TaskResult {
+        workflow_id: WorkflowId::from("wf-comp".to_string()),
+        task_id: TaskId::from("t-comp".to_string()),
+        task_name: "comp".to_string(),
+        outcome: crate::common::WireTaskOutcome::Completed(vec![1]),
+        worker_node: NodeId::from("node-comp".to_string()),
+    };
+    pending_tx
+        .send(PendingResult {
+            target: "peer-comp".to_string(),
+            request: req,
+            attempts: 1,
+        })
+        .await
+        .unwrap();
+
+    // 超限后必须发布 TaskFailed 补偿事件，而非静默丢弃。
+    let event = tokio::time::timeout(Duration::from_secs(2), failed_rx.recv())
+        .await
+        .expect("compensation event should arrive")
+        .expect("channel open");
+    match event {
+        BusEvent::TaskFailed(completion) => {
+            assert_eq!(completion.task_id().to_string(), "t-comp");
+            assert_eq!(completion.workflow_id().as_str(), "wf-comp");
+        }
+        other => panic!("expected TaskFailed, got {other:?}"),
+    }
 }

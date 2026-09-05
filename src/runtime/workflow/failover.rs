@@ -120,13 +120,6 @@ impl LeaseEntry {
             deadline: None,
         }
     }
-
-    /// 续租：更新墙钟 expires_at_ms 并刷新单调 deadline。
-    fn renew(&mut self, lease_duration_ms: u64, now_ms: u64) {
-        self.expires_at_ms = now_ms + lease_duration_ms;
-        self.deadline = std::time::Instant::now()
-            .checked_add(std::time::Duration::from_millis(lease_duration_ms));
-    }
 }
 
 impl Clone for LeaseEntry {
@@ -641,14 +634,37 @@ impl FailoverManager {
 
     /// 检测失效 peer 并按一致性哈希接管 orphan workflow。
     ///
+    /// 先把失联 peer 清出视图并取得其最后快照：孤儿 workflow 列表来自快照，
+    /// 而接管选举的候选集合只包含存活节点（活跃 peer + 本节点）——否则孤儿
+    /// workflow 可能被哈希给已失联的节点，永远无人接管。
+    ///
     /// 单个 workflow 接管或重调度失败只记录错误并继续处理其他 workflow，避免一个
     /// 损坏状态阻塞整批故障恢复。
     pub async fn detect_and_claim_failed_nodes(&self) {
-        let peers = self.get_peer_infos();
+        let stale = self.expire_stale_peers();
+        if !stale.is_empty() {
+            tracing::info!(
+                removed = stale.len(),
+                "expired stale peers before failure detection"
+            );
+        }
         let now_ms = crate::common::epoch_millis();
-        let timeout_ms = self.failure_timeout_ms;
+        let timeout_ms = self.failure_timeout_ms();
+        let my_id = &self.node_id;
+        // 选举候选集合：仅存活节点（expire 后视图中的 peer + 本节点）。
+        let candidate_ids: Vec<String> = {
+            let mut ids: Vec<_> = self.peers.iter().map(|e| e.key().0.clone()).collect();
+            ids.push(my_id.0.clone());
+            ids
+        };
 
-        for (node_id, info) in &peers {
+        // 待检测集合：失联快照 + 当前视图（覆盖边界时序下仍超时的 peer）。
+        let mut to_check: Vec<(NodeId, PeerInfo)> = stale;
+        for (node_id, info) in self.get_peer_infos() {
+            to_check.push((node_id, info));
+        }
+
+        for (node_id, info) in &to_check {
             let is_failed = info.last_heartbeat_ms > 0
                 && now_ms.saturating_sub(info.last_heartbeat_ms) > timeout_ms;
             if !is_failed || info.active_workflows.is_empty() {
@@ -662,13 +678,6 @@ impl FailoverManager {
                     .map(|w| w.0.clone())
                     .collect::<Vec<_>>()
             );
-
-            let my_id = &self.node_id;
-            let candidate_ids: Vec<String> = {
-                let mut ids: Vec<_> = peers.keys().map(|k| k.0.clone()).collect();
-                ids.push(my_id.0.clone());
-                ids
-            };
 
             // 使用 per-workflow 一致性哈希将 claim 均匀分布到
             // 存活节点，而非将所有 workflow 发往
@@ -692,6 +701,10 @@ impl FailoverManager {
     }
 
     /// 处理远端心跳并更新 peer 视图。
+    ///
+    /// `last_heartbeat_ms` 记录**接收方本地时钟**的接收时刻而非发送方
+    /// `timestamp_ms`：故障检测窗口由接收方度量，若使用发送方时钟，
+    /// 跨节点时钟偏差会直接侵蚀/放大检测窗口（偏差大时误判失联或漏判）。
     pub fn handle_heartbeat(&self, hb: &NodeHeartbeat) {
         if hb.node_id != self.node_id {
             tracing::debug!(
@@ -700,6 +713,7 @@ impl FailoverManager {
                 hb.active_workflows.len()
             );
             let is_new = !self.peers.contains_key(&hb.node_id);
+            let received_at_ms = crate::common::epoch_millis();
             let mut peer = self.peers.entry(hb.node_id.clone()).or_insert(PeerState {
                 last_heartbeat_ms: 0,
                 active_workflows: HashSet::new(),
@@ -707,7 +721,7 @@ impl FailoverManager {
                 max_slots: 0,
                 endpoint_addr: None,
             });
-            peer.last_heartbeat_ms = hb.timestamp_ms;
+            peer.last_heartbeat_ms = received_at_ms;
             peer.active_workflows = hb.active_workflows.iter().cloned().collect();
             peer.available_slots = hb.available_slots;
             peer.max_slots = hb.max_slots;
@@ -729,70 +743,76 @@ impl FailoverManager {
             }
         };
         let active_set: HashSet<WorkflowId> = active.into_iter().collect();
-        let lease_duration_ms = self.lease_duration_ms;
 
-        let expired: Vec<WorkflowId> = self
-            .leases
-            .iter()
-            .filter(|ref_multi| {
-                let wf_id = ref_multi.key();
-                let lease = ref_multi.value();
-                // 优先使用单调时钟判定过期，避免 NTP 跳变误判（M5-2）。
-                if lease.is_valid(now_ms, now_monotonic) {
-                    return false;
-                }
-                if lease.node_id == self.node_id && active_set.contains(wf_id) {
-                    return false;
-                }
-                true
-            })
-            .map(|ref_multi| ref_multi.key().clone())
-            .collect();
-
-        // 为本节点拥有的活跃 workflow 续租约。
-        // 先收集需要续租的 key，再逐个 get_mut 修改，避免 iter_mut 持有 guard 时修改。
-        let to_renew_keys: Vec<WorkflowId> = self
-            .leases
-            .iter()
-            .filter_map(|ref_multi| {
-                let wf_id = ref_multi.key().clone();
-                let lease = ref_multi.value();
-                if lease.node_id == self.node_id
-                    && !lease.is_valid(now_ms, now_monotonic)
-                    && active_set.contains(&wf_id)
-                {
-                    Some(wf_id)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        let mut to_renew: Vec<(WorkflowId, LeaseEntry)> = Vec::new();
-        for wf_id in &to_renew_keys {
-            if let Some(mut lease) = self.leases.get_mut(wf_id) {
-                lease.renew(lease_duration_ms, now_ms);
-                to_renew.push((wf_id.clone(), lease.clone()));
+        // 租约仲裁语义：本节点活跃 workflow 即续租。
+        //
+        // - 本节点持有、workflow 仍在本节点 active_set：**无条件续租**——本地
+        //   延长到期时间并持久化，不走 claim→adopt→广播→全 peer persist 的
+        //   重选路径，消除每个 lease_duration 周期的写放大；也避免过期后参与
+        //   接管选举、输给新加入 peer 时出现租约无人持有的窗口（分区自愈）。
+        //
+        //   反双主依赖 handle_claim 的时序契约：远端节点 claim 成功后广播
+        //   claim，本节点收到即 remove_active_workflow，workflow 退出
+        //   active_set，下一轮 expire_leases 不再为其续租，旧主让位。claim
+        //   与心跳走同一传输通道；若 claim 通知丢失，claimer 会在后续
+        //   detect_and_claim_failed_nodes 循环中重新 claim，窗口由
+        //   `lease_duration_ms > failure_timeout_ms` 的配置约束兜底。
+        //
+        // - 其余过期租约（非本节点持有，或 workflow 已不活跃）：移除。
+        //   过期失效路径仅对非活跃 workflow 生效。
+        let mut lapsed_own_active: Vec<WorkflowId> = Vec::new();
+        let mut expired: Vec<WorkflowId> = Vec::new();
+        for entry in self.leases.iter() {
+            let (wf_id, lease) = (entry.key(), entry.value());
+            if lease.is_valid(now_ms, now_monotonic) {
+                continue;
             }
-        }
-
-        for (wf_id, lease) in &to_renew {
-            if let Err(e) = self.persist_lease(wf_id, lease) {
-                tracing::error!("failed to persist lease for workflow {}: {}", wf_id.0, e);
+            if lease.node_id == self.node_id && active_set.contains(wf_id) {
+                lapsed_own_active.push(wf_id.clone());
+            } else {
+                expired.push(wf_id.clone());
             }
         }
 
         for wf_id in &expired {
-            self.leases.remove(wf_id);
-            if let Some(ref store) = self.store {
-                let key = format!("{}{}", STORE_KEY_LEASE, wf_id.0);
-                if let Err(e) = store.delete(&key) {
-                    tracing::warn!(
-                        "failed to delete expired lease for workflow {}: {}",
-                        wf_id.0,
-                        e
-                    );
-                }
+            self.remove_lease(wf_id);
+        }
+
+        for wf_id in &lapsed_own_active {
+            let renewed = LeaseEntry::new_with_monotonic(
+                self.node_id.clone(),
+                now_ms,
+                now_ms + self.lease_duration_ms,
+                self.lease_duration_ms,
+            );
+            // 持久化失败保留旧租约记录，下一轮 expire_leases 重试续租。
+            if let Err(e) = self.persist_lease(wf_id, &renewed) {
+                tracing::warn!(
+                    workflow = %wf_id.0,
+                    error = %e,
+                    "failed to persist renewed lease for active workflow"
+                );
+                continue;
+            }
+            self.leases.insert(wf_id.clone(), renewed);
+            tracing::debug!(
+                workflow = %wf_id.0,
+                "renewed lapsed lease for active workflow owned by this node"
+            );
+        }
+    }
+
+    /// 从内存与持久化存储中移除租约。
+    fn remove_lease(&self, wf_id: &WorkflowId) {
+        self.leases.remove(wf_id);
+        if let Some(ref store) = self.store {
+            let key = format!("{}{}", STORE_KEY_LEASE, wf_id.0);
+            if let Err(e) = store.delete(&key) {
+                tracing::warn!(
+                    "failed to delete expired lease for workflow {}: {}",
+                    wf_id.0,
+                    e
+                );
             }
         }
     }

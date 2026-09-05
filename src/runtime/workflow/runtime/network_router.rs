@@ -18,46 +18,46 @@ use crate::runtime::event_bus::{BusEvent, EventBus};
 use crate::runtime::network::{DirectResponseChannel, NetworkEvent, Transport};
 use crate::runtime::workflow::messaging::encode;
 use crate::runtime::workflow::Scheduler;
+use tracing::Instrument;
 
 /// 将传入的网络事件路由到适当的处理程序。
 ///
 /// 封装了主题匹配和反序列化逻辑，使运行时主循环专注于任务执行。
-pub(super) struct NetworkEventRouterConfig {
-    pub(super) network: Arc<dyn Transport>,
-    pub(super) event_bus: EventBus,
-    pub(super) scheduler: Arc<dyn Scheduler>,
-    pub(super) actor_system: Option<Arc<ActorSystem>>,
+pub(crate) struct NetworkEventRouterConfig {
+    pub(crate) network: Arc<dyn Transport>,
+    pub(crate) event_bus: EventBus,
+    pub(crate) scheduler: Arc<dyn Scheduler>,
+    pub(crate) actor_system: Option<Arc<ActorSystem>>,
     /// 本地 WorkflowActor 的 id。若存在，远程 TaskResult 会直接路由给它。
-    pub(super) workflow_actor_id: Option<crate::common::ActorId>,
+    pub(crate) workflow_actor_id: Option<crate::common::ActorId>,
     /// 本地 DagGossipActor 的 id。若存在，工作流状态请求/响应会直接路由给它。
-    pub(super) dag_gossip_actor_id: Option<crate::common::ActorId>,
-    /// Actor 注册表 gossip 处理器（A2）。若存在，`TOPIC_ACTOR_REGISTRY` 上的
-    /// gossip 消息会通过 `handle_gossip` 更新本地注册表。
-    pub(super) actor_registry_gossip:
-        Option<Arc<crate::runtime::actor::router::ActorRegistryGossipActor>>,
+    pub(crate) dag_gossip_actor_id: Option<crate::common::ActorId>,
     /// Capability gossip 处理器。若存在，`TOPIC_CAPABILITY_GOSSIP` 上的
     /// gossip 消息会通过 `handle_gossip` 更新本地 capability 视图。
-    pub(super) capability_gossip:
+    pub(crate) capability_gossip:
         Option<Arc<crate::runtime::capability::gossip::CapabilityGossipActor>>,
-    pub(super) cancel_flags: Arc<parking_lot::Mutex<HashMap<String, CancelFlag>>>,
-    pub(super) cancelled_tasks: Arc<parking_lot::Mutex<HashMap<String, Instant>>>,
+    /// 故障转移管理器。若存在，入站 Heartbeat / Claim wire 消息会直连分发到
+    /// `handle_heartbeat` / `handle_claim`（控制面指令不经过 EventBus）。
+    pub(crate) failover: Option<Arc<crate::runtime::workflow::FailoverManager>>,
+    pub(crate) cancel_flags: Arc<parking_lot::Mutex<HashMap<String, CancelFlag>>>,
+    pub(crate) cancelled_tasks: Arc<parking_lot::Mutex<HashMap<String, Instant>>>,
 }
 
-pub(super) struct NetworkEventRouter {
+pub(crate) struct NetworkEventRouter {
     network: Arc<dyn Transport>,
     event_bus: EventBus,
     scheduler: Arc<dyn Scheduler>,
     actor_system: Option<Arc<ActorSystem>>,
     workflow_actor_id: Option<crate::common::ActorId>,
     dag_gossip_actor_id: Option<crate::common::ActorId>,
-    actor_registry_gossip: Option<Arc<crate::runtime::actor::router::ActorRegistryGossipActor>>,
     capability_gossip: Option<Arc<crate::runtime::capability::gossip::CapabilityGossipActor>>,
+    failover: Option<Arc<crate::runtime::workflow::FailoverManager>>,
     cancel_flags: Arc<parking_lot::Mutex<HashMap<String, CancelFlag>>>,
     cancelled_tasks: Arc<parking_lot::Mutex<HashMap<String, Instant>>>,
 }
 
 impl NetworkEventRouter {
-    pub(super) fn new(cfg: NetworkEventRouterConfig) -> Self {
+    pub(crate) fn new(cfg: NetworkEventRouterConfig) -> Self {
         Self {
             network: cfg.network,
             event_bus: cfg.event_bus,
@@ -65,15 +65,15 @@ impl NetworkEventRouter {
             actor_system: cfg.actor_system,
             workflow_actor_id: cfg.workflow_actor_id,
             dag_gossip_actor_id: cfg.dag_gossip_actor_id,
-            actor_registry_gossip: cfg.actor_registry_gossip,
             capability_gossip: cfg.capability_gossip,
+            failover: cfg.failover,
             cancel_flags: cfg.cancel_flags,
             cancelled_tasks: cfg.cancelled_tasks,
         }
     }
 
     /// 将单个 `NetworkEvent` 分发给适当的处理程序。
-    pub(super) async fn handle(&self, event: NetworkEvent) {
+    pub(crate) async fn handle(&self, event: NetworkEvent) {
         match event {
             NetworkEvent::Message(msg) => {
                 self.handle_message(&msg.topic, &msg.data).await;
@@ -82,15 +82,13 @@ impl NetworkEventRouter {
                 tracing::info!("peer connected: {}", peer_id);
                 crate::metrics::inc_connected_peers();
                 self.event_bus
-                    .publish(BusEvent::PeerConnected(NodeId(peer_id.clone())))
-                    .await;
+                    .publish(BusEvent::PeerConnected(NodeId(peer_id.clone())));
             }
             NetworkEvent::PeerDisconnected { peer_id } => {
                 tracing::info!("peer disconnected: {}", peer_id);
                 crate::metrics::dec_connected_peers();
                 self.event_bus
-                    .publish(BusEvent::PeerDisconnected(NodeId(peer_id)))
-                    .await;
+                    .publish(BusEvent::PeerDisconnected(NodeId(peer_id)));
             }
             NetworkEvent::DirectRequest {
                 peer_id,
@@ -102,7 +100,7 @@ impl NetworkEventRouter {
         }
     }
 
-    pub(super) async fn handle_message(&self, topic_str: &str, payload: &[u8]) {
+    pub(crate) async fn handle_message(&self, topic_str: &str, payload: &[u8]) {
         let topic = Topic::from(topic_str);
         // 解码一次后在整个分发过程中复用。失败时直接返回（避免每个分支重复 decode）。
         let decoded = WireEnvelope::decode(payload);
@@ -143,47 +141,70 @@ impl NetworkEventRouter {
                 tracing::field::display(crate::common::wire::traceparent::HexDisplay(&ctx.span_id)),
             );
         }
-        let _enter = span.enter();
-        // 设置 thread-local scope：guard 在同步代码块结束时 drop，恢复前值。
-        // 注意：guard 不能跨 await，因此 await 必须发生在 guard 仍然活跃的同步
-        // 代码块内。当前实现：所有 await 都在 match 体内，guard 在 match 之前
-        // drop（因为 _scope 在 match 之前结束），因此多跳传播仅对同步代码路径
-        // 生效。这是当前实现的折中——若需跨 await 传播，应改用 tokio::task_local。
+        // 不使用 `span.enter()`：其 guard 若跨 await 持有，await 期间同一线程上
+        // 轮询的其他 task 会被错误地归入本 span。改用 `Instrument`：span 只在
+        // 分发 future 轮询期间生效，await 挂起时自动退出。
+        self.dispatch_topic(&topic, decoded, payload, parsed_ctx)
+            .instrument(span)
+            .await;
+    }
+
+    /// 按话题分类分发已解码的 wire message。
+    ///
+    /// 在调用方 `wire.recv` span 的 `Instrument` 作用域内执行；`parsed_ctx`
+    /// 在此同步压入 thread-local（guard 生命周期等同本 future，与原先行为一致），
+    /// 使分发路径中的同步 `WireEnvelope::wrap()` 调用延续入站 trace。
+    async fn dispatch_topic(
+        &self,
+        topic: &Topic,
+        decoded: Option<(WireMessage, Option<String>)>,
+        payload: &[u8],
+        parsed_ctx: Option<crate::common::wire::TraceContext>,
+    ) {
         let _scope = parsed_ctx.map(crate::common::wire::current_trace_scope);
 
         match topic.classify() {
             crate::common::TopicRoute::Task(_) => {
                 if let Some((WireMessage::TaskDispatch(task), _)) = decoded {
-                    if let Err(e) = self.scheduler.enqueue(task).await {
-                        tracing::warn!("scheduler rejected task (drain mode?): {}", e);
-                    }
-                }
-            }
-            crate::common::TopicRoute::Actor(_) => {
-                if let Some(ref sys) = self.actor_system {
-                    if let Ok(remote_req) =
-                        crate::common::decode_postcard::<crate::common::RemoteActorRequest>(payload)
-                    {
-                        sys.handle_remote_request(remote_req).await;
-                    }
-                }
-            }
-            crate::common::TopicRoute::ActorReply(_) => {
-                if let Some(ref sys) = self.actor_system {
-                    if let Some((WireMessage::RemoteActorReply(reply), _)) = decoded {
-                        sys.deliver_reply(reply);
+                    if let Err(e) = self.scheduler.enqueue(task.clone()).await {
+                        // 入队失败即任务被丢弃：必须以 error 级别留下任务标识，
+                        // 否则任务在日志中完全消失（提交方只能观察到永久等待）。
+                        tracing::error!(
+                            task_id = %task.id.as_str(),
+                            task_name = %task.name,
+                            error = %e,
+                            "scheduler rejected task dispatch; task dropped"
+                        );
                     }
                 }
             }
             crate::common::TopicRoute::DagState => {
                 if let Some((WireMessage::DagStateUpdate(update), _)) = decoded {
-                    self.event_bus.publish(BusEvent::DagUpdate(update)).await;
+                    // 控制面直连：DAG 状态 CRDT 更新直接分发给 DagGossipActor，
+                    // 不经 EventBus（观测 tap 有损，不承载正确性语义）。
+                    self.handle_workflow_state_event(
+                        crate::runtime::workflow::gossip_methods::APPLY_REMOTE_UPDATE,
+                        &update,
+                    )
+                    .await;
                 }
             }
             crate::common::TopicRoute::Heartbeat => {
                 if let Some((WireMessage::NodeHeartbeat(hb), _)) = decoded {
-                    tracing::debug!("publishing heartbeat from {} to event_bus", hb.node_id.0);
-                    self.event_bus.publish(BusEvent::Heartbeat(hb)).await;
+                    match &self.failover {
+                        Some(failover) => {
+                            // 控制面直连：handle_heartbeat 更新 peer 表并随心跳
+                            // 刷新容量视图（available/max slots、endpoint），
+                            // 驱动远端转发与故障检测/接管选举。
+                            failover.handle_heartbeat(&hb);
+                        }
+                        None => {
+                            tracing::warn!(
+                                heartbeat_node = %hb.node_id.0,
+                                "no failover manager configured; dropping inbound heartbeat"
+                            );
+                        }
+                    }
                 } else {
                     tracing::warn!(
                         "heartbeat topic but failed to unwrap envelope, payload len={}",
@@ -193,14 +214,30 @@ impl NetworkEventRouter {
             }
             crate::common::TopicRoute::Failover => {
                 if let Some((WireMessage::OrchestratorClaim(claim), _)) = decoded {
-                    self.event_bus.publish(BusEvent::Claim(claim)).await;
+                    match &self.failover {
+                        Some(failover) => {
+                            // 控制面直连：更新本地租约表，非本节点 claim 时移除
+                            // 本地 active 状态，构成双主防护。
+                            failover.handle_claim(&claim).await;
+                        }
+                        None => {
+                            tracing::warn!(
+                                claim_node = %claim.node_id.0,
+                                workflow_id = %claim.workflow_id.as_str(),
+                                "no failover manager configured; dropping inbound claim"
+                            );
+                        }
+                    }
                 }
             }
             crate::common::TopicRoute::Heads => {
                 if let Some((WireMessage::HeadsExchange(exchange), _)) = decoded {
-                    self.event_bus
-                        .publish(BusEvent::HeadsExchange(exchange))
-                        .await;
+                    // 控制面直连：workflow 发现 / adopt / 按需请求全量状态。
+                    self.handle_workflow_state_event(
+                        crate::runtime::workflow::gossip_methods::HANDLE_HEADS_EXCHANGE,
+                        &exchange,
+                    )
+                    .await;
                 }
             }
             crate::common::TopicRoute::WorkflowStateReq(_) => {
@@ -252,20 +289,7 @@ impl NetworkEventRouter {
                             task_id: tid.clone(),
                             task_name: tid.0,
                             target_node: None,
-                        }))
-                        .await;
-                }
-            }
-            crate::common::TopicRoute::ActorRegistry => {
-                // A2：跨节点 actor 注册表 gossip。注意 payload 是裸 postcard 编码的
-                // `ActorRegistryGossipMsg`，不包裹在 `WireEnvelope` 中
-                // （与 `CapabilityGossipActor` 一致，保持 gossip 消息轻量）。
-                if let Some(ref gossip) = self.actor_registry_gossip {
-                    gossip.handle_gossip(payload);
-                } else {
-                    tracing::debug!(
-                        "received actor registry gossip but no gossip handler configured"
-                    );
+                        }));
                 }
             }
             crate::common::TopicRoute::CapabilityGossip => {
@@ -289,10 +313,17 @@ impl NetworkEventRouter {
     ) {
         match request {
             crate::runtime::network::DirectRequest::DispatchTask { task } => {
-                let accepted = match self.scheduler.enqueue(task).await {
+                let accepted = match self.scheduler.enqueue(task.clone()).await {
                     Ok(()) => true,
                     Err(e) => {
-                        tracing::warn!("scheduler rejected direct dispatch (drain mode?): {}", e);
+                        // 直连派发被拒即任务丢弃：以 error 级别记录任务标识，
+                        // 便于与提交方的"任务永久等待"告警关联排查。
+                        tracing::error!(
+                            task_id = %task.id.as_str(),
+                            task_name = %task.name,
+                            error = %e,
+                            "scheduler rejected direct task dispatch; task dropped"
+                        );
                         false
                     }
                 };
@@ -314,41 +345,6 @@ impl NetworkEventRouter {
                 let response = crate::runtime::network::DirectResponse::TaskResultAck { accepted };
                 if let Err(e) = self.network.send_direct_response(channel, response).await {
                     tracing::warn!("failed to send TaskResultAck: {}", e);
-                }
-            }
-            crate::runtime::network::DirectRequest::ActorCallByType {
-                actor_type,
-                method,
-                payload,
-                reply_to,
-            } => {
-                // A2：按 actor 类型在本节点选择 actor 实例并调用。
-                // 若本节点无此类型 actor，返回 Error 响应（避免调用方永久阻塞）。
-                let response = match self.actor_system.as_ref() {
-                    Some(sys) => match sys.find_local_actor_by_type(&actor_type) {
-                        Some(actor_id) => {
-                            self.handle_actor_call_by_type(sys, actor_id, method, payload, reply_to)
-                                .await
-                        }
-                        None => {
-                            tracing::warn!(
-                                actor_type = %actor_type,
-                                "no local actor of requested type"
-                            );
-                            crate::runtime::network::DirectResponse::Error {
-                                message: format!(
-                                    "no local actor of type '{}' on this node",
-                                    actor_type
-                                ),
-                            }
-                        }
-                    },
-                    None => crate::runtime::network::DirectResponse::Error {
-                        message: "no actor system configured".into(),
-                    },
-                };
-                if let Err(e) = self.network.send_direct_response(channel, response).await {
-                    tracing::warn!("failed to send ActorCallByType response: {}", e);
                 }
             }
             other => {
@@ -373,51 +369,6 @@ impl NetworkEventRouter {
                         error = %e,
                         "failed to send DirectResponse::Error for unhandled DirectRequest",
                     );
-                }
-            }
-        }
-    }
-
-    /// 处理远端按 actor 类型发起的调用（A2 接收侧）。
-    ///
-    /// 在本地 ActorSystem 上调用选中的 actor 实例，将结果序列化为
-    /// `DirectResponse::ActorCallResult`。`reply_to` 参数当前未使用
-    /// （响应通过 DirectResponse channel 返回，与 `ActorCall` 一致），
-    /// 保留用于未来可能的异步通知路径。
-    async fn handle_actor_call_by_type(
-        &self,
-        actor_system: &Arc<ActorSystem>,
-        actor_id: crate::common::ActorId,
-        method: String,
-        payload: Vec<u8>,
-        _reply_to: crate::common::RemoteReplyAddress,
-    ) -> crate::runtime::network::DirectResponse {
-        match actor_system.call(&actor_id, &method, payload).await {
-            Ok(result) => match crate::common::encode_postcard(&result) {
-                Ok(bytes) => {
-                    crate::runtime::network::DirectResponse::ActorCallResult { result: bytes }
-                }
-                Err(e) => {
-                    tracing::error!(
-                        actor_id = %actor_id.as_str(),
-                        method = %method,
-                        error = %e,
-                        "failed to encode ActorCallByType result"
-                    );
-                    crate::runtime::network::DirectResponse::Error {
-                        message: format!("failed to encode actor result: {}", e),
-                    }
-                }
-            },
-            Err(e) => {
-                tracing::warn!(
-                    actor_id = %actor_id.as_str(),
-                    method = %method,
-                    error = %e,
-                    "ActorCallByType local call failed"
-                );
-                crate::runtime::network::DirectResponse::Error {
-                    message: format!("actor call failed: {}", e),
                 }
             }
         }
@@ -636,7 +587,7 @@ impl NetworkEventRouter {
             TaskCompletion::Skipped { .. } => BusEvent::TaskSkipped(completion),
             TaskCompletion::Completed { .. } => BusEvent::TaskCompleted(completion),
         };
-        self.event_bus.publish(bus_event).await;
+        self.event_bus.publish(bus_event);
     }
 }
 

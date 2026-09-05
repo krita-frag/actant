@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import threading
 import asyncio
+import threading
 from typing import Any
 
 from actant.exceptions import ActantTimeoutError, TaskCancelledError
-from actant.task._async_result import AsyncResult, _set_aio_result
+from actant.task._async_result import AsyncResult, _await_slots, _set_aio_result
 
 
 def gather(
@@ -161,10 +161,22 @@ async def gather_async(
             loop.call_soon_threadsafe(_set_aio_result, aio_future, value, None)
         except BaseException as exc:
             loop.call_soon_threadsafe(_set_aio_result, aio_future, None, exc)
+        finally:
+            _await_slots.release()
 
-    # 单线程执行 gather，避免多线程 GIL 竞争。
-    t = threading.Thread(target=_worker, daemon=True)
-    t.start()
+    # 有界信号量限制并发等待线程数（与 AsyncResult.__await__ 共享，见
+    # _async_result._await_slots 注释）。槽位由等待线程完成后释放，不依赖
+    # loop 推进，无死锁。
+    _await_slots.acquire()
+    try:
+        # 单线程执行 gather，避免多线程 GIL 竞争。
+        t = threading.Thread(target=_worker, daemon=True, name="actant-await")
+        t.start()
+    except BaseException:
+        # 线程创建失败（资源耗尽等）：释放槽位，否则泄漏的槽位会让
+        # 后续 gather_async 永久阻塞在 acquire 上。
+        _await_slots.release()
+        raise
     return await aio_future
 
 

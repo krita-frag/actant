@@ -3,6 +3,15 @@
 
 use super::*;
 
+/// 构造一个不拉取任何 worker 子进程的进程池分发器，供 `init_worker` 传递
+/// （`init_worker` 仅存储调度器，不在测试中真正派发任务）。
+fn hermetic_dispatcher() -> Arc<dyn TaskDispatcher> {
+    Arc::new(
+        ProcessTaskDispatcher::new(0, "python3".to_string(), 1, Vec::new(), Vec::new())
+            .expect("process task dispatcher init"),
+    )
+}
+
 #[test]
 fn empty_data_dir_rejected() {
     assert!(matches!(validate_data_dir(""), Err(ActantError::Config(_))));
@@ -80,8 +89,37 @@ fn symlink_to_system_dir_rejected() {
 }
 
 #[test]
-fn subdir_of_system_dir_accepted() {
-    assert!(validate_data_dir("/etc/actant-nonexistent-xyz-123").is_ok());
+fn subdir_of_system_dir_rejected() {
+    // H6.3：黑名单祖先判断——系统目录的子路径同样拒绝，即使目录尚不存在
+    // （canonicalize 失败，走逐级向上找已存在祖先的归一化路径）。
+    let result = validate_data_dir("/etc/actant-nonexistent-xyz-123");
+    assert!(
+        matches!(result, Err(ActantError::Config(_))),
+        "data_dir under /etc must be rejected, got {:?}",
+        result
+    );
+}
+
+#[test]
+fn deep_subdir_of_system_dir_rejected() {
+    let result = validate_data_dir("/usr/local/x");
+    assert!(
+        matches!(result, Err(ActantError::Config(_))),
+        "data_dir=/usr/local/x must be rejected, got {:?}",
+        result
+    );
+}
+
+#[test]
+fn tmp_dir_accepted() {
+    // /tmp 在 macOS 上是 /private/tmp 的 symlink，验证归一化后不误判。
+    assert!(validate_data_dir("/tmp/actant-test").is_ok());
+}
+
+#[test]
+fn similar_named_path_not_rejected_by_ancestor_check() {
+    // 按组件前缀比较：/etcfoo 不是 /etc 的子路径。
+    assert!(validate_data_dir("/etcfoo").is_ok());
 }
 
 // ───────────────────────── init_actor_system 测试 ─────────────────────────
@@ -98,11 +136,9 @@ fn make_node(id: &str) -> NodeId {
 #[test]
 fn init_actor_system_without_data_dir_returns_in_memory_system() {
     let node_id = make_node("node-A");
-    let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-A"));
     let event_bus = EventBus::new();
     let config = crate::common::ActantConfig::default();
-    let (system, _registry, _router) =
-        init_actor_system(None, &node_id, &network, &event_bus, &config).unwrap();
+    let system = init_actor_system(None, &node_id, &event_bus, &config).unwrap();
     assert!(Arc::strong_count(&system) >= 1);
 }
 
@@ -110,13 +146,11 @@ fn init_actor_system_without_data_dir_returns_in_memory_system() {
 fn init_actor_system_with_data_dir_creates_persistence_files() {
     let dir = tempdir().unwrap();
     let node_id = make_node("node-B");
-    let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-B"));
     let event_bus = EventBus::new();
     let config = crate::common::ActantConfig::default();
-    let (system, _registry, _router) = init_actor_system(
+    let system = init_actor_system(
         Some(dir.path().to_str().unwrap()),
         &node_id,
-        &network,
         &event_bus,
         &config,
     )
@@ -130,12 +164,12 @@ fn init_actor_system_with_data_dir_creates_persistence_files() {
 #[test]
 fn init_actor_system_with_invalid_data_dir_returns_storage_io_error() {
     let node_id = make_node("node-C");
-    let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-C"));
     let event_bus = EventBus::new();
     let config = crate::common::ActantConfig::default();
-    // /dev/null 是文件而非目录，create_dir_all 应失败。
-    let result = init_actor_system(Some("/dev/null"), &node_id, &network, &event_bus, &config);
-    assert!(matches!(result, Err(ActantError::StorageIo(_))));
+    // /dev/null 是文件而非目录，LmdbStore::open_with_config 内部的
+    // create_dir_all 应失败（错误经 map_err 包装为 Storage）。
+    let result = init_actor_system(Some("/dev/null"), &node_id, &event_bus, &config);
+    assert!(matches!(result, Err(ActantError::Storage(_))));
 }
 
 // ───────────────────────── init_orchestrator 测试 ─────────────────────────
@@ -202,9 +236,7 @@ async fn init_worker_with_fifo_scheduler_spawns_actor_and_returns_worker() {
     let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-F"));
     let event_bus = EventBus::new();
     let actor_system = Arc::new(ActorSystem::new());
-    let dispatcher = TaskRegistry::new(1, 8, Vec::new())
-        .expect("TaskRegistry init")
-        .into_dispatcher();
+    let dispatcher = hermetic_dispatcher();
     let failover = make_failover(&node_id, &network).await;
     let handle = tokio::runtime::Handle::current();
 
@@ -220,7 +252,6 @@ async fn init_worker_with_fifo_scheduler_spawns_actor_and_returns_worker() {
         tokio_handle: handle,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
-        actor_registry_gossip: None,
         capability_gossip: None,
     })
     .await
@@ -236,9 +267,7 @@ async fn init_worker_with_priority_scheduler_spawns_actor() {
     let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-G"));
     let event_bus = EventBus::new();
     let actor_system = Arc::new(ActorSystem::new());
-    let dispatcher = TaskRegistry::new(1, 8, Vec::new())
-        .expect("TaskRegistry init")
-        .into_dispatcher();
+    let dispatcher = hermetic_dispatcher();
     let failover = make_failover(&node_id, &network).await;
     let handle = tokio::runtime::Handle::current();
 
@@ -254,7 +283,6 @@ async fn init_worker_with_priority_scheduler_spawns_actor() {
         tokio_handle: handle,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
-        actor_registry_gossip: None,
         capability_gossip: None,
     })
     .await
@@ -269,9 +297,7 @@ async fn init_worker_with_unknown_scheduler_kind_returns_config_error() {
     let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-H"));
     let event_bus = EventBus::new();
     let actor_system = Arc::new(ActorSystem::new());
-    let dispatcher = TaskRegistry::new(1, 8, Vec::new())
-        .expect("TaskRegistry init")
-        .into_dispatcher();
+    let dispatcher = hermetic_dispatcher();
     let failover = make_failover(&node_id, &network).await;
     let handle = tokio::runtime::Handle::current();
 
@@ -287,7 +313,6 @@ async fn init_worker_with_unknown_scheduler_kind_returns_config_error() {
         tokio_handle: handle,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
-        actor_registry_gossip: None,
         capability_gossip: None,
     })
     .await;
@@ -304,9 +329,7 @@ async fn init_worker_attaches_optional_actor_ids_when_provided() {
     let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-I"));
     let event_bus = EventBus::new();
     let actor_system = Arc::new(ActorSystem::new());
-    let dispatcher = TaskRegistry::new(1, 8, Vec::new())
-        .expect("TaskRegistry init")
-        .into_dispatcher();
+    let dispatcher = hermetic_dispatcher();
     let failover = make_failover(&node_id, &network).await;
     let handle = tokio::runtime::Handle::current();
     let workflow_actor_id = ActorId::workflow(&node_id);
@@ -324,7 +347,6 @@ async fn init_worker_attaches_optional_actor_ids_when_provided() {
         tokio_handle: handle,
         workflow_actor_id: Some(workflow_actor_id.clone()),
         dag_gossip_actor_id: Some(dag_gossip_actor_id.clone()),
-        actor_registry_gossip: None,
         capability_gossip: None,
     })
     .await
@@ -363,6 +385,11 @@ fn make_test_config() -> ActantConfig {
     config.network.discovery_mode = DiscoveryMode::new_unchecked(discovery_mode::NONE);
     config.network.capability_gossip_interval_ms = 60_000;
     config.worker.drain_timeout_secs = 5;
+    // 进程池后端：build 会急切拉起 worker 子进程。测试只验证编排子系统，
+    // 不真正派发任务；减少进程数并指定解释器路径即可（子进程即使因缺少
+    // `actant.task._worker` 模块立即退出也不影响这些断言）。
+    config.worker.num_worker_processes = 1;
+    config.worker.worker_program = "python3".to_string();
     config.payload_signing_key = b"test-signing-key".to_vec();
     config
 }
@@ -567,4 +594,111 @@ async fn build_can_be_called_multiple_times_with_different_dirs() {
 
     rt1.shutdown().await.expect("shutdown rt1 ok");
     rt2.shutdown().await.expect("shutdown rt2 ok");
+}
+
+// ───────────────────────── P0-5 恢复重派发接线测试 ─────────────────────────
+
+use crate::runtime::workflow::{Dag, DagNode, Orchestrator};
+
+fn make_signed_node(id: &str, name: &str, signing_key: &[u8]) -> DagNode {
+    DagNode {
+        task_id: crate::common::TaskId::from(id.to_string()),
+        name: name.to_string(),
+        payload: crate::common::payload::sign(signing_key, b"").unwrap(),
+        retry_policy: None,
+        timeout_ms: None,
+        priority: 0,
+        metadata: std::collections::HashMap::new(),
+    }
+}
+
+/// 端到端：节点重启后（RuntimeBuilder::build），恢复出的 Pending 且依赖已满足
+/// 的任务被重新派发入队；已 Completed 的任务不重跑，未就绪的任务不重派发。
+///
+/// 时间线：预置 data_dir/orchestrator 中一个线性 DAG（t1 → t2 → t3）推进到
+/// t1 完成；build 恢复后调度器中应恰好只有 t2。
+#[tokio::test]
+async fn build_redispatches_recovered_pending_tasks_only() {
+    use crate::runtime::state::Store;
+
+    let dir = tempdir().unwrap();
+    let signing_key = b"test-signing-key";
+
+    // 预置：在与 build 相同的 orchestrator 子存储中写入崩溃前的进度。
+    let orch_dir = dir.path().join("orchestrator");
+    let lmdb = LmdbStore::open(&orch_dir).unwrap();
+    let pre_store = Store::new(lmdb.clone());
+    let pre = Orchestrator::new()
+        .with_signing_key(signing_key.to_vec())
+        .with_store(pre_store);
+    let wf = crate::common::WorkflowId::from("wf-rebuild-1");
+    let mut dag = Dag::new();
+    dag.add_node(make_signed_node("t1", "first", signing_key))
+        .unwrap();
+    dag.add_node(make_signed_node("t2", "second", signing_key))
+        .unwrap();
+    dag.add_node(make_signed_node("t3", "third", signing_key))
+        .unwrap();
+    dag.add_edge(
+        crate::common::TaskId::from("t1"),
+        crate::common::TaskId::from("t2"),
+    )
+    .unwrap();
+    dag.add_edge(
+        crate::common::TaskId::from("t2"),
+        crate::common::TaskId::from("t3"),
+    )
+    .unwrap();
+    pre.submit(wf.clone(), dag).await.unwrap();
+    let roots = pre.start(&wf).unwrap();
+    assert_eq!(roots.len(), 1);
+    pre.mark_task_running(&wf, &roots[0].id).unwrap();
+    let (ready, _, _) = pre
+        .on_task_completed(&wf, &crate::common::TaskId::from("t1"), b"r1".to_vec())
+        .await
+        .unwrap();
+    assert_eq!(ready.len(), 1, "t2 should become ready after t1 completes");
+    pre.flush_dirty().await.unwrap();
+    drop(pre);
+    drop(lmdb);
+
+    // 模拟重启：build 恢复状态并重派发 ready 任务。
+    let node_id = make_node("node-build-recover");
+    let mut config = make_test_config();
+    config.payload_signing_key = signing_key.to_vec();
+    let runtime = RuntimeBuilder::new(node_id, config)
+        .with_data_dir(dir.path().to_str().unwrap().to_string())
+        .build()
+        .await
+        .expect("build should recover and redispatch");
+
+    let worker = runtime.worker().expect("worker injected");
+    let task = worker
+        .scheduler()
+        .try_dequeue()
+        .await
+        .expect("recovered ready task t2 should be re-enqueued");
+    assert_eq!(task.id.to_string(), "t2", "only t2 should be redispatched");
+    assert!(
+        worker.scheduler().try_dequeue().await.is_none(),
+        "no other task may be redispatched: t1 is Completed (no re-run), t3 has unfinished dependencies"
+    );
+
+    runtime.shutdown().await.expect("shutdown ok");
+}
+
+/// build 在无持久化（内存模式编排器）时不应重派发任何任务。
+#[tokio::test]
+async fn build_without_store_redispatches_nothing() {
+    // RuntimeBuilder 要求 data_dir，这里退而验证 init_orchestrator 内存路径
+    // 不产出恢复任务：内存 Orchestrator 没有任何 workflow。
+    let node_id = make_node("node-D");
+    let config = ActantConfig::default();
+    let orchestrator = init_orchestrator(None, &node_id, &config).await.unwrap();
+    assert!(Arc::strong_count(&orchestrator) >= 1);
+    let recovered = orchestrator.recover_ready_tasks();
+    assert!(
+        recovered.is_empty(),
+        "empty orchestrator has no ready tasks"
+    );
 }

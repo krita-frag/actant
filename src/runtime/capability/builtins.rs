@@ -10,11 +10,12 @@
 //! - 基于真实子系统的 handler（`StoreHandler` / `ExecuteHandler`）
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::common::{ActantError, ActorId, MessageId, NodeId, TaskId, WorkflowId};
+use crate::common::{ActantError, NodeId, TaskId, WorkflowId};
 use crate::runtime::dispatcher::TaskDispatcher;
 use crate::runtime::state::LmdbStore as StateStore;
 
@@ -85,6 +86,11 @@ impl Execute {
     }
 }
 
+/// `Execute` capability 请求上下文。
+///
+/// `timeout_ms` 语义与 Python `@task(timeout_ms=...)` 文档对齐：`0` = 无超时
+/// （由 [`ExecuteHandler`] 映射为远期硬超时，见 [`EXECUTE_NO_TIMEOUT`]），
+/// 非 `0` 值为毫秒级硬超时——超时后 dispatcher 立即强杀 worker 进程。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecuteCtx {
     pub task_id: TaskId,
@@ -185,69 +191,6 @@ pub enum NodeEvent {
     Heartbeat { node_id: NodeId, timestamp_ms: u64 },
 }
 
-pub struct ActorMessaging;
-impl Capability for ActorMessaging {
-    type Request = ActorMessageReq;
-    type Response = Result<MessageId, String>;
-}
-impl ActorMessaging {
-    pub fn meta() -> CapabilityMeta {
-        CapabilityMeta::new::<Self>("ActorMessaging", EffectKind::Perform)
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ActorMessageReq {
-    pub target: ActorId,
-    pub payload: Vec<u8>,
-    pub sender: Option<ActorId>,
-}
-
-pub struct ActorSupervision;
-impl Capability for ActorSupervision {
-    type Request = ActorFailureCtx;
-    type Response = Option<SupervisionDecision>;
-}
-impl ActorSupervision {
-    pub fn meta() -> CapabilityMeta {
-        CapabilityMeta::new::<Self>("ActorSupervision", EffectKind::Ask)
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ActorFailureCtx {
-    pub actor_id: ActorId,
-    pub error: String,
-    pub restart_count: u32,
-    pub max_restarts: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum SupervisionDecision {
-    Restart,
-    Stop,
-    Resume,
-}
-
-pub struct ActorLifecycle;
-impl Capability for ActorLifecycle {
-    type Request = ActorEvent;
-    type Response = ();
-}
-impl ActorLifecycle {
-    pub fn meta() -> CapabilityMeta {
-        CapabilityMeta::new::<Self>("ActorLifecycle", EffectKind::Emit)
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ActorEvent {
-    Spawned { actor_id: ActorId, name: String },
-    Stopped { actor_id: ActorId },
-    Failed { actor_id: ActorId, error: String },
-    Restarted { actor_id: ActorId, attempt: u32 },
-}
-
 /// 内置 Capability 注册表。
 pub fn builtin_capabilities() -> Vec<CapabilityMeta> {
     vec![
@@ -258,9 +201,6 @@ pub fn builtin_capabilities() -> Vec<CapabilityMeta> {
         TaskLifecycle::meta(),
         WorkflowLifecycle::meta(),
         NodeLifecycle::meta(),
-        ActorMessaging::meta(),
-        ActorSupervision::meta(),
-        ActorLifecycle::meta(),
     ]
 }
 
@@ -278,9 +218,6 @@ pub fn register_defaults(runtime: &CapabilityRuntime) {
     runtime.register_codec::<TaskLifecycle>();
     runtime.register_codec::<WorkflowLifecycle>();
     runtime.register_codec::<NodeLifecycle>();
-    runtime.register_codec::<ActorMessaging>();
-    runtime.register_codec::<ActorSupervision>();
-    runtime.register_codec::<ActorLifecycle>();
 
     runtime.ensure_layer::<Serialization>(Serialization::meta());
     runtime.ensure_layer::<Transport>(Transport::meta());
@@ -289,9 +226,6 @@ pub fn register_defaults(runtime: &CapabilityRuntime) {
     runtime.ensure_layer::<TaskLifecycle>(TaskLifecycle::meta());
     runtime.ensure_layer::<WorkflowLifecycle>(WorkflowLifecycle::meta());
     runtime.ensure_layer::<NodeLifecycle>(NodeLifecycle::meta());
-    runtime.ensure_layer::<ActorMessaging>(ActorMessaging::meta());
-    runtime.ensure_layer::<ActorSupervision>(ActorSupervision::meta());
-    runtime.ensure_layer::<ActorLifecycle>(ActorLifecycle::meta());
 }
 
 /// `Serialization` capability 的内置 handler。
@@ -361,6 +295,14 @@ impl ExecuteHandler {
     }
 }
 
+/// `timeout_ms = 0`（无超时语义）映射到的硬超时时长。
+///
+/// 取 tokio `time::sleep` 支持的最大毫秒数（约 2.2 年，更长的输入会被 tokio
+/// 截断到同一上限），使任务在实践中等效于不受超时约束。直接传
+/// `Duration::from_millis(0)` 会让 dispatcher 的超时分支立即命中并强杀
+/// worker——历史陷阱，`0` 必须先行映射。
+const EXECUTE_NO_TIMEOUT: Duration = Duration::from_millis(68_719_476_734);
+
 #[async_trait]
 impl Handler<Execute> for ExecuteHandler {
     async fn handle(&self, req: ExecuteCtx) -> Option<Result<ExecuteOutcome, String>> {
@@ -371,9 +313,14 @@ impl Handler<Execute> for ExecuteHandler {
             Ok(p) => p,
             Err(e) => return Some(Err(e)),
         };
+        let timeout = if req.timeout_ms == 0 {
+            EXECUTE_NO_TIMEOUT
+        } else {
+            Duration::from_millis(req.timeout_ms)
+        };
         let result = self
             .dispatcher
-            .dispatch(req.task_id.as_ref(), payload, cancel_flag)
+            .dispatch(req.task_id.as_ref(), payload, cancel_flag, timeout)
             .await;
         Some(match result {
             Ok(result_payload) => Ok(ExecuteOutcome {
@@ -409,8 +356,8 @@ pub fn register_serialization_handler(runtime: &CapabilityRuntime) -> Result<(),
 /// 注册真实 `Execute` handler。
 ///
 /// Rust 核心不在 `register_defaults` 中注册任何 `Execute` handler；
-/// `dispatcher` 必须已经注册了能够执行实际任务 payload 的 handler（如 Python 侧的
-/// `__actant_generic__`），否则 `Execute` capability 调用会失败。
+/// `dispatcher` 必须注入实现了 [`TaskDispatcher`] 的执行后端（生产为
+/// 进程池 `ProcessTaskDispatcher`），否则 `Execute` capability 调用会失败。
 pub fn register_execute_handler(
     runtime: &CapabilityRuntime,
     dispatcher: Arc<dyn TaskDispatcher>,

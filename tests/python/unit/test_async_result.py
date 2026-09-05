@@ -124,6 +124,27 @@ def test_cancel_notifies_rust_core(monkeypatch: pytest.MonkeyPatch) -> None:
     assert ("t1", "wf1") in runtime._rust_core.broadcast_cancel_calls
 
 
+def test_cancel_rust_core_failure_logged_but_continues(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """cancel_task 失败不静默：记录 warning，且本地取消流程继续（尽力而为语义）。"""
+
+    class _FailingCancelCore(_FakeRustCore):
+        def cancel_task(self, task_id: str) -> None:
+            raise RuntimeError("rust core gone")
+
+    h = AsyncResult("t1", workflow_id="wf1")
+    runtime = _FakeRuntime()
+    runtime._rust_core = _FailingCancelCore()
+
+    monkeypatch.setattr(_async_result_module, "get_current_runtime", lambda: runtime)
+    with caplog.at_level("WARNING", logger="actant.task"):
+        assert h.cancel() is True
+    assert any(
+        "cancel_task failed for" in rec.getMessage() for rec in caplog.records
+    )
+
+
 def test_cancel_completed_returns_false() -> None:
     h = AsyncResult("t1")
     h._set_result(cloudpickle.dumps(42))
@@ -195,3 +216,58 @@ def test_repr() -> None:
     h = AsyncResult("t1")
     assert "t1" in repr(h)
     assert "pending" in repr(h)
+
+
+# ───────────────────────── P0-6 并发回归 ─────────────────────────
+
+
+def test_add_done_callback_not_lost_when_racing_completion() -> None:
+    """P0-6 回归：``add_done_callback`` 与 ``_set_result`` 并发时回调不得丢失。
+
+    完成协议在锁内置终态、锁外 set future；若 ``add_done_callback`` 以
+    ``is_set()`` 判定完成，窗口内新回调会 append 进已清空的列表而永久丢失。
+    此测试循环多轮，每轮多线程经 barrier 同时注册回调与完成任务，
+    断言每个回调恰好被调用一次。
+    """
+    for round_index in range(1000):
+        _race_round(round_index)
+
+
+def _race_round(round_index: int) -> None:
+    """单轮竞态：2 个回调注册线程与 1 个完成线程同时起跑，回调各恰好触发一次。"""
+    import threading
+
+    adders = 2
+    h = AsyncResult(f"race-{round_index}")
+    counts = [0] * adders
+    counts_lock = threading.Lock()
+    barrier = threading.Barrier(adders + 1)
+
+    def _bump(i: int) -> None:
+        with counts_lock:
+            counts[i] += 1
+
+    def _adder(i: int) -> None:
+        barrier.wait()
+        h.add_done_callback(lambda _h, i=i: _bump(i))
+
+    def _completer() -> None:
+        barrier.wait()
+        h._set_result(cloudpickle.dumps(round_index))
+
+    threads = [
+        threading.Thread(target=_adder, args=(i,), daemon=True)
+        for i in range(adders)
+    ]
+    threads.append(threading.Thread(target=_completer, daemon=True))
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5.0)
+        assert not t.is_alive(), f"round {round_index}: thread did not finish"
+
+    assert all(c == 1 for c in counts), (
+        f"round {round_index}: callback counts {counts} (lost or duplicated)"
+    )
+    assert h.done()
+    assert h.result(timeout=0) == round_index

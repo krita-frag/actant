@@ -1,7 +1,7 @@
 """Python 侧 Runtime：统一注册表 + effect dispatcher。
 
 `Runtime` 是 actant 的统一运行时入口。所有扩展点（Routing、Scheduling、
-Transport、Store、Actor、Lifecycle 等）都注册为 Layer，由 Runtime 按 name 分桶存储。
+Transport、Store、Lifecycle 等）都注册为 Layer，由 Runtime 按 name 分桶存储。
 
 # 设计
 
@@ -41,6 +41,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 from actant.capabilities import (
     BUILTIN_CAPABILITIES,
     RUST_BACKED_CAPABILITIES,
+    TASK_LIFECYCLE,
     CapabilityMeta,
     EffectKind,
     RetryCtx,
@@ -48,25 +49,38 @@ from actant.capabilities import (
     ScheduleCtx,
 )
 from actant.exceptions import ActantError, InvalidStateError, NotFoundError, reconstruct_error
+
 if TYPE_CHECKING:
     from actant.actant import _ActantConfig
     from actant.task import AsyncResult
 
 # 当前线程的 Runtime 上下文。使用 threading.local 保证每个线程有独立的活跃 Runtime。
-# 注意：``Task.submit`` 在独立线程池中执行 ``perform``，需通过 ``use_runtime(rt)``
-# 显式传播上下文（见 ``actant.task``）。dispatch handler 在 Rust 线程池中运行，
-# 其 Runtime 引用在注册时通过闭包捕获（``_bind_dispatch_handler``），不依赖本变量。
+# `Task.submit` 沿途的 perform/ask 请求经本变量解析活跃 Runtime；任务本身在 worker
+# 子进程中执行，不共享本局部。父进程侧结果回调（`_on_task_result`）与 TaskLifecycle
+# 事件发布显式经 `use_runtime(rt)` 注入自身作为活跃 Runtime。
 _runtime_local = threading.local()
 
 _logger = logging.getLogger("actant.runtime")
+
+# Rust `_TaskCompletion.state` 枚举的字符串镜像（src/py/types.rs）。
+# 集中定义避免与 Rust 枚举的裸字符串契约散落在比较逻辑中。
+TASK_STATE_RUNNING = "Running"
+TASK_STATE_COMPLETED = "Completed"
+TASK_STATE_FAILED = "Failed"
+TASK_STATE_CANCELLED = "Cancelled"
+TASK_STATE_SKIPPED = "Skipped"
+# Rust Orchestrator workflow 状态字符串镜像（get_workflow_state 返回的
+# "state" 字段，src/runtime/workflow/ 的持久化状态机）。
+WORKFLOW_STATE_COMPLETED = "Completed"
+WORKFLOW_STATE_FAILED = "Failed"
 
 
 def get_current_runtime() -> Runtime | None:
     """返回当前线程的活跃 Runtime，无则返回 `None`。
 
     仅查询 ``threading.local``；子线程需通过 ``use_runtime(rt)`` 显式继承。
-    dispatch handler 等在 Rust 线程池中运行的代码不调用此函数——它们使用
-    注册时闭包捕获的 Runtime 引用。
+    任务在 worker 子进程执行，不解析本局部；父进程侧 ``_on_task_result`` 回调
+    用 ``use_runtime(self)`` 显式注入运行时后发布 TaskLifecycle 事件。
     """
     return getattr(_runtime_local, "runtime", None)
 
@@ -112,12 +126,42 @@ class Layer:
     def chain(self, handler: Callable[[Any], Any]) -> Layer:
         """追加一个 handler，返回 self 以支持链式调用。
 
-        handler 立即注册到 Runtime，对后续 effect 调用可见。
+        handler 立即注册到 Runtime，对后续 **Python 端** effect 调用可见。
+
+        .. warning::
+            ``start()`` 后追加 Rust-backed capability（如 ``Execute`` / ``Store`` /
+            ``Transport``）的 handler 存在**预期外限制**：
+            Rust 内部分发路径（如 Worker 执行任务时调用 ``task_dispatcher.dispatch()``）
+            **不经过** Python ``_layers``，因此新追加的 Python handler 不会被
+            Rust 内部调用所咨询。Python handler 仅在用户代码显式调用
+            ``actant.ask/perform/emit(name, ...)`` 时生效。
+
+            如需覆盖 Rust 内部 dispatch 行为（如自定义任务执行逻辑），
+            请在 ``start()`` **之前** 通过 ``Runtime.layer(name).chain(handler)``
+            注册，或直接配置 Rust 侧 handler（参见 ``RuntimeBuilder``）。
+
+            纯 Python capability（``Routing`` / ``Scheduling`` / ``RetryPolicy``）
+            无此限制——它们始终走 Python 分发路径，``start()`` 后追加立即生效。
         """
         if not callable(handler):
             raise TypeError(f"handler must be callable, got {type(handler)}")
         with self._runtime._lock:
             self._runtime._layers[self._meta.name].append(handler)
+            # 检测"start 后追加 Rust-backed handler"的常见误用场景并 warn。
+            # 不阻止操作——Python 端 actant.ask/perform/emit 仍会读到该 handler，
+            # 但用户期望它影响 Rust 内部分发（如 Worker 任务执行）时会失效。
+            if self._runtime._started and self._meta.name in RUST_BACKED_CAPABILITIES:
+                _logger.warning(
+                    "Layer.chain(%r) called after Runtime.start(); "
+                    "this Python handler will NOT be consulted by Rust-internal "
+                    "dispatch paths (e.g. Worker task execution). It only takes "
+                    "effect for Python-initiated actant.ask/perform/emit calls. "
+                    "For Routing/Scheduling/RetryPolicy this is fine (Python-only "
+                    "capabilities). For Execute/Store/Transport, "
+                    "register before start() or configure Rust-side handlers via "
+                    "RuntimeBuilder to override Rust-internal behavior.",
+                    self._meta.name,
+                )
         return self
 
     def remove(self, handler: Callable[[Any], Any]) -> bool:
@@ -213,6 +257,8 @@ class Runtime:
         self._name = name  # 节点名称，传给 _RuntimeCore
         # 未指定 data_dir 时自动生成唯一临时目录，避免多实例/多测试共享 LMDB 数据
         # 导致状态污染或测试不稳定。Runtime 拥有该目录时 stop() 负责清理。
+        # auto_data_dir 标志随构造参数传给 _build_config 决定网络 preset，
+        # 不做路径嗅探——用户显式传入的路径（哪怕位于系统临时目录下）一律尊重。
         if data_dir is None:
             data_dir = tempfile.mkdtemp(prefix="actant-")
             self._owns_data_dir = True
@@ -222,6 +268,7 @@ class Runtime:
         self._config: _ActantConfig | None = self._build_config(
             config=config,
             data_dir=data_dir,
+            auto_data_dir=self._owns_data_dir,
             max_concurrent_tasks=max_concurrent_tasks,
             default_task_timeout_ms=default_task_timeout_ms,
             drain_timeout_secs=drain_timeout_secs,
@@ -237,9 +284,10 @@ class Runtime:
         # 活跃 flow 线程注册表：Runtime.stop() 时 join 它们，
         # 避免子线程在 Runtime 关闭后继续访问已释放的资源。
         self._flow_threads: list[threading.Thread] = []
-        # 可选的 Prometheus HTTP exporter 服务器实例。
-        # 由 start_metrics_server() 创建，stop_metrics_server() / stop() 清理。
-        self._metrics_server: Any = None
+        # TaskLifecycle 事件批处理器：start() 时创建、stop() 时关闭。
+        # 父进程侧每任务 2 次 emit（started/completed/failed）在后台线程批量派发，
+        # 降低高吞吐下 event_bus 的 publish 次数。未创建（未 start）时为 None。
+        self._event_batcher: Any = None
         # 注册所有内置 capability 为空 layer
         for cap_name, meta in BUILTIN_CAPABILITIES.items():
             self._metas[cap_name] = meta
@@ -250,6 +298,7 @@ class Runtime:
         *,
         config: _ActantConfig | None,
         data_dir: str | None,
+        auto_data_dir: bool,
         max_concurrent_tasks: int | None,
         default_task_timeout_ms: int | None,
         drain_timeout_secs: int | None,
@@ -259,21 +308,16 @@ class Runtime:
         """从 ``config`` 或便捷参数构造 ``_ActantConfig``。
 
         若提供了 ``config``，直接使用；否则构造一个 ``_ActantConfig``。
-        自动生成的临时 data_dir 使用 ``preset="none"`` 禁用 P2P 发现，
-        避免测试/短生命周期实例受 iroh 网络初始化抖动影响；用户显式传入的
-        data_dir 仍使用默认 "local" preset。
+        ``auto_data_dir`` 为 ``True``（data_dir 由 Runtime 内部自动生成的
+        临时目录）时使用 ``preset="none"`` 禁用 P2P 发现，避免测试/短生命
+        周期实例受 iroh 网络初始化抖动影响；用户显式传入 data_dir 时一律
+        使用默认 "local" preset，即使路径位于系统临时目录下。
         """
         if config is not None:
             return config
         from actant.actant import _ActantConfig, _NetworkConfig
 
-        preset = "local"
-        if (
-            data_dir is not None
-            and isinstance(data_dir, str)
-            and data_dir.startswith(tempfile.gettempdir())
-        ):
-            preset = "none"
+        preset = "none" if auto_data_dir else "local"
 
         return _ActantConfig(
             payload_signing_key="",
@@ -366,8 +410,6 @@ class Runtime:
             drain_timeout_secs: 退出时等待在途任务的最长秒数（默认 5）。
             scheduler: 调度器类型（``"priority"`` / ``"fifo"``，默认 ``"priority"``）。
         """
-        import os
-
         rt = cls(
             name=name or f"test-{os.getpid()}",
             data_dir=None,  # 自动创建临时目录，preset 自动为 "none"
@@ -434,9 +476,23 @@ class Runtime:
             )
         from actant.actant import _ActantConfig, _NetworkConfig
 
+        # 生产安全告警：allowed_peer_ids 为空时 peer_allowed 返回 true（allow-all），
+        # 任意 iroh 节点都可加入集群 gossip，存在被恶意节点投递伪造消息的风险。
+        # 此处仅 warn 而非强制报错——某些受信内网环境（如 K8s pod 间通信）
+        # 确实依赖默认的 "接受所有 peer" 行为；让用户根据告警决定是否收紧。
+        effective_network = network if network is not None else _NetworkConfig(preset="local")
+        if not effective_network.allowed_peer_ids:
+            _logger.warning(
+                "Runtime.production(): network.allowed_peer_ids is empty — "
+                "the node will accept gossip/wire messages from ANY iroh peer. "
+                "For production clusters, pass network=_NetworkConfig("
+                "allowed_peer_ids=['node-a', 'node-b', ...]) to restrict "
+                "membership to known peers."
+            )
+
         config = _ActantConfig(
             payload_signing_key=payload_signing_key,
-            network=network if network is not None else _NetworkConfig(preset="local"),
+            network=effective_network,
             failover=failover,
             gossip=gossip,
             max_concurrent_tasks=max_concurrent_tasks,
@@ -484,11 +540,25 @@ class Runtime:
         """向已存在的 capability 追加单个 handler，返回 self 以支持链式调用。
 
         与 ``Layer.chain`` 行为一致，区别在于此处按 name 直接操作 Runtime。
+        同样存在 ``start()`` 后追加 Rust-backed handler 的限制（详见 ``Layer.chain``
+        文档）。
         """
         with self._lock:
             if name not in self._layers:
                 raise KeyError(f"capability {name!r} not registered")
             self._layers[name].append(handler)
+            if self._started and name in RUST_BACKED_CAPABILITIES:
+                _logger.warning(
+                    "Runtime.chain(%r) called after Runtime.start(); "
+                    "this Python handler will NOT be consulted by Rust-internal "
+                    "dispatch paths (e.g. Worker task execution). It only takes "
+                    "effect for Python-initiated actant.ask/perform/emit calls. "
+                    "For Routing/Scheduling/RetryPolicy this is fine (Python-only "
+                    "capabilities). For Execute/Store/Transport, "
+                    "register before start() or configure Rust-side handlers via "
+                    "RuntimeBuilder to override Rust-internal behavior.",
+                    name,
+                )
         return self
 
     def replace_handler(self, name: str, handler: Callable[[Any], Any]) -> Runtime:
@@ -611,9 +681,10 @@ class Runtime:
                 errors.append(e)
                 _logger.warning("emit handler for %r failed", name, exc_info=True)
         if errors and on_error == "collect":
+            # ``from errors[0]`` 保留首个失败的异常链，便于 traceback 排因。
             raise ActantError(
                 f"emit {name!r}: {len(errors)} handler(s) failed; first: {errors[0]!r}"
-            )
+            ) from errors[0]
 
     @staticmethod
     def _get_asyncio_loop() -> asyncio.AbstractEventLoop:
@@ -737,9 +808,9 @@ class Runtime:
         视图作为 Python handler 缺失/弃权时的内置回退路径。两者共享同一套
         tokio runtime 与 capability 句柄。
 
-        分布式任务执行：注册 Python dispatch handler 到 Rust Worker，使
-        ``Task.submit()`` 提交的任务由 Worker 调度器拉取并调用 handler 执行；
-        注册结果回调，使 ``AsyncResult`` 能在任务完成时被解析。
+        分布式任务执行：启动时创建 Rust `_RuntimeCore` 并以进程池后端执行任务。
+        提交的任务由 Rust `ExecuteHandler` → `ProcessTaskDispatcher` 分发到
+        worker 子进程执行；注册结果回调，使 ``AsyncResult`` 能在任务完成时被解析。
         """
         with self._lock:
             if self._started:
@@ -754,23 +825,18 @@ class Runtime:
                 )
                 self._rust_runtime = core.capability_runtime()
                 # 保留 core 引用，避免其被提前释放导致 tokio runtime 关闭。
-                # 后续如需访问 actor / workflow / network 句柄，也通过此 core。
+                # 后续如需访问 workflow / network 句柄，也通过此 core。
                 self._rust_core = core
-            # 注册 Python dispatch handler：Worker 执行任务时调用此 handler，
-            # handler 反序列化 cloudpickle payload 并调用任务函数。
-            # 通过闭包捕获 self（Runtime 引用），使 dispatch handler 在 Rust
-            # 线程池中运行时无需依赖 threading.local 或全局变量。
-            from actant.task._dispatch import _bind_dispatch_handler, _generic_execute_handler
-
             core = self._rust_core
             if core is not None:
-                core.register_python_dispatch_handler(_bind_dispatch_handler(self))
                 core.register_task_result_callback(self._on_task_result)
-            # 保留 Execute capability handler 链供 perform("Execute", ...) 直接调用
-            # （如 @flow 内部的同步执行路径）。
-            if not self._layers.get("Execute"):
-                self._layers["Execute"] = [_generic_execute_handler]
             self._started = True
+            # 创建 TaskLifecycle 事件批处理器。flush 发生在后台线程，经
+            # _publish_task_event 把本 Runtime 绑定到该线程上下文后再 emit，
+            # 避免进程池后端下每任务 2 次同步 emit 成为高吞吐瓶颈。
+            from actant.task._helpers import _EventBatcher
+
+            self._event_batcher = _EventBatcher(render=self._publish_task_event)
         _runtime_local.runtime = self
         # 启动 Worker 守护循环（订阅 P2P topic + 任务执行循环）。
         # 非阻塞：worker.run() 在 tokio 后台 spawn，使任务能被调度执行。
@@ -803,6 +869,64 @@ class Runtime:
         except OSError:
             _logger.debug("failed to write node_meta.json", exc_info=True)
 
+    def _publish_task_event(
+        self,
+        kind: str,
+        task_id: str,
+        workflow_id: str,
+        event_kwargs: dict[str, Any],
+    ) -> None:
+        """事件批处理器渲染回调：把本 Runtime 绑定到当前线程后直接 emit。
+
+        由 ``_EventBatcher`` 的后台 flush 线程调用（该线程无线程局部 Runtime）。
+        ``_bypass_batcher=True`` 防止 flush 中再次路由回 batcher 造成回环。
+
+        Args:
+            kind: ``TaskLifecycle`` 事件类型（started/completed/failed）。
+            task_id: 事件源任务 id。
+            workflow_id: 事件源工作流 id。
+            event_kwargs: 事件附加字段（attempt/error 等）。
+        """
+        from actant.task._helpers import _emit_task_event
+
+        with use_runtime(self):
+            _emit_task_event(
+                kind,
+                task_id,
+                workflow_id,
+                _bypass_batcher=True,
+                **event_kwargs,
+            )
+
+    def _emit_batch(self, kind: str, task_id: str, workflow_id: str, **kwargs: Any) -> None:
+        """发布一条 ``TaskLifecycle`` 事件。
+
+        无任何 ``TaskLifecycle`` 消费者时自动静默：该 capability 是纯可观测事件，
+        唯一消费面为 Python handler，任务执行仍由 worker 结果回调（``_on_task_result``）
+        驱动，跳过 emit 不影响执行语义。零消费者由 ``_task_lifecycle_consumers`` 判定。
+        已启用批处理（start() 后）时把事件累积到 ``_event_batcher`` 批量派发；
+        未启用（未 start / 防御性路径）时退化为带运行时上下文的同步 emit。
+        """
+        if not self._task_lifecycle_consumers():
+            return
+        batcher = self._event_batcher
+        if batcher is not None:
+            batcher.add(kind, task_id, workflow_id, **kwargs)
+            return
+        from actant.task._helpers import _emit_task_event
+
+        with use_runtime(self):
+            _emit_task_event(kind, task_id, workflow_id, **kwargs)
+
+    def _task_lifecycle_consumers(self) -> bool:
+        """批次口径下 ``TaskLifecycle`` 是否仍有 Python 消费者。
+
+        读取 ``_layers[TASK_LIFECYCLE]`` 的非空性。加锁避免与 ``layer()/chain()``
+        追加发生竞态；``TaskLifecycle`` 为纯 emit 能力，无 handler 即无可观测消费方。
+        """
+        with self._lock:
+            return bool(self._layers.get(TASK_LIFECYCLE))
+
     def _on_task_result(self, completion: Any) -> None:
         """任务结果回调：由 Rust event_bus 触发，解析对应的 ``AsyncResult``。
 
@@ -818,12 +942,16 @@ class Runtime:
             handle = self._tasks.get(task_id)
         if handle is None:
             return
+        # 进程池后端：任务在 worker 子进程内执行，子进程以 silent=True 抑制
+        # TaskLifecycle 事件。started/completed/failed 事件改由本回调在父进程侧
+        # 依据 completion 状态发布，保持进程隔离前后可观测性契约一致。
         state = completion.state
-        if state == "Running":
+        if state == TASK_STATE_RUNNING:
             # Worker 已开始执行任务，更新状态为 running（非终态，不从注册表移除）。
             handle._set_running()
+            self._emit_batch("started", task_id, handle.workflow_id)
             return
-        if state == "Completed":
+        if state == TASK_STATE_COMPLETED:
             # dispatch handler 返回 cloudpickle.dumps((success, payload_obj))
             # payload_obj 是未序列化的 result/exc 对象。
             raw = completion.result or b""
@@ -839,6 +967,7 @@ class Runtime:
                 # 使用 _set_result_obj 而非 _set_result：标记 _result_is_obj=True，
                 # 避免任务返回 bytes（如 echo(b"x")）被 result() 误当作序列化结果。
                 handle._set_result_obj(payload_obj)
+                self._emit_batch("completed", task_id, handle.workflow_id)
             else:
                 # 失败：payload_obj 是异常对象。
                 # 检查是否为 TaskCancelledError，是则设置 cancelled 状态。
@@ -849,16 +978,27 @@ class Runtime:
                 else:
                     # _set_error 接受 BaseException，内部 dumps 存入 _error_payload。
                     handle._set_error(payload_obj)
-        elif state == "Failed":
+                    self._emit_batch(
+                        "failed",
+                        task_id,
+                        handle.workflow_id,
+                        error=f"{type(payload_obj).__name__}: {payload_obj}",
+                    )
+        elif state == TASK_STATE_FAILED:
             # error 字段是 Rust 端生成的字符串。通过 reconstruct_error 解析
             # kind 前缀（``[actant:KIND] message``）重建对应 Python 异常子类，
             # 保留错误类型（如 timeout → ActantTimeoutError）。
-            
 
             handle._set_error(reconstruct_error(completion.error or "unknown error"))
-        elif state == "Cancelled":
+            self._emit_batch(
+                "failed",
+                task_id,
+                handle.workflow_id,
+                error=completion.error or "unknown error",
+            )
+        elif state == TASK_STATE_CANCELLED:
             handle._set_cancelled()
-        elif state == "Skipped":
+        elif state == TASK_STATE_SKIPPED:
             handle._set_error("task skipped")
         # 任务终态后从注册表移除（本地孤儿回收）。
         self.unregister_task(task_id)
@@ -910,12 +1050,19 @@ class Runtime:
                         _logger.warning("failed to join flow thread %s", t.name, exc_info=True)
                         if shutdown_err is None:
                             shutdown_err = e
+        # 关闭事件批处理器：停止后台 flush 线程并派发剩余缓冲事件。须在
+        # rust_runtime 释放之前执行，使 flush 能经 _publish_task_event 正常 emit。
+        if self._event_batcher is not None:
+            try:
+                self._event_batcher.close()
+            except Exception as e:
+                _logger.warning("failed to close event batcher", exc_info=True)
+                if shutdown_err is None:
+                    shutdown_err = e
+            self._event_batcher = None
         with self._lock:
             self._started = False
             core = self._rust_core
-            # 清理 metrics HTTP 服务器（若已启动），释放端口。
-            metrics_server = self._metrics_server
-            self._metrics_server = None
             # 清理引用：让 PyRuntimeCore 在 stop() 内显式释放（shutdown 已释放 GIL），
             # 而非延迟到 GC 时（GIL 持有状态下 Drop iroh/actor 资源会死锁）。
             self._rust_core = None
@@ -938,15 +1085,6 @@ class Runtime:
         with self._lock:
             self._tasks.clear()
             self._cancelled_tasks.clear()
-        # 停止 metrics HTTP 服务器（若已启动），释放端口。
-        if metrics_server is not None:
-            try:
-                metrics_server.shutdown()
-                metrics_server.server_close()
-            except Exception as e:
-                _logger.warning("failed to stop metrics server", exc_info=True)
-                if shutdown_err is None:
-                    shutdown_err = e
         # 无论 shutdown 是否成功都清理线程上下文，避免后续 effect 调用
         # 持有已失效的 Runtime 引用。
         if getattr(_runtime_local, "runtime", None) is self:
@@ -1177,8 +1315,16 @@ class Runtime:
         self._mark_task_cancelled(task_id)
         # 通知 Rust Worker 设置 cancel_flag，使正在运行的任务在下次检查点退出。
         if self._rust_core is not None:
-            with suppress(Exception):
+            try:
                 self._rust_core.cancel_task(task_id)
+            except Exception:
+                # Rust 侧取消失败不阻断 Python 侧取消标记的设置（预取消标记
+                # 仍能阻止尚未被 Worker 拉取的任务执行），但必须记录告警便于排查。
+                _logger.warning(
+                    "cancel_task(%s): rust core cancel_task failed",
+                    task_id,
+                    exc_info=True,
+                )
         cancelled = bool(handle.cancel())
         if not cancelled:
             self._clear_task_cancelled(task_id)
@@ -1190,11 +1336,100 @@ class Runtime:
             handle._set_cancelled()
         return cancelled
 
+    def submit_dag(
+        self,
+        workflow_id: str,
+        nodes: list[Any],
+        edges: list[tuple[str, str]],
+        *,
+        failure_strategy: str | None = None,
+        default_retry_policy: Any = None,
+    ) -> None:
+        """将 ``@flow`` 执行期记录的 DAG 提交到 Rust Orchestrator 持久化。
+
+        由 ``@flow`` 在函数体成功返回后调用。此后该 workflow 的状态由
+        Orchestrator 状态机驱动，可通过 :meth:`get_workflow_state` 查询。
+
+        Args:
+            workflow_id: 工作流唯一标识（``@flow`` 生成）。
+            nodes: ``_DagNode`` 列表（由 ``FlowDAG.to_nodes`` 构造）。
+            edges: ``(upstream_task_id, downstream_task_id)`` 依赖边列表。
+            failure_strategy: 失败策略（``"fail_fast"`` / ``"continue"``）。
+            default_retry_policy: DAG 级默认重试策略（``_RetryPolicy``）。
+
+        Raises:
+            InvalidStateError: Runtime 未启动。
+        """
+        core = self._rust_core
+        if core is None:
+            raise InvalidStateError("Runtime not started: rust_core is None")
+        core.submit_dag(
+            workflow_id,
+            nodes,
+            edges,
+            failure_strategy,
+            default_retry_policy,
+        )
+
+    def complete_workflow(
+        self,
+        workflow_id: str,
+        outcomes: list[tuple[str, bool, bytes]],
+    ) -> None:
+        """把 flow 已执行完成的任务结果回灌 Orchestrator，驱动状态机推进到终态。
+
+        由 ``@flow`` 在 DAG 提交后调用：成功项调用 ``COMPLETE_TASK``，失败项
+        调用 ``FAIL_TASK``（WorkflowLevel 作用域），使持久化工作流从 Pending
+        推进到 Completed / Failed，从而让生命周期事件与 Orchestrator 状态一致。
+
+        Args:
+            workflow_id: 工作流唯一标识（``@flow`` 生成）。
+            outcomes: ``[(task_id, success, result_bytes)]``，需按拓扑序传入
+                （依赖先于下游）。
+
+        Raises:
+            InvalidStateError: Runtime 未启动。
+        """
+        core = self._rust_core
+        if core is None:
+            raise InvalidStateError("Runtime not started: rust_core is None")
+        core.complete_workflow(workflow_id, outcomes)
+
+    def get_workflow_state(self, workflow_id: str) -> dict[str, Any] | None:
+        """查询 Orchestrator 中 workflow 的持久化状态。
+
+        Returns:
+            状态字典（``workflow_id`` / ``state`` / ``tasks`` / 计数等），
+            不存在时返回 ``None``。
+
+        Raises:
+            InvalidStateError: Runtime 未启动。
+        """
+        core = self._rust_core
+        if core is None:
+            raise InvalidStateError("Runtime not started: rust_core is None")
+        return cast("dict[str, Any] | None", core.get_workflow_state(workflow_id))
+
+    def list_workflows(self) -> list[str]:
+        """列出 Orchestrator 中活跃 workflow 的 id 列表。
+
+        Raises:
+            InvalidStateError: Runtime 未启动。
+        """
+        core = self._rust_core
+        if core is None:
+            raise InvalidStateError("Runtime not started: rust_core is None")
+        return list(core.list_workflows())
+
     def metrics_text(self) -> str:
         """返回所有已注册指标的 Prometheus exposition format 文本。
 
         用于自定义 HTTP 服务器暴露 ``/metrics`` 端点，或直接抓取/打印。
         若 Runtime 未启动（``metrics::init()`` 未调用），返回空字符串。
+
+        HTTP 托管不在核心层（外置默认）：需要 HTTP 端点时用 ``http.server``
+        自行包裹本方法，参见 ``examples/metrics_server.py`` 与
+        ``actant worker --metrics-port``。
 
         Returns:
             Prometheus 文本格式字符串。
@@ -1202,88 +1437,6 @@ class Runtime:
         from actant.actant import prometheus_text
 
         return prometheus_text()
-
-    def start_metrics_server(self, port: int) -> int:
-        """启动 Prometheus HTTP exporter，在 ``port`` 上监听 ``/metrics``。
-
-        在独立线程中运行，不阻塞调用方。可重复调用：若已有服务器在运行，
-        先停止旧服务器再启动新的。Runtime.stop() 会自动停止服务器。
-
-        Args:
-            port: 监听端口。``0`` 表示由 OS 分配随机可用端口。
-
-        Returns:
-            实际监听端口（当 ``port=0`` 时由 OS 分配）。
-
-        Raises:
-            InvalidStateError: Runtime 未启动。
-            OSError: 端口被占用或绑定失败。
-        """
-        import http.server
-        import socketserver
-
-        from actant.actant import prometheus_text
-
-        if self._rust_core is None:
-            raise InvalidStateError("Runtime not started")
-
-        with self._lock:
-            # 若已有服务器在运行，先停止。
-            if self._metrics_server is not None:
-                self._stop_metrics_server_locked()
-
-            class _PrometheusHandler(http.server.BaseHTTPRequestHandler):
-                """处理 ``/metrics`` 抓取请求，返回 Prometheus 文本。"""
-
-                def do_GET(self) -> None:
-                    if self.path != "/metrics":
-                        self.send_response(404)
-                        self.end_headers()
-                        return
-                    text = prometheus_text()
-                    body = text.encode("utf-8")
-                    self.send_response(200)
-                    self.send_header(
-                        "Content-Type",
-                        "text/plain; version=0.0.4; charset=utf-8",
-                    )
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
-
-                def log_message(self, format: str, *args: Any) -> None:
-                    _logger.debug("metrics: " + format, *args)
-
-            class _ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
-                daemon_threads = True
-                allow_reuse_address = True
-
-            server = _ThreadingHTTPServer(("0.0.0.0", port), _PrometheusHandler)
-            actual_port = server.server_address[1]
-            thread = threading.Thread(
-                target=server.serve_forever,
-                name=f"actant-metrics-{actual_port}",
-                daemon=True,
-            )
-            thread.start()
-            self._metrics_server = server
-            return actual_port
-
-    def stop_metrics_server(self) -> None:
-        """停止 Prometheus HTTP 服务器（若已启动）。
-
-        线程安全；若服务器未运行则为空操作。
-        """
-        with self._lock:
-            self._stop_metrics_server_locked()
-
-    def _stop_metrics_server_locked(self) -> None:
-        """在持有 ``_lock`` 的前提下停止 metrics 服务器。"""
-        server = self._metrics_server
-        self._metrics_server = None
-        if server is not None:
-            server.shutdown()
-            server.server_close()
 
     def set_max_concurrent_tasks(self, new_max: int) -> None:
         """运行时调整 Worker 最大并发任务数（仅支持扩容）。

@@ -9,10 +9,9 @@ use tokio::sync::mpsc;
 
 use crate::common::{
     ActantError, ActorConfig, ActorId, ActorMessage, ActorMessageResult, ActorStatus, MessageId,
-    NodeId, RemoteActorReply, RemoteActorRequest, RemoteReplyAddress, Result,
+    NodeId, Result,
 };
 use crate::runtime::event_bus::EventBus;
-use crate::runtime::network::Transport;
 use crate::runtime::state::{
     ActorSnapshot, CheckpointManager, HybridLogicalClock, LmdbStore, Store, WalWriter,
 };
@@ -253,113 +252,6 @@ async fn stop_unknown_actor_is_noop() {
 }
 
 #[tokio::test]
-async fn spawn_emits_actor_started_supervision_event() {
-    let system = ActorSystem::new();
-    // 必须在 spawn 前订阅——emit() 通过 tokio::spawn 异步发布到 EventBus，
-    // 订阅者通过 mpsc 接收；如果在 spawn 后订阅，可能错过事件。
-    let mut rx = system.supervision.subscribe();
-
-    let actor_id = ActorId::from("sup-1");
-    let (actor, _) = EchoActor::new();
-    system.spawn(actor_id.clone(), actor).await.unwrap();
-
-    let event = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
-        .await
-        .expect("should receive ActorStarted event")
-        .expect("channel not closed");
-    match event {
-        crate::runtime::event_bus::BusEvent::SupervisionEvent(SupervisionEvent::ActorStarted {
-            actor_id: id,
-        }) => {
-            assert_eq!(id.as_str(), "sup-1");
-        }
-        other => panic!("expected ActorStarted, got {:?}", other),
-    }
-}
-
-#[tokio::test]
-async fn stop_emits_actor_stopped_supervision_event() {
-    let system = ActorSystem::new();
-    // 在 spawn 之前订阅——stop 时 emit ActorStopped 通过 EventBus 异步发布。
-    let mut rx = system.supervision.subscribe();
-    let actor_id = ActorId::from("sup-2");
-    let (actor, _) = EchoActor::new();
-    system.spawn(actor_id.clone(), actor).await.unwrap();
-
-    // 消费 spawn 触发的 ActorStarted。
-    let started = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
-        .await
-        .expect("should receive ActorStarted first")
-        .expect("channel not closed");
-    assert!(matches!(
-        started,
-        crate::runtime::event_bus::BusEvent::SupervisionEvent(
-            SupervisionEvent::ActorStarted { .. }
-        )
-    ));
-
-    system.stop(&actor_id).await.unwrap();
-
-    let event = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
-        .await
-        .expect("should receive ActorStopped event")
-        .expect("channel not closed");
-    assert!(
-        matches!(
-            event,
-            crate::runtime::event_bus::BusEvent::SupervisionEvent(
-                SupervisionEvent::ActorStopped { .. }
-            )
-        ),
-        "expected ActorStopped, got {:?}",
-        event
-    );
-}
-
-#[tokio::test]
-async fn actor_failure_emits_actor_failed_supervision_event() {
-    let system = ActorSystem::new();
-    // spawn 之前订阅——ActorStarted/ActorFailed 都通过 EventBus 异步发布。
-    let mut rx = system.supervision.subscribe();
-    let actor_id = ActorId::from("sup-3");
-    let (actor, _) = EchoActor::with_fail("boom");
-    system.spawn(actor_id.clone(), actor).await.unwrap();
-
-    let _ = system.call(&actor_id, "boom", vec![]).await;
-
-    // 先消费 ActorStarted，再等待 ActorFailed。
-    let started = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
-        .await
-        .expect("should receive first event")
-        .expect("channel not closed");
-    assert!(
-        matches!(
-            started,
-            crate::runtime::event_bus::BusEvent::SupervisionEvent(
-                SupervisionEvent::ActorStarted { .. }
-            )
-        ),
-        "expected ActorStarted first, got {:?}",
-        started
-    );
-
-    let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
-        .await
-        .expect("should receive ActorFailed event")
-        .expect("channel not closed");
-    match event {
-        crate::runtime::event_bus::BusEvent::SupervisionEvent(SupervisionEvent::ActorFailed {
-            actor_id: id,
-            error,
-        }) => {
-            assert_eq!(id.as_str(), "sup-3");
-            assert!(error.contains("intentional failure"));
-        }
-        other => panic!("expected ActorFailed, got {:?}", other),
-    }
-}
-
-#[tokio::test]
 async fn multiple_actors_process_messages_concurrently() {
     let system = ActorSystem::new();
 
@@ -383,20 +275,6 @@ async fn multiple_actors_process_messages_concurrently() {
 }
 
 #[tokio::test]
-async fn call_remote_without_network_returns_error() {
-    let system = ActorSystem::new();
-    let target_node = NodeId::from("remote");
-    let result = system
-        .call_remote(&target_node, ActorId::from("a"), "method".into(), vec![])
-        .await;
-    assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("network not configured"));
-}
-
-#[tokio::test]
 async fn with_config_sets_mailbox_capacity() {
     let config = ActorConfig {
         mailbox_capacity: 16,
@@ -410,39 +288,6 @@ async fn with_config_sets_mailbox_capacity() {
 async fn with_node_id_stores_node_id() {
     let system = ActorSystem::new().with_node_id(NodeId::from("node-1"));
     assert_eq!(system.node_id().unwrap().as_str(), "node-1");
-}
-
-#[tokio::test]
-async fn supervision_delivers_to_subscriber() {
-    let tree = SupervisionTree::with_event_bus(EventBus::new());
-    let mut rx = tree.subscribe();
-
-    tree.emit(SupervisionEvent::ActorStarted {
-        actor_id: ActorId("a1".into()),
-    });
-
-    let event = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
-        .await
-        .expect("should receive emitted event")
-        .expect("channel not closed");
-    match event {
-        crate::runtime::event_bus::BusEvent::SupervisionEvent(SupervisionEvent::ActorStarted {
-            actor_id,
-        }) => {
-            assert_eq!(actor_id.0, "a1");
-        }
-        other => panic!("expected ActorStarted, got {:?}", other),
-    }
-}
-
-#[tokio::test]
-async fn supervision_without_subscribers_is_silent_noop() {
-    let tree = SupervisionTree::with_event_bus(EventBus::new());
-    tree.emit(SupervisionEvent::ActorStarted {
-        actor_id: ActorId("a1".into()),
-    });
-    // 让 spawn 完成无订阅者的 publish（不会 panic）。
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 }
 
 #[tokio::test]
@@ -507,33 +352,26 @@ async fn replay_after_replays_all_wal_events_in_order() {
 // ───────────────────────── ActorSystem builder 方法测试 ─────────────────────────
 
 #[tokio::test]
-async fn with_network_stores_transport() {
-    use crate::test_support::MockTransport;
-    let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-net"));
-    let system = ActorSystem::new().with_network(network);
-    // 通过 call_remote 不再返回 "network not configured" 错误验证
-    let result = system
-        .call_remote(
-            &NodeId::from("remote"),
-            ActorId::from("a"),
-            "method".into(),
-            vec![],
-        )
-        .await;
-    // 会失败但不是 "network not configured"
-    assert!(result.is_err());
-    assert!(!result
-        .unwrap_err()
-        .to_string()
-        .contains("network not configured"));
-}
-
-#[tokio::test]
 async fn with_event_bus_stores_bus() {
     let bus = EventBus::new();
     let system = ActorSystem::new().with_event_bus(bus);
-    // event_bus 字段不可直接访问，但构造应不 panic。
-    let _ = system.config;
+    // 注入的 bus 应替换默认 bus：经 system.event_bus 发布的生命周期错误
+    // 应能被该 bus 上的订阅者收到。
+    let mut rx = system
+        .event_bus
+        .subscribe(crate::runtime::event_bus::Topic::ActorLifecycleError);
+    system.emit_lifecycle_error(ActorId::from("lc-1"), "boom".into());
+    let event = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+        .await
+        .expect("should receive lifecycle error event")
+        .expect("channel not closed");
+    match event {
+        crate::runtime::event_bus::BusEvent::ActorLifecycleError { actor_id, error } => {
+            assert_eq!(actor_id.as_str(), "lc-1");
+            assert_eq!(error, "boom");
+        }
+        other => panic!("expected ActorLifecycleError, got {:?}", other),
+    }
 }
 
 #[tokio::test]
@@ -680,78 +518,6 @@ async fn stop_compaction_task_without_start_is_noop() {
     let system = ActorSystem::new();
     // 没有启动过 compaction task，stop 应是 noop
     system.stop_compaction_task();
-}
-
-// ───────────────────────── deliver_reply 测试 ─────────────────────────
-
-#[tokio::test]
-async fn deliver_reply_for_unknown_correlation_is_silent_noop() {
-    let system = ActorSystem::new();
-    // 未注册的 correlation_id 应静默忽略
-    system.deliver_reply(RemoteActorReply {
-        correlation_id: MessageId::from("unknown-id"),
-        result: ActorMessageResult {
-            message_id: MessageId::generate(),
-            payload: vec![],
-            error: None,
-        },
-    });
-}
-
-// ───────────────────────── handle_remote_request 测试 ─────────────────────────
-
-#[tokio::test]
-async fn handle_remote_request_to_unknown_actor_logs_warning() {
-    let system = ActorSystem::new();
-    // 目标 actor 不存在，应仅 log warning 而不 panic
-    system
-        .handle_remote_request(RemoteActorRequest {
-            target: ActorId::from("ghost"),
-            method: "ping".into(),
-            payload: vec![],
-            reply_to: None,
-        })
-        .await;
-}
-
-#[tokio::test]
-async fn handle_remote_request_with_reply_to_unknown_actor_spawns_no_reply() {
-    let system = ActorSystem::new();
-    // 目标 actor 不存在但带 reply_to，不应 panic
-    system
-        .handle_remote_request(RemoteActorRequest {
-            target: ActorId::from("ghost"),
-            method: "ping".into(),
-            payload: vec![],
-            reply_to: Some(RemoteReplyAddress {
-                node_id: NodeId::from("origin"),
-                correlation_id: MessageId::from("corr-1"),
-            }),
-        })
-        .await;
-    // 短暂等待让可能的 spawn task 完成
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-}
-
-#[tokio::test]
-async fn handle_remote_request_to_existing_actor_delivers_message() {
-    let system = ActorSystem::new();
-    let (actor, received) = EchoActor::new();
-    let actor_id = ActorId::from("remote-target");
-    system.spawn(actor_id.clone(), actor).await.unwrap();
-
-    system
-        .handle_remote_request(RemoteActorRequest {
-            target: actor_id.clone(),
-            method: "remote-method".into(),
-            payload: b"remote-data".to_vec(),
-            reply_to: None,
-        })
-        .await;
-
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    let received = received.lock().unwrap();
-    assert_eq!(*received, vec!["remote-method".to_string()]);
 }
 
 // ───────────────────────── MailboxRegistry 扩展测试 ─────────────────────────
@@ -926,9 +692,7 @@ async fn spawn_many_actors_concurrently() {
 fn actor_config_default_has_sane_values() {
     let c = ActorConfig::default();
     assert!(c.mailbox_capacity > 0);
-    assert!(c.remote_call_timeout_ms > 0);
     assert!(c.wal_compaction_interval_secs > 0);
-    assert!(c.supervision_event_capacity > 0);
     assert!(c.checkpoint_retention_count >= 1);
     assert!(c.stop_timeout_ms > 0);
 }
@@ -939,4 +703,371 @@ fn actor_system_default_equals_new() {
     let b = ActorSystem::new();
     // 两者应具有相同的默认配置
     assert_eq!(a.config.mailbox_capacity, b.config.mailbox_capacity);
+}
+
+// ───────────────────────── on_start 失败的幽灵注册清理 ─────────────────────────
+
+struct OnStartFailActor;
+
+#[async_trait]
+impl Actor for OnStartFailActor {
+    fn actor_type(&self) -> &str {
+        "onstart-fail"
+    }
+
+    async fn handle_message(&mut self, msg: ActorMessage) -> Result<ActorMessageResult> {
+        Ok(ActorMessageResult {
+            message_id: msg.id,
+            payload: vec![],
+            error: None,
+        })
+    }
+
+    async fn on_start(&mut self) -> Result<()> {
+        Err(ActantError::Actor("intentional on_start failure".into()))
+    }
+}
+
+#[tokio::test]
+async fn spawn_on_start_failure_cleans_up_ghost_registrations() {
+    let system = ActorSystem::new();
+    let actor_id = ActorId::from("onstart-fail-1");
+    let err = system
+        .spawn(actor_id.clone(), OnStartFailActor)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("on_start failed"));
+
+    // 邮箱注册已清理：send 报 not found 而非入队到无人消费的通道。
+    let msg = ActorMessage::new(actor_id.clone(), "ping".into(), vec![]);
+    assert!(system.send(&actor_id, msg).await.is_err());
+    assert!(system.list_actors().is_empty());
+
+    // 清理后同 id 可重新 spawn 成功。
+    let (actor, _) = EchoActor::new();
+    system.spawn(actor_id.clone(), actor).await.unwrap();
+    assert!(system.list_actors().contains(&actor_id));
+}
+
+// ───────────────────────── 消息失败不退役 actor（指标单一扣减的行为不变量） ─────────────────────────
+
+#[tokio::test]
+async fn message_failure_does_not_retire_actor() {
+    let system = ActorSystem::new();
+    let actor_id = ActorId::from("still-active-1");
+    let (actor, _) = EchoActor::with_fail("boom");
+    system.spawn(actor_id.clone(), actor).await.unwrap();
+
+    // 消息失败后 actor 仍处于 Running（active_actors 不在消息级失败路径扣减，
+    // 其对应行为是：actor 生命周期未被消息失败终止）。
+    let result = system.call(&actor_id, "boom", vec![]).await.unwrap();
+    assert!(result.error.is_some());
+    assert_eq!(system.actor_status(&actor_id), Some(ActorStatus::Running));
+
+    // 后续消息仍被正常处理。
+    let ok = system
+        .call(&actor_id, "ping", b"data".to_vec())
+        .await
+        .unwrap();
+    assert_eq!(ok.payload, b"data");
+}
+
+// ───────────────────────── pending 消息 at-least-once 语义 ─────────────────────────
+
+#[tokio::test]
+async fn pending_message_persists_until_ack() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::new(LmdbStore::open(dir.path()).unwrap());
+    let registry = MailboxRegistry::new().with_store(store.clone());
+
+    let actor_id = ActorId::from("ack-persist-1");
+    let (tx, mut rx) = mpsc::channel(8);
+    registry.register(actor_id.clone(), tx);
+
+    let msg = ActorMessage::new(actor_id.clone(), "work".into(), b"payload".to_vec());
+    let msg_id = msg.id.clone();
+    registry.send(&actor_id, msg).await.unwrap();
+    let _delivered = rx.recv().await.unwrap();
+
+    // 入队成功不删除 pending 记录（由 ack 删除）。
+    let prefix = format!("pending:{}:", actor_id.0);
+    let entries = store.scan_prefix(&prefix).await.unwrap();
+    assert_eq!(entries.len(), 1, "pending record must survive enqueue");
+
+    registry.ack_message(&actor_id, &msg_id).await.unwrap();
+    let entries = store.scan_prefix(&prefix).await.unwrap();
+    assert_eq!(entries.len(), 0, "ack_message must delete pending record");
+}
+
+#[tokio::test]
+async fn recover_pending_redelivers_unacked_messages() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::new(LmdbStore::open(dir.path()).unwrap());
+    let registry = MailboxRegistry::new().with_store(store.clone());
+
+    let actor_id = ActorId::from("recover-1");
+    let (tx, _rx) = mpsc::channel(8);
+    registry.register(actor_id.clone(), tx);
+
+    let msg = ActorMessage::new(actor_id.clone(), "work".into(), b"payload".to_vec());
+    let msg_id = msg.id.clone();
+    registry.send(&actor_id, msg).await.unwrap();
+
+    // 模拟重启：注销旧邮箱，注册新通道后恢复未确认消息。
+    registry.unregister(&actor_id);
+    let (tx2, mut rx2) = mpsc::channel(8);
+    registry.register(actor_id.clone(), tx2);
+
+    let count = registry.recover_pending(&actor_id).await.unwrap();
+    assert_eq!(count, 1, "unacked message should be redelivered");
+
+    let redelivered = rx2.recv().await.unwrap();
+    assert_eq!(redelivered.id, msg_id);
+    assert_eq!(redelivered.method, "work");
+
+    // 重投不删除 pending 记录——仅 ack_message（成功处理后）删除。
+    let prefix = format!("pending:{}:", actor_id.0);
+    let entries = store.scan_prefix(&prefix).await.unwrap();
+    assert_eq!(entries.len(), 1, "redelivery must keep pending record");
+
+    registry.ack_message(&actor_id, &msg_id).await.unwrap();
+    let entries = store.scan_prefix(&prefix).await.unwrap();
+    assert_eq!(entries.len(), 0);
+}
+
+#[tokio::test]
+async fn failed_message_redelivered_after_actor_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LmdbStore::open(dir.path()).unwrap();
+    let wal_path = dir.path().join("redeliver.wal");
+    let wal_writer = WalWriter::open(&wal_path).unwrap();
+    let system = ActorSystem::new().with_wal(wal_writer, store);
+
+    let actor_id = ActorId::from("redeliver-1");
+    let (actor, received1) = EchoActor::with_fail("boom");
+    system.spawn(actor_id.clone(), actor).await.unwrap();
+
+    system
+        .send(
+            &actor_id,
+            ActorMessage::new(actor_id.clone(), "boom".into(), vec![]),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(*received1.lock().unwrap(), vec!["boom".to_string()]);
+
+    // 失败不 ack：重启后 recover_pending 重投该消息。
+    system.stop(&actor_id).await.unwrap();
+    let (actor2, received2) = EchoActor::with_fail("boom");
+    system.spawn(actor_id.clone(), actor2).await.unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        *received2.lock().unwrap(),
+        vec!["boom".to_string()],
+        "unacked message must be redelivered after restart"
+    );
+
+    // 成功处理的消息被 ack，再次重启不重投。
+    system
+        .send(
+            &actor_id,
+            ActorMessage::new(actor_id.clone(), "ping".into(), b"ok".to_vec()),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(*received2.lock().unwrap(), vec!["boom", "ping"]);
+
+    system.stop(&actor_id).await.unwrap();
+    let (actor3, received3) = EchoActor::new();
+    system.spawn(actor_id.clone(), actor3).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // "ping" 已 ack 不重投；"boom" 未 ack 会重投并再次失败。
+    assert_eq!(
+        *received3.lock().unwrap(),
+        vec!["boom".to_string()],
+        "acked message must not be redelivered"
+    );
+}
+
+// ───────────────────────── 毒消息 bounded-redelivery 测试 ─────────────────────────
+
+/// 捕获 tracing 输出到内存的 writer，用于断言毒消息判定发出 error 日志。
+#[derive(Clone)]
+struct PoisonLogWriter {
+    buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+impl PoisonLogWriter {
+    fn new() -> Self {
+        Self {
+            buf: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+    fn captured(&self) -> String {
+        String::from_utf8_lossy(&self.buf.lock().unwrap()).into_owned()
+    }
+}
+
+impl std::io::Write for PoisonLogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.buf.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for PoisonLogWriter {
+    type Writer = PoisonLogWriter;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+fn poison_test_registry(dir: &std::path::Path) -> (MailboxRegistry, LmdbStore) {
+    let store = LmdbStore::open(dir).unwrap();
+    let registry = MailboxRegistry::new().with_store(Store::new(store.clone()));
+    (registry, store)
+}
+
+#[tokio::test]
+async fn recover_pending_increments_delivery_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, store) = poison_test_registry(dir.path());
+    let actor_id = ActorId::from("redeliver-1");
+    let (tx, mut rx) = mpsc::channel(8);
+    registry.register(actor_id.clone(), tx);
+
+    let msg = ActorMessage::new(actor_id.clone(), "job".into(), b"p".to_vec());
+    let key = crate::runtime::actor::mailbox::pending_key(&actor_id, &msg.id);
+    registry.send(&actor_id, msg).await.unwrap();
+
+    let read_count = |store: &LmdbStore, key: &str| -> u32 {
+        let raw = store
+            .get(key)
+            .unwrap()
+            .expect("pending record should exist");
+        postcard::from_bytes::<crate::runtime::actor::mailbox::PersistentMessage>(&raw)
+            .unwrap()
+            .delivery_count()
+    };
+
+    // 首次投递 delivery_count = 0
+    assert_eq!(read_count(&store, &key), 0);
+
+    // 每次 recover_pending 重投成功后计数递增并回写
+    registry.recover_pending(&actor_id).await.unwrap();
+    assert_eq!(
+        read_count(&store, &key),
+        1,
+        "delivery count should increment on first redelivery"
+    );
+    registry.recover_pending(&actor_id).await.unwrap();
+    assert_eq!(
+        read_count(&store, &key),
+        2,
+        "delivery count should increment on second redelivery"
+    );
+
+    // 消息确实被重投进邮箱
+    let redelivered = rx.recv().await.unwrap();
+    assert_eq!(redelivered.method, "job");
+}
+
+#[tokio::test]
+async fn poison_pending_message_dropped_and_logged_after_max_redeliveries() {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, store) = poison_test_registry(dir.path());
+    let actor_id = ActorId::from("poison-1");
+    let (tx, mut rx) = mpsc::channel(32);
+    registry.register(actor_id.clone(), tx);
+
+    let msg = ActorMessage::new(actor_id.clone(), "doom".into(), b"p".to_vec());
+    let key = crate::runtime::actor::mailbox::pending_key(&actor_id, &msg.id);
+    registry.send(&actor_id, msg).await.unwrap();
+
+    let writer = PoisonLogWriter::new();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(writer.clone())
+        .with_max_level(tracing::Level::ERROR)
+        .with_ansi(false)
+        .finish();
+    let dispatch = tracing::dispatcher::Dispatch::new(subscriber);
+
+    // recover_pending 不依赖 tokio 运行时设施（LMDB 同步 + try_send），
+    // 可在 dispatcher 作用域内用 executor 驱动。
+    tracing::dispatcher::with_default(&dispatch, || {
+        // MAX_PENDING_REDELIVERIES = 5：前 5 次 recover 正常重投，第 6 次超限丢弃。
+        for round in 1..=5 {
+            let recovered =
+                futures::executor::block_on(registry.recover_pending(&actor_id)).unwrap();
+            assert_eq!(recovered, 1, "round {round}: message should be redelivered");
+            assert!(
+                store.get(&key).unwrap().is_some(),
+                "round {round}: record must be kept before exceeding the limit"
+            );
+        }
+
+        let recovered = futures::executor::block_on(registry.recover_pending(&actor_id)).unwrap();
+        assert_eq!(recovered, 0, "poison message must not be redelivered");
+    });
+
+    // 记录已被删除，不会随下一次 spawn 再度重投。
+    assert!(
+        store.get(&key).unwrap().is_none(),
+        "poison message record must be deleted after exceeding max redeliveries"
+    );
+    // 邮箱内应存在此前轮次重投的消息（未被消费），但不含第 6 条。
+    assert!(
+        rx.try_recv().is_ok(),
+        "earlier redeliveries should remain in the mailbox"
+    );
+
+    let captured = writer.captured();
+    assert!(
+        captured.contains("ERROR") && captured.contains("poison message"),
+        "dropping a poison message must log an error, got: {captured}"
+    );
+    assert!(
+        captured.contains(&actor_id.0) && captured.contains(&msg_id_str(&key)),
+        "error log must carry actor_id and msg_id, got: {captured}"
+    );
+}
+
+/// 从 pending key 提取 msg_id（key 形如 `pending:{actor}:{msg}`）。
+fn msg_id_str(key: &str) -> String {
+    key.rsplit(':').next().unwrap_or("").to_string()
+}
+
+#[tokio::test]
+async fn ack_message_deletes_pending_record_resetting_redelivery_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, store) = poison_test_registry(dir.path());
+    let actor_id = ActorId::from("ack-1");
+    let (tx, mut rx) = mpsc::channel(8);
+    registry.register(actor_id.clone(), tx);
+
+    let msg = ActorMessage::new(actor_id.clone(), "job".into(), b"p".to_vec());
+    let key = crate::runtime::actor::mailbox::pending_key(&actor_id, &msg.id);
+    registry.send(&actor_id, msg).await.unwrap();
+    assert!(store.get(&key).unwrap().is_some());
+
+    // 成功处理后的 ack：删除 pending 记录（重投计数随之归零消失）。
+    let delivered = rx.recv().await.unwrap();
+    registry
+        .ack_message(&actor_id, &delivered.id)
+        .await
+        .unwrap();
+    assert!(
+        store.get(&key).unwrap().is_none(),
+        "acked message must have its pending record deleted"
+    );
+
+    // ack 后 recover_pending 无可重投消息。
+    let recovered = registry.recover_pending(&actor_id).await.unwrap();
+    assert_eq!(recovered, 0, "acked message must not be redelivered");
 }

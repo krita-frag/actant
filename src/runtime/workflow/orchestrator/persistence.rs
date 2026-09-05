@@ -15,24 +15,34 @@ use crate::runtime::workflow::{Dag, Terminal, WorkflowExecution};
 
 use super::{keys::*, types::*, Orchestrator};
 
-impl Orchestrator {
-    pub(crate) fn log_event(&self, payload: WorkflowEventPayload) {
-        if let Some(log) = self.event_log.as_ref() {
-            let topic = payload.topic();
-            match postcard::to_allocvec(&payload) {
-                Ok(bytes) => {
-                    if let Err(e) = log.append(&topic, &bytes) {
-                        tracing::warn!(error = %e, topic = %topic, "failed to append workflow event");
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, topic = %topic, "failed to serialize workflow event");
-                }
+/// 将工作流事件写入 event_log（若存在）。
+///
+/// 序列化或追加失败仅记录 warn 日志——事件日志供外部观测，写入失败不阻断
+/// 核心状态推进。独立于 `Orchestrator` 实例，供超时 watcher 等仅持有
+/// `event_log` 克隆的后台任务复用。
+pub(crate) fn append_event(event_log: Option<&Arc<dyn EventLog>>, payload: WorkflowEventPayload) {
+    let Some(log) = event_log else {
+        return;
+    };
+    let topic = payload.topic();
+    match postcard::to_allocvec(&payload) {
+        Ok(bytes) => {
+            if let Err(e) = log.append(&topic, &bytes) {
+                tracing::warn!(error = %e, topic = %topic, "failed to append workflow event");
             }
         }
-        // 规则评估在 Python 编排循环中实现：远端订阅者通过
-        // WireEnvelope::TaskDispatch / TaskResult 接收事件，业务规则在
-        // Python 侧订阅 EventBus 自行处理。
+        Err(e) => {
+            tracing::warn!(error = %e, topic = %topic, "failed to serialize workflow event");
+        }
+    }
+    // 规则评估在 Python 编排循环中实现：远端订阅者通过
+    // WireEnvelope::TaskDispatch / TaskResult 接收事件，业务规则在
+    // Python 侧订阅 EventBus 自行处理。
+}
+
+impl Orchestrator {
+    pub(crate) fn log_event(&self, payload: WorkflowEventPayload) {
+        append_event(self.event_log.as_ref(), payload);
     }
 
     /// 从持久化 [Store] 恢复 orchestrator 状态。
@@ -252,16 +262,43 @@ impl Orchestrator {
                             let Some(slot) = state.slots.get(wf_id) else {
                                 continue;
                             };
-                            if let Ok(exec_bytes) = serialize_rkyv(&slot.execution) {
-                                batch.push((exec_key(wf_id), exec_bytes));
+                            // 序列化失败不得静默丢弃：记录 error 并重新标记脏，
+                            // 让下一轮 flush 重试（drain 已把该 workflow 移出脏集合）。
+                            match serialize_rkyv(&slot.execution) {
+                                Ok(exec_bytes) => batch.push((exec_key(wf_id), exec_bytes)),
+                                Err(e) => {
+                                    tracing::error!(
+                                        workflow = %wf_id.as_str(),
+                                        error = %e,
+                                        "persist flush: failed to serialize execution"
+                                    );
+                                    state.mark_dirty(wf_id);
+                                }
                             }
-                            if let Ok(pending_bytes) = serialize_rkyv(&slot.pending) {
-                                batch.push((pending_key(wf_id), pending_bytes));
+                            match serialize_rkyv(&slot.pending) {
+                                Ok(pending_bytes) => {
+                                    batch.push((pending_key(wf_id), pending_bytes))
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        workflow = %wf_id.as_str(),
+                                        error = %e,
+                                        "persist flush: failed to serialize pending map"
+                                    );
+                                    state.mark_dirty(wf_id);
+                                }
                             }
                         }
                         if !batch.is_empty() {
                             if let Err(e) = store.put_batch(&batch).await {
+                                // 写入失败时把本轮 drained 的 workflow 重新加入脏集合，
+                                // 避免状态丢失直到下一轮 flush 重试。
                                 tracing::error!("persist flush failed: {}", e);
+                                for wf_id in &dirty_ids {
+                                    if state.slots.contains_key(wf_id) {
+                                        state.mark_dirty(wf_id);
+                                    }
+                                }
                             }
                         }
                     }
@@ -287,11 +324,29 @@ impl Orchestrator {
             let Some(slot) = self.state.slots.get(wf_id) else {
                 continue;
             };
-            if let Ok(exec_bytes) = serialize_rkyv(&slot.execution) {
-                batch.push((exec_key(wf_id), exec_bytes));
+            // 序列化失败不得静默丢弃：记录 error 并重新标记脏，保持与后台
+            // flush 相同的重试语义（drain 已把该 workflow 移出脏集合）。
+            match serialize_rkyv(&slot.execution) {
+                Ok(exec_bytes) => batch.push((exec_key(wf_id), exec_bytes)),
+                Err(e) => {
+                    tracing::error!(
+                        workflow = %wf_id.as_str(),
+                        error = %e,
+                        "flush_dirty: failed to serialize execution"
+                    );
+                    self.state.mark_dirty(wf_id);
+                }
             }
-            if let Ok(pending_bytes) = serialize_rkyv(&slot.pending) {
-                batch.push((pending_key(wf_id), pending_bytes));
+            match serialize_rkyv(&slot.pending) {
+                Ok(pending_bytes) => batch.push((pending_key(wf_id), pending_bytes)),
+                Err(e) => {
+                    tracing::error!(
+                        workflow = %wf_id.as_str(),
+                        error = %e,
+                        "flush_dirty: failed to serialize pending map"
+                    );
+                    self.state.mark_dirty(wf_id);
+                }
             }
         }
         if !batch.is_empty() {

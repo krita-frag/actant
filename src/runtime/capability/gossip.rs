@@ -73,6 +73,7 @@ impl CapabilityGossipActor {
             network,
             sequence: std::sync::atomic::AtomicU64::new(0),
             seen: dashmap::DashMap::new(),
+            // 默认广播间隔 60s；测试或调优可通过 `with_broadcast_interval` 覆盖。
             broadcast_interval: Duration::from_secs(60),
         }
     }

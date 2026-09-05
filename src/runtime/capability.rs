@@ -225,11 +225,12 @@ where
         let req_ref = req
             .downcast_ref::<C::Request>()
             .ok_or_else(|| ActantError::Internal("emit: request type mismatch".into()))?;
-        // emit 语义是 fire-and-forget 反应型：按 ERH 协议，emit handler 的错误
-        // 不应中断后续 handler 调用。此处单个 handler 的 Err 由 emit 调用方
-        // （CapabilityRuntime::emit）按错误策略统一处理，本 ErasedHandler
-        // 层级只负责调用，丢弃返回值符合 emit 语义。
-        let _ = Handler::handle(&self.handler, req_ref.clone()).await;
+        // `Handler` trait 无错误通道：handle 返回 `Option<Response>`，None 表示
+        // 该 handler 对本事件无意见（非失败），emit 语义下响应值不消费。
+        // 自带错误通道的 handler（如 Python emit handler）直接实现
+        // `ErasedHandler::emit`，其错误由调用循环（CapabilityActor）聚合后
+        // 透传给调用方。
+        let _response = Handler::handle(&self.handler, req_ref.clone()).await;
         Ok(())
     }
 }
@@ -542,10 +543,7 @@ impl CapabilityRuntime {
             Some(result.payload)
         };
 
-        let response_bytes = match local_bytes {
-            Some(b) => Some(b),
-            None => self.route_remote::<C>(EffectKind::Ask, req_bytes).await?,
-        };
+        let response_bytes = local_bytes;
 
         let response_bytes = match response_bytes {
             Some(b) if !b.is_empty() && b[0] != 0 => b,
@@ -595,37 +593,25 @@ impl CapabilityRuntime {
             .cloned()
             .ok_or_else(|| ActantError::Internal("actor system not bound".into()))?;
 
-        let local_handlers = self.handler_count_by_type_id(type_id).unwrap_or(0);
         let req_arc: Arc<dyn Any + Send + Sync> = Arc::new(req);
         let req_bytes = codec
             .serialize_request(req_arc)
             .map_err(|e| ActantError::Internal(format!("perform codec: {}", e)))?;
 
-        let response_bytes = if local_handlers == 0 {
-            // 本地无 handler：尝试路由到具备该 capability 的对等节点。
-            self.route_remote::<C>(EffectKind::Perform, req_bytes)
-                .await?
-                .ok_or_else(|| {
-                    ActantError::Internal(
-                        "perform: no local handler and no peer with capability".into(),
-                    )
-                })?
-        } else {
-            let envelope = CapabilityEnvelope {
-                kind: EffectKind::Perform,
-                payload: req_bytes,
-            };
-            let bytes = postcard::to_allocvec(&envelope)
-                .map_err(|e| ActantError::Serialization(e.to_string()))?;
-            let result = actor_system
-                .call(&actor_id, "perform", bytes)
-                .await
-                .map_err(|e| ActantError::Actor(e.to_string()))?;
-            if let Some(err) = result.error {
-                return Err(ActantError::from(err));
-            }
-            result.payload
+        let envelope = CapabilityEnvelope {
+            kind: EffectKind::Perform,
+            payload: req_bytes,
         };
+        let bytes = postcard::to_allocvec(&envelope)
+            .map_err(|e| ActantError::Serialization(e.to_string()))?;
+        let result = actor_system
+            .call(&actor_id, "perform", bytes)
+            .await
+            .map_err(|e| ActantError::Actor(e.to_string()))?;
+        if let Some(err) = result.error {
+            return Err(ActantError::from(err));
+        }
+        let response_bytes = result.payload;
 
         let resp = codec
             .deserialize_response(&response_bytes)
@@ -678,7 +664,7 @@ impl CapabilityRuntime {
         if local_handlers > 0 {
             let envelope = CapabilityEnvelope {
                 kind: EffectKind::Emit,
-                payload: req_bytes.clone(),
+                payload: req_bytes,
             };
             let bytes = postcard::to_allocvec(&envelope)
                 .map_err(|e| ActantError::Serialization(e.to_string()))?;
@@ -689,157 +675,6 @@ impl CapabilityRuntime {
             if let Some(err) = result.error {
                 return Err(ActantError::from(err));
             }
-        }
-
-        // 同时路由到所有声明该 capability 的对等节点（尽力而为，不阻塞错误）。
-        self.route_emit_to_peers::<C>(req_bytes)?;
-        Ok(())
-    }
-
-    /// 将 capability 请求路由到声明了该能力的远端节点。
-    ///
-    /// 当前策略：选择声明了该 capability 的节点中 `node_id` 字典序最小的一个，
-    /// 通过 `ActorSystem::call_remote` 调用其 `CapabilityActor`。
-    /// 返回 `Ok(None)` 表示没有已知节点具备该能力。
-    async fn route_remote<C: Capability>(
-        &self,
-        kind: EffectKind,
-        payload: Vec<u8>,
-    ) -> Result<Option<Vec<u8>>, ActantError>
-    where
-        C::Request: Any + Clone + Send + Sync,
-        C::Response: Any + Send + Sync,
-    {
-        // Fast path：单节点场景（无任何远端 capability 元信息）直接返回 None，
-        // 避免获取 metas 读锁与线性扫描。
-        if self.cap_to_peers.is_empty() {
-            return Ok(None);
-        }
-
-        let type_id = TypeId::of::<C>();
-        let meta = self
-            .metas
-            .read()
-            .iter()
-            .find(|m| m.type_id == type_id)
-            .cloned()
-            .ok_or_else(|| {
-                ActantError::Internal(format!(
-                    "remote route: capability {:?} meta not found",
-                    std::any::type_name::<C>()
-                ))
-            })?;
-        let actor_system = self
-            .actor_system
-            .read()
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| ActantError::Internal("actor system not bound".into()))?;
-
-        let target_node = {
-            // 使用反向索引 cap_to_peers，O(1) 查找而非 O(N×M) 全表扫描。
-            let mut target: Option<NodeId> = None;
-            if let Some(peers) = self.cap_to_peers.get(meta.name) {
-                for node in peers.iter() {
-                    let candidate = node.clone();
-                    match target {
-                        None => target = Some(candidate),
-                        Some(ref current) if candidate.0 < current.0 => target = Some(candidate),
-                        _ => {}
-                    }
-                }
-            }
-            target
-        };
-
-        let target_node = match target_node {
-            Some(n) => n,
-            None => return Ok(None),
-        };
-
-        let actor_id = ActorId::capability(meta.name);
-        let envelope = CapabilityEnvelope { kind, payload };
-        let bytes = postcard::to_allocvec(&envelope)
-            .map_err(|e| ActantError::Serialization(e.to_string()))?;
-        let result = actor_system
-            .call_remote(&target_node, actor_id, "invoke".to_string(), bytes)
-            .await
-            .map_err(|e| ActantError::Actor(e.to_string()))?;
-        if let Some(err) = result.error {
-            return Err(ActantError::from(err));
-        }
-        Ok(Some(result.payload))
-    }
-
-    /// 将 emit 事件尽力路由到所有声明了该 capability 的对等节点。
-    fn route_emit_to_peers<C: Capability>(&self, payload: Vec<u8>) -> Result<(), ActantError>
-    where
-        C::Request: Any + Clone + Send + Sync,
-        C::Response: Any + Send + Sync,
-    {
-        // Fast path：若全局尚无任何远端 capability 元信息（典型单节点场景），
-        // 直接跳过 metas 锁获取与 cap_to_peers 查找。这把单节点 emit 的
-        // 远端分发检查从"读锁 + 线性扫描 metas"降为单次 DashMap len() 调用。
-        if self.cap_to_peers.is_empty() {
-            return Ok(());
-        }
-
-        let type_id = TypeId::of::<C>();
-        let meta = self
-            .metas
-            .read()
-            .iter()
-            .find(|m| m.type_id == type_id)
-            .cloned()
-            .ok_or_else(|| {
-                ActantError::Internal(format!(
-                    "remote emit: capability {:?} meta not found",
-                    std::any::type_name::<C>()
-                ))
-            })?;
-        let actor_system = self
-            .actor_system
-            .read()
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| ActantError::Internal("actor system not bound".into()))?;
-
-        // 使用反向索引 cap_to_peers，O(1) 查找而非 O(N×M) 全表扫描。
-        let target_nodes: Vec<NodeId> = self
-            .cap_to_peers
-            .get(meta.name)
-            .map(|peers| peers.iter().map(|n| n.clone()).collect())
-            .unwrap_or_default();
-
-        if target_nodes.is_empty() {
-            return Ok(());
-        }
-
-        let actor_id = ActorId::capability(meta.name);
-        let envelope = CapabilityEnvelope {
-            kind: EffectKind::Emit,
-            payload,
-        };
-        let bytes = postcard::to_allocvec(&envelope)
-            .map_err(|e| ActantError::Serialization(e.to_string()))?;
-
-        for target_node in target_nodes {
-            let bytes = bytes.clone();
-            let actor_system = actor_system.clone();
-            let actor_id = actor_id.clone();
-            tokio::spawn(async move {
-                if let Err(e) = actor_system
-                    .call_remote(&target_node, actor_id, "invoke".to_string(), bytes)
-                    .await
-                {
-                    tracing::warn!(
-                        target_node = %target_node.as_str(),
-                        capability = %meta.name,
-                        error = %e,
-                        "remote emit failed"
-                    );
-                }
-            });
         }
         Ok(())
     }

@@ -69,11 +69,6 @@ fn init_console_subscriber() {
     // feature 未启用时忽略环境变量；纯 tracing 已在 init_tracing 中处理。
 }
 
-/// 关闭可观测性子系统。
-///
-/// 当前实现为空操作：tracing subscriber 的清理由运行时统一处理。
-pub fn shutdown() {}
-
 #[cfg(test)]
 #[path = "../tests/rust/unit/observability.rs"]
 mod tests;

@@ -449,21 +449,6 @@ fn direct_response_error_serialization_roundtrip() {
     }
 }
 
-#[test]
-fn direct_response_actor_call_result_serialization_roundtrip() {
-    let resp = DirectResponse::ActorCallResult {
-        result: vec![0x01, 0x02],
-    };
-    let bytes = postcard::to_allocvec(&resp).expect("serialize");
-    let decoded: DirectResponse = postcard::from_bytes(&bytes).expect("deserialize");
-    match decoded {
-        DirectResponse::ActorCallResult { result } => {
-            assert_eq!(result, vec![0x01, 0x02]);
-        }
-        _ => panic!("wrong variant"),
-    }
-}
-
 // ───────────────────────── NetworkMessage ─────────────────────────
 
 #[test]
@@ -578,36 +563,6 @@ fn direct_request_query_workflow_state_serialization_roundtrip() {
         } => {
             assert_eq!(workflow_id.as_str(), "wf-q");
             assert_eq!(requesting_node.as_str(), "node-q");
-        }
-        _ => panic!("wrong variant"),
-    }
-}
-
-#[test]
-fn direct_request_actor_call_serialization_roundtrip() {
-    let req = DirectRequest::ActorCall {
-        target: crate::common::ActorId::from("actor-1"),
-        method: "do_thing".to_string(),
-        payload: vec![0xAA, 0xBB],
-        reply_to: RemoteReplyAddress {
-            node_id: NodeId::from("node-reply"),
-            correlation_id: crate::common::MessageId::from("corr-1"),
-        },
-    };
-    let bytes = postcard::to_allocvec(&req).expect("serialize");
-    let decoded: DirectRequest = postcard::from_bytes(&bytes).expect("deserialize");
-    match decoded {
-        DirectRequest::ActorCall {
-            target,
-            method,
-            payload,
-            reply_to,
-        } => {
-            assert_eq!(target.as_str(), "actor-1");
-            assert_eq!(method, "do_thing");
-            assert_eq!(payload, vec![0xAA, 0xBB]);
-            assert_eq!(reply_to.node_id.as_str(), "node-reply");
-            assert_eq!(reply_to.correlation_id.as_str(), "corr-1");
         }
         _ => panic!("wrong variant"),
     }
@@ -842,4 +797,91 @@ async fn network_manager_new_with_invalid_discovery_mode_returns_error() {
     config.discovery_mode = crate::common::DiscoveryMode::new_unchecked("no-such-mode");
     let result = NetworkManager::new(NodeId::from("test-bad-discovery"), config).await;
     assert!(result.is_err(), "invalid discovery mode should fail");
+}
+
+// ───────────────────────── route_direct_request ─────────────────────────
+
+fn stub_direct_event(payload_len: usize) -> DirectEvent {
+    // route_direct_request 按请求序列化后的字节数判定超限，
+    // 用等长 workflow_id 使 payload_len 真实反映序列化大小。
+    DirectEvent::Request {
+        peer_id: "peer-under-test".to_string(),
+        request: DirectRequest::QueryWorkflowState {
+            workflow_id: crate::common::WorkflowId::from("w".repeat(payload_len)),
+            requesting_node: NodeId::from("caller"),
+        },
+        channel: DirectResponseChannel::test_stub(),
+    }
+}
+
+/// 超尺寸请求应被拒绝且回送错误（stub channel 上表现为仅日志），不进入转发通道。
+#[tokio::test]
+async fn route_direct_request_rejects_oversize() {
+    let (tx, rx) = mpsc::channel::<NetworkEvent>(4);
+    let outcome = route_direct_request(&tx, 64, stub_direct_event(256)).await;
+    assert_eq!(outcome, DirectRouteOutcome::RejectedOversize);
+    assert!(rx.is_empty(), "rejected request must not be forwarded");
+}
+
+/// event channel 有空位时请求正常转发。
+#[tokio::test]
+async fn route_direct_request_forwards_within_limit() {
+    let (tx, mut rx) = mpsc::channel::<NetworkEvent>(4);
+    let outcome = route_direct_request(&tx, 1024, stub_direct_event(16)).await;
+    assert_eq!(outcome, DirectRouteOutcome::Forwarded);
+    match rx.recv().await {
+        Some(NetworkEvent::DirectRequest { peer_id, .. }) => {
+            assert_eq!(peer_id, "peer-under-test");
+        }
+        other => panic!("expected DirectRequest event, got {:?}", other.is_some()),
+    }
+}
+
+/// event channel 已满时请求被丢弃并回错（不静默丢弃导致对端等超时）。
+#[tokio::test]
+async fn route_direct_request_reports_channel_full() {
+    let (tx, mut rx) = mpsc::channel::<NetworkEvent>(1);
+    // 占满唯一槽位。
+    tx.send(NetworkEvent::Message(NetworkMessage {
+        topic: "filler".to_string(),
+        data: vec![],
+    }))
+    .await
+    .expect("fill channel");
+
+    let outcome = route_direct_request(&tx, 1024, stub_direct_event(16)).await;
+    assert_eq!(outcome, DirectRouteOutcome::ChannelFull);
+
+    // 排空后通道内不应混入该直连请求。
+    let drained = rx.recv().await;
+    assert!(
+        matches!(drained, Some(NetworkEvent::Message(_))),
+        "only the filler event should be in the channel"
+    );
+    assert!(rx.is_empty());
+}
+
+/// 并发订阅同一 topic：所有调用成功，且订阅表恰好只有一条记录
+/// （check-then-insert 在写锁内原子完成后不会重复 gossip.subscribe）。
+#[tokio::test]
+async fn network_manager_concurrent_subscribe_is_idempotent() {
+    let manager = NetworkManager::new(NodeId::from("test-sub-race"), test_network_config())
+        .await
+        .expect("create manager");
+
+    const N: usize = 8;
+    // join_all 并发 poll 各订阅 future（不 spawn，避免 'static 借用约束），
+    // 足以触发 check-then-insert 的并发窗口。
+    let futures: Vec<_> = (0..N).map(|_| manager.subscribe("race-topic")).collect();
+    for result in futures::future::join_all(futures).await {
+        result.expect("subscribe ok");
+    }
+
+    let subs = manager.topic_subscriptions.read().await;
+    assert_eq!(
+        subs.len(),
+        1,
+        "exactly one subscription should be registered"
+    );
+    assert!(subs.contains_key("race-topic"));
 }

@@ -4,10 +4,10 @@
 - ``bench_task_dispatch`` — 单任务端到端调度延迟
 - ``bench_gather`` — ``actant.gather`` 并行等待吞吐（intrusively-linked futures）
 - ``bench_flow_imperative`` — 命令式 ``@flow`` 执行延迟
-- ``bench_flow_compiled`` — DAG 编译式 ``@flow(compiled=True)`` 执行延迟
 - ``bench_events`` — 事件批量化吞吐与 ``silent`` 跳过开销
 - ``bench_payload`` — 不同 payload 大小对调度延迟的影响
 - ``bench_concurrency`` — 并发任务数扩展性（10/100/1000）
+- ``bench_pool`` — 进程池专项：冷启动、池化收益、超时强杀回收延迟（独立脚本，不经 pytest-benchmark）
 
 运行方式::
 

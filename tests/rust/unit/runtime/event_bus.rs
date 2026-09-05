@@ -1,18 +1,26 @@
 //! Unit tests extracted from `src/runtime/event_bus.rs`.
 //! Compiled via `#[path]` attribute — retains `super::` access to private items.
+//!
+//! EventBus 是纯非阻塞观测 tap：`publish` 对所有订阅者 `try_send`，满即丢，
+//! 无 await 点。dropped 计数（`actant.event_bus.publish.dropped`）的全局指标
+//! 断言在 `tests/rust/unit/metrics.rs`（需全局 provider 串行化），此处通过
+//! 「事件未送达 + publish 即时返回」验证丢弃行为本身。
 
 use super::*;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+fn task_started(wf: &str) -> BusEvent {
+    BusEvent::TaskStarted {
+        workflow_id: WorkflowId::from(wf),
+        task_id: TaskId::from("t-1"),
+    }
+}
 
 #[tokio::test]
 async fn subscribe_and_publish_roundtrip() {
     let bus = EventBus::new();
     let mut rx = bus.subscribe(Topic::TaskStarted);
-    bus.publish(BusEvent::TaskStarted {
-        workflow_id: WorkflowId::from("wf-1"),
-        task_id: TaskId::from("t-1"),
-    })
-    .await;
+    bus.publish(task_started("wf-1"));
     let ev = tokio::time::timeout(Duration::from_millis(500), rx.recv())
         .await
         .expect("recv in time")
@@ -38,23 +46,61 @@ async fn publish_without_subscriber_is_noop() {
         task_name: "tn".to_string(),
         result: vec![1],
         target_node: None,
-    }))
-    .await;
+    }));
 }
 
 #[tokio::test]
-async fn subscriber_timeout_pruning() {
+async fn publish_to_full_channel_returns_immediately_and_drops() {
     let bus = EventBus::with_config(EventBusConfig {
         subscriber_capacity: 1,
-        publish_timeout_ms: 10,
-        max_subscriber_timeouts: 1,
     });
-    let _rx = bus.subscribe(Topic::ClusterHeartbeat);
-    bus.publish(BusEvent::PeerConnected(NodeId::from("n-1")))
-        .await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    bus.publish(BusEvent::PeerConnected(NodeId::from("n-2")))
-        .await;
+    let mut rx = bus.subscribe(Topic::TaskStarted);
+
+    // 第一条占满通道。
+    bus.publish(task_started("wf-keep"));
+    // 第二条：通道满，必须即时返回（不阻塞、不等待），事件被丢弃。
+    let start = Instant::now();
+    bus.publish(task_started("wf-dropped"));
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(50),
+        "publish to full channel must not block, took {:?}",
+        elapsed
+    );
+
+    // 被丢弃的事件不会在订阅者腾出空间后重投。
+    let ev = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+        .await
+        .expect("first event should be delivered")
+        .expect("channel open");
+    match ev {
+        BusEvent::TaskStarted { workflow_id, .. } => {
+            assert_eq!(workflow_id.as_str(), "wf-keep");
+        }
+        other => panic!("unexpected event: {:?}", other),
+    }
+    let result = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await;
+    assert!(
+        result.is_err(),
+        "dropped event must not be redelivered after subscriber catches up"
+    );
+}
+
+#[tokio::test]
+async fn closed_subscriber_is_pruned_on_publish() {
+    let bus = EventBus::new();
+    let rx = bus.subscribe(Topic::TaskStarted);
+    drop(rx);
+
+    bus.publish(task_started("wf-1"));
+
+    let mut rx2 = bus.subscribe(Topic::TaskStarted);
+    bus.publish(task_started("wf-2"));
+    let ev = tokio::time::timeout(Duration::from_millis(500), rx2.recv())
+        .await
+        .expect("recv in time")
+        .expect("event present");
+    assert!(matches!(ev, BusEvent::TaskStarted { .. }));
 }
 
 #[test]
@@ -64,14 +110,6 @@ fn event_bus_config_default() {
         cfg.subscriber_capacity,
         EventBusConfig::DEFAULT_SUBSCRIBER_CAPACITY
     );
-    assert_eq!(
-        cfg.publish_timeout_ms,
-        EventBusConfig::DEFAULT_PUBLISH_TIMEOUT_MS
-    );
-    assert_eq!(
-        cfg.max_subscriber_timeouts,
-        EventBusConfig::DEFAULT_MAX_SUBSCRIBER_TIMEOUTS
-    );
 }
 
 #[tokio::test]
@@ -80,11 +118,7 @@ async fn multiple_subscribers_receive_same_event() {
     let mut rx1 = bus.subscribe(Topic::TaskStarted);
     let mut rx2 = bus.subscribe(Topic::TaskStarted);
 
-    bus.publish(BusEvent::TaskStarted {
-        workflow_id: WorkflowId::from("wf-1"),
-        task_id: TaskId::from("t-1"),
-    })
-    .await;
+    bus.publish(task_started("wf-1"));
 
     let ev1 = tokio::time::timeout(Duration::from_millis(500), rx1.recv())
         .await
@@ -103,11 +137,7 @@ async fn subscriber_for_different_topic_does_not_receive() {
     let bus = EventBus::new();
     let mut rx = bus.subscribe(Topic::TaskCompleted);
 
-    bus.publish(BusEvent::TaskStarted {
-        workflow_id: WorkflowId::from("wf-1"),
-        task_id: TaskId::from("t-1"),
-    })
-    .await;
+    bus.publish(task_started("wf-1"));
 
     let result = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await;
     assert!(
@@ -122,8 +152,7 @@ async fn bus_clone_shares_subscribers() {
     let bus2 = bus.clone();
     let mut rx = bus.subscribe(Topic::NetworkPeer);
 
-    bus2.publish(BusEvent::PeerConnected(NodeId::from("n-1")))
-        .await;
+    bus2.publish(BusEvent::PeerConnected(NodeId::from("n-1")));
 
     let ev = tokio::time::timeout(Duration::from_millis(500), rx.recv())
         .await
@@ -137,8 +166,7 @@ async fn network_peer_topic_roundtrip() {
     let bus = EventBus::new();
     let mut rx = bus.subscribe(Topic::NetworkPeer);
 
-    bus.publish(BusEvent::PeerConnected(NodeId::from("n-1")))
-        .await;
+    bus.publish(BusEvent::PeerConnected(NodeId::from("n-1")));
 
     let ev = tokio::time::timeout(Duration::from_millis(500), rx.recv())
         .await
@@ -149,14 +177,7 @@ async fn network_peer_topic_roundtrip() {
 
 #[test]
 fn bus_event_topic_maps_correctly() {
-    assert_eq!(
-        BusEvent::TaskStarted {
-            workflow_id: WorkflowId::from("wf-1"),
-            task_id: TaskId::from("t-1"),
-        }
-        .topic(),
-        Topic::TaskStarted
-    );
+    assert_eq!(task_started("wf-1").topic(), Topic::TaskStarted);
     assert_eq!(
         BusEvent::PeerConnected(NodeId::from("n-1")).topic(),
         Topic::NetworkPeer
@@ -175,32 +196,10 @@ fn bus_event_topic_maps_correctly() {
 }
 
 #[test]
-fn cloneable_events_can_be_cloned() {
-    let ev = BusEvent::TaskStarted {
-        workflow_id: WorkflowId::from("wf-1"),
-        task_id: TaskId::from("t-1"),
-    };
-    assert!(ev.clone_broadcast().is_some());
-}
-
-#[tokio::test]
-async fn best_effort_topic_drops_when_full() {
-    let bus = EventBus::with_config(EventBusConfig {
-        subscriber_capacity: 1,
-        publish_timeout_ms: 1000,
-        max_subscriber_timeouts: 100,
-    });
-    let _rx = bus.subscribe(Topic::ClusterHeartbeat);
-
-    bus.publish(BusEvent::Heartbeat(NodeHeartbeat {
-        node_id: NodeId::from("n-1"),
-        active_workflows: Vec::new(),
-        timestamp_ms: 0,
-        available_slots: 0,
-        max_slots: 0,
-        endpoint_addr: None,
-    }))
-    .await;
+fn bus_event_is_clone() {
+    let ev = task_started("wf-1");
+    let cloned = ev.clone();
+    assert!(matches!(cloned, BusEvent::TaskStarted { .. }));
 }
 
 #[test]
@@ -253,46 +252,6 @@ fn bus_event_topic_all_variants() {
         Topic::NetworkPeer
     );
     assert_eq!(
-        BusEvent::Heartbeat(NodeHeartbeat {
-            node_id: nid.clone(),
-            active_workflows: vec![],
-            timestamp_ms: 0,
-            available_slots: 0,
-            max_slots: 0,
-            endpoint_addr: None,
-        })
-        .topic(),
-        Topic::ClusterHeartbeat
-    );
-    assert_eq!(
-        BusEvent::Claim(OrchestratorClaim {
-            node_id: nid.clone(),
-            workflow_id: wf.clone(),
-            timestamp_ms: 0,
-        })
-        .topic(),
-        Topic::ClusterClaim
-    );
-    assert_eq!(
-        BusEvent::DagUpdate(WireDagStateUpdate {
-            workflow_id: wf.clone(),
-            task_id: tid.clone(),
-            task_state: crate::common::wire::WireTaskState::Running,
-            hlc_timestamp: crate::runtime::state::HlcTimestamp::zero(),
-            origin_node: nid.clone(),
-        })
-        .topic(),
-        Topic::DagUpdate
-    );
-    assert_eq!(
-        BusEvent::HeadsExchange(crate::common::wire::HeadsExchange {
-            node_id: nid.clone(),
-            heads: vec![],
-        })
-        .topic(),
-        Topic::HeadsExchange
-    );
-    assert_eq!(
         BusEvent::WorkerDrained {
             node_id: nid.clone()
         }
@@ -308,8 +267,8 @@ fn bus_event_topic_all_variants() {
     );
     assert_eq!(
         BusEvent::TaskDequeued {
-            workflow_id: wf.clone(),
-            task_id: tid.clone(),
+            workflow_id: wf,
+            task_id: tid,
         }
         .topic(),
         Topic::TaskDequeued
@@ -324,117 +283,12 @@ fn bus_event_topic_all_variants() {
     );
     assert_eq!(
         BusEvent::WalCompacted {
-            node_id: nid.clone(),
+            node_id: nid,
             retained_events: 0,
         }
         .topic(),
         Topic::WalCompacted
     );
-}
-
-// ───────────────────────── delivery_guarantee() ─────────────────────────
-
-#[test]
-fn delivery_guarantee_reliable_for_critical_events() {
-    let wf = WorkflowId::from("wf");
-    let tid = TaskId::from("t");
-    let completion = TaskCompletion::Completed {
-        workflow_id: wf.clone(),
-        task_id: tid.clone(),
-        task_name: "n".into(),
-        result: vec![],
-        target_node: None,
-    };
-
-    assert_eq!(
-        BusEvent::TaskStarted {
-            workflow_id: wf.clone(),
-            task_id: tid.clone(),
-        }
-        .delivery_guarantee(),
-        DeliveryGuarantee::Reliable
-    );
-    assert_eq!(
-        BusEvent::TaskCompleted(completion).delivery_guarantee(),
-        DeliveryGuarantee::Reliable
-    );
-    // 新增：ActorLifecycleError / WalCompacted 归 Reliable（驱动外部介入/检查点清理）。
-    assert_eq!(
-        BusEvent::ActorLifecycleError {
-            actor_id: crate::common::ActorId::from("a"),
-            error: "boom".into(),
-        }
-        .delivery_guarantee(),
-        DeliveryGuarantee::Reliable
-    );
-    assert_eq!(
-        BusEvent::WalCompacted {
-            node_id: NodeId::from("n"),
-            retained_events: 0,
-        }
-        .delivery_guarantee(),
-        DeliveryGuarantee::Reliable
-    );
-}
-
-#[test]
-fn delivery_guarantee_best_effort_for_periodic_events() {
-    let nid = NodeId::from("n");
-    assert_eq!(
-        BusEvent::PeerConnected(nid.clone()).delivery_guarantee(),
-        DeliveryGuarantee::BestEffort
-    );
-    assert_eq!(
-        BusEvent::Heartbeat(NodeHeartbeat {
-            node_id: nid.clone(),
-            active_workflows: vec![],
-            timestamp_ms: 0,
-            available_slots: 0,
-            max_slots: 0,
-            endpoint_addr: None,
-        })
-        .delivery_guarantee(),
-        DeliveryGuarantee::BestEffort
-    );
-    assert_eq!(
-        BusEvent::WorkerDraining {
-            node_id: nid.clone()
-        }
-        .delivery_guarantee(),
-        DeliveryGuarantee::BestEffort
-    );
-    // 新增：TaskDequeued 归 BestEffort（仅为观测信号，丢失不影响正确性）。
-    assert_eq!(
-        BusEvent::TaskDequeued {
-            workflow_id: WorkflowId::from("wf"),
-            task_id: TaskId::from("t"),
-        }
-        .delivery_guarantee(),
-        DeliveryGuarantee::BestEffort
-    );
-}
-
-// ───────────────────────── clone_broadcast() ─────────────────────────
-
-#[test]
-fn clone_broadcast_returns_some_for_cloneable_events() {
-    let wf = WorkflowId::from("wf");
-    let tid = TaskId::from("t");
-    let nid = NodeId::from("n");
-
-    let ev = BusEvent::TaskStarted {
-        workflow_id: wf.clone(),
-        task_id: tid.clone(),
-    };
-    assert!(ev.clone_broadcast().is_some());
-
-    let ev = BusEvent::PeerConnected(nid.clone());
-    assert!(ev.clone_broadcast().is_some());
-
-    let ev = BusEvent::WorkerDrained {
-        node_id: nid.clone(),
-    };
-    assert!(ev.clone_broadcast().is_some());
 }
 
 // ───────────────────────── subscribe_with_capacity ─────────────────────────
@@ -445,11 +299,7 @@ async fn subscribe_with_capacity_uses_custom_value() {
     let mut rx = bus.subscribe_with_capacity(Topic::TaskStarted, 5);
 
     for i in 0..5 {
-        bus.publish(BusEvent::TaskStarted {
-            workflow_id: WorkflowId::from(format!("wf-{i}")),
-            task_id: TaskId::from(format!("t-{i}")),
-        })
-        .await;
+        bus.publish(task_started(&format!("wf-{i}")));
     }
 
     for i in 0..5 {
@@ -469,131 +319,6 @@ async fn subscribe_with_capacity_uses_custom_value() {
 // ───────────────────────── publish edge cases ─────────────────────────
 
 #[tokio::test]
-async fn publish_reliable_event_to_slow_subscriber_succeeds_within_timeout() {
-    let bus = EventBus::with_config(EventBusConfig {
-        subscriber_capacity: 1,
-        publish_timeout_ms: 500,
-        max_subscriber_timeouts: 10,
-    });
-    let mut rx = bus.subscribe(Topic::TaskCompleted);
-
-    bus.publish(BusEvent::TaskCompleted(TaskCompletion::Completed {
-        workflow_id: WorkflowId::from("wf-1"),
-        task_id: TaskId::from("t-1"),
-        task_name: "n".into(),
-        result: vec![],
-        target_node: None,
-    }))
-    .await;
-
-    let _ = rx.recv().await;
-
-    bus.publish(BusEvent::TaskCompleted(TaskCompletion::Completed {
-        workflow_id: WorkflowId::from("wf-2"),
-        task_id: TaskId::from("t-2"),
-        task_name: "n".into(),
-        result: vec![],
-        target_node: None,
-    }))
-    .await;
-
-    let ev = rx.recv().await.unwrap();
-    match ev {
-        BusEvent::TaskCompleted(c) => assert_eq!(c.workflow_id().as_str(), "wf-2"),
-        _ => panic!("unexpected event"),
-    }
-}
-
-#[tokio::test]
-async fn publish_best_effort_event_skips_full_subscriber() {
-    let bus = EventBus::with_config(EventBusConfig {
-        subscriber_capacity: 1,
-        publish_timeout_ms: 1000,
-        max_subscriber_timeouts: 100,
-    });
-    let _rx = bus.subscribe(Topic::NetworkPeer);
-
-    bus.publish(BusEvent::PeerConnected(NodeId::from("n-1")))
-        .await;
-    bus.publish(BusEvent::PeerDisconnected(NodeId::from("n-2")))
-        .await;
-}
-
-#[tokio::test]
-async fn publish_to_topic_with_no_subscribers_is_noop() {
-    let bus = EventBus::new();
-    bus.publish(BusEvent::DagUpdate(
-        crate::common::wire::WireDagStateUpdate {
-            workflow_id: WorkflowId::from("wf-1"),
-            task_id: TaskId::from("t-1"),
-            task_state: crate::common::wire::WireTaskState::Running,
-            hlc_timestamp: crate::runtime::state::HlcTimestamp::zero(),
-            origin_node: NodeId::from("n-1"),
-        },
-    ))
-    .await;
-}
-
-#[tokio::test]
-async fn publish_claim_event_roundtrip() {
-    let bus = EventBus::new();
-    let mut rx = bus.subscribe(Topic::ClusterClaim);
-
-    let claim = OrchestratorClaim {
-        node_id: NodeId::from("n-1"),
-        workflow_id: WorkflowId::from("wf-1"),
-        timestamp_ms: 12345,
-    };
-    bus.publish(BusEvent::Claim(claim)).await;
-
-    let ev = tokio::time::timeout(Duration::from_millis(500), rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(matches!(ev, BusEvent::Claim(_)));
-}
-
-#[tokio::test]
-async fn publish_dag_update_roundtrip() {
-    let bus = EventBus::new();
-    let mut rx = bus.subscribe(Topic::DagUpdate);
-
-    bus.publish(BusEvent::DagUpdate(
-        crate::common::wire::WireDagStateUpdate {
-            workflow_id: WorkflowId::from("wf-1"),
-            task_id: TaskId::from("t-1"),
-            task_state: crate::common::wire::WireTaskState::Completed { result: vec![1] },
-            hlc_timestamp: crate::runtime::state::HlcTimestamp::zero(),
-            origin_node: NodeId::from("n-1"),
-        },
-    ))
-    .await;
-
-    let ev = tokio::time::timeout(Duration::from_millis(500), rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(matches!(ev, BusEvent::DagUpdate(_)));
-}
-
-#[tokio::test]
-async fn publish_supervision_event_roundtrip() {
-    let bus = EventBus::new();
-    let mut rx = bus.subscribe(Topic::Supervision);
-
-    bus.publish(BusEvent::SupervisionEvent(SupervisionEvent::ActorStarted {
-        actor_id: crate::common::ActorId::workflow(&NodeId::from("n-1")),
-    }))
-    .await;
-
-    let ev = tokio::time::timeout(Duration::from_millis(500), rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(matches!(ev, BusEvent::SupervisionEvent(_)));
-}
-
-#[tokio::test]
 async fn publish_worker_lifecycle_events() {
     let bus = EventBus::new();
     let mut rx = bus.subscribe(Topic::WorkerLifecycle);
@@ -601,13 +326,11 @@ async fn publish_worker_lifecycle_events() {
     let nid = NodeId::from("n-1");
     bus.publish(BusEvent::WorkerDraining {
         node_id: nid.clone(),
-    })
-    .await;
+    });
     bus.publish(BusEvent::WorkerDrained {
         node_id: nid.clone(),
-    })
-    .await;
-    bus.publish(BusEvent::WorkerStopped { node_id: nid }).await;
+    });
+    bus.publish(BusEvent::WorkerStopped { node_id: nid });
 
     assert!(matches!(
         rx.recv().await.unwrap(),
@@ -624,26 +347,6 @@ async fn publish_worker_lifecycle_events() {
 }
 
 #[tokio::test]
-async fn publish_heads_exchange_roundtrip() {
-    let bus = EventBus::new();
-    let mut rx = bus.subscribe(Topic::HeadsExchange);
-
-    bus.publish(BusEvent::HeadsExchange(
-        crate::common::wire::HeadsExchange {
-            node_id: NodeId::from("n-1"),
-            heads: vec![],
-        },
-    ))
-    .await;
-
-    let ev = tokio::time::timeout(Duration::from_millis(500), rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(matches!(ev, BusEvent::HeadsExchange(_)));
-}
-
-#[tokio::test]
 async fn publish_task_failed_roundtrip() {
     let bus = EventBus::new();
     let mut rx = bus.subscribe(Topic::TaskFailed);
@@ -654,8 +357,7 @@ async fn publish_task_failed_roundtrip() {
         task_name: "n".into(),
         error: "boom".into(),
         target_node: None,
-    }))
-    .await;
+    }));
 
     let ev = tokio::time::timeout(Duration::from_millis(500), rx.recv())
         .await
@@ -677,8 +379,7 @@ async fn publish_task_cancelled_roundtrip() {
         task_id: TaskId::from("t-1"),
         task_name: "n".into(),
         target_node: None,
-    }))
-    .await;
+    }));
 
     let ev = tokio::time::timeout(Duration::from_millis(500), rx.recv())
         .await
@@ -697,8 +398,7 @@ async fn publish_task_skipped_roundtrip() {
         task_id: TaskId::from("t-1"),
         task_name: "n".into(),
         target_node: None,
-    }))
-    .await;
+    }));
 
     let ev = tokio::time::timeout(Duration::from_millis(500), rx.recv())
         .await
@@ -708,35 +408,10 @@ async fn publish_task_skipped_roundtrip() {
 }
 
 #[tokio::test]
-async fn subscriber_pruning_after_max_timeouts() {
-    let bus = EventBus::with_config(EventBusConfig {
-        subscriber_capacity: 1,
-        publish_timeout_ms: 10,
-        max_subscriber_timeouts: 2,
-    });
-    let _rx = bus.subscribe(Topic::TaskCompleted);
-
-    for i in 0..5 {
-        bus.publish(BusEvent::TaskCompleted(TaskCompletion::Completed {
-            workflow_id: WorkflowId::from(format!("wf-{i}")),
-            task_id: TaskId::from(format!("t-{i}")),
-            task_name: "n".into(),
-            result: vec![],
-            target_node: None,
-        }))
-        .await;
-    }
-}
-
-#[tokio::test]
 async fn event_bus_default_creates_valid_instance() {
     let bus = EventBus::default();
     let mut rx = bus.subscribe(Topic::TaskStarted);
-    bus.publish(BusEvent::TaskStarted {
-        workflow_id: WorkflowId::from("wf-1"),
-        task_id: TaskId::from("t-1"),
-    })
-    .await;
+    bus.publish(task_started("wf-1"));
     assert!(matches!(
         rx.recv().await,
         Some(BusEvent::TaskStarted { .. })
@@ -748,23 +423,3 @@ async fn event_bus_default_creates_valid_instance() {
 // DirectRequest 不走 EventBus（参见 src/runtime/event_bus.rs 顶部注释与
 // `NetworkEventRouter::handle_direct_request` 的 `other` 分支）：点对点请求-响应
 // 由接收方直接处理或回送 Error，无独占投递路径，故此处无对应测试用例。
-
-#[tokio::test]
-async fn closed_subscriber_is_pruned_on_publish() {
-    let bus = EventBus::new();
-    let rx = bus.subscribe(Topic::TaskStarted);
-    drop(rx);
-
-    bus.publish(BusEvent::TaskStarted {
-        workflow_id: WorkflowId::from("wf-1"),
-        task_id: TaskId::from("t-1"),
-    })
-    .await;
-
-    let mut rx2 = bus.subscribe(Topic::TaskStarted);
-    let result = tokio::time::timeout(Duration::from_millis(100), rx2.recv()).await;
-    assert!(
-        result.is_err(),
-        "pruned subscriber should not receive stale events"
-    );
-}

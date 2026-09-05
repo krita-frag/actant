@@ -164,36 +164,6 @@ impl Runtime {
             self.workflow_actor_id.clone(),
         ));
         let dag_gossip_actor_id = crate::common::ActorId::dag_gossip(&self.node_id);
-        // A2：构造 actor registry gossip actor 并订阅 topic，与 builder 路径保持一致。
-        // 注意此路径未注入 actor_registry 到 ActorSystem（context 的 ActorSystem
-        // 由外部传入，是否带 registry 由调用方决定）；此处仅启动 gossip 接收侧。
-        let actor_registry = Arc::new(
-            crate::runtime::actor::router::ActorRegistry::new()
-                .with_local_node_id(self.node_id.clone()),
-        );
-        let actor_registry_gossip = Arc::new(
-            crate::runtime::actor::router::ActorRegistryGossipActor::new(
-                self.node_id.clone(),
-                actor_registry,
-                self.network.clone(),
-            )
-            .with_broadcast_interval(std::time::Duration::from_millis(
-                self.config.network.actor_registry_gossip_interval_ms,
-            )),
-        );
-        self.network
-            .subscribe(crate::common::Topic::actor_registry().as_str())
-            .await
-            .map_err(|e| {
-                crate::common::ActantError::Network(format!(
-                    "failed to subscribe to actor registry topic: {}",
-                    e
-                ))
-            })?;
-        if let Err(e) = actor_registry_gossip.broadcast_registry().await {
-            tracing::warn!(error = %e, "initial actor registry broadcast failed");
-        }
-        self.register_background_loop_cancel(actor_registry_gossip.clone().start_background_loop());
         let worker = init_worker(WorkerInitParams {
             node_id: &self.node_id,
             network: &self.network,
@@ -206,7 +176,6 @@ impl Runtime {
             tokio_handle,
             workflow_actor_id: Some(self.workflow_actor_id.clone()),
             dag_gossip_actor_id: Some(dag_gossip_actor_id),
-            actor_registry_gossip: Some(actor_registry_gossip),
             capability_gossip: None,
         })
         .await?;

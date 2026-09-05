@@ -49,13 +49,20 @@ fn getters_return_configured_values() {
 #[test]
 fn handle_heartbeat_records_peer() {
     let fm = make_fm("node-A");
-    let now = crate::common::epoch_millis();
-    fm.handle_heartbeat(&hb("node-B", now, &["wf-1"]));
+    // last_heartbeat_ms 使用接收方本地时钟记录（而非发送方 timestamp_ms），
+    // 断言落在调用前后的墙钟窗口内。
+    let before = crate::common::epoch_millis();
+    fm.handle_heartbeat(&hb("node-B", before, &["wf-1"]));
+    let after = crate::common::epoch_millis();
 
     let infos = fm.get_peer_infos();
     assert!(infos.contains_key(&NodeId::from("node-B".to_string())));
     let peer = &infos[&NodeId::from("node-B".to_string())];
-    assert_eq!(peer.last_heartbeat_ms, now);
+    assert!(
+        peer.last_heartbeat_ms >= before && peer.last_heartbeat_ms <= after,
+        "last_heartbeat_ms should be receiver local receive time, got {}",
+        peer.last_heartbeat_ms
+    );
     assert_eq!(peer.available_slots, 4);
     assert_eq!(peer.max_slots, 8);
     assert_eq!(peer.endpoint_addr.as_deref(), Some("peer-node-B"));
@@ -76,10 +83,12 @@ fn handle_heartbeat_updates_existing_peer() {
     let fm = make_fm("node-A");
     let now = crate::common::epoch_millis();
     fm.handle_heartbeat(&hb("node-B", now, &["wf-1"]));
+    let first = fm.get_peer_infos()[&NodeId::from("node-B".to_string())].last_heartbeat_ms;
     fm.handle_heartbeat(&hb("node-B", now + 1000, &["wf-1", "wf-2"]));
 
     let peer = &fm.get_peer_infos()[&NodeId::from("node-B".to_string())];
-    assert_eq!(peer.last_heartbeat_ms, now + 1000);
+    // 接收方本地时钟：第二次心跳的记录时间不早于第一次。
+    assert!(peer.last_heartbeat_ms >= first);
     assert_eq!(peer.active_workflows.len(), 2);
 }
 
@@ -95,19 +104,25 @@ fn remove_peer_drops_entry() {
 
 #[test]
 fn expire_stale_peers_removes_only_timed_out() {
-    let fm = make_fm("node-A");
-    let now = crate::common::epoch_millis();
-    let timeout = fm.failure_timeout_ms();
-    // node-B: 心跳新鲜；node-C: 心跳过期
-    fm.handle_heartbeat(&hb("node-B", now, &[]));
-    fm.handle_heartbeat(&hb("node-C", now.saturating_sub(timeout + 5000), &[]));
+    // last_heartbeat_ms 由接收方本地时钟记录，无法用伪造的旧时间戳构造失联；
+    // 使用短超时（failure_timeout_ms=5ms）配置并真实等待。
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let fm = make_fm_with_short_lease("node-A").await;
+        register_and_age_peer(&fm, "node-C", &[]).await;
+        // node-C 失联后刷新 node-B 心跳，保持其新鲜（超时窗口仅 5ms）。
+        fm.handle_heartbeat(&hb("node-B", crate::common::epoch_millis(), &[]));
 
-    let removed = fm.expire_stale_peers();
-    let removed_ids: Vec<String> = removed.iter().map(|(n, _)| n.0.clone()).collect();
-    assert_eq!(removed_ids, vec!["node-C".to_string()]);
-    let infos = fm.get_peer_infos();
-    assert!(infos.contains_key(&NodeId::from("node-B".to_string())));
-    assert!(!infos.contains_key(&NodeId::from("node-C".to_string())));
+        let removed = fm.expire_stale_peers();
+        let removed_ids: Vec<String> = removed.iter().map(|(n, _)| n.0.clone()).collect();
+        assert_eq!(removed_ids, vec!["node-C".to_string()]);
+        let infos = fm.get_peer_infos();
+        assert!(infos.contains_key(&NodeId::from("node-B".to_string())));
+        assert!(!infos.contains_key(&NodeId::from("node-C".to_string())));
+    });
 }
 
 #[test]
@@ -338,23 +353,23 @@ fn handle_heartbeat_zero_slot_values() {
 
 #[test]
 fn expire_stale_peers_returns_expired_peer_info() {
-    let fm = make_fm("node-A");
-    let now = crate::common::epoch_millis();
-    let timeout = fm.failure_timeout_ms();
-    fm.handle_heartbeat(&hb(
-        "node-stale",
-        now.saturating_sub(timeout + 1000),
-        &["wf-x"],
-    ));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let fm = make_fm_with_short_lease("node-A").await;
+        register_and_age_peer(&fm, "node-stale", &["wf-x"]).await;
 
-    let removed = fm.expire_stale_peers();
-    assert_eq!(removed.len(), 1);
-    let (node_id, info) = &removed[0];
-    assert_eq!(node_id.0, "node-stale");
-    // 返回的 PeerInfo 应保留原 active_workflows
-    assert!(info
-        .active_workflows
-        .contains(&WorkflowId("wf-x".to_string())));
+        let removed = fm.expire_stale_peers();
+        assert_eq!(removed.len(), 1);
+        let (node_id, info) = &removed[0];
+        assert_eq!(node_id.0, "node-stale");
+        // 返回的 PeerInfo 应保留原 active_workflows
+        assert!(info
+            .active_workflows
+            .contains(&WorkflowId("wf-x".to_string())));
+    });
 }
 
 #[test]
@@ -756,44 +771,33 @@ async fn reschedule_workflow_tasks_enqueues_tasks_via_scheduler() {
 
 #[tokio::test]
 async fn detect_and_claim_failed_nodes_claims_orphaned_workflows() {
-    let fm = make_fm_with_stub_actor("node-A").await;
-    let now = crate::common::epoch_millis();
-    let timeout = fm.failure_timeout_ms();
+    let fm = make_fm_with_short_lease("node-A").await;
 
-    // 找一个 should_claim_workflow 判定由 node-A 负责的 workflow。
-    let mut target_wf = None;
-    for i in 0..20 {
-        let wf = format!("wf-orphan-{i}");
-        if crate::common::should_claim_workflow(
-            &wf,
-            "node-A",
-            vec!["node-A".to_string(), "node-B".to_string()],
-        ) {
-            target_wf = Some(wf);
-            break;
-        }
-    }
-    let wf = target_wf.expect("should find a workflow claimed by node-A");
-
-    // node-B 心跳过期且有一个活跃 workflow
-    fm.handle_heartbeat(&hb("node-B", now.saturating_sub(timeout + 10000), &[&wf]));
+    // node-B 心跳过期（接收方本地时钟 + 真实等待）且有一个活跃 workflow。
+    register_and_age_peer(&fm, "node-B", &["wf-orphan"]).await;
 
     fm.detect_and_claim_failed_nodes().await;
 
     let leases = fm.active_leases();
-    assert!(leases.iter().any(|(w, n, _, _)| w == &wf && n == "node-A"));
+    assert!(
+        leases
+            .iter()
+            .any(|(w, n, _, _)| w == "wf-orphan" && n == "node-A"),
+        "node-A is the only live candidate and must claim the orphan: {leases:?}"
+    );
 }
 
+/// 失联节点不参与接管选举：即使一致性哈希本会把 workflow 分配给死节点，
+/// 也由存活节点接管。
 #[tokio::test]
-async fn detect_and_claim_failed_nodes_skips_workflows_not_assigned_to_self() {
-    let fm = make_fm_with_stub_actor("node-A").await;
-    let now = crate::common::epoch_millis();
-    let timeout = fm.failure_timeout_ms();
+async fn detect_and_claim_excludes_stale_nodes_from_election() {
+    let fm = make_fm_with_short_lease("node-A").await;
 
-    // 找一个 should_claim_workflow 判定不由 node-A 负责的 workflow。
+    // 找一个在 [node-A, node-B] 候选下会分配给 node-B（死节点）的 workflow：
+    // 旧语义下无人接管；新语义下 node-B 被清出候选集，node-A 必须接管。
     let mut target_wf = None;
-    for i in 0..20 {
-        let wf = format!("wf-other-{i}");
+    for i in 0..50 {
+        let wf = format!("wf-dead-{i}");
         if !crate::common::should_claim_workflow(
             &wf,
             "node-A",
@@ -803,16 +807,31 @@ async fn detect_and_claim_failed_nodes_skips_workflows_not_assigned_to_self() {
             break;
         }
     }
-    let wf = target_wf.expect("should find a workflow not claimed by node-A");
+    let wf = target_wf.expect("should find a workflow the hash assigns to node-B");
 
-    fm.handle_heartbeat(&hb("node-B", now.saturating_sub(timeout + 10000), &[&wf]));
+    register_and_age_peer(&fm, "node-B", &[&wf]).await;
 
     fm.detect_and_claim_failed_nodes().await;
 
     let leases = fm.active_leases();
     assert!(
-        leases.is_empty(),
-        "should not claim workflows assigned to other nodes"
+        leases.iter().any(|(w, n, _, _)| w == &wf && n == "node-A"),
+        "orphan assigned to the dead node must be claimed by the live node: {leases:?}"
+    );
+}
+
+/// 检测前失联节点已被清出视图（P1：detect_and_claim_failed_nodes 先 expire_stale_peers）。
+#[tokio::test]
+async fn detect_and_claim_failed_nodes_expires_stale_peers_first() {
+    let fm = make_fm_with_short_lease("node-A").await;
+    register_and_age_peer(&fm, "node-stale", &[]).await;
+
+    fm.detect_and_claim_failed_nodes().await;
+
+    assert!(
+        !fm.get_peer_infos()
+            .contains_key(&NodeId::from("node-stale".to_string())),
+        "stale peer must be removed from the view before claim election"
     );
 }
 
@@ -843,6 +862,187 @@ async fn make_fm_with_short_lease(node_id: &str) -> FailoverManager {
     )
 }
 
+/// 注册一条心跳并真实等待超过 failure_timeout_ms（5ms），使其成为失联 peer。
+///
+/// last_heartbeat_ms 由接收方本地时钟记录，无法用伪造的旧时间戳构造失联。
+async fn register_and_age_peer(fm: &FailoverManager, node: &str, workflows: &[&str]) {
+    fm.handle_heartbeat(&hb(node, crate::common::epoch_millis(), workflows));
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+}
+
+/// 活跃 workflow 集合可变的 WorkflowActor 桩：真实响应
+/// `active_workflow_ids` 与 `remove_active_workflow`，其余方法返回空 ok。
+struct MutableActiveIdsActor {
+    active: std::sync::Mutex<HashSet<WorkflowId>>,
+}
+
+#[async_trait::async_trait]
+impl Actor for MutableActiveIdsActor {
+    fn actor_type(&self) -> &str {
+        "WorkflowActor"
+    }
+
+    async fn handle_message(
+        &mut self,
+        msg: ActorMessage,
+    ) -> crate::common::Result<ActorMessageResult> {
+        match msg.method.as_str() {
+            "active_workflow_ids" => {
+                let ids: Vec<WorkflowId> = self.active.lock().unwrap().iter().cloned().collect();
+                Ok(ActorMessageResult {
+                    message_id: msg.id,
+                    payload: crate::runtime::workflow::messaging::encode(&ids)?,
+                    error: None,
+                })
+            }
+            "remove_active_workflow" => {
+                let wf: WorkflowId = crate::runtime::workflow::messaging::decode(&msg.payload)?;
+                self.active.lock().unwrap().remove(&wf);
+                Ok(ActorMessageResult {
+                    message_id: msg.id,
+                    payload: vec![],
+                    error: None,
+                })
+            }
+            _ => Ok(ActorMessageResult {
+                message_id: msg.id,
+                payload: vec![],
+                error: None,
+            }),
+        }
+    }
+}
+
+/// 构造 FailoverManager 并保留 MockTransport 句柄，供广播计数断言。
+async fn make_fm_with_mutable_active(
+    node_id: &str,
+    ids: Vec<WorkflowId>,
+) -> (FailoverManager, Arc<MockTransport>) {
+    let network = Arc::new(MockTransport::new(node_id));
+    let actor_system = Arc::new(ActorSystem::new());
+    let wf_actor_id = ActorId::workflow(&NodeId::from(node_id.to_string()));
+    actor_system
+        .spawn(
+            wf_actor_id.clone(),
+            MutableActiveIdsActor {
+                active: std::sync::Mutex::new(ids.into_iter().collect()),
+            },
+        )
+        .await
+        .unwrap();
+    let config = FailoverConfig {
+        heartbeat_interval_ms: 1,
+        failure_timeout_ms: 5,
+        lease_duration_ms: 10,
+        lease_expiry_check_interval_secs: 1,
+    };
+    let fm = FailoverManager::with_config(
+        NodeId::from(node_id.to_string()),
+        network.clone(),
+        actor_system,
+        wf_actor_id,
+        config,
+        None,
+    );
+    (fm, network)
+}
+
+/// 0.3.1 租约裁决：本节点活跃 workflow 的失效租约**无条件续租**——
+/// 直接本地延长到期时间并持久化，不重走 claim→广播→重选路径。
+#[tokio::test]
+async fn expire_leases_renews_lapsed_lease_for_active_workflow_without_reclaim() {
+    let (fm, network) =
+        make_fm_with_mutable_active("node-A", vec![WorkflowId("wf-lapsed".to_string())]).await;
+    let wf = WorkflowId("wf-lapsed".to_string());
+
+    fm.claim_workflow(&wf).await.unwrap();
+    assert_eq!(fm.active_leases().len(), 1);
+    let old_expires = fm.active_leases()[0].3;
+    let broadcasts_after_claim = network.broadcast_count();
+
+    // 等待租约过期（lease_duration_ms=10ms）。
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+    fm.expire_leases().await;
+
+    // 活跃 workflow 的失效租约被续租：fresh expiry，持有者不变。
+    let leases = fm.active_leases();
+    assert_eq!(
+        leases.len(),
+        1,
+        "lapsed lease of an active workflow must be renewed, not dropped"
+    );
+    assert_eq!(leases[0].1, "node-A");
+    assert!(
+        leases[0].3 > old_expires,
+        "renewed lease must have a fresh expiry, not the old one"
+    );
+    assert_eq!(
+        network.broadcast_count(),
+        broadcasts_after_claim,
+        "renewal must not broadcast a claim (no re-election / write amplification)"
+    );
+}
+
+/// 反双主时序契约：远端 claim 使本节点让位（remove_active_workflow），
+/// 让位后旧主不再为该 workflow 续租。
+#[tokio::test]
+async fn expire_leases_stops_renewing_after_remote_claim_removes_workflow() {
+    let (fm, _network) =
+        make_fm_with_mutable_active("node-A", vec![WorkflowId("wf-shared".to_string())]).await;
+    let wf = WorkflowId("wf-shared".to_string());
+
+    fm.claim_workflow(&wf).await.unwrap();
+
+    // 租约过期时 workflow 仍活跃 → 续租（不丢租约）。
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    fm.expire_leases().await;
+    assert_eq!(
+        fm.active_leases().len(),
+        1,
+        "active workflow must keep its lease across expiry"
+    );
+
+    // 远端 node-Z claim：本节点让位，workflow 退出 active_set。
+    let claim = OrchestratorClaim {
+        node_id: NodeId::from("node-Z".to_string()),
+        workflow_id: wf.clone(),
+        timestamp_ms: crate::common::epoch_millis(),
+    };
+    fm.handle_claim(&claim).await;
+    let active = fm.active_workflow_ids().await.unwrap();
+    assert!(
+        !active.contains(&wf),
+        "remote claim must remove the workflow from the local active set"
+    );
+
+    // 让位后旧主不再续租：租约过期走失效移除路径。
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    fm.expire_leases().await;
+    assert!(
+        fm.active_leases().iter().all(|l| l.0 != "wf-shared"),
+        "workflow removed by remote claim must not be renewed nor held locally"
+    );
+}
+
+/// 过期租约不再无条件下自续：workflow 不再活跃时失效租约被直接移除。
+#[tokio::test]
+async fn expire_leases_removes_lapsed_own_lease_for_inactive_workflow() {
+    let fm = make_fm_with_short_lease("node-A").await;
+    let wf = WorkflowId("wf-lapsed-inactive".to_string());
+
+    fm.claim_workflow(&wf).await.unwrap();
+    assert_eq!(fm.active_leases().len(), 1);
+
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+    fm.expire_leases().await;
+    assert!(
+        fm.active_leases().is_empty(),
+        "lapsed lease for inactive workflow must be dropped"
+    );
+}
+
 #[tokio::test]
 async fn expire_leases_removes_expired_leases_for_inactive_workflows() {
     let fm = make_fm_with_short_lease("node-A").await;
@@ -862,15 +1062,14 @@ async fn expire_leases_removes_expired_leases_for_inactive_workflows() {
 }
 
 #[tokio::test]
-async fn expire_leases_renews_own_valid_lease_for_active_workflow() {
+async fn expire_leases_keeps_own_valid_lease() {
     let fm = make_fm_with_short_lease("node-A").await;
     let wf = WorkflowId("wf-renew".to_string());
 
     fm.claim_workflow(&wf).await.unwrap();
     let _ = fm.active_leases().pop().unwrap();
 
-    // 在租约过期前调用 expire_leases，stub 返回空 active workflow ids，
-    // 因此不会走续租分支，但会保留有效租约。
+    // 在租约过期前调用 expire_leases：租约仍有效，不应被移除。
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     fm.expire_leases().await;
 

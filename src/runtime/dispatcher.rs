@@ -1,18 +1,49 @@
-//! 本模块负责将任务 payload 分发给注册的 handler 并管理执行线程池。
-//! 与工作流编排无直接耦合，属于通用执行基础设施。
+//! 本模块负责将任务 payload 分发给 worker 子进程并管理进程池。
+//!
+//! 进程池是唯一的任务执行后端：每个任务由独立的 Python worker 子进程
+//! （`actant.task._worker`）执行，杀进程即精确终止一个任务，实现严格的
+//! 进程级隔离。与工作流编排无直接耦合，属于通用执行基础设施。
+//!
+//! # 通信协议
+//!
+//! 与 `actant/task/_worker.py` 保持一致的长度前缀二进制帧；传输层为 stdio pipe：
+//! 每帧为 ``[4 字节小端长度][1 字节类型][正文]``，帧头与正文连续写入同一管道：
+//!
+//! ```text
+//! pipe 上 [4 字节长度][1 字节类型][正文]
+//! ```
+//!
+//! - 父 → 子：`Dispatch`(0x01) 正文 = **v2 载荷**（紧凑控制头部 + cloudpickle 编码的
+//!   `(func, args, kwargs)`，头部承载 retries/retry_delay_ms/task_id/workflow_id，
+//!   见 `actant/task/_helpers.py::_build_v2_envelope`）；`Cancel`(0x02) 为空正文。
+//!   关闭时由 `shutdown` 直接强杀空闲 worker（不发送 `Shutdown` 帧）。
+//! - 子 → 父：`Result`(0x02) 正文 = cloudpickle 编码的 `(success, payload)`，
+//!   Python 封装层按此约定解包。
+//!
+//! 本模块对正文格式不感知——payload 对 Rust 不透明，仅作字节校验与搬运。
 
-use std::sync::atomic::AtomicBool;
+use std::collections::VecDeque;
+use std::io::IoSlice;
+use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
-use dashmap::DashMap;
+use parking_lot::Mutex;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+use tokio::sync::Semaphore;
+
+#[cfg(unix)]
+use std::os::unix::io::{AsRawFd, FromRawFd};
 
 use crate::common::ActantError;
 
-/// 取消标志，用于协调任务分发器和任务处理程序之间的取消操作。
+/// 取消标志，用于协调任务分发器和跨进程取消操作。
 ///
-/// 分发器为每次分发创建一个 `Arc<AtomicBool>`，并将其克隆传递给处理程序。
-/// 超时时，分发器将 `true` 存入该标志；处理程序（或通过 `PyCancelToken` 的 Python）
-/// 轮询该标志以协作退出长时间运行的操作。
+/// 分发器为每次分发创建一个 `Arc<AtomicBool>`，并将其克隆传递给调用方。
+/// 超时或取消时，分发器将其置为 `true` 并向 worker 发送 `Cancel` 帧；
+/// worker 子进程内的协作代码轮询其线程取消事件以干净退出。
 pub type CancelFlag = Arc<AtomicBool>;
 
 /// 创建一个新鲜的取消标志（初始值为 `false`）。
@@ -20,309 +51,636 @@ pub fn new_cancel_flag() -> CancelFlag {
     Arc::new(AtomicBool::new(false))
 }
 
-pub type TaskHandler =
-    Arc<dyn Fn(Vec<u8>, CancelFlag) -> crate::common::Result<Vec<u8>> + Send + Sync + 'static>;
+// 帧类型常量（与 `actant/task/_worker.py` 保持一致）。
+const FRAME_DISPATCH: u8 = 0x01;
+const FRAME_CANCEL: u8 = 0x02;
+// 子进程回传的结果帧类型。
+const FRAME_RESULT: u8 = 0x02;
 
-/// 有界线程池，用于任务执行。
-///
-/// 使用固定数量的工作线程从共享队列中拉取任务。
-/// 这样可以避免无限制的线程创建（每个任务一个线程），同时将任务执行与 Tokio 的运行时线程隔离。
-struct TaskThreadPool {
-    sender: crossbeam_channel::Sender<Job>,
-    /// 工作线程句柄，用于 shutdown 时 join。
-    workers: Vec<std::thread::JoinHandle<()>>,
+/// `Cancel` 帧的完整字节（4 字节长度 + 1 字节类型 + 空正文）。
+const CANCEL_FRAME_BYTES: [u8; 5] = [1, 0, 0, 0, FRAME_CANCEL];
+
+/// 帧头长度：4 字节小端长度。
+const FRAME_HEADER_LEN: usize = 4;
+
+/// 一个 worker 子进程：同一时刻恰好执行一个任务。
+struct WorkerProc {
+    child: Child,
+    /// worker 写端（hot path）：派发独占持有，**无 Mutex**。
+    ///
+    /// 取消轮询不与派发抢同一把锁——取消通过独立 dup 出来的 `cancel_stdin` 写入。
+    /// Cancel 帧固定 5 字节（< PIPE_BUF 512），内核保证原子写入不会与 hot-path
+    /// 写交错（任何 < PIPE_BUF 单次 write 到 pipe 均为原子）。
+    stdin: ChildStdin,
+    /// 取消帧的独立写端（dup(2) of stdin），仅供 `spawn_cancel_poller` 使用。
+    cancel_stdin: Option<tokio::fs::File>,
+    /// 发送帧用的头缓存（4B 长度 + 1B 类型）。栈上固定 5 字节数组，省一次
+    /// `Vec::with_capacity` 分配 + memcpy，供 `write_vectored` 组合 iovec。
+    header_buf: [u8; FRAME_HEADER_LEN + 1],
+    /// stdout 由当前在途的分发独占读取；空闲时缓存于此供复用。
+    stdout: ChildStdout,
 }
 
-type Job = Box<dyn FnOnce() + Send + 'static>;
-
-impl TaskThreadPool {
-    fn new(worker_count: usize, channel_capacity: usize) -> Result<Self, ActantError> {
-        if worker_count == 0 {
-            return Err(ActantError::Config(
-                "task thread pool worker_count must be > 0".into(),
-            ));
-        }
-        let (sender, receiver) = crossbeam_channel::bounded::<Job>(channel_capacity);
-        let mut workers = Vec::with_capacity(worker_count);
-        for i in 0..worker_count {
-            let rx = receiver.clone();
-            let handle = std::thread::Builder::new()
-                .name(format!("actant-task-worker-{i}"))
-                .spawn(move || {
-                    while let Ok(job) = rx.recv() {
-                        job();
-                    }
-                })
-                .map_err(|e| {
-                    ActantError::Worker(format!("failed to spawn task worker thread: {e}"))
-                })?;
-            workers.push(handle);
-        }
-        // 注：工作线程非 daemon。shutdown_and_wait 通过关闭 channel 让
-        // 空闲线程退出并 join；正在执行不可中断任务的线程会阻塞 join
-        // 直到任务完成（由 drain_timeout_secs 限制总时长）。
-        Ok(Self { sender, workers })
-    }
-
-    /// 关闭线程池并等待所有工作线程退出。
+impl WorkerProc {
+    /// 向子进程发送一帧：``[4B 长度][1B 类型][正文]`` 连续写入 pipe。
     ///
-    /// 通过替换 sender 为一个无关的、已关闭的 channel，使原 channel 的所有 sender
-    /// 都被 drop，工作线程的 `rx.recv()` 返回 `Err` 并退出。
-    /// 不会中断正在执行的任务。
-    ///
-    /// `timeout` 限制总等待时长。超时后尚未退出的工作线程被放弃 join（线程为
-    /// 非 daemon，进程退出时仍会等待，但调用方不会被无限阻塞）。
-    fn shutdown_and_wait(&mut self, timeout: std::time::Duration) {
-        // 替换 sender 为无关的新 channel，原 sender 被 drop。
-        // mem::replace 总是返回旧值，此处明确丢弃旧 sender 以触发 worker
-        // 退出路径（drop sender → channel 关闭 → recv 返回 Err）。
-        let (dummy_tx, _) = crossbeam_channel::bounded::<Job>(0);
-        let _ = std::mem::replace(&mut self.sender, dummy_tx);
-        let workers = std::mem::take(&mut self.workers);
-        if workers.is_empty() {
-            return;
-        }
-        // 在独立线程中 join 所有 worker，主线程通过 channel 超时等待。
-        // 在 workers 被 move 进 spawn 闭包前捕获数量，供超时日志使用。
-        let worker_count = workers.len();
-        let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(1);
-        // spawn 失败仅发生在 OS 资源耗尽（OOM/thread limit），此时 worker
-        // 线程仍会自行退出（sender 已 drop）；done_tx 不会发送，主线程将
-        // 走 timeout 路径。失败信息由 OS 通过其他渠道报错。
-        let _ = std::thread::Builder::new()
-            .name("actant-task-pool-shutdown".into())
-            .spawn(move || {
-                for handle in workers {
-                    if let Err(e) = handle.join() {
-                        tracing::warn!("task worker thread join failed: {:?}", e);
-                    }
-                }
-                // done_tx.send 失败仅当 done_rx 被 drop（主线程已 timeout 退出），
-                // 属正常竞争路径，无需处理。
-                let _ = done_tx.send(());
-            });
-        match done_rx.recv_timeout(timeout) {
-            Ok(()) => {}
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                tracing::warn!(
-                    "task thread pool shutdown timed out after {:?}; \
-                     abandoning {} worker thread(s) still running",
-                    timeout,
-                    worker_count,
-                );
-            }
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                // join 线程已退出（所有 worker 均已 join 完成）
-            }
-        }
-    }
-
-    fn submit<F>(&self, f: F) -> Result<(), ActantError>
-    where
-        F: FnOnce() + Send + 'static,
-    {
-        self.sender.try_send(Box::new(f)).map_err(|e| match e {
-            crossbeam_channel::TrySendError::Full(_) => {
-                ActantError::Internal("task thread pool is at capacity".into())
-            }
-            crossbeam_channel::TrySendError::Disconnected(_) => {
-                ActantError::Internal("task thread pool is shut down".into())
-            }
-        })
-    }
-}
-
-/// 任务分发器抽象。
-///
-/// 此 trait 将 worker 运行时与具体执行后端解耦。默认实现 [`TaskRegistry`]
-/// 使用固定大小线程池 + `DashMap` handler 注册表，支持协作式取消。
-///
-/// # 公共扩展点
-///
-/// 此 trait 是 Rust 核心的公共扩展点。外部 Rust 用户可实现此 trait 以替换执行后端
-/// （例如进程池、GPU 任务队列、远程 RPC 调用等）。实现只需满足 `Send + Sync`。
-///
-/// `cancel_flag` 由调用方创建并传入；实现应在超时或取消时将其置为 `true`，
-/// 处理程序通过轮询该标志协作退出长时间运行的操作。
-#[async_trait::async_trait]
-pub trait TaskDispatcher: Send + Sync {
-    /// 将任务分发给其处理程序。
-    ///
-    /// `cancel_flag` 是分发器和处理程序之间的共享标志。
-    /// 超时时，分发器将其设置为 `true`；处理程序应轮询它以协作取消长时间运行的工作。
-    async fn dispatch(
-        &self,
-        name: &str,
-        payload: Vec<u8>,
-        cancel_flag: CancelFlag,
-    ) -> crate::common::Result<Vec<u8>>;
-
-    /// 注册一个任务处理程序。
-    ///
-    /// 默认实现返回错误，表示此 dispatcher 不支持动态注册。
-    /// `TaskRegistry` 覆盖此方法以支持运行时注册。
-    fn register_handler(&self, _name: &str, _handler: TaskHandler) -> crate::common::Result<()> {
-        Err(ActantError::Internal(
-            "this dispatcher does not support register_handler".into(),
-        ))
-    }
-
-    /// 关闭 dispatcher 并等待所有执行中的任务完成。
-    ///
-    /// 默认实现为空操作；`TaskRegistry` 覆盖以关闭线程池。
-    /// 调用方应在 Worker drain 阶段调用此方法，确保在 Runtime 关闭前
-    /// 所有任务线程已退出，避免访问已释放的资源。
-    fn shutdown(&self) {}
-}
-
-pub struct TaskRegistry {
-    handlers: DashMap<String, TaskHandler>,
-    pool: parking_lot::Mutex<TaskThreadPool>,
-    /// Payload 签名密钥。非空时 dispatch 会验证 payload MAC。
-    payload_signing_key: Vec<u8>,
-    /// shutdown 时等待工作线程退出的总超时。
-    drain_timeout: std::time::Duration,
-}
-
-impl TaskRegistry {
-    pub fn new(
-        pool_workers: usize,
-        pool_channel_capacity: usize,
-        payload_signing_key: Vec<u8>,
-    ) -> crate::common::Result<Self> {
-        Self::with_drain_timeout(
-            pool_workers,
-            pool_channel_capacity,
-            payload_signing_key,
-            std::time::Duration::from_secs(30),
-        )
-    }
-
-    /// 创建 `TaskRegistry` 并指定 shutdown 超时。
-    ///
-    /// `drain_timeout` 限制 `shutdown` 时等待工作线程退出的总时长，超时后
-    /// 放弃 join 尚未退出的线程。默认 30s（对应 `WorkerConfig::drain_timeout_secs`）。
-    pub fn with_drain_timeout(
-        pool_workers: usize,
-        pool_channel_capacity: usize,
-        payload_signing_key: Vec<u8>,
-        drain_timeout: std::time::Duration,
-    ) -> crate::common::Result<Self> {
-        Ok(Self {
-            handlers: DashMap::new(),
-            pool: parking_lot::Mutex::new(TaskThreadPool::new(
-                pool_workers,
-                pool_channel_capacity,
-            )?),
-            payload_signing_key,
-            drain_timeout,
-        })
-    }
-
-    pub fn register<F>(&self, name: &str, handler: F)
-    where
-        F: Fn(Vec<u8>, CancelFlag) -> crate::common::Result<Vec<u8>> + Send + Sync + 'static,
-    {
-        self.handlers.insert(name.to_string(), Arc::new(handler));
-    }
-
-    pub fn into_dispatcher(self) -> Arc<dyn TaskDispatcher> {
-        Arc::new(self)
-    }
-}
-
-/// 通用计算节点 fallback handler 名。
-///
-/// 当任务名未在 `TaskRegistry::handlers` 中注册时,`dispatch` 会回退到此名。
-/// Python 端 worker 启动时总是注册此 handler,用于反序列化内联 callable payload,
-/// 让无业务模块依赖的 worker 也能执行任意 cloudpickle 任务。
-pub const GENERIC_DISPATCH_NAME: &str = "__actant_generic__";
-
-#[async_trait::async_trait]
-impl TaskDispatcher for TaskRegistry {
-    async fn dispatch(
-        &self,
-        name: &str,
-        payload: Vec<u8>,
-        cancel_flag: CancelFlag,
-    ) -> crate::common::Result<Vec<u8>> {
-        let handler = {
-            // 先按 name 精确查找(快路径:worker 预加载业务模块的场景)。
-            // 未命中则回退到 __actant_generic__ handler,执行内联 payload 中的 callable。
-            // 避免对 "__actant_generic__" 本身递归回退造成无限循环。
-            let h = if name == GENERIC_DISPATCH_NAME {
-                None
-            } else {
-                self.handlers.get(name)
-            };
-            let h = match h {
-                Some(h) => h,
-                None => self.handlers.get(GENERIC_DISPATCH_NAME).ok_or_else(|| {
-                    ActantError::Internal(format!(
-                        "no handler registered for task '{}' and no generic fallback available",
-                        name
-                    ))
-                })?,
-            };
-            h.clone()
-        };
-        tracing::debug!(%name, "TaskRegistry::dispatch");
-
-        // 验证 payload MAC
-        let verified_payload = crate::common::payload::verify(&self.payload_signing_key, &payload)
-            .map_err(|e| ActantError::Internal(format!("payload verification: {}", e)))?;
-
-        let (tx, rx) = tokio::sync::oneshot::channel();
-
-        self.pool.lock().submit(move || {
-            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                (handler)(verified_payload, cancel_flag)
-            }));
-            match res {
-                Ok(Ok(value)) => {
-                    if tx.send(Ok(value)).is_err() {
-                        tracing::warn!("dispatcher: result channel closed before sending Ok");
-                    }
-                }
-                Ok(Err(e)) => {
-                    if tx.send(Err(e)).is_err() {
-                        tracing::warn!("dispatcher: result channel closed before sending Err");
-                    }
-                }
-                Err(panic_payload) => {
-                    let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
-                        s.to_string()
-                    } else if let Some(s) = panic_payload.downcast_ref::<String>() {
-                        s.clone()
-                    } else {
-                        "unknown panic".to_string()
-                    };
-                    if tx
-                        .send(Err(ActantError::Internal(format!(
-                            "task handler panicked: {}",
-                            msg
-                        ))))
-                        .is_err()
-                    {
-                        tracing::warn!("dispatcher: result channel closed before sending panic");
-                    }
-                }
-            }
-        })?;
-
-        match rx.await {
-            Ok(result) => result,
-            Err(_) => Err(ActantError::Internal("task handler panicked".into())),
-        }
-    }
-
-    fn register_handler(&self, name: &str, handler: TaskHandler) -> crate::common::Result<()> {
-        self.handlers.insert(name.to_string(), handler);
+    /// 空正文（Cancel）：只写 5 字节帧头；否则用 vectored I/O 让帧头与正文
+    /// 一次 `write_vectored` 落入 pipe，正文按 pipe 容量分多轮短写推进。
+    async fn send_frame(&mut self, msg_type: u8, body: &[u8]) -> Result<(), ActantError> {
+        let frame_len: u32 = (1 + body.len()) as u32;
+        self.header_buf[..FRAME_HEADER_LEN].copy_from_slice(&frame_len.to_le_bytes());
+        self.header_buf[FRAME_HEADER_LEN] = msg_type;
+        let iov = [IoSlice::new(&self.header_buf), IoSlice::new(body)];
+        self.stdin
+            .write_vectored(&iov)
+            .await
+            .map_err(map_io("worker stdin"))?;
+        self.stdin.flush().await.map_err(map_io("worker stdin"))?;
         Ok(())
     }
 
+    /// 异步地从 stdout 读结果帧正文。
+    ///
+    /// 先读 5 字节帧头（4B 长度 + 1B 类型），再按帧头长度读完整正文。
+    /// 到达 EOF（worker 崩溃或正常退出）返回 `Ok(None)`。
+    async fn read_result_frame(&mut self) -> Result<Option<Vec<u8>>, ActantError> {
+        let mut header = [0u8; FRAME_HEADER_LEN + 1];
+        match self.stdout.read_exact(&mut header).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(map_io("worker stdout")(e)),
+        }
+        let mut len_bytes = [0u8; FRAME_HEADER_LEN];
+        len_bytes.copy_from_slice(&header[..FRAME_HEADER_LEN]);
+        let len = u32::from_le_bytes(len_bytes) as usize;
+        if len < 1 {
+            return Err(ActantError::Worker(
+                "worker returned invalid frame length".into(),
+            ));
+        }
+        let msg_type = header[FRAME_HEADER_LEN];
+        let body_len = len - 1;
+        let mut buf = vec![0u8; body_len];
+        self.stdout
+            .read_exact(&mut buf)
+            .await
+            .map_err(map_io("worker stdout"))?;
+        if msg_type != FRAME_RESULT {
+            tracing::warn!(
+                frame_type = msg_type,
+                "worker returned unexpected frame type (expected Result)"
+            );
+        }
+        Ok(Some(buf))
+    }
+}
+
+fn map_io(ctx: &'static str) -> impl Fn(std::io::Error) -> ActantError + 'static {
+    move |e| ActantError::Worker(format!("{ctx}: {e}"))
+}
+
+/// 进程池任务分发器。
+///
+/// # 生命周期
+///
+/// 构造时按 `num_workers` 一次性拉起 worker 子进程。`dispatch` 通过有界信号量
+/// 领用一个空闲 worker 发送 `Dispatch` 帧；超时**即时强杀**并替补一个新 worker
+/// （不等待取消宽限期，资源即刻释放）；取消发送 `Cancel` 帧协作退出，宽限期
+/// （`worker_cancel_grace_ms`）内未收到结果帧才强杀兜底；崩溃（EOF / 写失败）
+/// 同样触发替补，保持进程池容量恒定。
+#[async_trait::async_trait]
+pub trait TaskDispatcher: Send + Sync {
+    /// 将任务分发给 worker 子进程执行。
+    ///
+    /// `timeout` 是硬超时：超时后 dispatcher **立即强杀** worker 进程，释放计算
+    /// 资源并回收并发槽位（不等待取消宽限期，任务已失联视为无需清理）。
+    /// `cancel_flag` 置位时发送 `Cancel` 帧触发协作取消，宽限期
+    /// （`worker_cancel_grace_ms`）内未收到结果帧才强杀兜底。两者均保持进程池
+    /// 容量恒定（杀一个补一个）。
+    async fn dispatch(
+        &self,
+        name: &str,
+        payload: Vec<u8>,
+        cancel_flag: CancelFlag,
+        timeout: Duration,
+    ) -> crate::common::Result<Vec<u8>>;
+
+    /// 关闭 dispatcher 并终止所有 worker 进程。
+    fn shutdown(&self) {}
+}
+
+pub struct ProcessTaskDispatcher {
+    /// worker 启动 argv（生产：`[python, -m, actant.task._worker]`）。
+    worker_argv: Vec<String>,
+    /// worker 子进程的 `PYTHONPATH`，透传给 spawn 的 Command 环境。
+    python_path: Option<String>,
+    /// 空闲 worker 队列。并发度由 `slots` 信号量保证，队列长度与之一致。
+    free_workers: Mutex<VecDeque<WorkerProc>>,
+    /// 并发槽位：容量 = 进程池大小，dispatch 据此公平领用空闲 worker。
+    slots: Arc<Semaphore>,
+    /// Payload 签名密钥。非空时 dispatch 会验证 payload MAC。
+    signing_key: Vec<u8>,
+    /// 取消后等待 worker 协作退出的宽限期，超时则强杀。
+    cancel_grace: Duration,
+    /// 关闭时终止空闲 worker。
+    shutting_down: AtomicBool,
+}
+
+impl ProcessTaskDispatcher {
+    /// 创建进程池任务分发器。
+    ///
+    /// `worker_program` 为 worker 解释器路径（如 `sys.executable`），进程池
+    /// 以 `[worker_program, -m, actant.task._worker]` 拉起 worker 子进程。
+    /// `python_path` 若非空，透传给 worker 子进程作为 `PYTHONPATH`，保证
+    /// 模块级任务函数在子进程内可被 by-reference 再导入。
+    pub fn new(
+        num_workers: usize,
+        worker_program: String,
+        worker_cancel_grace_ms: u64,
+        signing_key: Vec<u8>,
+        python_path: Vec<String>,
+    ) -> crate::common::Result<Self> {
+        if worker_program.trim().is_empty() {
+            return Err(ActantError::Config(
+                "worker_program must be a non-empty interpreter path".into(),
+            ));
+        }
+        let argv = vec![
+            worker_program,
+            "-m".to_string(),
+            "actant.task._worker".to_string(),
+        ];
+        // PYTHONPATH 条目须以平台路径列表分隔符（unix `:`）拼接，而非路径内分隔符。
+        let python_env = if python_path.is_empty() {
+            None
+        } else {
+            std::env::join_paths(python_path.iter())
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
+        };
+        let cancel_grace = Duration::from_millis(worker_cancel_grace_ms.max(1));
+        let dispatcher = Self {
+            worker_argv: argv.clone(),
+            python_path: python_env,
+            free_workers: Mutex::new(VecDeque::with_capacity(num_workers.max(0))),
+            slots: Arc::new(Semaphore::new(num_workers)),
+            signing_key,
+            cancel_grace,
+            shutting_down: AtomicBool::new(false),
+        };
+        for _ in 0..num_workers {
+            let worker = ProcessTaskDispatcher::spawn_one(
+                &dispatcher.worker_argv,
+                dispatcher.python_path.as_deref(),
+                &dispatcher,
+            )?;
+            dispatcher.free_workers.lock().push_back(worker);
+        }
+        Ok(dispatcher)
+    }
+
+    /// 测试专用：完全不拉取 worker 子进程。
+    ///
+    /// `dispatch` 在 `verify`（签名校验失败即提前返回）之前不需要 worker，
+    /// 因此校验路径测试无需实际子进程，可纯 Rust 构建。
+    #[cfg(test)]
+    fn without_workers(signing_key: Vec<u8>) -> Self {
+        Self {
+            worker_argv: Vec::new(),
+            python_path: None,
+            free_workers: Mutex::new(VecDeque::new()),
+            slots: Arc::new(Semaphore::new(0)),
+            signing_key,
+            cancel_grace: Duration::from_millis(10),
+            shutting_down: AtomicBool::new(false),
+        }
+    }
+    /// 在 Unix 下从 `ChildStdin` dup 原始 fd 封装回 tokio `File`，作为取消帧独立写端。
+    ///
+    /// Cancel 帧固定 5 字节（< PIPE_BUF 512），dup 后并发写入不会与 hot-path
+    /// 写交错（POSIX 保证任何 < PIPE_BUF 的单次 write 到 pipe 为原子）。
+    /// 非 Unix 返回 `None`，降级为 dispatcher 自身发送 Cancel（语义等价）。
+    #[cfg(unix)]
+    fn try_clone_cancel_stdin(stdin: &ChildStdin) -> Option<tokio::fs::File> {
+        // 变参符号必须经 libc crate 调用：手工声明的变参 extern 在当前工具链上
+        // 会丢失第三个实参（F_SETFL 静默失效，O_NONBLOCK 落不到 fd 上）。
+        let raw = stdin.as_raw_fd();
+        // SAFETY: `dup`/`fcntl`/`close` 是纯系统调用，`from_raw_fd` 仅在 dup 返回 ≥0 时执行。
+        let dup_raw = unsafe { libc::dup(raw) };
+        if dup_raw < 0 {
+            return None;
+        }
+        // tokio `from_std` 要求底层 fd 已设置 nonblocking（否则写入会 block tokio
+        // worker thread）。fcntl(F_SETFL, old | O_NONBLOCK) 完成，不依赖额外 trait。
+        let flags = unsafe { libc::fcntl(dup_raw, libc::F_GETFL) };
+        if flags < 0 {
+            // 拿不到 flags（罕见）→ 就地关闭 dup fd（防泄漏），退回 fallback 路径
+            // （poller 不写 Cancel，dispatcher 自己 terminate_and_replace 兜底发 Cancel）。
+            unsafe { libc::close(dup_raw) };
+            return None;
+        }
+        if unsafe { libc::fcntl(dup_raw, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            unsafe { libc::close(dup_raw) };
+            return None;
+        }
+        let std_file = unsafe { std::fs::File::from_raw_fd(dup_raw) };
+        Some(tokio::fs::File::from_std(std_file))
+    }
+
+    #[cfg(not(unix))]
+    fn try_clone_cancel_stdin(_stdin: &ChildStdin) -> Option<tokio::fs::File> {
+        None
+    }
+
+    /// 拉起单个 worker 子进程并把 stderr 转发到 tracing。
+    fn spawn_one(
+        argv: &[String],
+        python_path: Option<&str>,
+        _ctx: &ProcessTaskDispatcher,
+    ) -> Result<WorkerProc, ActantError> {
+        let mut cmd = Command::new(&argv[0]);
+        cmd.args(&argv[1..])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(pp) = python_path {
+            cmd.env("PYTHONPATH", pp);
+        }
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| ActantError::Worker(format!("failed to spawn worker: {e}")))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| ActantError::Worker("worker stdin not available".into()))?;
+        let cancel_stdin = Self::try_clone_cancel_stdin(&stdin);
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| ActantError::Worker("worker stdout not available".into()))?;
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(drain_stderr(stderr));
+        }
+        Ok(WorkerProc {
+            child,
+            stdin,
+            cancel_stdin,
+            header_buf: [0u8; FRAME_HEADER_LEN + 1],
+            stdout,
+        })
+    }
+
+    /// 领用一个空闲 worker。调用方须先持有 `slots` 信号量许可，
+    /// 保证空闲队列非空；队列为空时等待（仅发生在极端竞态下）。
+    async fn pop_worker(&self) -> Result<WorkerProc, ActantError> {
+        loop {
+            if let Some(w) = self.free_workers.lock().pop_front() {
+                return Ok(w);
+            }
+            if self.shutting_down.load(Ordering::Acquire) {
+                return Err(ActantError::Internal("worker pool shut down".into()));
+            }
+            // 信号量许可保证队列应有 worker；此处兜底等待以免忙轮询。
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    fn release_worker(&self, worker: WorkerProc) {
+        // shutdown 后不再回收入池：在途任务结束（或强杀）释放的 worker 直接终止
+        // 回收，否则该 worker 塞回队列后无人消费、也无人强杀，父进程存活期间
+        // 泄漏一个常驻 Python 子进程。
+        if self.shutting_down.load(Ordering::Acquire) {
+            let mut worker = worker;
+            if let Err(e) = worker.child.start_kill() {
+                tracing::warn!(error = %e, "failed to kill worker released after shutdown");
+            }
+            tokio::spawn(async move {
+                if let Err(e) = worker.child.wait().await {
+                    tracing::warn!(error = %e, "failed to reap worker released after shutdown");
+                }
+            });
+            return;
+        }
+        self.free_workers.lock().push_back(worker);
+    }
+
+    /// 硬超时强杀：不发送 `Cancel`、不等待宽限期，立即终止并替补。
+    ///
+    /// 硬超时意味着任务已失联（未在时限内返回），无需再给协作清理机会；
+    /// 立即强杀保证计算资源即时释放、槽位即时回收（与取消的宽限语义区分）。
+    async fn kill_and_replace(&self, mut worker: WorkerProc) {
+        Self::force_kill(&mut worker.child).await;
+        self.ensure_replacement();
+        let _ = worker;
+    }
+
+    /// 等待取消标志置位后的宽限窗口结束（15ms 轮询，与 `spawn_cancel_poller` 一致）。
+    ///
+    /// 取消置位后先进入 `grace` 宽限窗口；协作 worker 会在窗口内以结果帧响应，
+    /// 由 `dispatch` 的**结果臂**（select 中列在前，优先）赢得并发而保留 worker 复用；
+    /// 仅当窗口耗尽仍未收到结果帧（不可协作 worker）才返回，触发本臂强杀兜底。
+    /// `active` 为真时才轮询，避免分发已结束（worker 释放复用后）的残留取消信号
+    /// 误触发取消分支。
+    async fn wait_for_cancel(flag: &CancelFlag, active: &AtomicBool, grace: Duration) {
+        loop {
+            if !active.load(Ordering::Relaxed) {
+                return;
+            }
+            if flag.load(Ordering::Relaxed) {
+                tokio::time::sleep(grace).await;
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+    }
+
+    /// 取消强杀：向 worker 发送 `Cancel` 帧 → 宽限等待协作退出 → 未退出则强杀，
+    /// 并替补新 worker 以保持进程池容量恒定。调用方持有该 worker 的槽位许可。
+    async fn terminate_and_replace(&self, mut worker: WorkerProc) {
+        let _ = worker.send_frame(FRAME_CANCEL, &[]).await;
+        let grace = tokio::time::sleep(self.cancel_grace);
+        tokio::pin!(grace);
+        let child = &mut worker.child;
+        tokio::select! {
+            _ = &mut grace => {
+                // 宽限期耗尽仍未退出，强杀。
+                Self::force_kill(child).await;
+            }
+            _status = child.wait() => {
+                // worker 在宽限期内协作退出。
+            }
+        }
+        self.ensure_replacement();
+        let _ = worker; // 丢弃已终止的 worker
+    }
+
+    /// 强制终止子进程并等待其回收，避免僵尸进程。
+    async fn force_kill(child: &mut Child) {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+    }
+
+    /// 替补一个已崩溃/被杀的 worker。
+    fn ensure_replacement(&self) {
+        // shutdown 后不再替补：在途任务的终止路径（超时强杀/崩溃回收）会走到这里，
+        // 新 spawn 的 worker 在 shutdown 语义下无人消费也无人回收，属纯泄漏。
+        if self.shutting_down.load(Ordering::Acquire) {
+            return;
+        }
+        match ProcessTaskDispatcher::spawn_one(&self.worker_argv, self.python_path.as_deref(), self)
+        {
+            Ok(worker) => self.release_worker(worker),
+            Err(e) => tracing::warn!(error = %e, "failed to respawn worker; pool shrunk"),
+        }
+    }
+
+    /// `dispatch` 内派发帧写失败 / 读到 EOF 时的崩溃回收路径。
+    async fn recover_crash(&self, mut worker: WorkerProc) {
+        Self::force_kill(&mut worker.child).await;
+        self.ensure_replacement();
+        let _ = worker;
+    }
+
+    /// 后台任务：轮询 `cancel_flag`，置位时向 worker 发送 `Cancel` 帧。
+    /// `active` 标志防止 worker 被释放复用后残留的轮询误发帧。
+    ///
+    /// 使用独立 dup 出的 `cancel_stdin`：hot-path dispatch 不再与 poller 竞争同一把
+    /// Mutex。Cancel 帧固定 5 字节（< PIPE_BUF），Unix 内核保证 write 原子，不与
+    /// dispatch 的并发写交错。若 `cancel_stdin` 不可用（非 Unix / dup 失败），
+    /// poller 不写帧——dispatcher 侧 `terminate_and_replace` 兜底自行发 Cancel，
+    /// 语义等价，仅延迟 ≤ 15ms（一轮 poll interval）。
+    ///
+    /// `writing` 由 dispatch 与 poller 共享：poller 进入写帧路径前置位，dispatch
+    /// 在 poller 结束后据此判断 worker stdin 是否可能残留 Cancel 帧
+    ///（见 [`Self::stop_cancel_poller`]）。
+    fn spawn_cancel_poller(
+        cancel_stdin: Option<tokio::fs::File>,
+        cancel_flag: CancelFlag,
+        active: Arc<AtomicBool>,
+        writing: Arc<AtomicBool>,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        tokio::sync::oneshot::Receiver<Option<tokio::fs::File>>,
+    ) {
+        // 向 poller task 传入 cancel_stdin 所有权；结束后通过 oneshot 归还给 dispatch。
+        // 这样 poller 活在自己的 task 里，dispatch 与 poller 之间无跨 task Arc<Mutex<…>>。
+        let (ret_tx, ret_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let mut cs = cancel_stdin;
+            loop {
+                if cancel_flag.load(Ordering::Relaxed) {
+                    if active.load(Ordering::Relaxed) {
+                        // 先置写帧标记再进入写路径：即使随后被 abort（写帧可能
+                        // 进行到一半），dispatch 也能从标记得知「不能复用」。
+                        writing.store(true, Ordering::Release);
+                        if let Some(c) = cs.as_mut() {
+                            let _ = c.write_all(&CANCEL_FRAME_BYTES).await;
+                            let _ = c.flush().await;
+                        }
+                    }
+                    // 归还 cancel_stdin；接收端已 abort 时发送失败，File 随之
+                    // Drop 关闭 fd，由下次 ensure_replacement 重建，无需补救。
+                    let _ = ret_tx.send(cs);
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(15)).await;
+            }
+        });
+        (handle, ret_rx)
+    }
+
+    /// 终止取消轮询任务并等待其退出，返回 `(cancel_stdin, poller 可能已写帧)`。
+    ///
+    /// 所有处置 worker 的路径都必须先经过这里再释放/复用：abort 之后**等待
+    /// poller 真正退出**才返回，保证「poller 检查 active → 写 Cancel 帧」与
+    /// 「结果臂释放 worker 复用」互斥——否则 poller 可能已通过 active 检查但尚未
+    /// 写帧，结果臂先 release 了 worker，过期 Cancel 帧随后落入复用 worker 的
+    /// stdin，误杀下一个任务（TOCTOU）。
+    ///
+    /// 第二个返回值为 `true` 表示 poller 已进入写帧阶段，worker stdin 上可能残留
+    /// 完整或部分 Cancel 帧，复用会让残留帧与下一任务的 Dispatch 帧失步——
+    /// 调用方应回收该 worker 而非复用。
+    async fn stop_cancel_poller(
+        canceller: tokio::task::JoinHandle<()>,
+        cancel_stdin_rx: tokio::sync::oneshot::Receiver<Option<tokio::fs::File>>,
+        writing: &AtomicBool,
+    ) -> (Option<tokio::fs::File>, bool) {
+        canceller.abort();
+        match cancel_stdin_rx.await {
+            // poller 观察到 flag 置位后自行结束并归还写端；写帧是否发生以
+            // writing 标记为准。
+            Ok(cancel_stdin) => (cancel_stdin, writing.load(Ordering::Acquire)),
+            // poller 被 abort：等待任务彻底退出后再读 writing——此刻 poller 不可能
+            // 再推进，writing 为 false 即证明从未进入写帧阶段（任务正常完成路径）。
+            Err(_) => {
+                // JoinError(Cancelled) 是 abort 的预期结果，仅需等待任务退出。
+                let _ = canceller.await;
+                (None, writing.load(Ordering::Acquire))
+            }
+        }
+    }
+}
+
+/// 指标边带行前缀：worker 经 stderr 单行上报从属计时指标（见 `_worker.py`）。
+const METRIC_LINE_PREFIX: &str = "actant_metric: ";
+
+/// 将 worker stderr 逐行转发到 tracing，避免子进程日志丢失（隔离副产）。
+///
+/// 同时识别从属指标边带：以 ``actant_metric:`` 开头、形如
+/// ``<name>=<value_ms>`` 的行，汇入对应 OTel histogram（当前仅
+/// ``python.handler_ms``）；其余行原样作为日志透传，不改变可观测性契约。
+async fn drain_stderr(mut stderr: ChildStderr) {
+    let mut lines = tokio::io::BufReader::new(&mut stderr).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        if let Some(value) = line.strip_prefix(METRIC_LINE_PREFIX) {
+            if let Some((name, value_ms)) = value.split_once('=') {
+                if let Ok(ms) = value_ms.trim().parse::<u64>() {
+                    if name == "python.handler_ms" {
+                        crate::metrics::observe_python_handler_ms(ms);
+                    }
+                }
+            }
+            continue;
+        }
+        tracing::warn!(target: "actant.worker", "{line}");
+    }
+}
+
+/// 提供兼容构造入口以便 `RuntimeBuilder` 以 `Arc<dyn TaskDispatcher>` 注入。
+///
+/// 使用独立的 trait 对象封装，避免 `ProcessTaskDispatcher` 直接实现 trait 时
+/// 与测试用 `StubDispatcher` 的手写实现冲突（无实际冲突，仅为 API 清晰）。
+#[async_trait::async_trait]
+impl TaskDispatcher for ProcessTaskDispatcher {
+    async fn dispatch(
+        &self,
+        _name: &str,
+        payload: Vec<u8>,
+        cancel_flag: CancelFlag,
+        timeout: Duration,
+    ) -> crate::common::Result<Vec<u8>> {
+        let verified = crate::common::payload::verify(&self.signing_key, &payload)
+            .map_err(|e| ActantError::Internal(format!("payload verification: {e}")))?;
+        // 领用并发槽位（容量 = 进程池大小），确保公平获取空闲 worker。
+        let _permit = self
+            .slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| ActantError::Internal("worker pool closed".into()))?;
+        let mut worker = self.pop_worker().await?;
+
+        // 取出独立取消写端，交由 poller task 拥有；归还有两种路径：
+        //  1) poller 通过 oneshot 在自己发完 Cancel 后归还（正常/取消分支）；
+        //  2) abort poller 时，cancel_stdin 所有权在 poller 内 → oneshot 被 close 变为
+        //     RecvError → 本函数视为 None，等下次 ensure_replacement / spawn_one 重建。
+        // 这样 hot-path send_frame（→write_vectored）全程无 Mutex、无 Arc clone 竞争。
+        let cancel_stdin = worker.cancel_stdin.take();
+        let active = Arc::new(AtomicBool::new(true));
+        // 与 poller 共享的写帧标记：poller 进入写 Cancel 路径前置位，dispatch 在
+        // poller 退出后据此判断 worker stdin 是否可能残留过期 Cancel 帧。
+        let writing = Arc::new(AtomicBool::new(false));
+        let (canceller, cancel_stdin_rx) = Self::spawn_cancel_poller(
+            cancel_stdin,
+            cancel_flag.clone(),
+            active.clone(),
+            writing.clone(),
+        );
+
+        if let Err(e) = worker.send_frame(FRAME_DISPATCH, &verified).await {
+            // 派发帧写失败：worker 已死，等待 poller 退出后替补并返回错误。
+            active.store(false, Ordering::Relaxed);
+            let (cancel_stdin, _) =
+                Self::stop_cancel_poller(canceller, cancel_stdin_rx, &writing).await;
+            worker.cancel_stdin = cancel_stdin;
+            tracing::warn!(error = %e, "worker dispatch write failed; crashing worker");
+            self.recover_crash(worker).await;
+            return Err(ActantError::Worker(format!(
+                "worker terminated before dispatch: {e}"
+            )));
+        }
+
+        let outcome = tokio::select! {
+            result = worker.read_result_frame() => {
+                active.store(false, Ordering::Relaxed);
+                // 先等 poller 彻底退出再决定 worker 去留：保证「poller 检查 active →
+                // 写 Cancel 帧」与释放/复用互斥，过期帧不会落入复用的 worker。
+                let (cancel_stdin, cancel_maybe_written) =
+                    Self::stop_cancel_poller(canceller, cancel_stdin_rx, &writing).await;
+                worker.cancel_stdin = cancel_stdin;
+                match result {
+                    Ok(Some(body)) => {
+                        if cancel_maybe_written {
+                            // 取消与完成竞态：Cancel 帧可能已写入该 worker 的 stdin，
+                            // 复用会让残留帧误杀下一任务，回收并替补。
+                            tracing::warn!(
+                                "cancel frame raced with task completion; recycling worker"
+                            );
+                            self.recover_crash(worker).await;
+                        } else {
+                            self.release_worker(worker);
+                        }
+                        Ok(body)
+                    }
+                    Ok(None) => {
+                        // EOF：worker 崩溃退出。替补后返回错误。
+                        tracing::warn!("worker encountered EOF (crash) while reading result");
+                        self.recover_crash(worker).await;
+                        Err(ActantError::Worker(
+                            "worker process crashed while executing task".into(),
+                        ))
+                    }
+                    Err(e) => {
+                        self.recover_crash(worker).await;
+                        Err(e)
+                    }
+                }
+            }
+            _ = Self::wait_for_cancel(&cancel_flag, &active, self.cancel_grace) => {
+                // 取消尚未被协作 worker 以结果帧响应（非协作 worker 阻塞在
+                // 不可中断代码）：发送 `Cancel`、宽限等待协作退出，宽限耗尽才强杀，
+                // 兜底回收槽位与进程池容量。
+                active.store(false, Ordering::Relaxed);
+                let (cancel_stdin, _) =
+                    Self::stop_cancel_poller(canceller, cancel_stdin_rx, &writing).await;
+                worker.cancel_stdin = cancel_stdin;
+                tracing::warn!("task cancelled, granting grace before killing worker");
+                self.terminate_and_replace(worker).await;
+                Err(ActantError::Cancelled("task cancelled".into()))
+            }
+            _ = tokio::time::sleep(timeout) => {
+                active.store(false, Ordering::Relaxed);
+                let (cancel_stdin, _) =
+                    Self::stop_cancel_poller(canceller, cancel_stdin_rx, &writing).await;
+                worker.cancel_stdin = cancel_stdin;
+                tracing::warn!(timeout_ms = timeout.as_millis(), "task hard-timeout, killing worker");
+                // 硬超时：任务已失联，立即强杀即时释放资源（不等取消宽限期）。
+                self.kill_and_replace(worker).await;
+                Err(ActantError::Timeout(format!(
+                    "task timed out after {}ms",
+                    timeout.as_millis()
+                )))
+            }
+        };
+        outcome
+    }
+
     fn shutdown(&self) {
-        self.pool.lock().shutdown_and_wait(self.drain_timeout);
+        self.shutting_down.store(true, Ordering::Release);
+        // 取出全部空闲 worker 并强杀。start_kill 只投递终止信号，必须 spawn wait()
+        // 消费终止状态回收子进程，否则留下僵尸进程。调用方保证关闭前排空在途
+        // 任务，且 shutdown 在 tokio 运行时上下文中执行（与 spawn_one 一致）。
+        let workers = std::mem::take(&mut *self.free_workers.lock());
+        for mut w in workers {
+            if let Err(e) = w.child.start_kill() {
+                tracing::warn!(error = %e, "failed to kill idle worker on shutdown");
+            }
+            tokio::spawn(async move {
+                if let Err(e) = w.child.wait().await {
+                    tracing::warn!(error = %e, "failed to reap worker on shutdown");
+                }
+            });
+        }
     }
 }
 

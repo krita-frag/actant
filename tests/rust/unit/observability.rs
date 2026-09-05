@@ -4,13 +4,6 @@
 use super::*;
 
 #[test]
-fn init_and_shutdown_noop_without_env() {
-    // 默认无环境变量时，init / shutdown 不应 panic。
-    init();
-    shutdown();
-}
-
-#[test]
 fn init_tracing_with_actant_tracing_env() {
     // 设置 ACTANT_TRACING=1，验证 init_tracing 不 panic。
     // 注意：tracing global subscriber 只能设置一次，因此本测试必须在其他

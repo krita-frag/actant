@@ -205,6 +205,9 @@ pub struct TaskState {
     #[serde(default)]
     pub error: Option<String>,
     retry_count: u32,
+    /// 任务派发代数（dispatch generation）：每次重派发/重试（`reset_task`
+    /// 的 `increment_attempt`）递增一次，并随 TaskDefinition 带上派发。
+    /// 用于结果接受侧的 attempt fencing——过期代数的结果必须被丢弃。
     attempt: u32,
 }
 
@@ -348,17 +351,92 @@ impl WorkflowExecution {
         }
     }
 
-    pub fn mark_task_completed(&mut self, task_id: &TaskId, result: Vec<u8>) {
+    /// 标记任务为 Completed。
+    ///
+    /// 返回 `true` 表示状态实际发生推进；`false` 表示被守卫拒绝：
+    /// - 终态守卫（[`Self::can_transition_task`]）：工作流已终态，或任务已处于
+    ///   任意终态——迟到的重复完成结果不得改写 `Cancelled` / `Failed` 等终态，
+    ///   也不得把已终态工作流"复活"为 Completed；
+    /// - attempt fencing（[`Self::attempt_fencing_passes`]）：结果所属派发代数
+    ///   落后于任务当前记录的代数——重派发/重试后旧代在途执行的迟到结果被丢弃。
+    ///
+    /// `result_attempt` 为 `None` 表示结果通路未携带派发代数（wire 协议尚未
+    /// 扩展 `WireTaskResult` / `WireDagStateUpdate`），无法判定代数，fencing
+    /// 放行。
+    pub fn mark_task_completed(
+        &mut self,
+        task_id: &TaskId,
+        result: Vec<u8>,
+        result_attempt: Option<u32>,
+    ) -> bool {
+        if !self.can_transition_task(task_id)
+            || !self.attempt_fencing_passes(task_id, result_attempt)
+        {
+            return false;
+        }
         if let Some(task) = self.tasks.get_mut(task_id) {
-            // 幂等性：已 completed 则跳过
-            if matches!(task.state, Phase::Completed) {
-                return;
-            }
             task.state = Phase::Completed;
             task.result = Some(result);
             self.succeeded_count += 1;
         }
         self.check_workflow_completion();
+        true
+    }
+
+    /// attempt fencing：判定结果所属派发代数是否仍可被接受。
+    ///
+    /// 结果的 attempt 必须 ≥ 任务当前记录的 attempt（同代重复投递或更新代均
+    /// 放行）。派发侧保证每次重派发/重试（`reset_task` 的 `increment_attempt`）
+    /// 递增 [`TaskState::attempt`] 并随 TaskDefinition 携带，因此小于当前值的
+    /// result_attempt 一定是过期代数在途执行的迟到结果。
+    ///
+    /// 与 [`Self::can_transition_task`] 互补：fencing 校验派发代际，
+    /// 终态守卫校验状态机合法性。任务不存在时放行（NotFound 由上层处理）。
+    ///
+    /// `pub(crate)`：orchestrator 的 `complete_task` 在推进状态与发事件**之前**
+    /// 需要先判定 fencing（被拒结果不得触发 TaskCompleted 事件或后继调度），
+    /// 因此单独暴露给同 crate 使用；`mark_task_completed` / `fail_task` 内部
+    /// 亦会再次调用，保证任何直接写入路径都经过 fencing。
+    pub(crate) fn attempt_fencing_passes(
+        &self,
+        task_id: &TaskId,
+        result_attempt: Option<u32>,
+    ) -> bool {
+        let Some(result_attempt) = result_attempt else {
+            return true;
+        };
+        let Some(task) = self.tasks.get(task_id) else {
+            return true;
+        };
+        let current_attempt = task.attempt();
+        if result_attempt < current_attempt {
+            tracing::debug!(
+                task = %task_id.as_str(),
+                result_attempt,
+                current_attempt,
+                "dropping stale result: dispatch generation older than current attempt"
+            );
+            return false;
+        }
+        true
+    }
+
+    /// 集中式终态守卫：判断任务是否允许被推进（Completed / Failed 等写入）。
+    ///
+    /// 合法迁移要求同时满足：
+    /// - 工作流未处于终态（终态工作流不可被任何任务事件改写）；
+    /// - 任务存在且未处于终态（终态任务不可被覆盖）。
+    ///
+    /// 所有任务状态写入路径（`mark_task_completed` / `fail_task` /
+    /// orchestrator 的 `complete_task`）都应经由本守卫判断，避免守卫口径
+    /// 分散后出现遗漏。
+    pub fn can_transition_task(&self, task_id: &TaskId) -> bool {
+        if self.state.is_terminal() {
+            return false;
+        }
+        self.tasks
+            .get(task_id)
+            .is_some_and(|t| !t.state.is_terminal())
     }
 
     /// 标记任务为已跳过（条件分支未被取）。
@@ -376,6 +454,11 @@ impl WorkflowExecution {
 
     /// 检查工作流是否已到达终态。
     fn check_workflow_completion(&mut self) {
+        // 终态工作流不可被改写：已终态（如 Cancelled / Failed）后到达的
+        // 任务事件不得把状态翻转为 Completed。
+        if self.state.is_terminal() {
+            return;
+        }
         // 所有 task 已完成或被跳过 → workflow 完成
         if self.succeeded_count + self.skipped_count == self.total_count {
             self.state = Phase::Completed;
@@ -413,20 +496,24 @@ impl WorkflowExecution {
     ///
     /// Idempotency: skips if the task is already Completed or Failed, or if
     /// the workflow is already in a terminal state.
-    pub fn fail_task(&mut self, task_id: &TaskId, error: String, mode: FailureScope) {
-        // 幂等性：workflow 已处于终态则跳过
-        if self.state.is_terminal() {
+    ///
+    /// `result_attempt` 语义与 [`Self::mark_task_completed`] 相同：过期派发
+    /// 代数的失败报告同样会被 attempt fencing 丢弃。
+    pub fn fail_task(
+        &mut self,
+        task_id: &TaskId,
+        error: String,
+        mode: FailureScope,
+        result_attempt: Option<u32>,
+    ) {
+        // 幂等性：workflow 已处于终态、任务已处任意终态（含 Cancelled——迟到的失败
+        // 事件不得把已取消任务改写为 Failed 并参与 fail-fast 计数）则跳过。
+        if !self.can_transition_task(task_id)
+            || !self.attempt_fencing_passes(task_id, result_attempt)
+        {
             return;
         }
         if let Some(task) = self.tasks.get_mut(task_id) {
-            // 已 Completed 的 task 跳过 — 永不覆盖成功结果
-            if matches!(task.state, Phase::Completed) {
-                return;
-            }
-            // 已 Failed 的 task 跳过（幂等性）
-            if matches!(task.state, Phase::Failed) {
-                return;
-            }
             task.state = Phase::Failed;
             task.error = Some(error.clone());
         }
@@ -460,7 +547,15 @@ impl WorkflowExecution {
             if t.state == Phase::Failed {
                 let e = t.error.as_deref().unwrap_or("");
                 let truncated = if e.len() > MAX_FAILED_ERROR_LEN {
-                    format!("{}…", &e[..MAX_FAILED_ERROR_LEN])
+                    // 按字节切片会 panic：若第 MAX_FAILED_ERROR_LEN 字节落在多字节
+                    // UTF-8 字符（中文/emoji）中间，&e[..MAX_FAILED_ERROR_LEN] 会
+                    // 触发 "byte index is not a char boundary"。回退到最近的字符
+                    // 边界，保证不 panic 且不超过字节上限。
+                    let mut end = MAX_FAILED_ERROR_LEN;
+                    while !e.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    format!("{}…", &e[..end])
                 } else {
                     e.to_string()
                 };

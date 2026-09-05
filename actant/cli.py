@@ -11,6 +11,7 @@ CLI 保持极简：只负责 worker 启动与状态查询（节点、任务、�
 from __future__ import annotations
 
 import argparse
+import http.server
 import logging
 import os
 import signal
@@ -20,6 +21,42 @@ from typing import Any
 
 import actant
 from actant import TaskEvent
+
+_logger = logging.getLogger("actant.cli")
+
+
+class _MetricsHandler(http.server.BaseHTTPRequestHandler):
+    """Prometheus ``/metrics`` 端点 handler。
+
+    CLI 自有的 HTTP 托管：核心 ``Runtime`` 只提供 ``metrics_text()`` 文本，
+    不持有 HTTP server（外置默认守则）。
+    """
+
+    def do_GET(self) -> None:
+        if self.path != "/metrics":
+            self.send_response(404)
+            self.end_headers()
+            return
+        body = actant.metrics_text().encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: Any) -> None:
+        _logger.debug("metrics: " + format, *args)
+
+
+def _start_metrics_server(port: int) -> tuple[http.server.ThreadingHTTPServer, int]:
+    """在 ``port`` 上启动线程化 metrics HTTP 服务器（``0`` = OS 分配端口）。
+
+    返回 ``(server, actual_port)``；调用方负责 ``shutdown()`` + ``server_close()``。
+    绑定 ``0.0.0.0``：``--metrics-port`` / ``actant metrics`` 均为显式 opt-in，
+    供 Prometheus 跨机抓取；指标端点无认证，网络隔离由部署方负责。
+    """
+    server = http.server.ThreadingHTTPServer(("0.0.0.0", port), _MetricsHandler)
+    return server, server.server_address[1]
 
 
 def _configure_logging(level: str) -> None:
@@ -136,7 +173,7 @@ def cmd_metrics(args: argparse.Namespace) -> int:
     rt.start()
     # 不调用 rt.serve()——不参与 worker 调度循环。
 
-    actual_port = rt.start_metrics_server(args.port)
+    server, actual_port = _start_metrics_server(args.port)
     print(
         f"actant metrics exporter listening on http://0.0.0.0:{actual_port}/metrics",
         file=sys.stderr,
@@ -153,6 +190,8 @@ def cmd_metrics(args: argparse.Namespace) -> int:
 
     stop_event.wait()
     print("shutting down...", file=sys.stderr)
+    server.shutdown()
+    server.server_close()
     rt.stop()
     print("stopped", file=sys.stderr)
     return 0
@@ -181,10 +220,11 @@ def cmd_worker(args: argparse.Namespace) -> int:
     rt.start()
     rt.serve()  # 非阻塞：worker.run() 在 tokio 后台 spawn
 
-    # 可选：启动 Prometheus HTTP exporter。
+    # 可选：启动 Prometheus HTTP exporter（CLI 自有托管，见 _start_metrics_server）。
+    metrics_server: http.server.ThreadingHTTPServer | None = None
     metrics_port = None
     if args.metrics_port:
-        metrics_port = rt.start_metrics_server(args.metrics_port)
+        metrics_server, metrics_port = _start_metrics_server(args.metrics_port)
 
     node_id = rt.node_id
     print(f"actant worker started: node_id={node_id}", file=sys.stderr)
@@ -195,7 +235,18 @@ def cmd_worker(args: argparse.Namespace) -> int:
             f"metrics: http://0.0.0.0:{metrics_port}/metrics",
             file=sys.stderr,
         )
-    print("P2P auto-discovery active (no central server needed)", file=sys.stderr)
+    if args.data_dir:
+        print(
+            "P2P auto-discovery active (no central server needed)",
+            file=sys.stderr,
+        )
+    else:
+        # 显式 data_dir 缺省时 Runtime 生成临时目录并以 "none" preset 运行
+        # （不启动 iroh）：单进程 worker，不参与 P2P 发现。
+        print(
+            "P2P disabled: no --data-dir given, running as an isolated single-process worker",
+            file=sys.stderr,
+        )
     print("press Ctrl+C to drain in-flight tasks and shutdown", file=sys.stderr)
 
     stop_event = threading.Event()
@@ -210,6 +261,9 @@ def cmd_worker(args: argparse.Namespace) -> int:
 
     print("draining in-flight tasks and shutting down...", file=sys.stderr)
     rt.stop()
+    if metrics_server is not None:
+        metrics_server.shutdown()
+        metrics_server.server_close()
     print("worker stopped", file=sys.stderr)
     return 0
 
@@ -252,7 +306,19 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_task(args: argparse.Namespace, *, runtime: actant.Runtime | None = None) -> int:
-    """本地任务状态查询/取消（极简，不涉及跨节点调度）。"""
+    """本地任务状态查询/取消（极简，不涉及跨节点调度）。
+
+    ``list`` 读取的本地任务注册表是**进程内内存态**：仅在注入活跃 ``runtime``
+    时有意义。无 ``runtime`` 注入时直接提示并返回 1，而不是新建空 Runtime
+    制造"永远 no tasks"的假象。``cancel`` 同样依赖内存注册表，保持既有行为。
+    """
+    if args.action == "list" and runtime is None:
+        print(
+            "task registry is in-memory and requires a running runtime; "
+            "start a runtime or use `actant status`",
+            file=sys.stderr,
+        )
+        return 1
     rt = runtime if runtime is not None else actant.Runtime.with_defaults().start()
     owns_runtime = runtime is None
     try:

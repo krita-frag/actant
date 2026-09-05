@@ -30,16 +30,11 @@ SERIALIZATION = "Serialization"
 TRANSPORT = "Transport"
 STORE = "Store"
 EXECUTE = "Execute"
-ACTOR_MESSAGING = "ActorMessaging"
-
-#: 决策型（Rust Actor 系统提供）
-ACTOR_SUPERVISION = "ActorSupervision"
 
 #: 反应型（Rust 事件总线广播，Python 可订阅）
 TASK_LIFECYCLE = "TaskLifecycle"
 WORKFLOW_LIFECYCLE = "WorkflowLifecycle"
 NODE_LIFECYCLE = "NodeLifecycle"
-ACTOR_LIFECYCLE = "ActorLifecycle"
 
 
 @dataclass
@@ -105,7 +100,11 @@ class StoreReq:
 
 @dataclass
 class ExecuteCtx:
-    """`Execute` capability 的请求上下文。"""
+    """`Execute` capability 的请求上下文。
+
+    ``timeout_ms`` 与 ``@task(timeout_ms=...)`` 语义对齐：``0`` = 无超时
+    （Rust 侧 ``ExecuteHandler`` 映射为远期硬超时），非 ``0`` 为毫秒级硬超时。
+    """
 
     task_id: str
     workflow_id: str
@@ -158,52 +157,6 @@ class NodeEvent:
     peer_id: str = ""
     timestamp_ms: int = 0
 
-
-# Actor 相关 capability 的请求/事件类型
-# 以下类型对应 Rust `ActorMessaging` / `ActorSupervision` / `ActorLifecycle`
-# capability，PyO3 codec 已在 `src/py/types.rs` 中实现。Python 层声明这些
-# dataclass 仅用于类型注解与运行时 isinstance 校验，实际编码由 Rust 完成。
-
-
-@dataclass
-class ActorMessageReq:
-    """`ActorMessaging` capability 的请求（perform）。
-
-    对应 Rust `ActorMessageReq`：向目标 Actor 投递消息，返回 `message_id: str`。
-    """
-
-    target: str
-    payload: bytes
-    sender: str = ""
-
-
-@dataclass
-class ActorFailureCtx:
-    """`ActorSupervision` capability 的请求（ask）。
-
-    对应 Rust `ActorFailureCtx`：Actor 失败时由系统触发，决策返回
-    `"restart"` / `"stop"` / `"resume"` 或 `None`（弃权，由更上层决策）。
-    """
-
-    actor_id: str
-    error: str
-    restart_count: int = 0
-    max_restarts: int = 3
-
-
-@dataclass
-class ActorEvent:
-    """`ActorLifecycle` capability 的事件（emit）。
-
-    对应 Rust `ActorEvent` 枚举。Python 层用扁平 dataclass 表示，
-    `kind` 字段区分具体事件类型。
-    """
-
-    kind: Literal["spawned", "stopped", "failed", "restarted"]
-    actor_id: str
-    name: str = ""
-    error: str = ""
-    attempt: int = 0
 
 @runtime_checkable
 class RoutingHandler(Protocol):
@@ -275,26 +228,6 @@ class NodeLifecycleHandler(Protocol):
     def __call__(self, event: NodeEvent) -> None: ...
 
 
-@runtime_checkable
-class ActorMessagingHandler(Protocol):
-    """副作用型：向目标 Actor 投递消息，返回 `message_id`。"""
-
-    def __call__(self, req: ActorMessageReq) -> str: ...
-
-
-@runtime_checkable
-class ActorSupervisionHandler(Protocol):
-    """决策型：Actor 失败监督。返回 `"restart"`/`"stop"`/`"resume"` 或 `None` 弃权。"""
-
-    def __call__(self, ctx: ActorFailureCtx) -> str | None: ...
-
-
-@runtime_checkable
-class ActorLifecycleHandler(Protocol):
-    """反应型：Actor 生命周期事件订阅。"""
-
-    def __call__(self, event: ActorEvent) -> None: ...
-
 #: 所有内置 capability 的元数据。
 #:
 #: 注意分层（见AGENTS.md）：
@@ -303,7 +236,6 @@ class ActorLifecycleHandler(Protocol):
 #:   或 `Runtime.with_defaults()` 注册 Python handler，否则 ask 返回 None。
 #: - 其余 7 个：Rust 核心提供 codec（`register_defaults`），具体 handler 由
 #:   `RuntimeBuilder` 注入（如 StoreHandler / ExecuteHandler）或 Python 层覆盖。
-#:   `ActorMessaging` / `ActorSupervision` / `ActorLifecycle` 由 Rust Actor 系统提供。
 BUILTIN_CAPABILITIES: dict[str, CapabilityMeta] = {
     # ── 策略型（Python-only，无 Rust fallback）──
     "Routing": CapabilityMeta("Routing", "ask"),
@@ -314,14 +246,10 @@ BUILTIN_CAPABILITIES: dict[str, CapabilityMeta] = {
     "Transport": CapabilityMeta("Transport", "perform"),
     "Store": CapabilityMeta("Store", "perform"),
     "Execute": CapabilityMeta("Execute", "perform"),
-    "ActorMessaging": CapabilityMeta("ActorMessaging", "perform"),
-    # ── 决策型（Rust Actor 系统提供）──
-    "ActorSupervision": CapabilityMeta("ActorSupervision", "ask"),
     # ── 反应型（Rust 事件总线广播，Python 可订阅）──
     "TaskLifecycle": CapabilityMeta("TaskLifecycle", "emit"),
     "WorkflowLifecycle": CapabilityMeta("WorkflowLifecycle", "emit"),
     "NodeLifecycle": CapabilityMeta("NodeLifecycle", "emit"),
-    "ActorLifecycle": CapabilityMeta("ActorLifecycle", "emit"),
 }
 
 #: 仅 Python 层实现的策略型 capability（无 Rust fallback）。
@@ -365,9 +293,6 @@ def get_builtin_capability_meta(name: str) -> CapabilityMeta:
 
 
 __all__ = [
-    "ACTOR_LIFECYCLE",
-    "ACTOR_MESSAGING",
-    "ACTOR_SUPERVISION",
     "BUILTIN_CAPABILITIES",
     "EXECUTE",
     "NODE_LIFECYCLE",
@@ -381,12 +306,6 @@ __all__ = [
     "TASK_LIFECYCLE",
     "TRANSPORT",
     "WORKFLOW_LIFECYCLE",
-    "ActorEvent",
-    "ActorFailureCtx",
-    "ActorLifecycleHandler",
-    "ActorMessageReq",
-    "ActorMessagingHandler",
-    "ActorSupervisionHandler",
     "CapabilityMeta",
     "EffectKind",
     "ExecuteCtx",

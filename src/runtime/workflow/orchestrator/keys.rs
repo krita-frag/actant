@@ -24,6 +24,16 @@ pub(super) fn result_key(wf_id: &WorkflowId) -> String {
     format!("{}{}", STORE_KEY_RESULT, wf_id.as_str())
 }
 
+/// 构造带 MAC 签名的 task payload：有前驱依赖时，把所有已产出结果的前驱
+/// 结果统一前置到原始 payload 前并重新签名。
+///
+/// ## 约定：无结果的前驱被跳过
+///
+/// 收集 `upstream_results` 时，`filter_map` 会跳过没有 `result` 的前驱
+/// （典型为条件分支中未被激活、已被标记 `Skipped` 的条件前驱——它们按
+/// 设计不产生结果）。因此下游任务收到的上游结果数量可能少于其前驱数量，
+/// 该行为是有意的：参数合并逻辑（Python dispatcher 侧）按顺序消费存在的
+/// 结果，不依赖与前驱数量一一对应。
 pub(super) fn build_task_payload(
     dag: &Dag,
     execution: &WorkflowExecution,
@@ -52,7 +62,7 @@ pub(super) fn build_task_payload(
                 .and_then(|t| t.result.clone())
         })
         .collect();
-    let inner = crate::common::payload::pack_upstream_prefix(&upstream_results, &raw_payload);
+    let inner = crate::common::payload::pack_upstream_prefix(&upstream_results, &raw_payload)?;
     crate::common::payload::sign(signing_key, &inner)
         .map_err(|e| crate::common::ActantError::Internal(format!("payload sign: {}", e)))
 }

@@ -3,8 +3,8 @@
 
 use super::*;
 use crate::common::{
-    ActorId, ActorMessage, ActorMessageResult, MessageId, NodeId, TaskCompletion, TaskDefinition,
-    TaskId, Topic, WireEnvelope, WireMessage, WireTaskOutcome, WorkflowId,
+    ActorId, ActorMessage, ActorMessageResult, NodeId, TaskCompletion, TaskDefinition, TaskId,
+    Topic, WireEnvelope, WireMessage, WireTaskOutcome, WorkflowId,
 };
 use crate::runtime::actor::{Actor, ActorSystem};
 use crate::runtime::dispatcher::CancelFlag;
@@ -224,8 +224,8 @@ fn make_router(
         actor_system,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
-        actor_registry_gossip: None,
         capability_gossip: None,
+        failover: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
     })
@@ -313,8 +313,8 @@ async fn handle_direct_task_result_without_actor_publishes_event() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
-        actor_registry_gossip: None,
         capability_gossip: None,
+        failover: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
     });
@@ -357,8 +357,8 @@ async fn handle_peer_connected_publishes_event() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
-        actor_registry_gossip: None,
         capability_gossip: None,
+        failover: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
     });
@@ -396,8 +396,8 @@ async fn handle_cancel_broadcast_sets_cancel_flag_and_publishes_event() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
-        actor_registry_gossip: None,
         capability_gossip: None,
+        failover: None,
         cancel_flags,
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
     });
@@ -423,90 +423,6 @@ async fn handle_cancel_broadcast_sets_cancel_flag_and_publishes_event() {
     assert!(matches!(event, BusEvent::TaskCancelled(_)));
 }
 
-// ───────────────────────── Actor-system routed paths ─────────────────────────
-
-#[tokio::test]
-async fn handle_actor_topic_routes_to_actor_system() {
-    let transport = Arc::new(MockTransport::new("node-A", "peer-A"));
-    let scheduler: Arc<dyn Scheduler> = Arc::new(MockScheduler::new());
-    let actor_system = Arc::new(ActorSystem::new());
-    let actor_id = ActorId::from("actor-node-A");
-    actor_system
-        .spawn(actor_id.clone(), EchoActor)
-        .await
-        .unwrap();
-
-    let router = NetworkEventRouter::new(NetworkEventRouterConfig {
-        network: transport,
-        event_bus: EventBus::new(),
-        scheduler,
-        actor_system: Some(actor_system.clone()),
-        workflow_actor_id: None,
-        dag_gossip_actor_id: None,
-        actor_registry_gossip: None,
-        capability_gossip: None,
-        cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-        cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-    });
-
-    let remote_req = crate::common::RemoteActorRequest {
-        target: actor_id.clone(),
-        method: "ping".to_string(),
-        payload: vec![1, 2, 3],
-        reply_to: None,
-    };
-    let payload = postcard::to_allocvec(&remote_req).unwrap();
-
-    router
-        .handle(NetworkEvent::Message(NetworkMessage {
-            topic: Topic::actor(&NodeId::from("node-A".to_string()))
-                .as_str()
-                .to_string(),
-            data: payload,
-        }))
-        .await;
-}
-
-#[tokio::test]
-async fn handle_actor_reply_topic_delivers_reply() {
-    let transport = Arc::new(MockTransport::new("node-A", "peer-A"));
-    let scheduler: Arc<dyn Scheduler> = Arc::new(MockScheduler::new());
-    let actor_system = Arc::new(ActorSystem::new());
-
-    let router = NetworkEventRouter::new(NetworkEventRouterConfig {
-        network: transport,
-        event_bus: EventBus::new(),
-        scheduler,
-        actor_system: Some(actor_system.clone()),
-        workflow_actor_id: None,
-        dag_gossip_actor_id: None,
-        actor_registry_gossip: None,
-        capability_gossip: None,
-        cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-        cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-    });
-
-    let reply = crate::common::RemoteActorReply {
-        correlation_id: MessageId::generate(),
-        result: ActorMessageResult {
-            message_id: MessageId::generate(),
-            payload: vec![1, 2, 3],
-            error: None,
-        },
-    };
-    let envelope = WireEnvelope::wrap(WireMessage::RemoteActorReply(reply));
-    let payload = postcard::to_allocvec(&envelope).unwrap();
-
-    router
-        .handle(NetworkEvent::Message(NetworkMessage {
-            topic: Topic::actor_reply(&NodeId::from("node-A".to_string()))
-                .as_str()
-                .to_string(),
-            data: payload,
-        }))
-        .await;
-}
-
 #[tokio::test]
 async fn handle_workflow_state_request_routes_to_dag_gossip_actor() {
     let transport = Arc::new(MockTransport::new("node-A", "peer-A"));
@@ -525,8 +441,8 @@ async fn handle_workflow_state_request_routes_to_dag_gossip_actor() {
         actor_system: Some(actor_system.clone()),
         workflow_actor_id: None,
         dag_gossip_actor_id: Some(dag_gossip_id.clone()),
-        actor_registry_gossip: None,
         capability_gossip: None,
+        failover: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
     });
@@ -566,8 +482,8 @@ async fn handle_direct_task_result_routes_to_workflow_actor() {
         actor_system: Some(actor_system.clone()),
         workflow_actor_id: Some(workflow_actor_id.clone()),
         dag_gossip_actor_id: None,
-        actor_registry_gossip: None,
         capability_gossip: None,
+        failover: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
     });
@@ -608,8 +524,8 @@ async fn handle_peer_disconnected_publishes_event() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
-        actor_registry_gossip: None,
         capability_gossip: None,
+        failover: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
     });
@@ -628,20 +544,40 @@ async fn handle_peer_disconnected_publishes_event() {
 }
 
 #[tokio::test]
-async fn handle_dag_state_topic_publishes_update() {
+async fn handle_dag_state_topic_dispatches_to_dag_gossip_actor() {
     let transport = Arc::new(MockTransport::new("node-A", "peer-A"));
     let scheduler: Arc<dyn Scheduler> = Arc::new(MockScheduler::new());
-    let event_bus = EventBus::new();
-    let mut rx = event_bus.subscribe(BusTopic::DagUpdate);
+    let actor_system = Arc::new(ActorSystem::new());
+    let node_id = NodeId::from("node-A".to_string());
+    let workflow_actor_id = ActorId::workflow(&node_id);
+    actor_system
+        .spawn(workflow_actor_id.clone(), EchoActor)
+        .await
+        .unwrap();
+    let gossip = crate::runtime::workflow::DagGossip::new(
+        transport.clone(),
+        actor_system.clone(),
+        workflow_actor_id,
+        crate::common::GossipConfig::default(),
+    );
+    let dag_gossip_id = ActorId::dag_gossip(&node_id);
+    actor_system
+        .spawn(
+            dag_gossip_id.clone(),
+            crate::runtime::workflow::DagGossipActor::new(gossip.clone()),
+        )
+        .await
+        .unwrap();
+
     let router = NetworkEventRouter::new(NetworkEventRouterConfig {
         network: transport,
-        event_bus,
+        event_bus: EventBus::new(),
         scheduler,
-        actor_system: None,
+        actor_system: Some(actor_system),
         workflow_actor_id: None,
-        dag_gossip_actor_id: None,
-        actor_registry_gossip: None,
+        dag_gossip_actor_id: Some(dag_gossip_id),
         capability_gossip: None,
+        failover: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
     });
@@ -663,28 +599,38 @@ async fn handle_dag_state_topic_publishes_update() {
         }))
         .await;
 
-    let event = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
-        .await
-        .expect("event should be published")
-        .expect("event bus should not be closed");
-    assert!(matches!(event, BusEvent::DagUpdate(_)));
+    // 直连分发：DagGossipActor 应登记远端更新（gossip seen）。
+    for _ in 0..50 {
+        if gossip.seen_count() >= 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(gossip.seen_count(), 1, "remote update should be applied");
 }
 
 #[tokio::test]
-async fn handle_heartbeat_topic_publishes_heartbeat() {
+async fn handle_heartbeat_topic_dispatches_to_failover_manager() {
     let transport = Arc::new(MockTransport::new("node-A", "peer-A"));
     let scheduler: Arc<dyn Scheduler> = Arc::new(MockScheduler::new());
-    let event_bus = EventBus::new();
-    let mut rx = event_bus.subscribe(BusTopic::ClusterHeartbeat);
+    let node_id = NodeId::from("node-A".to_string());
+    let actor_system = Arc::new(ActorSystem::new());
+    let failover = Arc::new(crate::runtime::workflow::FailoverManager::new(
+        node_id.clone(),
+        transport.clone(),
+        actor_system,
+        ActorId::workflow(&node_id),
+    ));
+
     let router = NetworkEventRouter::new(NetworkEventRouterConfig {
         network: transport,
-        event_bus,
+        event_bus: EventBus::new(),
         scheduler,
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
-        actor_registry_gossip: None,
         capability_gossip: None,
+        failover: Some(failover.clone()),
         cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
     });
@@ -707,28 +653,37 @@ async fn handle_heartbeat_topic_publishes_heartbeat() {
         }))
         .await;
 
-    let event = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
-        .await
-        .expect("event should be published")
-        .expect("event bus should not be closed");
-    assert!(matches!(event, BusEvent::Heartbeat(_)));
+    // 直连分发：FailoverManager 应登记 peer 及其容量视图。
+    let peers = failover.get_peer_infos();
+    let peer = peers
+        .get(&NodeId::from("node-B".to_string()))
+        .expect("peer should be registered from heartbeat");
+    assert_eq!(peer.available_slots, 4);
+    assert_eq!(peer.max_slots, 8);
 }
 
 #[tokio::test]
-async fn handle_failover_topic_publishes_claim() {
+async fn handle_failover_topic_dispatches_claim_to_failover_manager() {
     let transport = Arc::new(MockTransport::new("node-A", "peer-A"));
     let scheduler: Arc<dyn Scheduler> = Arc::new(MockScheduler::new());
-    let event_bus = EventBus::new();
-    let mut rx = event_bus.subscribe(BusTopic::ClusterClaim);
+    let node_id = NodeId::from("node-A".to_string());
+    let actor_system = Arc::new(ActorSystem::new());
+    let failover = Arc::new(crate::runtime::workflow::FailoverManager::new(
+        node_id.clone(),
+        transport.clone(),
+        actor_system,
+        ActorId::workflow(&node_id),
+    ));
+
     let router = NetworkEventRouter::new(NetworkEventRouterConfig {
         network: transport,
-        event_bus,
+        event_bus: EventBus::new(),
         scheduler,
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
-        actor_registry_gossip: None,
         capability_gossip: None,
+        failover: Some(failover.clone()),
         cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
     });
@@ -748,28 +703,66 @@ async fn handle_failover_topic_publishes_claim() {
         }))
         .await;
 
-    let event = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
-        .await
-        .expect("event should be published")
-        .expect("event bus should not be closed");
-    assert!(matches!(event, BusEvent::Claim(_)));
+    // 直连分发：远端 claim 应记录到本地租约表。
+    let leases = failover.active_leases();
+    assert!(
+        leases
+            .iter()
+            .any(|(w, n, _, _)| w == "wf-1" && n == "node-B"),
+        "remote claim should be recorded: {leases:?}"
+    );
+}
+
+/// 记录到达方法的 Actor 桩：验证 wire 消息直连分发到了目标 actor 方法。
+struct RecordingActor {
+    methods: Arc<StdMutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl Actor for RecordingActor {
+    fn actor_type(&self) -> &str {
+        "recording"
+    }
+
+    async fn handle_message(
+        &mut self,
+        msg: ActorMessage,
+    ) -> crate::common::Result<ActorMessageResult> {
+        self.methods.lock().unwrap().push(msg.method);
+        Ok(ActorMessageResult {
+            message_id: msg.id,
+            payload: vec![],
+            error: None,
+        })
+    }
 }
 
 #[tokio::test]
-async fn handle_heads_topic_publishes_exchange() {
+async fn handle_heads_topic_dispatches_exchange_to_dag_gossip_actor() {
     let transport = Arc::new(MockTransport::new("node-A", "peer-A"));
     let scheduler: Arc<dyn Scheduler> = Arc::new(MockScheduler::new());
-    let event_bus = EventBus::new();
-    let mut rx = event_bus.subscribe(BusTopic::HeadsExchange);
+    let actor_system = Arc::new(ActorSystem::new());
+    let dag_gossip_id = ActorId::dag_gossip(&NodeId::from("node-A".to_string()));
+    let methods = Arc::new(StdMutex::new(Vec::new()));
+    actor_system
+        .spawn(
+            dag_gossip_id.clone(),
+            RecordingActor {
+                methods: methods.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
     let router = NetworkEventRouter::new(NetworkEventRouterConfig {
         network: transport,
-        event_bus,
+        event_bus: EventBus::new(),
         scheduler,
-        actor_system: None,
+        actor_system: Some(actor_system),
         workflow_actor_id: None,
-        dag_gossip_actor_id: None,
-        actor_registry_gossip: None,
+        dag_gossip_actor_id: Some(dag_gossip_id),
         capability_gossip: None,
+        failover: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
     });
@@ -788,11 +781,18 @@ async fn handle_heads_topic_publishes_exchange() {
         }))
         .await;
 
-    let event = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
-        .await
-        .expect("event should be published")
-        .expect("event bus should not be closed");
-    assert!(matches!(event, BusEvent::HeadsExchange(_)));
+    // 直连分发：HANDLE_HEADS_EXCHANGE 方法应被调用。
+    for _ in 0..50 {
+        if !methods.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        *methods.lock().unwrap(),
+        vec![crate::runtime::workflow::gossip_methods::HANDLE_HEADS_EXCHANGE.to_string()],
+        "heads exchange should be dispatched directly to the dag gossip actor"
+    );
 }
 
 #[tokio::test]
@@ -808,8 +808,8 @@ async fn handle_direct_request_other_returns_error_response() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
-        actor_registry_gossip: None,
         capability_gossip: None,
+        failover: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
     });
@@ -849,8 +849,8 @@ async fn handle_task_result_failed_publishes_event() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
-        actor_registry_gossip: None,
         capability_gossip: None,
+        failover: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
     });
@@ -890,8 +890,8 @@ async fn handle_task_result_cancelled_publishes_event() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
-        actor_registry_gossip: None,
         capability_gossip: None,
+        failover: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
     });
@@ -936,8 +936,8 @@ async fn handle_task_result_skipped_returns_false() {
         actor_system: Some(actor_system.clone()),
         workflow_actor_id: Some(workflow_actor_id.clone()),
         dag_gossip_actor_id: None,
-        actor_registry_gossip: None,
         capability_gossip: None,
+        failover: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
     });

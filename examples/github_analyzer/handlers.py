@@ -17,10 +17,6 @@ from actant import RetryCtx, RouteCtx, ScheduleCtx, emit
 
 from .models import IssueRecord, RepoStats
 
-# ---------------------------------------------------------------------------
-# 请求类型（自定义 capability 的 payload）
-# ---------------------------------------------------------------------------
-
 
 @dataclass
 class ThrottleCtx:
@@ -45,10 +41,6 @@ class AnalyzeReq:
     node: str
 
 
-# ---------------------------------------------------------------------------
-# ask：内容路由（覆盖默认 LocalRouter）
-# ---------------------------------------------------------------------------
-
 
 class OwnerRouter:
     """按仓库 owner 路由到不同分析节点。
@@ -71,10 +63,6 @@ class OwnerRouter:
         return self.nodes[idx]
 
 
-# ---------------------------------------------------------------------------
-# ask：优先级调度（覆盖默认 FifoScheduler）
-# ---------------------------------------------------------------------------
-
 
 class PrFirstScheduler:
     """PR 优先 + FIFO 调度。
@@ -92,10 +80,6 @@ class PrFirstScheduler:
         # 无 PR → 弃权，回退默认 FIFO
         return None
 
-
-# ---------------------------------------------------------------------------
-# ask：指数退避重试决策（覆盖默认 DefaultRetryPolicy，并组合 Audit emit）
-# ---------------------------------------------------------------------------
 
 
 class ExponentialBackoffRetry:
@@ -121,11 +105,6 @@ class ExponentialBackoffRetry:
             })
             return True
         return None
-
-
-# ---------------------------------------------------------------------------
-# ask：令牌桶限流（自定义 Throttle capability）
-# ---------------------------------------------------------------------------
 
 
 class TokenBucket:
@@ -165,12 +144,6 @@ class TokenBucket:
             return True
         return False
 
-
-# ---------------------------------------------------------------------------
-# perform：HTTP 拉取 + 缓存（自定义 Fetch capability）
-# ---------------------------------------------------------------------------
-
-
 class GithubFetcher:
     """GitHub issues 拉取器（自定义 perform capability）。
 
@@ -183,11 +156,6 @@ class GithubFetcher:
 
         raw = load_or_fetch(req.repo)
         return [IssueRecord.from_api(item, req.repo) for item in raw]
-
-
-# ---------------------------------------------------------------------------
-# perform：分仓库聚合分析（自定义 Analyze capability）
-# ---------------------------------------------------------------------------
 
 
 class RepoAnalyzer:
@@ -209,11 +177,6 @@ class RepoAnalyzer:
 
     def snapshot(self) -> dict[str, RepoStats]:
         return dict(self._by_repo)
-
-
-# ---------------------------------------------------------------------------
-# perform：文件持久化（自定义 ResultStore capability）
-# ---------------------------------------------------------------------------
 
 
 class FileResultStore:
@@ -238,10 +201,6 @@ class FileResultStore:
         raise ValueError(f"unknown op: {op!r}")
 
 
-# ---------------------------------------------------------------------------
-# emit：指标采集（自定义 Metrics capability）
-# ---------------------------------------------------------------------------
-
 
 class MetricsCollector:
     """指标采集器（自定义 emit capability）。"""
@@ -257,10 +216,6 @@ class MetricsCollector:
     def snapshot(self) -> dict[str, int]:
         return dict(self._counters)
 
-
-# ---------------------------------------------------------------------------
-# emit：审计落盘（自定义 Audit capability）
-# ---------------------------------------------------------------------------
 
 
 class AuditLogger:

@@ -24,7 +24,7 @@ proptest! {
     fn pack_group_unpack_roundtrip(
         items in prop::collection::vec(prop::collection::vec(any::<u8>(), 0..64), 0..16)
     ) {
-        let packed = pack_group(&items);
+        let packed = pack_group(&items).unwrap();
         let unpacked = unpack_payload(&packed).unwrap();
         prop_assert_eq!(unpacked, items);
     }
@@ -34,7 +34,7 @@ proptest! {
     fn pack_upstream_prefix_empty_returns_default(
         payload in prop::collection::vec(any::<u8>(), 0..256)
     ) {
-        let result = pack_upstream_prefix(&[], &payload);
+        let result = pack_upstream_prefix(&[], &payload).unwrap();
         prop_assert_eq!(result, payload);
     }
 
@@ -44,7 +44,7 @@ proptest! {
         upstream in prop::collection::vec(prop::collection::vec(any::<u8>(), 0..32), 1..8),
         default in prop::collection::vec(any::<u8>(), 0..128)
     ) {
-        let result = pack_upstream_prefix(&upstream, &default);
+        let result = pack_upstream_prefix(&upstream, &default).unwrap();
         prop_assert_eq!(result[0], TAG_UPSTREAM_PREFIX);
         // default_payload 应完整出现在 result 尾部
         let tail_start = result.len() - default.len();
@@ -56,7 +56,7 @@ proptest! {
     fn pack_upstream_prefix_count_matches(
         upstream in prop::collection::vec(prop::collection::vec(any::<u8>(), 0..32), 1..16)
     ) {
-        let result = pack_upstream_prefix(&upstream, b"");
+        let result = pack_upstream_prefix(&upstream, b"").unwrap();
         let count = u32::from_le_bytes([result[1], result[2], result[3], result[4]]);
         prop_assert_eq!(count as usize, upstream.len());
     }

@@ -237,3 +237,143 @@ async fn invalid_envelope_payload_returns_error() {
     let result = actor.handle_message(msg).await.unwrap();
     assert!(result.error.is_some());
 }
+
+// emit 反应型语义：单个 handler 失败不中断后续 handler 调用，
+// 全部调用完成后聚合失败信息回给调用方。
+#[tokio::test]
+async fn emit_handler_error_calls_remaining_handlers_and_aggregates_error() {
+    struct FailingHandler;
+    #[async_trait::async_trait]
+    impl ErasedHandler for FailingHandler {
+        async fn ask(
+            &self,
+            _req: Arc<dyn std::any::Any + Send + Sync>,
+        ) -> Option<Box<dyn std::any::Any + Send + Sync>> {
+            unreachable!()
+        }
+        async fn perform(
+            &self,
+            _req: Arc<dyn std::any::Any + Send + Sync>,
+        ) -> crate::common::Result<Box<dyn std::any::Any + Send + Sync>> {
+            unreachable!()
+        }
+        async fn emit(
+            &self,
+            _req: Arc<dyn std::any::Any + Send + Sync>,
+        ) -> crate::common::Result<()> {
+            Err(crate::common::ActantError::Internal(
+                "emit handler failed".into(),
+            ))
+        }
+    }
+
+    let called = Arc::new(AtomicBool::new(false));
+    struct OkHandler(Arc<AtomicBool>);
+    #[async_trait::async_trait]
+    impl ErasedHandler for OkHandler {
+        async fn ask(
+            &self,
+            _req: Arc<dyn std::any::Any + Send + Sync>,
+        ) -> Option<Box<dyn std::any::Any + Send + Sync>> {
+            unreachable!()
+        }
+        async fn perform(
+            &self,
+            _req: Arc<dyn std::any::Any + Send + Sync>,
+        ) -> crate::common::Result<Box<dyn std::any::Any + Send + Sync>> {
+            unreachable!()
+        }
+        async fn emit(
+            &self,
+            _req: Arc<dyn std::any::Any + Send + Sync>,
+        ) -> crate::common::Result<()> {
+            self.0.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    let ok_handler = Arc::new(OkHandler(called.clone()));
+
+    let mut actor = CapabilityActor::new(vec![Arc::new(FailingHandler), ok_handler], make_codec());
+    let result = actor
+        .handle_message(make_message(EffectKind::Emit, "ping"))
+        .await
+        .unwrap();
+    // 后续 handler 仍被调用
+    assert!(called.load(Ordering::SeqCst), "remaining handler must run");
+    // 调用方收到聚合错误
+    let error = result.error.expect("aggregated emit error expected");
+    assert!(error.message.contains("emit handler failed"));
+    assert!(error.message.contains("1/2 handlers failed"));
+}
+
+// H7.3：emit 聚合错误 kind 保真——首个失败 handler 的 kind 编码进错误消息
+// 前缀（`[actant:storage] ...`），Python 侧 decode_error_kind 据此重建
+// 对应异常子类，而非统一退化为 internal/task。
+#[tokio::test]
+async fn emit_aggregate_error_preserves_first_failure_kind() {
+    struct StorageFailingHandler;
+    #[async_trait::async_trait]
+    impl ErasedHandler for StorageFailingHandler {
+        async fn ask(
+            &self,
+            _req: Arc<dyn std::any::Any + Send + Sync>,
+        ) -> Option<Box<dyn std::any::Any + Send + Sync>> {
+            unreachable!()
+        }
+        async fn perform(
+            &self,
+            _req: Arc<dyn std::any::Any + Send + Sync>,
+        ) -> crate::common::Result<Box<dyn std::any::Any + Send + Sync>> {
+            unreachable!()
+        }
+        async fn emit(
+            &self,
+            _req: Arc<dyn std::any::Any + Send + Sync>,
+        ) -> crate::common::Result<()> {
+            Err(crate::common::ActantError::Storage("disk on fire".into()))
+        }
+    }
+    struct InternalFailingHandler;
+    #[async_trait::async_trait]
+    impl ErasedHandler for InternalFailingHandler {
+        async fn ask(
+            &self,
+            _req: Arc<dyn std::any::Any + Send + Sync>,
+        ) -> Option<Box<dyn std::any::Any + Send + Sync>> {
+            unreachable!()
+        }
+        async fn perform(
+            &self,
+            _req: Arc<dyn std::any::Any + Send + Sync>,
+        ) -> crate::common::Result<Box<dyn std::any::Any + Send + Sync>> {
+            unreachable!()
+        }
+        async fn emit(
+            &self,
+            _req: Arc<dyn std::any::Any + Send + Sync>,
+        ) -> crate::common::Result<()> {
+            Err(crate::common::ActantError::Internal("later failure".into()))
+        }
+    }
+
+    // 首个失败为 Storage，后续失败为 Internal：前缀必须取首个（storage）。
+    let mut actor = CapabilityActor::new(
+        vec![
+            Arc::new(StorageFailingHandler),
+            Arc::new(InternalFailingHandler),
+        ],
+        make_codec(),
+    );
+    let result = actor
+        .handle_message(make_message(EffectKind::Emit, "ping"))
+        .await
+        .unwrap();
+    let error = result.error.expect("aggregated emit error expected");
+    assert!(
+        error.message.starts_with("[actant:storage] "),
+        "aggregate error must carry first failure kind prefix, got: {}",
+        error.message
+    );
+    assert!(error.message.contains("2/2 handlers failed"));
+    assert!(error.message.contains("disk on fire"));
+}

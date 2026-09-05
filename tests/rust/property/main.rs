@@ -4,4 +4,5 @@
 //! 便于统一运行：`cargo test --test property`
 
 mod dag;
+mod hlc;
 mod payload;

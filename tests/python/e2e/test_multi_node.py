@@ -188,29 +188,36 @@ class TestCrossNodeTaskExecution:
             result = handle.result(timeout=30.0)
             assert result == 42
 
-    def test_task_with_retries_succeeds(self, two_nodes) -> None:
+    def test_task_with_retries_succeeds(self, two_nodes, tmp_path) -> None:
         """带重试的任务在临时失败后最终成功。"""
         rt_a, _ = two_nodes
+        marker = tmp_path / "retry_attempts.txt"
 
         @task(retries=2, retry_delay_ms=10)
-        def flaky() -> str:
-            # 用模块级状态跟踪调用次数（cloudpickle 序列化后闭包变量不共享）
+        def flaky(marker_path: str) -> str:
+            # 重试在同一个 worker 子进程内进行，每次尝试把标记写入临时文件，
+            # 供父进程统计尝试次数（模块级状态无法跨进程共享）。
             import tests.python.e2e.test_multi_node as mod
             mod._flaky_call_count += 1
+            with open(marker_path, "a") as f:
+                f.write("attempt\n")
+                f.flush()
             if mod._flaky_call_count < 2:
                 raise RuntimeError("temporary failure")
             return "ok"
 
-        # 重置模块级计数器
+        # 重置模块级计数器（worker 进程内独立副本，父进程仅用于验证结果）
         import tests.python.e2e.test_multi_node as mod
         mod._flaky_call_count = 0
 
         with actant.use_runtime(rt_a):
-            handle = flaky.submit()
+            handle = flaky.submit(str(marker))
             result = handle.result(timeout=30.0)
             assert result == "ok"
-            assert mod._flaky_call_count >= 2, (
-                f"flaky should be called at least 2 times, got {mod._flaky_call_count}"
+            # worker 子进程在重试期间把每次尝试写入标记文件
+            assert marker.read_text().count("attempt") >= 2, (
+                f"flaky should be called at least 2 times, "
+                f"got {marker.read_text().count('attempt')}"
             )
 
     def test_task_failure_propagates(self, two_nodes) -> None:

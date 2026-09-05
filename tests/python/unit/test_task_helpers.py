@@ -102,15 +102,73 @@ def test_pickle_exception_falls_back_for_unpicklable() -> None:
 
 
 def test_safe_serialize_round_trip() -> None:
+    """v2 envelope 往返：头部 + ``(func, args, kwargs)`` 可经 canonical 解析还原。"""
     def add(a: int, b: int) -> int:
         return a + b
 
+    from actant.task._helpers import _PAYLOAD_VERSION
+    from actant.task._worker import _parse_dispatch_payload
+
     raw = _safe_serialize(add, (1, 2), {"c": 3}, {"timeout_ms": 100}, task_id="t1")
-    loaded = cloudpickle.loads(raw)
-    assert loaded[1] == (1, 2)
-    assert loaded[2] == {"c": 3}
-    assert loaded[3] == {"timeout_ms": 100}
-    assert loaded[0](1, 2) == 3
+    # 首字节即版本字节。
+    assert raw[0] == _PAYLOAD_VERSION
+    retries, retry_delay_ms, task_id, workflow_id, func_payload = _parse_dispatch_payload(raw)
+    assert retries == 0
+    assert retry_delay_ms == 0
+    assert task_id == "t1"  # options 未给 task_id → 回退到 task_id 参数
+    assert workflow_id == ""
+    func, args, kwargs = cloudpickle.loads(func_payload)
+    assert args == (1, 2)
+    assert kwargs == {"c": 3}
+    assert func(1, 2) == 3
+
+
+def test_safe_serialize_v2_header_fields() -> None:
+    """options 中的控制字段迁入头部；``timeout_ms`` 为死参数不进头部。"""
+    def noop() -> None:
+        return None
+
+    from actant.task._worker import _parse_dispatch_payload
+
+    raw = _safe_serialize(
+        noop,
+        (),
+        {},
+        {
+            "retries": 3,
+            "retry_delay_ms": 50,
+            "task_id": "tid-1",
+            "workflow_id": "wf-7",
+            "timeout_ms": 999,
+        },
+        task_id="ignored-name",
+    )
+    retries, retry_delay_ms, task_id, workflow_id, func_payload = _parse_dispatch_payload(raw)
+    assert retries == 3
+    assert retry_delay_ms == 50
+    assert task_id == "tid-1"
+    assert workflow_id == "wf-7"
+    # func_payload 仅含 (func, args, kwargs)。cloudpickle 经名重建对象，校验语义。
+    func, args, kwargs = cloudpickle.loads(func_payload)
+    assert func.__name__ == "noop"
+    assert args == ()
+    assert kwargs == {}
+
+
+def test_parse_dispatch_payload_rejects_bad_version() -> None:
+    """非 v2 版本字节或头部截断应显式抛错（协议损坏走防御分支）。"""
+    import struct
+
+    from actant.task._worker import _parse_dispatch_payload
+
+    # v1 风格（版本字节 0x01）→ 版本不匹配。
+    body = struct.pack("<BIIH", 0x01, 0, 0, 0)
+    with pytest.raises(ValueError, match="version"):
+        _parse_dispatch_payload(body)
+
+    # 头部截断。
+    with pytest.raises(ValueError, match="too short"):
+        _parse_dispatch_payload(b"\x02\x00")
 
 
 def test_safe_serialize_fails_for_unserializable() -> None:
@@ -147,12 +205,26 @@ def test_task_context_scope_restores_on_exception() -> None:
         assert get_task_context() is outer
 
 
-def test_suppress_pickle_errors_swallows_exception() -> None:
+def test_suppress_pickle_errors_swallows_pickle_related_exception() -> None:
+    """抑制范围限定为 pickle 反序列化相关异常族（UnpicklingError/TypeError/
+    AttributeError/ValueError），族内异常静默。"""
+
+    class _Bad:
+        def __reduce__(self) -> None:
+            raise ValueError("bad")
+
+    with _suppress_pickle_errors():
+        cloudpickle.dumps(_Bad())
+
+
+def test_suppress_pickle_errors_reraises_other_exceptions() -> None:
+    """pickle 相关异常族之外的异常（如 RuntimeError）照常向上抛出，不静默。"""
+
     class _Bad:
         def __reduce__(self) -> None:
             raise RuntimeError("bad")
 
-    with _suppress_pickle_errors():
+    with pytest.raises(RuntimeError, match="bad"), _suppress_pickle_errors():
         cloudpickle.dumps(_Bad())
 
 

@@ -196,12 +196,6 @@ pub struct PyNetworkConfig {
     pub listen_ip: String,
     #[pyo3(get)]
     pub capability_gossip_interval_ms: u64,
-    /// 跨节点 Actor 路由策略（A2）。内置值：`"random"` / `"round-robin"` / `"least-loaded"`。
-    #[pyo3(get)]
-    pub actor_router_strategy: String,
-    /// Actor 注册表 gossip 广播间隔（毫秒）。
-    #[pyo3(get)]
-    pub actor_registry_gossip_interval_ms: u64,
     #[pyo3(get)]
     pub event_channel_capacity: usize,
     /// 自定义 DNS 起源域，仅当 `preset = "dns"` 时生效。
@@ -214,7 +208,7 @@ pub struct PyNetworkConfig {
 impl PyNetworkConfig {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (preset=None, bootstrap_nodes=None, hlc_max_drift_ms=crate::common::NetworkConfig::DEFAULT_HLC_MAX_DRIFT_MS, max_pending_direct_requests=crate::common::NetworkConfig::DEFAULT_MAX_PENDING_DIRECT_REQUESTS, gossip_bootstrap_peers=None, max_message_size=crate::common::NetworkConfig::DEFAULT_MAX_MESSAGE_SIZE, allowed_peer_ids=None, direct_request_timeout_ms=crate::common::NetworkConfig::DEFAULT_DIRECT_REQUEST_TIMEOUT_MS, listen_port=0, listen_ip="", capability_gossip_interval_ms=crate::common::NetworkConfig::DEFAULT_CAPABILITY_GOSSIP_INTERVAL_MS, actor_router_strategy=crate::common::NetworkConfig::DEFAULT_ACTOR_ROUTER_STRATEGY, actor_registry_gossip_interval_ms=crate::common::NetworkConfig::DEFAULT_ACTOR_REGISTRY_GOSSIP_INTERVAL_MS, event_channel_capacity=crate::common::NetworkConfig::DEFAULT_EVENT_CHANNEL_CAPACITY, dns_origin_domain=""))]
+    #[pyo3(signature = (preset=None, bootstrap_nodes=None, hlc_max_drift_ms=crate::common::NetworkConfig::DEFAULT_HLC_MAX_DRIFT_MS, max_pending_direct_requests=crate::common::NetworkConfig::DEFAULT_MAX_PENDING_DIRECT_REQUESTS, gossip_bootstrap_peers=None, max_message_size=crate::common::NetworkConfig::DEFAULT_MAX_MESSAGE_SIZE, allowed_peer_ids=None, direct_request_timeout_ms=crate::common::NetworkConfig::DEFAULT_DIRECT_REQUEST_TIMEOUT_MS, listen_port=0, listen_ip="", capability_gossip_interval_ms=crate::common::NetworkConfig::DEFAULT_CAPABILITY_GOSSIP_INTERVAL_MS, event_channel_capacity=crate::common::NetworkConfig::DEFAULT_EVENT_CHANNEL_CAPACITY, dns_origin_domain=""))]
     fn new(
         preset: Option<String>,
         bootstrap_nodes: Option<Vec<String>>,
@@ -227,8 +221,6 @@ impl PyNetworkConfig {
         listen_port: u16,
         listen_ip: &str,
         capability_gossip_interval_ms: u64,
-        actor_router_strategy: &str,
-        actor_registry_gossip_interval_ms: u64,
         event_channel_capacity: usize,
         dns_origin_domain: &str,
     ) -> Self {
@@ -244,8 +236,6 @@ impl PyNetworkConfig {
             listen_port,
             listen_ip: listen_ip.to_string(),
             capability_gossip_interval_ms,
-            actor_router_strategy: actor_router_strategy.to_string(),
-            actor_registry_gossip_interval_ms,
             event_channel_capacity,
             dns_origin_domain: dns_origin_domain.to_string(),
         }
@@ -269,10 +259,6 @@ impl Default for PyNetworkConfig {
             listen_ip: String::new(),
             capability_gossip_interval_ms:
                 crate::common::NetworkConfig::DEFAULT_CAPABILITY_GOSSIP_INTERVAL_MS,
-            actor_router_strategy: crate::common::NetworkConfig::DEFAULT_ACTOR_ROUTER_STRATEGY
-                .to_string(),
-            actor_registry_gossip_interval_ms:
-                crate::common::NetworkConfig::DEFAULT_ACTOR_REGISTRY_GOSSIP_INTERVAL_MS,
             event_channel_capacity: crate::common::NetworkConfig::DEFAULT_EVENT_CHANNEL_CAPACITY,
             dns_origin_domain: String::new(),
         }
@@ -295,8 +281,6 @@ impl TryFrom<&PyNetworkConfig> for NetworkConfig {
             listen_port: c.listen_port,
             listen_ip: c.listen_ip.clone(),
             capability_gossip_interval_ms: c.capability_gossip_interval_ms,
-            actor_router_strategy: c.actor_router_strategy.clone(),
-            actor_registry_gossip_interval_ms: c.actor_registry_gossip_interval_ms,
             event_channel_capacity: c.event_channel_capacity,
             dns_origin_domain: c.dns_origin_domain.clone(),
         })
@@ -377,33 +361,38 @@ pub struct PyGossipConfig {
 
 #[pymethods]
 impl PyGossipConfig {
+    /// 所有字段的默认值取自 Rust [`GossipConfig::default()`]（单一来源），
+    /// 此处不重复维护数值，避免 PyO3 与 Rust 侧默认值漂移。
     #[new]
-    #[pyo3(signature = (dedup_window_size=1024, dedup_ttl_secs=300, retry_attempts=3, retry_base_delay_ms=100, heads_broadcast_interval_ms=30_000))]
+    #[pyo3(signature = (dedup_window_size=None, dedup_ttl_secs=None, retry_attempts=None, retry_base_delay_ms=None, heads_broadcast_interval_ms=None))]
     fn new(
-        dedup_window_size: usize,
-        dedup_ttl_secs: u64,
-        retry_attempts: usize,
-        retry_base_delay_ms: u64,
-        heads_broadcast_interval_ms: u64,
+        dedup_window_size: Option<usize>,
+        dedup_ttl_secs: Option<u64>,
+        retry_attempts: Option<usize>,
+        retry_base_delay_ms: Option<u64>,
+        heads_broadcast_interval_ms: Option<u64>,
     ) -> Self {
+        let default = GossipConfig::default();
         Self {
-            dedup_window_size,
-            dedup_ttl_secs,
-            retry_attempts,
-            retry_base_delay_ms,
-            heads_broadcast_interval_ms,
+            dedup_window_size: dedup_window_size.unwrap_or(default.dedup_window_size),
+            dedup_ttl_secs: dedup_ttl_secs.unwrap_or(default.dedup_ttl_secs),
+            retry_attempts: retry_attempts.unwrap_or(default.retry_attempts),
+            retry_base_delay_ms: retry_base_delay_ms.unwrap_or(default.retry_base_delay_ms),
+            heads_broadcast_interval_ms: heads_broadcast_interval_ms
+                .unwrap_or(default.heads_broadcast_interval_ms),
         }
     }
 }
 
 impl Default for PyGossipConfig {
     fn default() -> Self {
+        let default = GossipConfig::default();
         Self {
-            dedup_window_size: 1024,
-            dedup_ttl_secs: 300,
-            retry_attempts: 3,
-            retry_base_delay_ms: 100,
-            heads_broadcast_interval_ms: 30_000,
+            dedup_window_size: default.dedup_window_size,
+            dedup_ttl_secs: default.dedup_ttl_secs,
+            retry_attempts: default.retry_attempts,
+            retry_base_delay_ms: default.retry_base_delay_ms,
+            heads_broadcast_interval_ms: default.heads_broadcast_interval_ms,
         }
     }
 }
@@ -464,12 +453,35 @@ pub struct PyActantConfig {
     /// 默认 `false`（向后兼容 0.2 行为，仅 warn 日志）。
     #[pyo3(get)]
     pub require_payload_signing: bool,
+    /// worker 子进程数（进程池大小）。每个 worker 同一时刻执行一个任务，
+    /// 杀进程即精确终止一个任务。`None` = 跟随 `max_concurrent_tasks`，
+    /// 保持信号量与进程池容量一致。
+    #[pyo3(get)]
+    pub num_worker_processes: usize,
+    /// worker 进程崩溃后任务重路由的最大执行次数（含首次）。默认取 Rust
+    /// `WorkerConfig::default`（3）。
+    #[pyo3(get)]
+    pub crash_failover_max_attempts: u32,
+    /// 工作流默认超时（毫秒），透传 `WorkflowConfig::default_timeout_ms`。
+    /// 未指定时取 Rust `WorkflowConfig::default`（3_600_000）。
+    #[pyo3(get)]
+    pub workflow_default_timeout_ms: u64,
 }
 
 #[pymethods]
 impl PyActantConfig {
+    /// 构造 `_ActantConfig`。
+    ///
+    /// Worker 相关参数：
+    /// - `num_worker_processes`：worker 子进程数（进程池大小，仅经 `_ActantConfig`
+    ///   可配置）。`None`（默认）= 跟随 `max_concurrent_tasks`，保证信号量背压与
+    ///   进程池容量一致；显式指定时二者解耦，需自行保证语义一致。
+    /// - `crash_failover_max_attempts`：worker 崩溃后任务重路由的最大执行次数
+    ///   （含首次）。`None`（默认）= Rust `WorkerConfig::default` 的 3。
+    /// - `workflow_default_timeout_ms`：工作流默认超时（毫秒）。`None`（默认）
+    ///   = Rust `WorkflowConfig::default` 的 3_600_000。
     #[new]
-    #[pyo3(signature = (payload_signing_key, network=None, failover=None, gossip=None, max_concurrent_tasks=None, default_task_timeout_ms=None, data_dir=None, drain_timeout_secs=None, remote_fallback_delay_ms=None, scheduler=None, require_payload_signing=false))]
+    #[pyo3(signature = (payload_signing_key, network=None, failover=None, gossip=None, max_concurrent_tasks=None, default_task_timeout_ms=None, data_dir=None, drain_timeout_secs=None, remote_fallback_delay_ms=None, scheduler=None, require_payload_signing=false, num_worker_processes=None, crash_failover_max_attempts=None, workflow_default_timeout_ms=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         payload_signing_key: String,
@@ -483,17 +495,20 @@ impl PyActantConfig {
         remote_fallback_delay_ms: Option<u64>,
         scheduler: Option<String>,
         require_payload_signing: bool,
+        num_worker_processes: Option<usize>,
+        crash_failover_max_attempts: Option<u32>,
+        workflow_default_timeout_ms: Option<u64>,
     ) -> Self {
         let default_worker = crate::common::WorkerConfig::default();
+        // 默认并发度 = num_cpus：多数 Python 任务为 IO-bound，
+        // 用户可显式传 max_concurrent_tasks 覆盖。
+        let max_concurrent = max_concurrent_tasks.unwrap_or_else(default_max_concurrent_tasks);
         Self {
             payload_signing_key,
             network: network.unwrap_or_default(),
             failover: failover.unwrap_or_default(),
             gossip: gossip.unwrap_or_default(),
-            // 默认并发度 = num_cpus * 2：多数 Python 任务为 IO-bound，
-            // 2x CPU 核心能更好利用 IO 等待时间，提升吞吐。
-            // 用户可显式传 max_concurrent_tasks 覆盖。
-            max_concurrent_tasks: max_concurrent_tasks.unwrap_or_else(default_max_concurrent_tasks),
+            max_concurrent_tasks: max_concurrent,
             default_task_timeout_ms: default_task_timeout_ms
                 .unwrap_or(default_worker.default_task_timeout_ms),
             data_dir,
@@ -502,34 +517,48 @@ impl PyActantConfig {
                 .unwrap_or(default_worker.remote_fallback_delay_ms),
             scheduler: scheduler.unwrap_or_else(|| "priority".to_string()),
             require_payload_signing,
+            // 默认跟随 max_concurrent_tasks：进程池模型中并发信号量须与
+            // 进程池容量一致（见 TryFrom<&PyActantConfig>）。
+            num_worker_processes: num_worker_processes
+                .map(|n| n.max(1))
+                .unwrap_or(max_concurrent),
+            crash_failover_max_attempts: crash_failover_max_attempts
+                .unwrap_or(default_worker.crash_failover_max_attempts),
+            workflow_default_timeout_ms: workflow_default_timeout_ms
+                .unwrap_or(crate::common::WorkflowConfig::default().default_timeout_ms),
         }
     }
 }
 
-/// 默认 Worker 并发度：``num_cpus * 2``。
+/// 默认 Worker 并发度：``num_cpus``。
 ///
-/// Python 任务多为 IO-bound（网络/磁盘等待），2x CPU 核心使 Worker 在
-/// 等待 IO 时仍能调度其他任务，提升整体吞吐。CPU-bound 场景用户应显式
-/// 传 ``max_concurrent_tasks=num_cpus`` 以避免过度切换。
+/// 进程池模型中每个 worker 子进程同一时刻执行一个任务，进程数即本地并发上限；
+/// 默认取 CPU 核数（与 `WorkerConfig::default` 保持一致）。CPU 密集与 IO 密集
+/// 场景均可用；如需更高并发可显式传 ``max_concurrent_tasks``，对应拉起更多进程。
 fn default_max_concurrent_tasks() -> usize {
-    num_cpus::get().saturating_mul(2).max(2)
+    num_cpus::get().max(1)
 }
 
 impl Default for PyActantConfig {
     fn default() -> Self {
         let default_worker = crate::common::WorkerConfig::default();
+        let max_concurrent = default_max_concurrent_tasks();
         Self {
             payload_signing_key: String::new(),
             network: PyNetworkConfig::default(),
             failover: PyFailoverConfig::default(),
             gossip: PyGossipConfig::default(),
-            max_concurrent_tasks: default_max_concurrent_tasks(),
+            max_concurrent_tasks: max_concurrent,
             default_task_timeout_ms: default_worker.default_task_timeout_ms,
             data_dir: None,
             drain_timeout_secs: default_worker.drain_timeout_secs,
             remote_fallback_delay_ms: default_worker.remote_fallback_delay_ms,
             scheduler: "priority".to_string(),
             require_payload_signing: false,
+            num_worker_processes: max_concurrent,
+            crash_failover_max_attempts: default_worker.crash_failover_max_attempts,
+            workflow_default_timeout_ms: crate::common::WorkflowConfig::default()
+                .default_timeout_ms,
         }
     }
 }
@@ -539,30 +568,99 @@ impl TryFrom<&PyActantConfig> for ActantConfig {
 
     fn try_from(c: &PyActantConfig) -> PyResult<Self> {
         let default = ActantConfig::default();
-        let task_thread_pool_workers = c.max_concurrent_tasks.max(1);
+        // 进程池模型：worker 子进程数决定有效本地并发。用户未显式指定
+        // num_worker_processes 时其值已在构造期跟随 max_concurrent_tasks，
+        // 保证并发背压信号量与进程池容量一致。
         Ok(Self {
             network: NetworkConfig::try_from(&c.network)?,
             failover: FailoverConfig::from(c.failover.clone()),
             gossip: GossipConfig::from(c.gossip.clone()),
             worker: crate::common::WorkerConfig {
-                max_concurrent_tasks: c.max_concurrent_tasks,
+                max_concurrent_tasks: c.max_concurrent_tasks.max(1),
+                num_worker_processes: c.num_worker_processes.max(1),
+                worker_program: python_executable(),
+                python_path: python_sys_path(),
                 default_task_timeout_ms: c.default_task_timeout_ms,
                 drain_timeout_secs: c.drain_timeout_secs,
                 remote_fallback_delay_ms: c.remote_fallback_delay_ms,
-                task_thread_pool_workers,
-                task_thread_pool_channel_capacity: task_thread_pool_workers * 16,
                 scheduler_kind: scheduler_kind_from_str(&c.scheduler)?,
+                crash_failover_max_attempts: c.crash_failover_max_attempts,
                 ..default.worker
             },
             store: crate::common::StoreConfig {
                 data_dir: c.data_dir.clone(),
                 ..default.store
             },
+            workflow: crate::common::WorkflowConfig {
+                default_timeout_ms: c.workflow_default_timeout_ms,
+                ..default.workflow
+            },
             payload_signing_key: c.payload_signing_key.as_bytes().to_vec(),
             require_payload_signing: c.require_payload_signing,
             ..default
         })
     }
+}
+
+/// 当前解释器路径（``sys.executable``），用于拉起 worker 子进程。
+///
+/// Python 层始终注入运行中的解释器；仅 Rust 纯嵌入场景由嵌入方显式配置
+/// `WorkerConfig::worker_program`，此时不经过本函数。
+///
+/// 提取失败（或得到空值）时返回空字符串并记录 `error` 日志——空
+/// `worker_program` 会使 worker 子进程无法 spawn，所有任务将停在
+/// 本地执行失败路径，日志必须能指向根因。
+fn python_executable() -> String {
+    pyo3::Python::attach(|py| {
+        let extracted = pyo3::types::PyModule::import(py, "sys")
+            .and_then(|sys| sys.getattr("executable"))
+            .and_then(|e| e.extract::<String>());
+        match extracted {
+            Ok(exe) if !exe.is_empty() => exe,
+            Ok(exe) => {
+                tracing::error!(
+                    "sys.executable resolved to an empty string; worker subprocesses \
+                     will fail to spawn and tasks will not execute"
+                );
+                exe
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "failed to read sys.executable; worker subprocesses will fail \
+                     to spawn and tasks will not execute"
+                );
+                String::new()
+            }
+        }
+    })
+}
+
+/// 当前解释器的 ``sys.path``，透传给 worker 子进程作为 ``PYTHONPATH``。
+///
+/// 进程隔离下模块级任务函数需要 by-reference 再导入；Rust 嵌入场景直接配置
+/// `WorkerConfig::python_path`，不经过本函数。
+///
+/// 提取失败时返回空列表并记录 `error` 日志——空 `python_path` 会使 worker
+/// 子进程内模块级任务函数导入失败（ModuleNotFoundError）。
+fn python_sys_path() -> Vec<String> {
+    pyo3::Python::attach(|py| {
+        let extracted = pyo3::types::PyModule::import(py, "sys")
+            .and_then(|sys| sys.getattr("path"))
+            .and_then(|path| path.extract::<Vec<String>>());
+        match extracted {
+            Ok(path) => path,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "failed to read sys.path; worker subprocesses will run with an \
+                     empty PYTHONPATH and module-level task functions may raise \
+                     ModuleNotFoundError"
+                );
+                Vec::new()
+            }
+        }
+    })
 }
 
 /// 在 Python 模块上注册所有 config 相关类。

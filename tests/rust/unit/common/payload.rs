@@ -6,7 +6,7 @@ use super::*;
 #[test]
 fn pack_upstream_prefix_empty_returns_default() {
     let default = b"hello".to_vec();
-    let result = pack_upstream_prefix(&[], &default);
+    let result = pack_upstream_prefix(&[], &default).unwrap();
     assert_eq!(result, default);
 }
 
@@ -14,7 +14,7 @@ fn pack_upstream_prefix_empty_returns_default() {
 fn pack_upstream_prefix_format() {
     let upstream = vec![b"a".to_vec(), b"bb".to_vec()];
     let default = b"inner".to_vec();
-    let result = pack_upstream_prefix(&upstream, &default);
+    let result = pack_upstream_prefix(&upstream, &default).unwrap();
 
     // [TAG_UPSTREAM_PREFIX, count=2, len1=1, "a", len2=2, "bb", "inner"]
     assert_eq!(result[0], TAG_UPSTREAM_PREFIX);
@@ -134,7 +134,7 @@ fn wire_mac_wrong_length_fails() {
 
 /// 回归测试（SE1）：所有字节位错的 MAC 都应被拒绝，且不依赖前缀提前返回。
 ///
-/// 旧实现使用 `==`，可能因短路比较而泄露前缀；改用 `subtle::ConstantTimeEq`
+/// 必须使用 `subtle::ConstantTimeEq` 恒定时间比较：`==` 的短路语义会因前缀不匹配提前返回，泄露时间侧信道
 /// 后，无论错位在 MAC 的哪个字节，行为应一致。
 #[test]
 fn mac_constant_time_rejects_all_byte_positions() {

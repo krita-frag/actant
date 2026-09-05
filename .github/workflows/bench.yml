@@ -1,0 +1,77 @@
+# 基准测试记录：nightly / 手动触发，跑 Rust (criterion) 与 Python (run_bench) 基准。
+#
+# ⚠️ Deliberate choice：本 workflow **不做阈值断言**（无自动回归失败）。
+# CI 共享 runner 的 CPU/噪声方差远大于真实性能回归幅度，硬阈值必然产生
+# 大量假阳性/假阴性。0.3.1（PLAN.md H8）裁决：先记录数字、留存 artifact
+# 供人工跨 run 对比；待基线在固定机型/自托管 runner 上稳定后，再引入
+# 回归阈值门禁（届时替换 judge 步骤为比较逻辑）。
+name: Bench
+
+on:
+  schedule:
+    - cron: "0 3 * * *" # 每日 UTC 03:00（北京时间 11:00）
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false # nightly 基准不互相打断，保证采样完整
+
+jobs:
+  rust-bench:
+    name: Rust 基准（criterion）
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo bench（全部 bench 目标）
+        run: cargo bench --all
+
+      # criterion 输出目录整体打包，含历史趋势数据（target/criterion）。
+      - name: 上传 Rust 基准结果
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-bench-${{ github.run_id }}
+          path: target/criterion
+          retention-days: 90
+          if-no-files-found: warn
+
+  python-bench:
+    name: Python 基准（run_bench）
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Sync Python 依赖
+        run: uv sync
+
+      - name: 构建 PyO3 扩展
+        run: uv run maturin develop
+
+      # run_bench.py 输出 Markdown 表格 + JSON 报告；--json 落到 run 专属路径
+      # （results/ 不入库，见 .gitignore；run_bench 不建父目录，这里先 mkdir）。
+      - name: 运行 Python 基准
+        run: |
+          mkdir -p benches/python/results
+          uv run python benches/python/run_bench.py \
+            --json "benches/python/results/py_bench_${{ github.run_id }}.json" \
+            | tee "benches/python/results/py_bench_${{ github.run_id }}.md"
+
+      - name: 上传 Python 基准结果
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-bench-${{ github.run_id }}
+          path: benches/python/results/py_bench_${{ github.run_id }}.*
+          retention-days: 90
+          if-no-files-found: warn

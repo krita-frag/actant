@@ -55,15 +55,31 @@ pub fn pack_single(pickle_bytes: Vec<u8>) -> Vec<u8> {
 /// 将多个结果打包为 `[TAG_GROUP, count(u32 LE), len1(u32 LE), data1, ...]`。
 ///
 /// 由 Python 侧调用构建 default_payload，Rust 不直接调用。
-pub fn pack_group(results: &[Vec<u8>]) -> Vec<u8> {
+///
+/// 返回 `Err` 当 `results.len()` 或任一 `data.len()` 超过 `u32::MAX`——
+/// payload 格式用 u32 LE 编码长度，超过会静默截断，导致 unpack 时读到
+/// 错误长度而解码出乱码。返回 `Result` 使此类边界错误显式失败。
+pub fn pack_group(results: &[Vec<u8>]) -> crate::common::Result<Vec<u8>> {
+    let count = u32::try_from(results.len()).map_err(|_| {
+        crate::common::ActantError::Serialization(format!(
+            "pack_group: results count {} exceeds u32::MAX",
+            results.len()
+        ))
+    })?;
     let mut buf = Vec::with_capacity(1 + 4 + results.len() * 8);
     buf.push(TAG_GROUP);
-    buf.extend_from_slice(&(results.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&count.to_le_bytes());
     for data in results {
-        buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        let len = u32::try_from(data.len()).map_err(|_| {
+            crate::common::ActantError::Serialization(format!(
+                "pack_group: item len {} exceeds u32::MAX",
+                data.len()
+            ))
+        })?;
+        buf.extend_from_slice(&len.to_le_bytes());
         buf.extend_from_slice(data);
     }
-    buf
+    Ok(buf)
 }
 
 /// 将上游结果前置到 default_payload，生成最终 payload。
@@ -77,20 +93,38 @@ pub fn pack_group(results: &[Vec<u8>]) -> Vec<u8> {
 /// - `default_payload`: Python 构建的原始 payload（含 callable + concrete args）
 ///
 /// 若 `upstream_results` 为空，直接返回 `default_payload`（无前驱的叶子任务）。
-pub fn pack_upstream_prefix(upstream_results: &[Vec<u8>], default_payload: &[u8]) -> Vec<u8> {
+///
+/// 返回 `Err` 当 `upstream_results.len()` 或任一 `r.len()` 超过 `u32::MAX`——
+/// 格式用 u32 LE 编码长度，超过会静默截断。
+pub fn pack_upstream_prefix(
+    upstream_results: &[Vec<u8>],
+    default_payload: &[u8],
+) -> crate::common::Result<Vec<u8>> {
     if upstream_results.is_empty() {
-        return default_payload.to_vec();
+        return Ok(default_payload.to_vec());
     }
+    let count = u32::try_from(upstream_results.len()).map_err(|_| {
+        crate::common::ActantError::Serialization(format!(
+            "pack_upstream_prefix: upstream count {} exceeds u32::MAX",
+            upstream_results.len()
+        ))
+    })?;
     let upstream_len: usize = upstream_results.iter().map(|r| 4 + r.len()).sum::<usize>();
     let mut buf = Vec::with_capacity(1 + 4 + upstream_len + default_payload.len());
     buf.push(TAG_UPSTREAM_PREFIX);
-    buf.extend_from_slice(&(upstream_results.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&count.to_le_bytes());
     for r in upstream_results {
-        buf.extend_from_slice(&(r.len() as u32).to_le_bytes());
+        let len = u32::try_from(r.len()).map_err(|_| {
+            crate::common::ActantError::Serialization(format!(
+                "pack_upstream_prefix: upstream item len {} exceeds u32::MAX",
+                r.len()
+            ))
+        })?;
+        buf.extend_from_slice(&len.to_le_bytes());
         buf.extend_from_slice(r);
     }
     buf.extend_from_slice(default_payload);
-    buf
+    Ok(buf)
 }
 
 /// 解包由 `pack_single` 或 `pack_group` 打包的负载。

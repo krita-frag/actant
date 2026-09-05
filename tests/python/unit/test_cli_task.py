@@ -24,9 +24,19 @@ def _long_task() -> str:
     return "done"
 
 
-def test_cmd_task_list_empty(capsys: pytest.CaptureFixture[str]) -> None:
+def test_cmd_task_list_without_runtime_is_honest(capsys: pytest.CaptureFixture[str]) -> None:
+    """无 runtime 注入时 list 不再新建空 Runtime 制造 "no tasks" 假象。"""
     args = argparse.Namespace(action="list")
-    assert cmd_task(args) == 0
+    assert cmd_task(args) == 1
+    captured = capsys.readouterr()
+    assert "in-memory" in captured.err
+    assert "actant status" in captured.err
+
+
+def test_cmd_task_list_empty_with_runtime(capsys: pytest.CaptureFixture[str]) -> None:
+    args = argparse.Namespace(action="list")
+    with actant.Runtime.with_defaults() as rt:
+        assert cmd_task(args, runtime=rt) == 0
     captured = capsys.readouterr()
     assert "no tasks" in captured.out
 

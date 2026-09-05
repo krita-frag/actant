@@ -226,3 +226,29 @@ def test_kind_to_exception_map_covers_core_kinds() -> None:
 
 def test_state_to_exception_map_covers_terminal_states() -> None:
     assert set(exc._STATE_TO_EXCEPTION.keys()) == {"Timeout", "Failed", "Cancelled"}
+
+
+# ---------------------------------------------------------------------------
+# H7.3：emit 聚合错误 kind 保真（Rust 侧 format_error_kind 前缀）重建
+# ---------------------------------------------------------------------------
+
+
+def test_emit_aggregate_error_prefix_decodes_to_storage_kind() -> None:
+    """Rust emit 聚合错误 `[actant:storage] emit: 1/2 handlers failed: ...`
+    经 decode_error_kind / reconstruct_error 应重建 StorageError，而非退化为
+    internal/task kind 的基类。"""
+    raw = "[actant:storage] emit: 1/2 handlers failed: storage error: disk on fire"
+    kind, message = exc.decode_error_kind(raw)
+    assert kind == "storage"
+    assert message.startswith("emit: 1/2 handlers failed")
+
+    rebuilt = exc.reconstruct_error(raw)
+    assert isinstance(rebuilt, StorageError)
+    assert "emit: 1/2 handlers failed" in str(rebuilt)
+
+
+def test_emit_aggregate_error_prefix_roundtrips_via_raise_for_kind() -> None:
+    raw = "[actant:storage] emit: 2/3 handlers failed: a; b"
+    kind, _ = exc.decode_error_kind(raw)
+    with pytest.raises(StorageError, match="2/3 handlers failed"):
+        exc.raise_for_kind(kind, "emit: 2/3 handlers failed: a; b")

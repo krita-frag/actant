@@ -9,14 +9,12 @@ use pyo3::exceptions::PyStopIteration;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use crate::common::{ActorId, MessageId, NodeId, TaskId, WorkflowId};
+use crate::common::{NodeId, TaskId, WorkflowId};
 use crate::py::gil_thread::GilThread;
-use crate::runtime::actor::SupervisionEvent;
 use crate::runtime::capability::{
-    ActorEvent, ActorFailureCtx, ActorLifecycle, ActorMessageReq, ActorMessaging, ActorSupervision,
     Execute, ExecuteCtx, ExecuteOutcome, NodeEvent, NodeLifecycle, Serialization, SerializationReq,
-    Store, StoreReq, SupervisionDecision, TaskEvent, TaskLifecycle, Transport, TransportReq,
-    WorkflowEvent, WorkflowLifecycle,
+    Store, StoreReq, TaskEvent, TaskLifecycle, Transport, TransportReq, WorkflowEvent,
+    WorkflowLifecycle,
 };
 use crate::runtime::dispatcher::CancelFlag;
 
@@ -46,14 +44,6 @@ pub trait PyEmitCodec<C: crate::runtime::capability::Capability> {
 /// 将 Rust 请求编码为 Python 对象，并把 Python handler 的返回值解码回 Rust 响应。
 ///
 /// 用于把 Python callable 注册为 Rust `CapabilityRuntime` handler，实现单一路径分发。
-pub trait PyHandlerAskCodec<C: crate::runtime::capability::Capability> {
-    fn encode_request<'py>(py: Python<'py>, req: &C::Request) -> PyResult<Bound<'py, PyAny>>;
-    fn decode_response<'py>(
-        py: Python<'py>,
-        obj: &Bound<'py, PyAny>,
-    ) -> PyResult<Option<C::Response>>;
-}
-
 pub trait PyHandlerPerformCodec<C: crate::runtime::capability::Capability> {
     fn encode_request<'py>(py: Python<'py>, req: &C::Request) -> PyResult<Bound<'py, PyAny>>;
     fn decode_response<'py>(py: Python<'py>, obj: &Bound<'py, PyAny>) -> PyResult<C::Response>;
@@ -66,22 +56,17 @@ pub trait PyHandlerEmitCodec<C: crate::runtime::capability::Capability> {
 /// 缓存高频属性名的 interned PyString，避免每次 getattr 都新建 Python 字符串对象。
 fn intern_attr<'py>(py: Python<'py>, name: &str) -> Bound<'py, pyo3::types::PyString> {
     match name {
-        "actor_id" => pyo3::intern!(py, "actor_id").clone(),
         "attempt" => pyo3::intern!(py, "attempt").clone(),
         "data" => pyo3::intern!(py, "data").clone(),
         "error" => pyo3::intern!(py, "error").clone(),
         "key" => pyo3::intern!(py, "key").clone(),
         "kind" => pyo3::intern!(py, "kind").clone(),
-        "max_restarts" => pyo3::intern!(py, "max_restarts").clone(),
-        "name" => pyo3::intern!(py, "name").clone(),
         "next_attempt" => pyo3::intern!(py, "next_attempt").clone(),
         "node_id" => pyo3::intern!(py, "node_id").clone(),
         "op" => pyo3::intern!(py, "op").clone(),
         "payload" => pyo3::intern!(py, "payload").clone(),
         "peer_id" => pyo3::intern!(py, "peer_id").clone(),
-        "restart_count" => pyo3::intern!(py, "restart_count").clone(),
         "result_payload" => pyo3::intern!(py, "result_payload").clone(),
-        "sender" => pyo3::intern!(py, "sender").clone(),
         "target" => pyo3::intern!(py, "target").clone(),
         "task_id" => pyo3::intern!(py, "task_id").clone(),
         "timestamp_ms" => pyo3::intern!(py, "timestamp_ms").clone(),
@@ -99,20 +84,6 @@ where
     let ob = ob.as_ref();
     let py = ob.py();
     ob.getattr(intern_attr(py, name))?.extract()
-}
-
-fn get_opt_string<'py, D>(ob: D, name: &str) -> PyResult<Option<String>>
-where
-    D: AsRef<Bound<'py, PyAny>>,
-{
-    let ob = ob.as_ref();
-    let py = ob.py();
-    let val = ob.getattr(intern_attr(py, name))?;
-    if val.is_none() {
-        Ok(None)
-    } else {
-        Ok(Some(val.extract()?))
-    }
 }
 
 fn get_u32<'py, D>(ob: D, name: &str) -> PyResult<u32>
@@ -166,75 +137,9 @@ where
     Ok(WorkflowId::from(s))
 }
 
-fn actor_id<'py, D>(ob: D, name: &str) -> PyResult<ActorId>
-where
-    D: AsRef<Bound<'py, PyAny>>,
-{
-    let s: String = get_string(&ob, name)?;
-    Ok(ActorId::from(s))
-}
-
 // 策略型 capability（Routing / Scheduling / RetryPolicy）由 Python 编排循环实现，
 // Rust 核心不提供这些 marker 类型及其 codec。
 
-pub struct ActorSupervisionCodec;
-
-impl PyAskCodec<ActorSupervision> for ActorSupervisionCodec {
-    fn decode_request(ob: &Bound<'_, PyAny>) -> PyResult<ActorFailureCtx> {
-        ob.extract()
-    }
-
-    fn encode_response(
-        py: Python<'_>,
-        resp: Option<Option<SupervisionDecision>>,
-    ) -> PyResult<Option<Bound<'_, PyAny>>> {
-        use pyo3::conversion::IntoPyObject;
-        // 闭包内不能使用 `?`，用显式 match 传播错误。
-        let d = match resp.flatten() {
-            Some(d) => d,
-            None => return Ok(None),
-        };
-        let s = match d {
-            SupervisionDecision::Restart => "restart",
-            SupervisionDecision::Stop => "stop",
-            SupervisionDecision::Resume => "resume",
-        };
-        Ok(Some(s.into_pyobject(py)?.to_owned().into_any()))
-    }
-}
-
-impl PyHandlerAskCodec<ActorSupervision> for ActorSupervisionCodec {
-    fn encode_request<'py>(py: Python<'py>, req: &ActorFailureCtx) -> PyResult<Bound<'py, PyAny>> {
-        let dict = dict_response(py);
-        dict.set_item("actor_id", req.actor_id.to_string())?;
-        dict.set_item("error", &req.error)?;
-        dict.set_item("restart_count", req.restart_count)?;
-        dict.set_item("max_restarts", req.max_restarts)?;
-        Ok(dict.into_any())
-    }
-
-    fn decode_response<'py>(
-        _py: Python<'py>,
-        obj: &Bound<'py, PyAny>,
-    ) -> PyResult<Option<Option<SupervisionDecision>>> {
-        if obj.is_none() {
-            return Ok(None);
-        }
-        let s: String = obj.extract()?;
-        let decision = match s.as_str() {
-            "restart" => SupervisionDecision::Restart,
-            "stop" => SupervisionDecision::Stop,
-            "resume" => SupervisionDecision::Resume,
-            _ => {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "unknown SupervisionDecision: {}",
-                    s
-                )))
-            }
-        };
-        Ok(Some(Some(decision)))
-    }
-}
 pub struct SerializationCodec;
 
 impl PyPerformCodec<Serialization> for SerializationCodec {
@@ -433,54 +338,6 @@ impl PyHandlerPerformCodec<Execute> for ExecuteCodec {
             result_payload: get_bytes(obj, "result_payload").unwrap_or_default(),
         };
         Ok(Ok(outcome))
-    }
-}
-
-pub struct ActorMessagingCodec;
-
-impl PyPerformCodec<ActorMessaging> for ActorMessagingCodec {
-    fn decode_request(ob: &Bound<'_, PyAny>) -> PyResult<ActorMessageReq> {
-        ob.extract()
-    }
-
-    fn encode_response(
-        py: Python<'_>,
-        resp: Result<MessageId, String>,
-    ) -> PyResult<Bound<'_, PyAny>> {
-        use pyo3::conversion::IntoPyObject;
-        match resp {
-            Ok(id) => {
-                let s = id.to_string().into_pyobject(py)?;
-                Ok(s.to_owned().into_any())
-            }
-            Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e)),
-        }
-    }
-}
-
-impl PyHandlerPerformCodec<ActorMessaging> for ActorMessagingCodec {
-    fn encode_request<'py>(py: Python<'py>, req: &ActorMessageReq) -> PyResult<Bound<'py, PyAny>> {
-        let dict = dict_response(py);
-        dict.set_item("target", req.target.to_string())?;
-        dict.set_item("payload", bytes_response(py, &req.payload)?)?;
-        dict.set_item(
-            "sender",
-            req.sender
-                .as_ref()
-                .map(|a| a.to_string())
-                .unwrap_or_default(),
-        )?;
-        Ok(dict.into_any())
-    }
-
-    fn decode_response<'py>(
-        _py: Python<'py>,
-        obj: &Bound<'py, PyAny>,
-    ) -> PyResult<Result<MessageId, String>> {
-        match obj.extract::<String>() {
-            Ok(s) => Ok(Ok(MessageId::from(s))),
-            Err(e) => Ok(Err(e.to_string())),
-        }
     }
 }
 
@@ -688,63 +545,6 @@ impl PyHandlerEmitCodec<NodeLifecycle> for NodeLifecycleCodec {
     }
 }
 
-pub struct ActorLifecycleCodec;
-
-impl PyEmitCodec<ActorLifecycle> for ActorLifecycleCodec {
-    fn decode_request(ob: &Bound<'_, PyAny>) -> PyResult<ActorEvent> {
-        let kind: String = get_string(ob, "kind")?;
-        match kind.as_str() {
-            "spawned" => Ok(ActorEvent::Spawned {
-                actor_id: actor_id(ob, "actor_id")?,
-                name: get_string(ob, "name")?,
-            }),
-            "stopped" => Ok(ActorEvent::Stopped {
-                actor_id: actor_id(ob, "actor_id")?,
-            }),
-            "failed" => Ok(ActorEvent::Failed {
-                actor_id: actor_id(ob, "actor_id")?,
-                error: get_string(ob, "error")?,
-            }),
-            "restarted" => Ok(ActorEvent::Restarted {
-                actor_id: actor_id(ob, "actor_id")?,
-                attempt: get_u32(ob, "attempt")?,
-            }),
-            _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "unknown ActorEvent kind: {}",
-                kind
-            ))),
-        }
-    }
-}
-
-impl PyHandlerEmitCodec<ActorLifecycle> for ActorLifecycleCodec {
-    fn encode_request<'py>(py: Python<'py>, req: &ActorEvent) -> PyResult<Bound<'py, PyAny>> {
-        let dict = dict_response(py);
-        match req {
-            ActorEvent::Spawned { actor_id, name } => {
-                dict.set_item("kind", "spawned")?;
-                dict.set_item("actor_id", actor_id.to_string())?;
-                dict.set_item("name", name)?;
-            }
-            ActorEvent::Stopped { actor_id } => {
-                dict.set_item("kind", "stopped")?;
-                dict.set_item("actor_id", actor_id.to_string())?;
-            }
-            ActorEvent::Failed { actor_id, error } => {
-                dict.set_item("kind", "failed")?;
-                dict.set_item("actor_id", actor_id.to_string())?;
-                dict.set_item("error", error)?;
-            }
-            ActorEvent::Restarted { actor_id, attempt } => {
-                dict.set_item("kind", "restarted")?;
-                dict.set_item("actor_id", actor_id.to_string())?;
-                dict.set_item("attempt", attempt)?;
-            }
-        }
-        Ok(dict.into_any())
-    }
-}
-
 pub fn bytes_response<'py>(py: Python<'py>, data: impl AsRef<[u8]>) -> PyResult<Bound<'py, PyAny>> {
     use pyo3::types::PyBytes;
     Ok(PyBytes::new(py, data.as_ref()).into_any())
@@ -867,32 +667,6 @@ impl<'a, 'py> FromPyObject<'a, 'py> for ExecuteCtx {
     }
 }
 
-impl<'a, 'py> FromPyObject<'a, 'py> for ActorMessageReq {
-    type Error = PyErr;
-    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> Result<Self, Self::Error> {
-        let ob = ob.to_owned();
-        let sender: Option<String> = get_opt_string(&ob, "sender")?;
-        Ok(ActorMessageReq {
-            target: actor_id(&ob, "target")?,
-            payload: get_bytes(&ob, "payload")?,
-            sender: sender.map(ActorId::from),
-        })
-    }
-}
-
-impl<'a, 'py> FromPyObject<'a, 'py> for ActorFailureCtx {
-    type Error = PyErr;
-    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> Result<Self, Self::Error> {
-        let ob = ob.to_owned();
-        Ok(ActorFailureCtx {
-            actor_id: actor_id(&ob, "actor_id")?,
-            error: get_string(&ob, "error")?,
-            restart_count: get_u32(&ob, "restart_count")?,
-            max_restarts: get_u32(&ob, "max_restarts")?,
-        })
-    }
-}
-
 impl<'a, 'py> FromPyObject<'a, 'py> for TaskEvent {
     type Error = PyErr;
     fn extract(ob: Borrowed<'a, 'py, PyAny>) -> Result<Self, Self::Error> {
@@ -981,35 +755,6 @@ impl<'a, 'py> FromPyObject<'a, 'py> for NodeEvent {
             }),
             _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "unknown NodeEvent kind: {}",
-                kind
-            ))),
-        }
-    }
-}
-
-impl<'a, 'py> FromPyObject<'a, 'py> for ActorEvent {
-    type Error = PyErr;
-    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> Result<Self, Self::Error> {
-        let ob = ob.to_owned();
-        let kind: String = get_string(&ob, "kind")?;
-        match kind.as_str() {
-            "spawned" => Ok(ActorEvent::Spawned {
-                actor_id: actor_id(&ob, "actor_id")?,
-                name: get_string(&ob, "name")?,
-            }),
-            "stopped" => Ok(ActorEvent::Stopped {
-                actor_id: actor_id(&ob, "actor_id")?,
-            }),
-            "failed" => Ok(ActorEvent::Failed {
-                actor_id: actor_id(&ob, "actor_id")?,
-                error: get_string(&ob, "error")?,
-            }),
-            "restarted" => Ok(ActorEvent::Restarted {
-                actor_id: actor_id(&ob, "actor_id")?,
-                attempt: get_u32(&ob, "attempt")?,
-            }),
-            _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "unknown ActorEvent kind: {}",
                 kind
             ))),
         }
@@ -1152,12 +897,29 @@ where
                 match result {
                     FutureResultToPy::Value(v) => {
                         if let Some(cb) = set_result {
-                            let _ = loop_obj.call_method1("call_soon_threadsafe", (cb, v));
+                            // call_soon_threadsafe 失败通常表示 event loop 已关闭
+                            // （Python 解释器关闭中）。此时 Future 永远不会 resolve，
+                            // 但程序正在退出，Future 会被 GC 回收。
+                            // 记录 warning 使问题可观测，避免静默挂起。
+                            if let Err(e) = loop_obj.call_method1("call_soon_threadsafe", (cb, v)) {
+                                tracing::warn!(
+                                    error = %e,
+                                    "call_soon_threadsafe(set_result) failed; \
+                                     event loop may be closed; Future will not resolve"
+                                );
+                            }
                         }
                     }
                     FutureResultToPy::Err(e) => {
                         if let Some(cb) = set_exception {
-                            let _ = loop_obj.call_method1("call_soon_threadsafe", (cb, e));
+                            if let Err(err) = loop_obj.call_method1("call_soon_threadsafe", (cb, e))
+                            {
+                                tracing::warn!(
+                                    error = %err,
+                                    "call_soon_threadsafe(set_exception) failed; \
+                                     event loop may be closed; Future will not resolve"
+                                );
+                            }
                         }
                     }
                 }
@@ -1227,10 +989,6 @@ pub struct PyEvent {
     pub kind: String,
     #[pyo3(get)]
     pub completion: Option<PyTaskCompletion>,
-    #[pyo3(get)]
-    pub orchestration: Option<PyOrchestrationEvent>,
-    #[pyo3(get)]
-    pub supervision: Option<PySupervisionEventData>,
 }
 
 #[pyclass(name = "_TaskCompletion", skip_from_py_object)]
@@ -1252,62 +1010,6 @@ pub struct PyTaskCompletion {
     pub target_node: Option<String>,
 }
 
-#[pyclass(name = "_OrchestrationEvent", skip_from_py_object)]
-#[derive(Clone)]
-pub struct PyOrchestrationEvent {
-    #[pyo3(get)]
-    pub event_type: String,
-    #[pyo3(get)]
-    pub workflow_id: Option<String>,
-    #[pyo3(get)]
-    pub task_id: Option<String>,
-    #[pyo3(get)]
-    pub node_id: Option<String>,
-    #[pyo3(get)]
-    pub active_workflows: Option<Vec<String>>,
-    #[pyo3(get)]
-    pub data: Option<Vec<u8>>,
-    #[pyo3(get)]
-    pub state: String,
-    #[pyo3(get)]
-    pub available_capacity: Option<u32>,
-    #[pyo3(get)]
-    pub max_capacity: Option<u32>,
-}
-
-#[pyclass(name = "_SupervisionEventData", skip_from_py_object)]
-#[derive(Clone)]
-pub struct PySupervisionEventData {
-    #[pyo3(get)]
-    pub event_type: String,
-    #[pyo3(get)]
-    pub actor_id: String,
-    #[pyo3(get)]
-    pub error: Option<String>,
-}
-
-impl From<SupervisionEvent> for PySupervisionEventData {
-    fn from(event: SupervisionEvent) -> Self {
-        match event {
-            SupervisionEvent::ActorStarted { actor_id } => PySupervisionEventData {
-                event_type: "ActorStarted".into(),
-                actor_id: actor_id.to_string(),
-                error: None,
-            },
-            SupervisionEvent::ActorFailed { actor_id, error } => PySupervisionEventData {
-                event_type: "ActorFailed".into(),
-                actor_id: actor_id.to_string(),
-                error: Some(error),
-            },
-            SupervisionEvent::ActorStopped { actor_id } => PySupervisionEventData {
-                event_type: "ActorStopped".into(),
-                actor_id: actor_id.to_string(),
-                error: None,
-            },
-        }
-    }
-}
-
 /// 生成 Rust 内置 capability 的 PyO3 分发函数。
 #[macro_export]
 macro_rules! capability_registry {
@@ -1316,6 +1018,9 @@ macro_rules! capability_registry {
         perform: { $( $perf_name:literal => $perf_cap:ty => $perf_codec:path ),* $(,)? }
         emit: { $( $emit_name:literal => $emit_cap:ty => $emit_codec:path ),* $(,)? }
     ) => {
+        // ask 注册表为空（Rust 核心当前无 ask 型 capability）时，
+        // 分发函数参数不被任何分支消费，故允许未使用变量。
+        #[allow(unused_variables)]
         fn dispatch_ask<'py>(
             py: pyo3::Python<'py>,
             name: &str,
@@ -1333,7 +1038,7 @@ macro_rules! capability_registry {
                         let resp = py.detach(move || {
                             tokio.block_on(inner.ask::<$ask_cap>(req))
                         })
-                            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+                            .map_err(PyErr::from)?;
                         tracing::trace!(cap = $ask_name, ms = _t.elapsed().as_millis() as u64, "dispatch_ask");
                         <$ask_codec as PyAskCodec<$ask_cap>>::encode_response(py, resp)
                     }
@@ -1362,7 +1067,7 @@ macro_rules! capability_registry {
                         let resp = py.detach(move || {
                             tokio.block_on(inner.perform::<$perf_cap>(req))
                         })
-                            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+                            .map_err(PyErr::from)?;
                         tracing::trace!(cap = $perf_name, ms = _t.elapsed().as_millis() as u64, "dispatch_perform");
                         <$perf_codec as PyPerformCodec<$perf_cap>>::encode_response(py, resp)
                     }
@@ -1391,7 +1096,7 @@ macro_rules! capability_registry {
                         py.detach(move || {
                             tokio.block_on(inner.emit::<$emit_cap>(req))
                         })
-                            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+                            .map_err(PyErr::from)?;
                         tracing::trace!(cap = $emit_name, ms = _t.elapsed().as_millis() as u64, "dispatch_emit");
                         Ok(())
                     }
@@ -1447,7 +1152,7 @@ macro_rules! capability_registry {
                                         })
                                     }
                                     Err(e) => FutureResultToPy::Err(
-                                        pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
+                                        PyErr::from(e)
                                     ),
                                 }
                             },
@@ -1462,6 +1167,7 @@ macro_rules! capability_registry {
         }
 
         /// 异步 ask 分发：返回 `asyncio.Future`，不阻塞 Python 主线程。
+        #[allow(unused_variables)]
         fn dispatch_ask_async<'py>(
             py: pyo3::Python<'py>,
             name: &str,
@@ -1494,7 +1200,7 @@ macro_rules! capability_registry {
                                         })
                                     }
                                     Err(e) => FutureResultToPy::Err(
-                                        pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
+                                        PyErr::from(e)
                                     ),
                                 }
                             },
@@ -1579,7 +1285,7 @@ macro_rules! capability_registry {
                                         })
                                     }
                                     Err(e) => $crate::py::types::FutureResultToPy::Err(
-                                        pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
+                                        PyErr::from(e)
                                     ),
                                 }
                             });
@@ -1636,7 +1342,5 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCancelToken>()?;
     m.add_class::<PyEvent>()?;
     m.add_class::<PyTaskCompletion>()?;
-    m.add_class::<PyOrchestrationEvent>()?;
-    m.add_class::<PySupervisionEventData>()?;
     Ok(())
 }

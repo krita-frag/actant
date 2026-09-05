@@ -33,6 +33,7 @@ dhat-heap.json
 
 # Benchmarks
 .benchmarks/
+benches/python/results/
 
 # Python cache
 .mypy_cache/
@@ -43,5 +44,8 @@ dhat-heap.json
 # Agent skills (embedded git repos)
 .agents/skills/
 
+# IDE local files
+.trae/
 
-/docs
+# Development working documents (local only)
+plans/

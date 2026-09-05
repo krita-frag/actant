@@ -1,5 +1,3 @@
-pub mod actor;
-pub mod actor_ops;
 pub mod capability;
 pub mod config;
 pub mod error;
@@ -8,17 +6,12 @@ pub mod handler;
 pub mod runtime;
 pub mod types;
 
-pub use actor::PythonActor;
-pub use actor_ops::PyActorCore;
 pub use config::{
     PyActantConfig, PyFailoverConfig, PyGossipConfig, PyNetworkConfig, PyRetryPolicy,
     PyWorkflowState,
 };
-pub use error::PyActantError;
 pub use runtime::{PyNode, PyRuntimeCore, PyTask};
-pub use types::{
-    PyCancelToken, PyEvent, PyOrchestrationEvent, PySupervisionEventData, PyTaskCompletion,
-};
+pub use types::{PyCancelToken, PyEvent, PyTaskCompletion};
 
 use pyo3::prelude::*;
 
@@ -31,7 +24,6 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     runtime::register(m)?;
     config::register(m)?;
     types::register(m)?;
-    actor_ops::register(m)?;
     capability::register(m)?;
     error::register_exceptions(m)?;
     Ok(())
@@ -50,13 +42,6 @@ pub fn actant(m: &Bound<'_, PyModule>) -> PyResult<()> {
     register(m)?;
     m.add_function(pyo3::wrap_pyfunction!(get_version, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(refresh_logger, m)?)?;
-    // 暴露 GENERIC_DISPATCH_NAME 给 Python 层，避免用户在 Python 代码中硬编码
-    // "__actant_generic__" 字符串。Rust 侧此常量定义为唯一真相来源
-    // （`crate::runtime::dispatcher::GENERIC_DISPATCH_NAME`）。
-    m.add(
-        "__actant_generic_dispatch_name__",
-        crate::runtime::dispatcher::GENERIC_DISPATCH_NAME,
-    )?;
     Ok(())
 }
 

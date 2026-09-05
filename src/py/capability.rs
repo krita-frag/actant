@@ -19,8 +19,7 @@ use crate::runtime::capability::{
     builtin_capabilities, register_defaults, CapabilityRuntime, EffectKind,
 };
 use crate::runtime::capability::{
-    ActorLifecycle, ActorMessaging, ActorSupervision, Execute, NodeLifecycle, Serialization, Store,
-    TaskLifecycle, Transport, WorkflowLifecycle,
+    Execute, NodeLifecycle, Serialization, Store, TaskLifecycle, Transport, WorkflowLifecycle,
 };
 
 use super::gil_thread::GilThread;
@@ -284,21 +283,17 @@ impl PyCapabilityRuntime {
 
 // 由 `capability_registry!` 生成 `dispatch_ask` / `dispatch_perform` / `dispatch_emit`。
 crate::capability_registry! {
-    ask: {
-        "ActorSupervision" => ActorSupervision => super::types::ActorSupervisionCodec,
-    }
+    ask: {}
     perform: {
         "Serialization" => Serialization => super::types::SerializationCodec,
         "Transport" => Transport => super::types::TransportCodec,
         "Store" => Store => super::types::StoreCodec,
         "Execute" => Execute => super::types::ExecuteCodec,
-        "ActorMessaging" => ActorMessaging => super::types::ActorMessagingCodec,
     }
     emit: {
         "TaskLifecycle" => TaskLifecycle => super::types::TaskLifecycleCodec,
         "WorkflowLifecycle" => WorkflowLifecycle => super::types::WorkflowLifecycleCodec,
         "NodeLifecycle" => NodeLifecycle => super::types::NodeLifecycleCodec,
-        "ActorLifecycle" => ActorLifecycle => super::types::ActorLifecycleCodec,
     }
 }
 

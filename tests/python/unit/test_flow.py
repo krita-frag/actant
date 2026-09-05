@@ -96,3 +96,28 @@ def test_cancel_flow_tasks_no_runtime_returns() -> None:
     with monkeypatch.context() as m:
         m.setattr(actant._runtime, "get_current_runtime", lambda: None)
         _flow_module._cancel_flow_tasks("wf1")
+
+
+def test_flow_rejects_invalid_failure_strategy() -> None:
+    """非法 failure_strategy 在装饰时抛 ValueError（而非提交时才失败）。"""
+    with pytest.raises(ValueError, match="failure_strategy"):
+
+        @_flow_module.flow(failure_strategy="explode")  # type: ignore[untyped-decorator]
+        def my_flow() -> None:
+            return None
+
+
+def test_flow_accepts_valid_failure_strategies() -> None:
+    """合法 failure_strategy（含 None 默认）装饰时不报错。"""
+
+    @_flow_module.flow(failure_strategy="fail_fast")  # type: ignore[untyped-decorator]
+    def flow_fail_fast() -> None:
+        return None
+
+    @_flow_module.flow(failure_strategy="continue")  # type: ignore[untyped-decorator]
+    def flow_continue() -> None:
+        return None
+
+    @_flow_module.flow  # type: ignore[untyped-decorator]
+    def flow_default() -> None:
+        return None

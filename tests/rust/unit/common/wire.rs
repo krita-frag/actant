@@ -17,19 +17,6 @@ fn topic_task_uses_correct_prefix() {
 }
 
 #[test]
-fn topic_actor_uses_correct_prefix() {
-    let t = Topic::actor(&node("node-a"));
-    assert_eq!(t.as_str(), "actant:actor:node-a");
-}
-
-#[test]
-fn topic_actor_reply_distinct_from_actor() {
-    let n = node("n1");
-    assert_ne!(Topic::actor(&n), Topic::actor_reply(&n));
-    assert_eq!(Topic::actor_reply(&n).as_str(), "actant:actor-reply:n1");
-}
-
-#[test]
 fn topic_dag_state_is_constant() {
     assert_eq!(Topic::dag_state().as_str(), constants::TOPIC_DAG_STATE);
 }
@@ -74,22 +61,6 @@ fn classify_task_extracts_node() {
 }
 
 #[test]
-fn classify_actor_extracts_node() {
-    assert_eq!(
-        Topic::actor(&node("a1")).classify(),
-        TopicRoute::Actor("a1".to_string())
-    );
-}
-
-#[test]
-fn classify_actor_reply_extracts_node() {
-    assert_eq!(
-        Topic::actor_reply(&node("r1")).classify(),
-        TopicRoute::ActorReply("r1".to_string())
-    );
-}
-
-#[test]
 fn classify_workflow_state_req_resp() {
     assert_eq!(
         Topic::workflow_state_req(&node("n")).classify(),
@@ -116,14 +87,9 @@ fn classify_unknown_for_unrecognized_topic() {
 }
 
 #[test]
-fn classify_actor_prefix_does_not_match_task_prefix() {
-    // 关键：prefix 不能互相包含，否则路由错误
-    let actor_topic = Topic::actor(&node("task"));
-    assert_eq!(
-        actor_topic.classify(),
-        TopicRoute::Actor("task".to_string())
-    );
-    // 反向：task topic 不应被分类为 actor
+fn classify_task_prefix_is_exact() {
+    // 关键：prefix 不能互相包含，否则路由错误。
+    // task topic 不应被误分类为其他节点作用域话题。
     let task_topic = Topic::task(&node("actor"));
     assert_eq!(task_topic.classify(), TopicRoute::Task("actor".to_string()));
 }
@@ -633,5 +599,190 @@ fn envelope_decode_rejects_tampered_bytes() {
     assert!(
         result.is_none(),
         "decode must drop tampered message (MAC mismatch)"
+    );
+}
+
+/// C3 集成测试：嵌套 scope 退出后恢复**进入前的旧值**（LIFO），而非清空为无 trace。
+///
+/// 回归测试：TraceScopeGuard 历史上 drop 时无条件清空 thread-local，嵌套场景下
+/// 外层 scope 的 trace 上下文会被内层 guard 的退出误删。
+#[test]
+fn trace_scope_guard_restore_recovers_previous_scope() {
+    let outer = TraceContext::new_root(true);
+    let inner = TraceContext::new_root(true);
+    assert_ne!(outer.trace_id, inner.trace_id);
+
+    let wrap_under_outer = || {
+        WireEnvelope::wrap(WireMessage::NodeHeartbeat(NodeHeartbeat {
+            node_id: node("nested"),
+            active_workflows: vec![],
+            timestamp_ms: 0,
+            available_slots: 0,
+            max_slots: 0,
+            endpoint_addr: None,
+        }))
+        .traceparent
+        .unwrap()
+    };
+
+    let outer_scope = current_trace_scope(outer.clone());
+    let tp_within_outer = wrap_under_outer();
+
+    let inner_scope = current_trace_scope(inner.clone());
+    let tp_within_inner = wrap_under_outer();
+    // 显式 restore 与 drop 两条恢复路径都验证。
+    inner_scope.restore();
+    let tp_after_inner = wrap_under_outer();
+    drop(outer_scope);
+    let tp_after_all = wrap_under_outer();
+
+    // 内层 scope 内：child of inner。
+    let child_of_inner = TraceContext::parse(&tp_within_inner).unwrap();
+    assert_eq!(child_of_inner.trace_id, inner.trace_id);
+    // 内层退出后：恢复为 child of outer（而非 root）。
+    let child_of_outer = TraceContext::parse(&tp_after_inner).unwrap();
+    assert_eq!(child_of_outer.trace_id, outer.trace_id);
+    // 外层 scope 进入时的 wrap 也是 child of outer（基线）。
+    let baseline = TraceContext::parse(&tp_within_outer).unwrap();
+    assert_eq!(baseline.trace_id, outer.trace_id);
+    // 全部退出后：退化为 root（独立 trace）。
+    let root = TraceContext::parse(&tp_after_all).unwrap();
+    assert_ne!(root.trace_id, outer.trace_id);
+    assert_ne!(root.trace_id, inner.trace_id);
+}
+
+/// 兼容性红线测试：MAC 覆盖字节的分段组装（`mac_input_bytes`）必须与
+/// 「序列化整个 `mac: None` 的 unsigned envelope」逐字节一致。
+///
+/// postcard 格式演进（字段增删、编码规则变化）若破坏该不变量，此测试先行
+/// 失败，防止跨节点 MAC 校验静默失效。
+#[test]
+fn mac_input_segments_match_unsigned_envelope_serialization() {
+    let heartbeat = heartbeat_msg("mac-segments");
+    let unsigned = WireEnvelope {
+        version: constants::WIRE_PROTOCOL_VERSION,
+        message: heartbeat.clone(),
+        traceparent: Some(TraceContext::new_root(true).to_header()),
+        mac: None,
+    };
+    let whole = crate::common::encode_postcard(&unsigned).unwrap();
+    let segments =
+        mac_input_bytes(unsigned.version, &unsigned.message, &unsigned.traceparent).unwrap();
+    assert_eq!(
+        segments, whole,
+        "MAC input segments must be byte-identical to unsigned envelope serialization"
+    );
+
+    // traceparent 为 None 时同样成立。
+    let unsigned_no_tp = WireEnvelope {
+        traceparent: None,
+        ..unsigned
+    };
+    let whole_no_tp = crate::common::encode_postcard(&unsigned_no_tp).unwrap();
+    let segments_no_tp =
+        mac_input_bytes(unsigned_no_tp.version, &unsigned_no_tp.message, &None).unwrap();
+    assert_eq!(segments_no_tp, whole_no_tp);
+}
+
+/// H6.2：同进程两个不同密钥 Runtime 互不干扰。
+///
+/// `register_wire_signing_key` 按 node 隔离：rt-b 注册新密钥后，rt-a 的出站
+/// 消息仍以 key-a 签名（旧的全局单密钥行为会被覆盖）；接收侧尝试全部已注册
+/// 密钥，两个 Runtime 各自集群的入站消息均可验证；未注册密钥签名的消息被拒绝。
+#[test]
+fn two_runtimes_with_different_keys_do_not_interfere() {
+    let _guard = MAC_TEST_LOCK.lock().unwrap();
+    let node_a = node("rt-a");
+    let node_b = node("rt-b");
+    crate::common::register_wire_signing_key(&node_a, b"cluster-key-a".to_vec());
+    let env_a_before = WireEnvelope::wrap(heartbeat_msg("rt-a"));
+    assert!(env_a_before.mac.is_some());
+
+    // 另一 Runtime 以不同密钥注册（旧全局单密钥行为会在此覆盖 rt-a 的密钥）。
+    crate::common::register_wire_signing_key(&node_b, b"cluster-key-b".to_vec());
+
+    // rt-a 出站仍用 key-a 签名：以 key-a 手工重算 MAC 必须一致。
+    let env_a_after = WireEnvelope::wrap(heartbeat_msg("rt-a"));
+    let bytes_a = postcard::to_allocvec(&env_a_after).unwrap();
+    let mac_a = env_a_after.mac.expect("rt-a envelope must be signed");
+    let unsigned_a = WireEnvelope {
+        mac: None,
+        ..env_a_after
+    };
+    let expected_a = crate::common::payload::wire_mac(
+        b"cluster-key-a",
+        &crate::common::encode_postcard(&unsigned_a).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        mac_a, expected_a,
+        "rt-a outbound must still be signed with key-a after rt-b registered key-b"
+    );
+
+    // rt-b 出站用 key-b 签名。
+    let env_b = WireEnvelope::wrap(heartbeat_msg("rt-b"));
+    let bytes_b = postcard::to_allocvec(&env_b).unwrap();
+    let mac_b = env_b.mac.expect("rt-b envelope must be signed");
+    let unsigned_b = WireEnvelope { mac: None, ..env_b };
+    let expected_b = crate::common::payload::wire_mac(
+        b"cluster-key-b",
+        &crate::common::encode_postcard(&unsigned_b).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(mac_b, expected_b);
+
+    // 接收侧：两个 Runtime 的消息均可验证。
+    assert!(
+        WireEnvelope::decode(&bytes_a).is_some(),
+        "rt-a message must decode after rt-b registration"
+    );
+    assert!(WireEnvelope::decode(&bytes_b).is_some());
+
+    // 未注册密钥（key-c）签名的消息仍被拒绝。
+    let rogue_unsigned = WireEnvelope {
+        version: constants::WIRE_PROTOCOL_VERSION,
+        message: heartbeat_msg("rt-c"),
+        traceparent: Some(TraceContext::new_root(true).to_header()),
+        mac: None,
+    };
+    let rogue_mac = crate::common::payload::wire_mac(
+        b"cluster-key-c",
+        &crate::common::encode_postcard(&rogue_unsigned).unwrap(),
+    )
+    .unwrap();
+    let rogue = WireEnvelope {
+        mac: Some(rogue_mac),
+        ..rogue_unsigned
+    };
+    let rogue_bytes = postcard::to_allocvec(&rogue).unwrap();
+    assert!(
+        WireEnvelope::decode(&rogue_bytes).is_none(),
+        "message signed with unregistered key must be rejected"
+    );
+
+    // 清理全局注册表，避免污染其他 MAC 测试。
+    crate::common::register_wire_signing_key(&node_a, Vec::new());
+    crate::common::register_wire_signing_key(&node_b, Vec::new());
+    set_wire_signing_key(Vec::new());
+}
+
+/// 兼容性红线测试：wrap() 用分段字节计算的 MAC 必须与对完整 unsigned envelope
+/// 一次性计算的结果一致（发送方/接收方任一路径单独演进都不允许漂移）。
+#[test]
+fn wire_mac_matches_oneshot_unsigned_serialization() {
+    let _guard = MAC_TEST_LOCK.lock().unwrap();
+    let key = b"segment-compat-key".to_vec();
+    set_wire_signing_key(key.clone());
+
+    let env = WireEnvelope::wrap(heartbeat_msg("mac-oneshot"));
+    let wrapped_mac = env.mac.expect("mac must be present with signing key");
+    set_wire_signing_key(Vec::new());
+
+    let unsigned = WireEnvelope { mac: None, ..env };
+    let whole = crate::common::encode_postcard(&unsigned).unwrap();
+    let oneshot = crate::common::payload::wire_mac(&key, &whole).unwrap();
+    assert_eq!(
+        wrapped_mac, oneshot,
+        "segment-assembled MAC input must equal one-shot unsigned serialization"
     );
 }

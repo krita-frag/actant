@@ -1,14 +1,11 @@
-"""``actant.task._dispatch`` 单元测试（不依赖 Runtime）。"""
+"""``actant.task._helpers._execute_with_retries`` 单元测试（不依赖 Runtime）。"""
 from __future__ import annotations
 
 import cloudpickle
-import pytest
 
-from actant.capabilities import ExecuteCtx
-from actant.exceptions import ActantError, TaskCancelledError
-from actant.task._dispatch import (
+from actant.exceptions import TaskCancelledError
+from actant.task._helpers import (
     _execute_with_retries,
-    _generic_execute_handler,
 )
 
 
@@ -103,15 +100,3 @@ def test_execute_with_retries_cancel_during_retry() -> None:
     )
     assert ok is False
     assert isinstance(exc_obj, TaskCancelledError)
-
-
-def test_generic_execute_handler_deserialization_failure() -> None:
-    """payload 无法反序列化时应抛出 ActantError serialization。"""
-    ctx = ExecuteCtx(
-        task_id="t1",
-        workflow_id="wf1",
-        payload=b"not cloudpickle data",
-        timeout_ms=1000,
-    )
-    with pytest.raises(ActantError, match="failed to deserialize payload"):
-        _generic_execute_handler(ctx)

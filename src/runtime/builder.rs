@@ -10,7 +10,7 @@ use std::time::Duration;
 use crate::common::scheduler_kind;
 use crate::common::{ActantConfig, ActantError, ActorId, NodeId, Topic};
 use crate::runtime::actor::ActorSystem;
-use crate::runtime::dispatcher::{TaskDispatcher, TaskRegistry};
+use crate::runtime::dispatcher::{ProcessTaskDispatcher, TaskDispatcher};
 use crate::runtime::event_bus::EventBus;
 use crate::runtime::network::Transport;
 use crate::runtime::state::{CheckpointManager, LmdbStore, Store, WalWriter};
@@ -38,68 +38,79 @@ const FORBIDDEN_SYSTEM_DIRS: &[&str] = &[
 ];
 
 /// 校验 operator 提供的 `data_dir` 配置。
+///
+/// 黑名单语义：黑名单目录是 `data_dir` 的**祖先（或相等）即拒绝**，而非仅
+/// 精确匹配——防止 `/etc/actant`、`/usr/local/x` 等系统目录子路径被当作数据目录。
+/// 唯一例外是 `/`：它是一切绝对路径的祖先，只做精确匹配（否则所有合法目录
+/// 都会被拒绝）。
+///
+/// 路径归一化：`data_dir` 在首次启动时通常尚不存在，无法直接 canonicalize。
+/// 实现为从候选路径逐级向上找到第一个已存在的祖先做 canonicalize（消除
+/// symlink 差异，如 macOS `/var` → `/private/var`），再把其余字面量组件拼回
+/// 后比对；黑名单项同样 canonicalize 后比对。
 pub fn validate_data_dir(data_dir: &str) -> Result<(), ActantError> {
     let trimmed = data_dir.trim();
     if trimmed.is_empty() {
         return Err(ActantError::Config("data_dir must not be empty".into()));
     }
     let candidate = Path::new(trimmed);
-    if let Ok(canon) = candidate.canonicalize() {
-        for forbidden in FORBIDDEN_SYSTEM_DIRS {
-            if let Ok(canon_forbidden) = Path::new(forbidden).canonicalize() {
-                if canon == canon_forbidden {
-                    return Err(ActantError::Config(format!(
-                        "data_dir must not point at system directory {}",
-                        forbidden
-                    )));
-                }
+
+    // 逐级向上找第一个已存在的祖先做 canonicalize；全部不存在（如相对路径
+    // 组件耗尽）时跳过归一化——此时无法解析 symlink，维持宽松放行。
+    let mut probe = candidate.to_path_buf();
+    let canonical = loop {
+        match probe.canonicalize() {
+            Ok(base) => {
+                // probe 是 candidate 的路径前缀（由重复 parent() 得到），
+                // strip_prefix 必然成功；unwrap_or 兜底空路径。
+                let suffix = candidate
+                    .strip_prefix(&probe)
+                    .unwrap_or_else(|_| Path::new(""));
+                break base.join(suffix);
             }
+            Err(_) => match probe.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => probe = parent.to_path_buf(),
+                _ => return Ok(()),
+            },
+        }
+    };
+
+    for forbidden in FORBIDDEN_SYSTEM_DIRS {
+        let Ok(canon_forbidden) = Path::new(forbidden).canonicalize() else {
+            continue;
+        };
+        let hit = if *forbidden == "/" {
+            canonical == canon_forbidden
+        } else {
+            // starts_with 为按组件的前缀比较：/etc/actant starts_with /etc，
+            // 且不会误匹配 /etcfoo 这类共享字符前缀的路径。
+            canonical.starts_with(&canon_forbidden)
+        };
+        if hit {
+            return Err(ActantError::Config(format!(
+                "data_dir must not point at system directory {}",
+                forbidden
+            )));
         }
     }
     Ok(())
 }
 
-/// `init_actor_system` 的返回值：actor 系统 + A2 跨节点路由组件。
-///
-/// 元组拆开使用，避免在每个调用点重复长类型签名。
-pub type ActorSystemWithRouter = (
-    Arc<ActorSystem>,
-    Arc<crate::runtime::actor::router::ActorRegistry>,
-    Arc<dyn crate::runtime::actor::router::ActorRouter>,
-);
-
 /// 初始化 actor 系统，可选持久化。
-///
-/// 注入 A2 跨节点路由组件：[`ActorRegistry`] 与 [`ActorRouter`]。
-/// `actor_router_strategy` 配置项决定具体策略实现（默认 `round-robin`）。
-/// Registry 在 `ActorSystem::spawn` 时自动注册本地 actor 类型，由调用方
-/// （`RuntimeBuilder::build`）启动 [`ActorRegistryGossipActor`] 后台广播。
 pub fn init_actor_system(
     data_dir: Option<&str>,
     node_id: &NodeId,
-    network: &Arc<dyn Transport>,
     event_bus: &EventBus,
     config: &crate::common::ActantConfig,
-) -> Result<ActorSystemWithRouter, ActantError> {
-    // A2：构造跨节点 actor 注册表 + 路由器。registry 在 spawn 时自动登记本地 actor 类型。
-    let registry = Arc::new(
-        crate::runtime::actor::router::ActorRegistry::new().with_local_node_id(node_id.clone()),
-    );
-    let strategy = crate::runtime::actor::router::RouterStrategy::parse(
-        &config.network.actor_router_strategy,
-    )?;
-    let router = crate::runtime::actor::router::make_router(strategy, registry.clone());
-
+) -> Result<Arc<ActorSystem>, ActantError> {
     let base = ActorSystem::new()
         .with_node_id(node_id.clone())
-        .with_network(network.clone())
-        .with_event_bus(event_bus.clone())
-        .with_actor_registry(registry.clone())
-        .with_actor_router(router.clone());
+        .with_event_bus(event_bus.clone());
     let system = if let Some(dir) = data_dir {
         let db_path = Path::new(dir).join("actor");
-        std::fs::create_dir_all(&db_path).map_err(ActantError::StorageIo)?;
-        let store = LmdbStore::open(&db_path)
+        // actor 子存储与主存储使用同一 StoreConfig（map_size / max_dbs /
+        // sync_mode），保证持久化语义一致。open_with_config 内部创建目录。
+        let store = LmdbStore::open_with_config(&db_path, &config.store)
             .map_err(|e| ActantError::Storage(format!("failed to open actor store: {}", e)))?;
         let checkpoint = CheckpointManager::new(store.clone());
         let wal_path = Path::new(dir).join("actor.wal");
@@ -109,7 +120,7 @@ pub fn init_actor_system(
     } else {
         Arc::new(base)
     };
-    Ok((system, registry, router))
+    Ok(system)
 }
 
 /// 初始化 orchestrator，可选持久化。
@@ -120,8 +131,9 @@ pub async fn init_orchestrator(
 ) -> Result<Arc<Orchestrator>, ActantError> {
     if let Some(dir) = data_dir {
         let db_path = Path::new(dir).join("orchestrator");
-        std::fs::create_dir_all(&db_path).map_err(ActantError::StorageIo)?;
-        let store = LmdbStore::open(&db_path)
+        // orchestrator 子存储与主存储使用同一 StoreConfig（map_size / max_dbs /
+        // sync_mode），保证持久化语义一致。
+        let store = LmdbStore::open_with_config(&db_path, &config.store)
             .map_err(|e| ActantError::Storage(format!("failed to open store: {}", e)))?;
         let async_store = Store::new(store.clone());
         let event_log = Arc::new(crate::runtime::state::event_log::LmdbEventLog::new(
@@ -158,8 +170,6 @@ pub struct WorkerInitParams<'a> {
     pub workflow_actor_id: Option<crate::common::ActorId>,
     /// 本地 DagGossipActor 的 id。用于处理工作流状态请求/响应主题。
     pub dag_gossip_actor_id: Option<crate::common::ActorId>,
-    /// Actor 注册表 gossip 处理器（A2）。用于接收 `TOPIC_ACTOR_REGISTRY` 上的远端注册表广播。
-    pub actor_registry_gossip: Option<Arc<crate::runtime::actor::router::ActorRegistryGossipActor>>,
     /// Capability gossip 处理器。用于接收 `TOPIC_CAPABILITY_GOSSIP` 上的远端 capability 广播。
     pub capability_gossip: Option<Arc<crate::runtime::capability::gossip::CapabilityGossipActor>>,
 }
@@ -176,7 +186,7 @@ pub async fn init_worker(params: WorkerInitParams<'_>) -> Result<Worker, ActantE
     let scheduler_actor = match params.scheduler_kind {
         scheduler_kind::FIFO => SchedulerActor::with_event_bus(params.event_bus.clone()),
         scheduler_kind::PRIORITY => {
-            SchedulerActor::with_event_bus(params.event_bus.clone()).with_priority()
+            SchedulerActor::with_event_bus(params.event_bus.clone()).with_priority()?
         }
         other => {
             return Err(ActantError::Config(format!(
@@ -225,10 +235,6 @@ pub async fn init_worker(params: WorkerInitParams<'_>) -> Result<Worker, ActantE
     };
     let worker = match params.dag_gossip_actor_id {
         Some(id) => worker.with_dag_gossip_actor_id(id),
-        None => worker,
-    };
-    let worker = match params.actor_registry_gossip {
-        Some(g) => worker.with_actor_registry_gossip(g),
         None => worker,
     };
     let worker = match params.capability_gossip {
@@ -297,7 +303,13 @@ impl RuntimeBuilder {
         // 空密钥 = 禁用 wire 签名验证，向后兼容 0.2（无 mac 字段）。
         // 非空密钥 = 集群内所有节点必须共享同一密钥；任一节点密钥不匹配
         // 将导致其跨节点消息被对端丢弃，提供端到端集群身份认证。
-        crate::common::set_wire_signing_key(self.config.payload_signing_key.clone());
+        // H6.2：按 node 注册——同进程多 Runtime 各自密钥互不覆盖，
+        // 出站签名按消息来源节点选择（wire 模块的调用点在冻结的
+        // workflow/ 子树中，密钥无法参数穿透，故保留进程级注册表）。
+        crate::common::register_wire_signing_key(
+            &self.node_id,
+            self.config.payload_signing_key.clone(),
+        );
 
         tracing::info!("build: NetworkManager::new enter");
         let network: Arc<dyn Transport> = Arc::new(
@@ -310,10 +322,9 @@ impl RuntimeBuilder {
         let event_bus = EventBus::new();
 
         tracing::info!("build: init_actor_system enter");
-        let (actor_system, actor_registry, _actor_router) = init_actor_system(
+        let actor_system = init_actor_system(
             self.data_dir.as_deref(),
             &self.node_id,
-            &network,
             &event_bus,
             &self.config,
         )?;
@@ -328,20 +339,25 @@ impl RuntimeBuilder {
             .data_dir
             .clone()
             .ok_or_else(|| ActantError::Config("RuntimeBuilder requires data_dir".into()))?;
+        // 拒绝指向系统目录等危险路径，尽早失败。
+        validate_data_dir(&data_dir)?;
         let store_path = Path::new(&data_dir).join("store");
-        std::fs::create_dir_all(&store_path).map_err(ActantError::StorageIo)?;
-        let lmdb_store = LmdbStore::open(&store_path)
+        // 主存储使用配置中的 StoreConfig（map_size / max_dbs / sync_mode），
+        // 不再隐式退回默认配置。open_with_config 内部创建目录。
+        let lmdb_store = LmdbStore::open_with_config(&store_path, &self.config.store)
             .map_err(|e| ActantError::Storage(format!("failed to open store: {}", e)))?;
         let store = Store::new(lmdb_store.clone());
 
-        let task_dispatcher: Arc<dyn TaskDispatcher> = TaskRegistry::with_drain_timeout(
-            self.config.worker.task_thread_pool_workers.max(1),
-            self.config.worker.task_thread_pool_channel_capacity.max(1),
-            self.config.payload_signing_key.clone(),
-            std::time::Duration::from_secs(self.config.worker.drain_timeout_secs.max(1)),
-        )
-        .map_err(|e| ActantError::Config(format!("failed to create task dispatcher: {}", e)))?
-        .into_dispatcher();
+        let task_dispatcher: Arc<dyn TaskDispatcher> = Arc::new(
+            ProcessTaskDispatcher::new(
+                self.config.worker.num_worker_processes.max(1),
+                self.config.worker.worker_program.clone(),
+                self.config.worker.worker_cancel_grace_ms,
+                self.config.payload_signing_key.clone(),
+                self.config.worker.python_path.clone(),
+            )
+            .map_err(|e| ActantError::Config(format!("failed to create task dispatcher: {}", e)))?,
+        );
 
         // ── Capability 注册 ────────────────────────────────────────────
         // 关键顺序：先 register_defaults + register_store_handler（chain 追加），
@@ -362,6 +378,11 @@ impl RuntimeBuilder {
         let workflow_actor_id = crate::common::ActorId::workflow(&self.node_id);
         let orchestrator =
             init_orchestrator(self.data_dir.as_deref(), &self.node_id, &self.config).await?;
+        // P0-5 接线：recover 完成后立即重建"Pending 且依赖已满足"的任务。
+        // 此处 WorkflowActor 尚未 spawn，Orchestrator 状态仍为独占引用，读取安全；
+        // 返回的任务在 init_worker 产出调度器后重新入队（见下方 enqueue_batch）。
+        // 若不接线，重启前处于可执行状态的任务会永久滞留。
+        let recovered_ready_tasks = orchestrator.recover_ready_tasks();
         // init_orchestrator 返回的 Arc 仅此一处引用，try_unwrap 必成功。
         let orchestrator = match Arc::try_unwrap(orchestrator) {
             Ok(o) => o,
@@ -434,8 +455,8 @@ impl RuntimeBuilder {
         // 跨节点 capability 元信息扩散。直接启动后台广播循环，
         // 不通过 ActorSystem（无需消息路由）。cancel handle 注册到 Runtime，
         // 保证 shutdown 时停止。
-        // 必须先订阅 topic 再启动后台循环（与 ActorRegistryGossip 一致），
-        // 确保 NetworkEventRouter 接收侧就绪后 gossip 消息才到达。
+        // 必须先订阅 topic 再启动后台循环，确保 NetworkEventRouter
+        // 接收侧就绪后 gossip 消息才到达。
         tracing::info!("build: capability gossip subscribe enter");
         let cap_gossip_topic = Topic::from(crate::common::wire::constants::TOPIC_CAPABILITY_GOSSIP);
         network
@@ -457,41 +478,6 @@ impl RuntimeBuilder {
         runtime.register_background_loop_cancel(cap_gossip.clone().start_background_loop());
         tracing::info!("build: capability gossip started");
 
-        // ── ActorRegistryGossip（A2）──────────────────────────────────
-        // 跨节点 actor 注册表同步：广播本地 actor 类型集合，接收远端注册表。
-        // gossip actor 通过 NetworkEventRouter 接收 `TOPIC_ACTOR_REGISTRY` 上的消息，
-        // 因此必须先订阅此 topic，再启动后台广播循环（保证接收侧就绪）。
-        tracing::info!("build: actor registry gossip subscribe enter");
-        let actor_registry_topic = Topic::actor_registry();
-        network
-            .subscribe(actor_registry_topic.as_str())
-            .await
-            .map_err(|e| {
-                ActantError::Network(format!(
-                    "failed to subscribe to actor registry topic: {}",
-                    e
-                ))
-            })?;
-        tracing::info!("build: actor registry gossip subscribed");
-        let actor_registry_gossip = Arc::new(
-            crate::runtime::actor::router::ActorRegistryGossipActor::new(
-                self.node_id.clone(),
-                actor_registry.clone(),
-                network.clone(),
-            )
-            .with_broadcast_interval(Duration::from_millis(
-                self.config.network.actor_registry_gossip_interval_ms,
-            )),
-        );
-        // 启动时立即广播一次：让对端尽快发现本节点承载的 actor 类型，
-        // 不必等待第一个 tick（默认 30s）。
-        if let Err(e) = actor_registry_gossip.broadcast_registry().await {
-            tracing::warn!(error = %e, "initial actor registry broadcast failed");
-        }
-        runtime
-            .register_background_loop_cancel(actor_registry_gossip.clone().start_background_loop());
-        tracing::info!("build: actor registry gossip started");
-
         // ── Worker（SchedulerActor + 任务消费循环）─────────────────────
         // 需要 failover 引用以便 capacity callback。tokio handle 取当前运行时。
         tracing::info!("build: init_worker enter");
@@ -508,7 +494,6 @@ impl RuntimeBuilder {
             tokio_handle,
             workflow_actor_id: Some(workflow_actor_id.clone()),
             dag_gossip_actor_id: Some(dag_gossip_actor_id.clone()),
-            actor_registry_gossip: Some(actor_registry_gossip.clone()),
             capability_gossip: Some(cap_gossip.clone()),
         })
         .await?;
@@ -517,7 +502,7 @@ impl RuntimeBuilder {
         let worker = Arc::new(worker.with_failover_manager(failover.clone()));
         // 注入 worker 到 runtime。此处 runtime 仍是唯一 Arc 引用
         //（register_background_loop_cancel 只借用 &self，未 clone Arc），
-        // 故 Arc::get_mut 可直接获取可变引用。此前用 runtime.clone() 会使
+        // 故 Arc::get_mut 可直接获取可变引用，无需克隆（克隆会
         // 引用计数变为 2，get_mut 永远返回 None → worker 从未注入。
         if let Some(rt) = Arc::get_mut(&mut runtime) {
             rt.set_worker(worker.clone());
@@ -526,6 +511,22 @@ impl RuntimeBuilder {
         }
         // failover 拿到 scheduler（worker 的 actor_scheduler 句柄）。
         failover.set_scheduler(worker.scheduler_clone());
+        // P0-5 接线（续）：把恢复出的 ready 任务重新入队。经 SchedulerActor 的
+        // enqueue 快路径进入调度器，Worker 主循环随后按正常流程执行；
+        // 终态任务不在此列（recover_ready_tasks 仅返回 Pending 且依赖已满足者）。
+        if !recovered_ready_tasks.is_empty() {
+            let count = recovered_ready_tasks.len();
+            let scheduler = worker.scheduler_clone();
+            if let Err(e) = scheduler.enqueue_batch(recovered_ready_tasks).await {
+                tracing::error!(
+                    count,
+                    error = %e,
+                    "failed to re-enqueue recovered ready tasks; they will remain pending"
+                );
+            } else {
+                tracing::info!(count, "re-enqueued recovered ready tasks after restart");
+            }
+        }
         // 所有依赖就绪后再启动心跳/故障检测后台循环（消耗 failover Arc）。
         // cancel handle 注册到 Runtime，保证 shutdown 时停止。
         tracing::info!("build: failover start_background_loops enter");
@@ -540,3 +541,7 @@ impl RuntimeBuilder {
 #[cfg(test)]
 #[path = "../../tests/rust/unit/runtime/builder.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../../tests/rust/unit/runtime/workflow/wiring.rs"]
+mod wiring_tests;

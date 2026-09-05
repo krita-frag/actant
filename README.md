@@ -145,15 +145,8 @@ Actant 的超时治理分两层，理解它们的协作方式有助于编写可�
 
 **任务级超时（`@task(timeout_ms=...)`）**
 
-- 由 Rust Worker 的 `tokio::time::timeout` 在 dispatch future 上强制触发。Python 侧不参与超时计时——`_run_with_timeout` 接收 `timeout_ms` 参数但不使用它。
-- 超时后的执行序列：
-  1. Rust 设置 `cancel_flag.store(true, Release)`；
-  2. dispatch future 被 drop（oneshot `rx` 释放）；
-  3. handler 完成时 `tx.send(...)` 返回 `Err`，仅记录 warn 日志；
-  4. **Python 函数仍会在 worker 线程中运行到结束**——结果被丢弃，不返回给调用方。
-- 但 **Python 无法被强制中断**——正在运行的同步代码会继续执行直到结束。worker 线程被该任务占用直到其真正返回，可能影响后续任务调度。
-- `_run_with_timeout` 仅在执行前/后检查取消标志，丢弃超时后的"成功"结果。
-- 因此长任务必须在内部主动轮询取消标志：
+- 任务在 **worker 子进程** 中执行（进程级隔离，每进程单任务）。超时由 Rust `ProcessTaskDispatcher` 通过 `tokio::time::timeout` 强制执行：超时后对对应 worker 进程**立即 `kill()`**（`kill_and_replace`，不等取消宽限期），**真正终止任务并释放计算资源**，槽位即时回收并自动拉起替补进程。这是硬超时，无需业务代码配合。
+- 因此长任务无需主动轮询取消标志也能被强制回收。若希望在超时前优雅收尾（如释放外部资源、写入中间结果），可在任务内配合协作式检查点：
 
 ```python
 from actant import task
@@ -165,26 +158,25 @@ def long_pipeline(items: list) -> list:
     ctx = get_task_context()
     out = []
     for i, x in enumerate(items):
-        # 协作检查点：每次迭代前检查取消标志
+        # 协作检查点：取消时抛出并清理（可选，硬超时仍是兜底）
         if ctx is not None and ctx.is_cancelled():
             raise TaskCancelledError(f"cancelled at item {i}")
         out.append(expensive_step(x))
     return out
 ```
 
-- 对 `time.sleep` / 重试退避，使用 `_interruptible_sleep` 替代，避免在取消后继续阻塞。
+- 匹配取消消息时协作式退出可以避免强杀，但进程终止始终兜底，语义不因业务代码是否配合而丢失。
 
 **Flow 级超时（`@flow(timeout_ms=...)`）**
 
 - 在主线程上用 `threading.Event` 等待子线程，超时后设置 `cancel_event`。
 - 子线程中后续的 `Task.submit` 调用会检查该事件并立即抛出 `ActantTimeoutError`，**阻止 orphan 任务继续创建**。
-- 注意：Python 无法中断正在运行的同步代码，但能阻止新任务提交——这是 flow 超时的核心防线。
-- daemon 子线程在主线程退出后由 OS 回收；`Runtime.stop()` 会尝试 join 已注册的 flow 线程。
+- Flow 级超时是软超时：flow 函数体在子线程中执行，超时后使已提交任务经进程池终态化，但函数体线程可能继续运行——Python 无法强制中断线程。长时间运行的 flow 应拆分为多个 `Task.submit`，由任务级硬超时兜底。
 
 **何时不用 `timeout_ms`**
 
-- 纯 CPU 密集型且无法插入检查点的任务（例如大型矩阵运算）：超时仅能丢弃结果，无法释放计算资源，建议改为外部进程隔离。
-- I/O 任务应优先使用原生异步超时（如 `httpx.Timeout`、`socket.settimeout`），`timeout_ms` 作为兜底。
+- 任务级硬超时已能强制回收计算资源，无需为了"释放 CPU"而回避 `timeout_ms`。
+- I/O 任务的超时建议优先使用原生异步超时（如 `httpx.Timeout`、`socket.settimeout`），`timeout_ms` 作为兜底，避免依赖进程强杀的相对较重回收路径。
 
 ---
 
@@ -200,6 +192,8 @@ uv run actant worker --max-concurrent-tasks 8 --scheduler priority
 
 节点通过 iroh P2P 自动发现对端，**无需连接中心服务器**。
 
+任务在 worker 子进程（进程池，大小默认 CPU 核数）中执行，每个 worker 一次执行一个任务。任务崩溃仅失败该任务、节点存活；超时通过终止 worker 进程硬回收资源；崩溃任务会被自动重路由（受 `crash_failover_max_attempts` 上限约束）。
+
 ---
 
 ## 示例
@@ -207,6 +201,7 @@ uv run actant worker --max-concurrent-tasks 8 --scheduler priority
 ```bash
 uv run python examples/quickstart.py            # ERH 全流程：ask/perform/emit/impossible
 uv run python examples/custom_capability.py     # 自定义 capability、handler 链组合
+uv run python examples/flow_pipeline.py         # 真实 DAG 流水线：分支/汇合/依赖/失败路径
 uv run python -m examples.github_analyzer       # 大型示例：真实 GitHub 仓库分析
 ```
 

@@ -374,9 +374,9 @@ async fn ask_without_codec_returns_error() {
 }
 
 #[test]
-fn builtin_capabilities_returns_all_ten() {
+fn builtin_capabilities_returns_all_seven() {
     let caps = builtin_capabilities();
-    assert_eq!(caps.len(), 10);
+    assert_eq!(caps.len(), 7);
     let names: Vec<&str> = caps.iter().map(|c| c.name).collect();
     assert!(names.contains(&"Serialization"));
     assert!(names.contains(&"Transport"));
@@ -385,9 +385,6 @@ fn builtin_capabilities_returns_all_ten() {
     assert!(names.contains(&"TaskLifecycle"));
     assert!(names.contains(&"WorkflowLifecycle"));
     assert!(names.contains(&"NodeLifecycle"));
-    assert!(names.contains(&"ActorMessaging"));
-    assert!(names.contains(&"ActorSupervision"));
-    assert!(names.contains(&"ActorLifecycle"));
 }
 
 #[test]
@@ -396,7 +393,7 @@ fn register_defaults_registers_all_codecs() {
     register_defaults(&rt);
     // register_defaults 注册 codec 与空 layer（ensure_layer），
     // 使所有内置 capability 都有 layer entry。
-    assert_eq!(rt.capability_count(), 10);
+    assert_eq!(rt.capability_count(), 7);
     // handler_count 查 layer 中 handler 数量，应为 0（空 layer）
     assert_eq!(rt.handler_count::<Store>(), 0);
 }
@@ -453,6 +450,7 @@ async fn execute_handler_dispatches_payload_and_returns_outcome() {
             _task_id: &str,
             payload: Vec<u8>,
             _cancel: crate::runtime::dispatcher::CancelFlag,
+            _timeout: std::time::Duration,
         ) -> crate::common::Result<Vec<u8>> {
             Ok(payload)
         }
@@ -489,6 +487,7 @@ async fn execute_handler_returns_error_on_dispatch_failure() {
             _task_id: &str,
             _payload: Vec<u8>,
             _cancel: crate::runtime::dispatcher::CancelFlag,
+            _timeout: std::time::Duration,
         ) -> crate::common::Result<Vec<u8>> {
             Err(ActantError::Internal("boom".to_string()))
         }
@@ -508,11 +507,11 @@ async fn execute_handler_returns_error_on_dispatch_failure() {
 
 #[test]
 fn register_execute_handler_adds_layer() {
-    use crate::runtime::dispatcher::TaskRegistry;
+    use crate::runtime::dispatcher::{ProcessTaskDispatcher, TaskDispatcher};
     let rt = CapabilityRuntime::new();
-    let dispatcher = TaskRegistry::new(1, 8, Vec::new())
-        .unwrap()
-        .into_dispatcher();
+    let dispatcher: Arc<dyn TaskDispatcher> = Arc::new(
+        ProcessTaskDispatcher::new(0, "python3".to_string(), 1, Vec::new(), Vec::new()).unwrap(),
+    );
     register_execute_handler(&rt, dispatcher, Vec::new()).unwrap();
     assert_eq!(rt.capability_count(), 1);
     assert_eq!(rt.handler_count::<Execute>(), 1);
@@ -726,8 +725,8 @@ async fn ask_with_bound_actor_system_returns_response() {
 
 #[tokio::test]
 async fn ask_with_bound_actor_system_no_handler_returns_none() {
-    // 注册 codec + 空 layer（无 handler），ask 时所有 handler 返回 None
-    // → actor 返回 payload=[0] → route_remote 返回 Ok(None) → ask 返回 Ok(None)
+    // 注册 codec + 空 layer（无 handler），ask 时无 handler 决策
+    // → actor 返回 payload=[0] → ask 返回 Ok(None)
     let rt = Arc::new(CapabilityRuntime::new());
     register_defaults(&rt);
     // 不注册任何 handler，仅 ensure_layer（register_defaults 已做）
@@ -767,8 +766,8 @@ async fn ask_with_bound_actor_system_returns_none_when_handler_returns_none() {
 }
 
 #[tokio::test]
-async fn perform_with_no_local_handler_and_no_peer_returns_error() {
-    // 注册 codec + 空 layer（无 handler），无 peer → perform 应报错
+async fn perform_with_no_local_handler_returns_error() {
+    // 注册 codec + 空 layer（无 handler）→ perform 应报错
     let rt = Arc::new(CapabilityRuntime::new());
     register_defaults(&rt);
     let actor_system = Arc::new(crate::runtime::actor::ActorSystem::new());
@@ -777,69 +776,9 @@ async fn perform_with_no_local_handler_and_no_peer_returns_error() {
     let result = rt
         .perform::<Store>(StoreReq::Get { key: b"k".to_vec() })
         .await;
-    assert!(matches!(result, Err(ActantError::Internal(_))));
-    let err_msg = format!("{}", result.unwrap_err());
-    assert!(err_msg.contains("no local handler and no peer with capability"));
-}
-
-#[tokio::test]
-async fn perform_with_no_local_handler_but_peer_exists_routes_remote() {
-    // 注册 codec + 空 layer（无 handler），但有 peer 声明该 capability
-    // → 调用 route_remote → actor_system.call_remote → 无 network → 报错
-    let rt = Arc::new(CapabilityRuntime::new());
-    register_defaults(&rt);
-    // 添加一个 peer 声明 Store capability
-    rt.update_peer_capabilities(
-        NodeId::from("peer-X".to_string()),
-        vec![GossipCapabilityMeta {
-            name: "Store".to_string(),
-            default_kind: EffectKind::Perform,
-        }],
-    );
-    // ActorSystem 无 network 配置
-    let actor_system = Arc::new(crate::runtime::actor::ActorSystem::new());
-    Arc::clone(&rt).bind_actor_system(actor_system).await;
-
-    let result = rt
-        .perform::<Store>(StoreReq::Get { key: b"k".to_vec() })
-        .await;
-    // route_remote 会调用 call_remote，无 network → Actor error
-    assert!(result.is_err());
-}
-
-#[tokio::test]
-async fn perform_with_no_local_handler_but_peer_with_network_returns_remote_error() {
-    // peer 声明 capability + ActorSystem 配置 MockTransport（send_direct_request 返回错误）
-    let rt = Arc::new(CapabilityRuntime::new());
-    register_defaults(&rt);
-    rt.update_peer_capabilities(
-        NodeId::from("peer-Y".to_string()),
-        vec![GossipCapabilityMeta {
-            name: "Store".to_string(),
-            default_kind: EffectKind::Perform,
-        }],
-    );
-    let transport: Arc<dyn crate::runtime::network::Transport> =
-        Arc::new(crate::test_support::MockTransport::new("local-node"));
-    let actor_system = Arc::new(
-        crate::runtime::actor::ActorSystem::new()
-            .with_node_id(NodeId::from("local-node".to_string()))
-            .with_network(transport),
-    );
-    Arc::clone(&rt).bind_actor_system(actor_system).await;
-
-    let result = rt
-        .perform::<Store>(StoreReq::Get { key: b"k".to_vec() })
-        .await;
-    // MockTransport.send_direct_request 返回 Internal error
     assert!(result.is_err());
     let err_msg = format!("{}", result.unwrap_err());
-    // 错误应来自 route_remote 的 call_remote 失败
-    assert!(
-        err_msg.contains("MockTransport") || err_msg.contains("Actor"),
-        "unexpected error: {}",
-        err_msg
-    );
+    assert!(err_msg.contains("no handler registered"));
 }
 
 #[tokio::test]
@@ -880,42 +819,8 @@ async fn emit_with_local_handler_calls_actor() {
 }
 
 #[tokio::test]
-async fn emit_without_local_handler_but_with_peers_spawns_remote() {
-    // 注册 codec + 空 layer（无 handler），有 peer 声明该 capability
-    // → emit 跳过本地 actor 调用，但 route_emit_to_peers 会 spawn 远程调用
-    let rt = Arc::new(CapabilityRuntime::new());
-    register_defaults(&rt);
-    rt.update_peer_capabilities(
-        NodeId::from("peer-emit".to_string()),
-        vec![GossipCapabilityMeta {
-            name: "TaskLifecycle".to_string(),
-            default_kind: EffectKind::Emit,
-        }],
-    );
-    let transport: Arc<dyn crate::runtime::network::Transport> =
-        Arc::new(crate::test_support::MockTransport::new("local-emit"));
-    let actor_system = Arc::new(
-        crate::runtime::actor::ActorSystem::new()
-            .with_node_id(NodeId::from("local-emit".to_string()))
-            .with_network(transport),
-    );
-    Arc::clone(&rt).bind_actor_system(actor_system).await;
-
-    // emit 应成功（远程调用是 spawn 的，不阻塞）
-    let result = rt
-        .emit::<TaskLifecycle>(TaskEvent::Started {
-            task_id: TaskId::from("t-emit-2".to_string()),
-            workflow_id: WorkflowId::from("wf-emit-2".to_string()),
-        })
-        .await;
-    assert!(result.is_ok());
-    // 等待 spawn 的任务执行
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-}
-
-#[tokio::test]
 async fn emit_without_local_handler_and_no_peers_succeeds() {
-    // 无 handler、无 peer → emit 直接成功（既不调用本地 actor，也不调用远程）
+    // 无 handler → emit 跳过本地 actor 调用，直接成功
     let rt = Arc::new(CapabilityRuntime::new());
     register_defaults(&rt);
     let actor_system = Arc::new(crate::runtime::actor::ActorSystem::new());
@@ -938,15 +843,14 @@ async fn emit_with_local_handler_error_propagates() {
     #[async_trait]
     impl Handler<TaskLifecycle> for FailingEmitHandler {
         async fn handle(&self, _req: TaskEvent) -> Option<()> {
-            // Handler 返回 None → emit 在 HandlerAdapter 中被忽略（不报错）
-            // 但 CapabilityActor::emit 会调用 ErasedHandler::emit
-            // 这里 HandlerAdapter::emit 不调用 handle，而是直接 Ok
+            // `Handler` trait 无错误通道：None 表示 handler 对本事件无意见
+            // （非失败），HandlerAdapter::emit 将其视为成功。
             None
         }
     }
 
-    // HandlerAdapter::emit 总是返回 Ok（即使 Handler::handle 返回 None）
-    // 所以这个测试验证 emit 不因 Handler 返回 None 而失败
+    // HandlerAdapter::emit 对 Some/None 均返回 Ok，
+    // 所以这个测试验证 emit 不因 Handler 返回 None 而失败。
     let rt = Arc::new(CapabilityRuntime::new());
     register_defaults(&rt);
     rt.register(
@@ -966,73 +870,77 @@ async fn emit_with_local_handler_error_propagates() {
     assert!(result.is_ok());
 }
 
-// =========================================================================
-// route_remote / route_emit_to_peers 间接覆盖
-// =========================================================================
-
+// emit handler（自带错误通道的 ErasedHandler 实现）失败时：
+// 调用方收到聚合错误，且失败 handler 之后的 handler 仍被调用。
 #[tokio::test]
-async fn ask_routes_to_remote_when_local_handler_returns_none() {
-    // 本地有 handler 但返回 None（ask 路径）→ 尝试 route_remote
-    // 无 peer → route_remote 返回 Ok(None) → ask 返回 Ok(None)
+async fn emit_handler_failure_returns_error_and_calls_remaining_handlers() {
     use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    struct NoneStoreHandler;
+    struct FailingEmitHandler;
     #[async_trait]
-    impl Handler<Store> for NoneStoreHandler {
-        async fn handle(&self, _req: StoreReq) -> Option<Result<Option<Vec<u8>>, String>> {
-            None
+    impl ErasedHandler for FailingEmitHandler {
+        async fn ask(
+            &self,
+            _req: Arc<dyn Any + Send + Sync>,
+        ) -> Option<Box<dyn Any + Send + Sync>> {
+            unreachable!()
+        }
+        async fn perform(
+            &self,
+            _req: Arc<dyn Any + Send + Sync>,
+        ) -> Result<Box<dyn Any + Send + Sync>, ActantError> {
+            unreachable!()
+        }
+        async fn emit(&self, _req: Arc<dyn Any + Send + Sync>) -> Result<(), ActantError> {
+            Err(ActantError::Internal("emit handler failed".into()))
+        }
+    }
+
+    struct CountingEmitHandler(Arc<AtomicUsize>);
+    #[async_trait]
+    impl ErasedHandler for CountingEmitHandler {
+        async fn ask(
+            &self,
+            _req: Arc<dyn Any + Send + Sync>,
+        ) -> Option<Box<dyn Any + Send + Sync>> {
+            unreachable!()
+        }
+        async fn perform(
+            &self,
+            _req: Arc<dyn Any + Send + Sync>,
+        ) -> Result<Box<dyn Any + Send + Sync>, ActantError> {
+            unreachable!()
+        }
+        async fn emit(&self, _req: Arc<dyn Any + Send + Sync>) -> Result<(), ActantError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         }
     }
 
     let rt = Arc::new(CapabilityRuntime::new());
     register_defaults(&rt);
-    rt.register(Layer::<Store>::new(Store::meta()).chain_erased(erase_handler(NoneStoreHandler)))
+    // 依次追加：失败 handler 在前，正常 handler 在后（bind 前 snapshot）。
+    rt.chain::<TaskLifecycle>(Arc::new(FailingEmitHandler))
+        .unwrap();
+    let counter = Arc::new(AtomicUsize::new(0));
+    rt.chain::<TaskLifecycle>(Arc::new(CountingEmitHandler(counter.clone())))
         .unwrap();
     let actor_system = Arc::new(crate::runtime::actor::ActorSystem::new());
     Arc::clone(&rt).bind_actor_system(actor_system).await;
 
     let result = rt
-        .ask::<Store>(StoreReq::Get {
-            key: b"route-k".to_vec(),
+        .emit::<TaskLifecycle>(TaskEvent::Started {
+            task_id: TaskId::from("t-emit-5".to_string()),
+            workflow_id: WorkflowId::from("wf-emit-5".to_string()),
         })
         .await;
-    assert!(matches!(result, Ok(None)));
-}
-
-#[tokio::test]
-async fn ask_routes_to_remote_with_peer_but_no_network_returns_error() {
-    // 本地 handler 返回 None + 有 peer + ActorSystem 无 network
-    use async_trait::async_trait;
-
-    struct NoneStoreHandler;
-    #[async_trait]
-    impl Handler<Store> for NoneStoreHandler {
-        async fn handle(&self, _req: StoreReq) -> Option<Result<Option<Vec<u8>>, String>> {
-            None
-        }
-    }
-
-    let rt = Arc::new(CapabilityRuntime::new());
-    register_defaults(&rt);
-    rt.register(Layer::<Store>::new(Store::meta()).chain_erased(erase_handler(NoneStoreHandler)))
-        .unwrap();
-    rt.update_peer_capabilities(
-        NodeId::from("peer-ask".to_string()),
-        vec![GossipCapabilityMeta {
-            name: "Store".to_string(),
-            default_kind: EffectKind::Ask,
-        }],
-    );
-    let actor_system = Arc::new(crate::runtime::actor::ActorSystem::new());
-    Arc::clone(&rt).bind_actor_system(actor_system).await;
-
-    let result = rt
-        .ask::<Store>(StoreReq::Get {
-            key: b"route-k".to_vec(),
-        })
-        .await;
-    // route_remote → call_remote → 无 network → Actor error
-    assert!(result.is_err());
+    // 调用方收到聚合错误
+    let err = result.unwrap_err();
+    assert!(err.to_string().contains("emit handler failed"));
+    assert!(err.to_string().contains("1/2 handlers failed"));
+    // 后续 handler 仍被调用
+    assert_eq!(counter.load(Ordering::SeqCst), 1);
 }
 
 // =========================================================================
@@ -1274,6 +1182,67 @@ fn layer_chain_multiple_handlers() {
 // ExecuteHandler 签名验证
 // =========================================================================
 
+/// H7.1：`timeout_ms = 0` 必须映射为"无超时"（远期硬超时），而非立即超时。
+///
+/// dispatcher 收到的 timeout 应为远期时长；同时用短任务冒烟验证 dispatch
+/// 不会被 0 值立即强杀。
+#[tokio::test]
+async fn execute_handler_timeout_zero_maps_to_no_timeout() {
+    use crate::runtime::dispatcher::TaskDispatcher;
+    use async_trait::async_trait;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    struct SlowOkDispatcher {
+        received_timeout: Arc<parking_lot::Mutex<Option<Duration>>>,
+    }
+    #[async_trait]
+    impl TaskDispatcher for SlowOkDispatcher {
+        async fn dispatch(
+            &self,
+            _task_id: &str,
+            payload: Vec<u8>,
+            _cancel: crate::runtime::dispatcher::CancelFlag,
+            timeout: Duration,
+        ) -> crate::common::Result<Vec<u8>> {
+            *self.received_timeout.lock() = Some(timeout);
+            // 快速 handler 冒烟：若 0 被误传为立即超时，此 sleep 期间任务
+            // 会被判超时失败（历史陷阱行为）。
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok(payload)
+        }
+    }
+
+    let received_timeout = Arc::new(parking_lot::Mutex::new(None));
+    let dispatcher: Arc<dyn TaskDispatcher> = Arc::new(SlowOkDispatcher {
+        received_timeout: received_timeout.clone(),
+    });
+    let handler = ExecuteHandler::new(dispatcher, Vec::new());
+    let ctx = ExecuteCtx {
+        task_id: TaskId::from("t-zero-timeout".to_string()),
+        workflow_id: WorkflowId::from("wf-zero-timeout".to_string()),
+        payload: b"smoke".to_vec(),
+        timeout_ms: 0,
+    };
+    let result = handler.handle(ctx).await;
+    let outcome = result.expect("handler must respond");
+    assert!(
+        outcome.is_ok(),
+        "timeout_ms=0 dispatch must not be killed immediately, got {:?}",
+        outcome
+    );
+
+    // 传给 dispatcher 的 timeout 必须是远期时长（≥ 1 年），而非 0。
+    let timeout = received_timeout
+        .lock()
+        .expect("dispatcher must receive a timeout");
+    assert!(
+        timeout >= Duration::from_secs(365 * 24 * 3600),
+        "timeout_ms=0 must map to a far-future timeout, got {:?}",
+        timeout
+    );
+}
+
 #[tokio::test]
 async fn execute_handler_signs_payload_before_dispatch() {
     use crate::runtime::dispatcher::TaskDispatcher;
@@ -1290,6 +1259,7 @@ async fn execute_handler_signs_payload_before_dispatch() {
             _task_id: &str,
             payload: Vec<u8>,
             _cancel: crate::runtime::dispatcher::CancelFlag,
+            _timeout: std::time::Duration,
         ) -> crate::common::Result<Vec<u8>> {
             *self.received_payload.lock() = payload.clone();
             Ok(payload)

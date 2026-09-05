@@ -39,7 +39,7 @@ mod cancel;
 mod network_router;
 mod result_delivery;
 
-use network_router::{NetworkEventRouter, NetworkEventRouterConfig};
+pub(crate) use network_router::{NetworkEventRouter, NetworkEventRouterConfig};
 use result_delivery::{start_pending_result_loop, try_enqueue_pending_result, PendingResult};
 
 #[cfg(test)]
@@ -134,6 +134,14 @@ async fn prefetch_tasks(
     }
 }
 
+/// 远端转发失败 / submit-only 回退重入队的每任务弹跳上限。
+///
+/// 与 [`WorkerConfig::crash_failover_max_attempts`]（进程崩溃故障转移）相互独立：
+/// 本上限针对"转发被对端拒绝"或"本地无并发且无远端可用"导致的重入队弹跳。
+/// 超限后任务转为 `TaskCompletion::Failed` 并走既有完成事件投递路径，
+/// 避免任务在调度器与主循环之间无限弹跳占用资源。
+const MAX_REROUTE_BOUNCES: u32 = 5;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WorkerState {
@@ -173,9 +181,6 @@ pub struct Worker {
     workflow_actor_id: Option<crate::common::ActorId>,
     /// 本地 DagGossipActor 的 id。用于处理工作流状态请求/响应主题。
     dag_gossip_actor_id: Option<crate::common::ActorId>,
-    /// Actor 注册表 gossip 处理器（A2）。用于接收 `TOPIC_ACTOR_REGISTRY` 上的远端注册表广播，
-    /// 通过 `NetworkEventRouter` 路由到 `handle_gossip`。
-    actor_registry_gossip: Option<Arc<crate::runtime::actor::router::ActorRegistryGossipActor>>,
     /// Capability gossip 处理器。用于接收 `TOPIC_CAPABILITY_GOSSIP` 上的远端 capability 广播，
     /// 通过 `NetworkEventRouter` 路由到 `handle_gossip`。
     capability_gossip: Option<Arc<crate::runtime::capability::gossip::CapabilityGossipActor>>,
@@ -184,6 +189,8 @@ pub struct Worker {
     /// 最大并发任务数。用 AtomicUsize 支持运行时扩容（`set_max_concurrent_tasks`）。
     max_concurrent_tasks: Arc<std::sync::atomic::AtomicUsize>,
     task_timeout: Duration,
+    /// 进程池 worker 崩溃后任务重路由的最大执行次数（含首次）。见 [`WorkerConfig::crash_failover_max_attempts`]。
+    crash_failover_max_attempts: u32,
     cancel: Arc<tokio::sync::watch::Sender<bool>>,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
     drain_timeout: Duration,
@@ -193,6 +200,17 @@ pub struct Worker {
     broadcast_retry_base_delay: Duration,
     remote_fallback_delay: Duration,
     pending_result_channel_capacity: usize,
+    /// 批量 prefetch 的最小/最大批量。由 [`WorkerConfig::prefetch_min`] /
+    /// [`WorkerConfig::prefetch_max`] 配置，构造时归一化保证 `min <= max`。
+    prefetch_min: usize,
+    prefetch_max: usize,
+    /// 远端转发失败 / submit-only 回退重入队的每任务计数。
+    ///
+    /// 两条重入队路径若目标节点持续不可用，任务会在调度器与主循环之间无限
+    /// 弹跳。此表记录每个任务的弹跳次数，超过 [`MAX_REROUTE_BOUNCES`] 后
+    /// 任务转为 Failed 并发布 TaskFailed 完成事件（复用既有失败投递路径）。
+    /// 任务成功转发、开始本地执行或因超限转 Failed 时移除对应条目。
+    reroute_counts: Arc<parking_lot::Mutex<HashMap<String, u32>>>,
     /// Callback invoked when running task count changes: (available, max).
     capacity_callback: Option<Arc<dyn Fn(u32, u32) + Send + Sync>>,
     /// Handle to the tokio runtime — used by publish_lifecycle to spawn
@@ -246,11 +264,11 @@ impl Worker {
             actor_system: None,
             workflow_actor_id: None,
             dag_gossip_actor_id: None,
-            actor_registry_gossip: None,
             capability_gossip: None,
             failover: None,
             max_concurrent_tasks: Arc::new(std::sync::atomic::AtomicUsize::new(max_concurrent)),
             task_timeout: Duration::from_millis(config.default_task_timeout_ms),
+            crash_failover_max_attempts: config.crash_failover_max_attempts,
             cancel: Arc::new(cancel_tx),
             cancel_rx,
             drain_timeout: Duration::from_secs(config.drain_timeout_secs),
@@ -260,6 +278,9 @@ impl Worker {
             broadcast_retry_base_delay: Duration::from_millis(config.broadcast_retry_base_delay_ms),
             remote_fallback_delay: Duration::from_millis(config.remote_fallback_delay_ms),
             pending_result_channel_capacity: config.pending_result_channel_capacity,
+            prefetch_min: config.prefetch_min.max(1),
+            prefetch_max: config.prefetch_max.max(config.prefetch_min.max(1)),
+            reroute_counts: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             capacity_callback: None,
             tokio_handle,
             cancel_flags: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
@@ -322,6 +343,12 @@ impl Worker {
         self
     }
 
+    /// 覆盖崩溃故障转移的最大执行次数（测试用）。
+    pub fn with_crash_failover_max_attempts(mut self, max: u32) -> Self {
+        self.crash_failover_max_attempts = max;
+        self
+    }
+
     pub fn with_drain_timeout(mut self, timeout: Duration) -> Self {
         self.drain_timeout = timeout;
         self
@@ -339,18 +366,6 @@ impl Worker {
 
     pub(crate) fn with_dag_gossip_actor_id(mut self, id: crate::common::ActorId) -> Self {
         self.dag_gossip_actor_id = Some(id);
-        self
-    }
-
-    /// 注入 Actor 注册表 gossip 处理器（A2）。
-    ///
-    /// `NetworkEventRouter` 在收到 `TOPIC_ACTOR_REGISTRY` gossip 消息时，
-    /// 通过此 handler 的 `handle_gossip` 方法更新本地注册表。
-    pub(crate) fn with_actor_registry_gossip(
-        mut self,
-        gossip: Arc<crate::runtime::actor::router::ActorRegistryGossipActor>,
-    ) -> Self {
-        self.actor_registry_gossip = Some(gossip);
         self
     }
 
@@ -418,6 +433,20 @@ impl Worker {
         } else {
             false
         }
+    }
+
+    /// 记录一次重入队弹跳；超过 [`MAX_REROUTE_BOUNCES`] 时清除计数并返回 `true`。
+    ///
+    /// 返回 `true` 表示调用方应将任务转为 Failed（不再重入队）。
+    fn record_reroute_bounce(&self, task_id: &str) -> bool {
+        let mut counts = self.reroute_counts.lock();
+        let entry = counts.entry(task_id.to_string()).or_insert(0);
+        *entry += 1;
+        if *entry > MAX_REROUTE_BOUNCES {
+            counts.remove(task_id);
+            return true;
+        }
+        false
     }
 
     /// 返回当前 Worker 状态。
@@ -520,15 +549,9 @@ impl Worker {
         tokio_handle.spawn(async move {
             let topics = [
                 Topic::task(&node_id),
-                Topic::actor(&node_id),
-                Topic::actor_reply(&node_id),
                 Topic::workflow_state_req(&node_id),
                 Topic::workflow_state_resp(&node_id),
                 Topic::from(crate::common::wire::constants::TOPIC_CANCEL),
-                // A2：actor 注册表 gossip topic。builder 启动 gossip actor 前已订阅一次，
-                // 这里在 worker 的 subscribe_topics 中重复订阅是幂等的
-                // （iroh 对同一 topic 的多次 subscribe 不报错）。
-                Topic::from(crate::common::wire::constants::TOPIC_ACTOR_REGISTRY),
             ];
             for topic in &topics {
                 tracing::info!("subscribing to topic: {}", topic);
@@ -556,8 +579,8 @@ impl Worker {
             actor_system: self.actor_system.clone(),
             workflow_actor_id: self.workflow_actor_id.clone(),
             dag_gossip_actor_id: self.dag_gossip_actor_id.clone(),
-            actor_registry_gossip: self.actor_registry_gossip.clone(),
             capability_gossip: self.capability_gossip.clone(),
+            failover: self.failover.clone(),
             cancel_flags: self.cancel_flags.clone(),
             cancelled_tasks: self.cancelled_tasks.clone(),
         });
@@ -597,6 +620,7 @@ impl Worker {
             self.broadcast_retry_attempts,
             self.broadcast_retry_base_delay,
             self.pending_result_channel_capacity,
+            self.event_bus.clone(),
         )
     }
 
@@ -617,14 +641,15 @@ impl Worker {
         let cancel_flags = self.cancel_flags.clone();
         let cancelled_tasks = self.cancelled_tasks.clone();
 
-        // Prefetch 批量大小：取 max_concurrent_tasks 与 16 的较大值。
-        // 一次拉取多个任务到本地 inflight，避免每任务一次 dequeue 调用。
-        // 上限 64 防止过度 prefetch 占用调度器内存。
+        // Prefetch 批量大小：取 max_concurrent_tasks 与 [prefetch_min, prefetch_max]
+        // 区间的钳制值（默认 [16, 64]）。一次拉取多个任务到本地 inflight，
+        // 避免每任务一次 dequeue 调用；上限防止过度 prefetch 占用调度器内存。
+        // prefetch_max 在构造时已归一化为 >= prefetch_min，clamp 不会 panic。
         let prefetch_limit = {
             let mc = self
                 .max_concurrent_tasks
                 .load(std::sync::atomic::Ordering::Acquire);
-            mc.clamp(16, 64)
+            mc.clamp(self.prefetch_min, self.prefetch_max)
         };
 
         // 本地 inflight 队列：prefetch 拉取的任务暂存于此，主循环从中取任务 dispatch。
@@ -637,9 +662,32 @@ impl Worker {
             if *self.state.subscribe().borrow() == WorkerState::Draining {
                 // 关闭 scheduler，使新 task 无法入队。
                 self.scheduler.close();
-                // 排空剩余排队的 task — 由于 scheduler 已关闭，
-                // 它们会被拒绝，因此直接丢弃。
-                while self.scheduler.try_dequeue().await.is_some() {}
+                // 排空剩余排队 task — 由于 scheduler 已关闭，新入队会被拒绝，
+                // 已排队任务直接丢弃。每个被丢弃任务必须发布 Cancelled 完成事件：
+                // 排队任务不会被执行，若不通知 origin，远端提交方会永久等待结果。
+                while let Some(dropped) = self.scheduler.try_dequeue().await {
+                    publish_drained_task_cancellation(
+                        dropped,
+                        &node_id,
+                        network.as_ref(),
+                        &event_bus,
+                        pending_tx,
+                        self.pending_result_channel_capacity,
+                    )
+                    .await;
+                }
+                // inflight 中已 prefetch 但未 dispatch 的任务同样被丢弃，逐个通知。
+                for dropped in inflight.drain(..) {
+                    publish_drained_task_cancellation(
+                        dropped,
+                        &node_id,
+                        network.as_ref(),
+                        &event_bus,
+                        pending_tx,
+                        self.pending_result_channel_capacity,
+                    )
+                    .await;
+                }
                 // 通知子任务（network event loop、retry loop）退出。
                 // 否则 rt.shutdown_timeout 会等待完整的 5s。
                 // cancel.send 失败仅当所有 receiver 已 drop（子任务已退出）。
@@ -673,7 +721,14 @@ impl Worker {
                             drain_timeout,
                             async {
                                 let sem = semaphore.clone();
-                                let permit = sem.acquire_many(self.max_concurrent_tasks.load(std::sync::atomic::Ordering::Acquire) as u32).await;
+                                // max_concurrent_tasks 理论上为 usize，semaphore::acquire_many
+                                // 接收 u32。实际值受 CPU 核数限制不会溢出，但显式截断
+                                // 比 `as u32` 静默截断更安全——溢出时取 u32::MAX 仍能
+                                // 正确 drain（等待所有 permit）。
+                                let max = u32::try_from(
+                                    self.max_concurrent_tasks.load(std::sync::atomic::Ordering::Acquire)
+                                ).unwrap_or(u32::MAX);
+                                let permit = sem.acquire_many(max).await;
                                 drop(permit);
                             },
                         ).await;
@@ -684,6 +739,31 @@ impl Worker {
                             tracing::info!("all running tasks completed, shutting down");
                         }
 
+                        // 与 Draining 主循环分支一致：关闭 scheduler 并排空残留
+                        // 排队/inflight 任务，逐个发布 Cancelled 完成事件通知 origin。
+                        self.scheduler.close();
+                        while let Some(dropped) = self.scheduler.try_dequeue().await {
+                            publish_drained_task_cancellation(
+                                dropped,
+                                &node_id,
+                                network.as_ref(),
+                                &event_bus,
+                                pending_tx,
+                                self.pending_result_channel_capacity,
+                            )
+                            .await;
+                        }
+                        for dropped in inflight.drain(..) {
+                            publish_drained_task_cancellation(
+                                dropped,
+                                &node_id,
+                                network.as_ref(),
+                                &event_bus,
+                                pending_tx,
+                                self.pending_result_channel_capacity,
+                            )
+                            .await;
+                        }
                         self.publish_lifecycle(BusEvent::WorkerDrained {
                             node_id: self.node_id.clone(),
                         });
@@ -741,7 +821,7 @@ impl Worker {
                     task_name: task.name.clone(),
                     target_node: task.target_node.clone(),
                 };
-                event_bus.publish(BusEvent::TaskCancelled(completion)).await;
+                event_bus.publish(BusEvent::TaskCancelled(completion));
                 cancelled_tasks.lock().remove(task.id.as_str());
                 crate::metrics::dec_cancelled_tasks_pending();
                 continue;
@@ -752,6 +832,8 @@ impl Worker {
                     match self.forward_remote_task(&task, target).await {
                         Ok(()) => {
                             crate::metrics::inc_task_forward_succeeded();
+                            // 转发成功：清零弹跳计数，后续失败重新从 1 计。
+                            self.reroute_counts.lock().remove(task.id.as_str());
                             continue;
                         }
                         Err(e) => {
@@ -763,6 +845,39 @@ impl Worker {
                                 target.as_str(),
                                 e
                             );
+                            // 弹跳上限：目标节点持续不可用（转发被拒/网络失败）时
+                            // 任务会无限重入队。超过 MAX_REROUTE_BOUNCES 次后转
+                            // Failed 并走既有完成投递路径，通知 origin 终止等待。
+                            if self.record_reroute_bounce(task.id.as_str()) {
+                                crate::metrics::inc_tasks_failed();
+                                let completion = TaskCompletion::Failed {
+                                    workflow_id: task
+                                        .workflow_id
+                                        .clone()
+                                        .unwrap_or_else(|| WorkflowId::from(String::new())),
+                                    task_id: task.id.clone(),
+                                    task_name: task.name.clone(),
+                                    error: format_error_kind(
+                                        "network",
+                                        &format!(
+                                            "task forwarding failed after {} reroute attempts, last error: {}",
+                                            MAX_REROUTE_BOUNCES, e
+                                        ),
+                                    ),
+                                    target_node: task.target_node.clone(),
+                                };
+                                publish_task_completion(
+                                    completion,
+                                    &task,
+                                    &node_id,
+                                    network.as_ref(),
+                                    &event_bus,
+                                    pending_tx,
+                                    self.pending_result_channel_capacity,
+                                )
+                                .await;
+                                continue;
+                            }
                             // 退避由独立 spawn 触发：延迟 remote_fallback_delay 后
                             // 再 enqueue，主循环不阻塞，可继续处理其他任务。
                             // target_node 已清空，重新入队后由路由器选择新目标。
@@ -796,6 +911,38 @@ impl Worker {
                     "submit-only node cannot execute task {} locally, re-enqueueing for re-routing",
                     task.id.as_str()
                 );
+                // 弹跳上限：submit-only 节点在无远端可用时任务会无限重入队，
+                // 处理方式与转发失败路径一致，超过上限转 Failed。
+                if self.record_reroute_bounce(task.id.as_str()) {
+                    crate::metrics::inc_tasks_failed();
+                    let completion = TaskCompletion::Failed {
+                        workflow_id: task
+                            .workflow_id
+                            .clone()
+                            .unwrap_or_else(|| WorkflowId::from(String::new())),
+                        task_id: task.id.clone(),
+                        task_name: task.name.clone(),
+                        error: format_error_kind(
+                            "network",
+                            &format!(
+                                "no local capacity and no remote peer available after {} reroute attempts",
+                                MAX_REROUTE_BOUNCES
+                            ),
+                        ),
+                        target_node: task.target_node.clone(),
+                    };
+                    publish_task_completion(
+                        completion,
+                        &task,
+                        &node_id,
+                        network.as_ref(),
+                        &event_bus,
+                        pending_tx,
+                        self.pending_result_channel_capacity,
+                    )
+                    .await;
+                    continue;
+                }
                 // 同上：退避由独立 spawn 触发，延迟 enqueue 避免主循环阻塞。
                 let scheduler = self.scheduler.clone();
                 let delay = self.remote_fallback_delay;
@@ -807,6 +954,9 @@ impl Worker {
                 });
                 continue;
             }
+
+            // 任务被接受本地执行：清零弹跳计数。
+            self.reroute_counts.lock().remove(task.id.as_str());
 
             let event_bus = event_bus.clone();
             let network = network.clone();
@@ -834,18 +984,21 @@ impl Worker {
             let semaphore_for_cb = semaphore.clone();
             crate::metrics::inc_running_tasks();
 
+            // 崩溃故障转移用捕获：scheduler（重入队）、崩溃重路由上限与延迟。
+            let scheduler_for_failover = self.scheduler.clone();
+            let crash_failover_max = self.crash_failover_max_attempts;
+            let failover_delay = self.remote_fallback_delay;
+
             // Publish TaskStarted to EventBus (所有任务，使 Python @task 也能收到 running 状态)
             {
                 let wf_id = task
                     .workflow_id
                     .clone()
                     .unwrap_or_else(|| WorkflowId::from("".to_string()));
-                event_bus
-                    .publish(BusEvent::TaskStarted {
-                        workflow_id: wf_id,
-                        task_id: task.id.clone(),
-                    })
-                    .await;
+                event_bus.publish(BusEvent::TaskStarted {
+                    workflow_id: wf_id,
+                    task_id: task.id.clone(),
+                });
             }
 
             if task.enqueued_at_ms > 0 {
@@ -855,6 +1008,16 @@ impl Worker {
             }
 
             let cancelled_tasks_for_spawn = cancelled_tasks.clone();
+
+            // 预注册 cancel_flag，消除 cancel_task 与 spawn 闭包内注册之间的竞态窗口。
+            // cancel_flag 预注册到主循环：消除「主循环检查通过 → 闭包内注册」之间存在的
+            // 窗口：cancel_task 查 cancel_flags 返回 false，取消请求丢失，任务继续执行
+            // 直到自身超时或正常完成。预注册后 cancel_task 立即生效；若 permit 等待
+            // 期间任务被取消，spawn 闭包开始后会检测到并直接走取消完成流程。
+            let cancel_flag = new_cancel_flag();
+            cancel_flags
+                .lock()
+                .insert(task.id.to_string(), cancel_flag.clone());
 
             tokio::spawn(async move {
                 let _permit = permit;
@@ -869,12 +1032,7 @@ impl Worker {
                     .map(std::time::Duration::from_millis)
                     .unwrap_or(task_timeout);
 
-                let cancel_flag = new_cancel_flag();
-                // 注册到 cancel_flags 表，使 Python cancel_task(task_id) 能找到此 flag。
-                {
-                    let mut flags = cancel_flags.lock();
-                    flags.insert(task.id.to_string(), cancel_flag.clone());
-                }
+                // cancel_flag 已在 spawn 前预注册到 cancel_flags，此处直接使用。
                 // 任务完成后从注册表移除（无论成功/失败/取消）。
                 let task_id_for_cleanup = task.id.clone();
                 let cancel_flags_for_cleanup = cancel_flags.clone();
@@ -887,8 +1045,46 @@ impl Worker {
                         .remove(task_id_for_cleanup.as_str());
                 };
 
+                // 检查是否在 permit 等待期间被取消（预注册使 cancel_task 能立即生效）。
+                if cancel_flag.load(std::sync::atomic::Ordering::Acquire) {
+                    tracing::info!(task_id = ?task.id, "task cancelled before dispatch");
+                    let completion = TaskCompletion::Cancelled {
+                        workflow_id: task
+                            .workflow_id
+                            .clone()
+                            .unwrap_or_else(|| WorkflowId::from(String::new())),
+                        task_id: task.id.clone(),
+                        task_name: task.name.clone(),
+                        target_node: task.target_node.clone(),
+                    };
+                    publish_task_completion(
+                        completion,
+                        &task,
+                        &node_id_for_spawn,
+                        network.as_ref(),
+                        &event_bus,
+                        &pending_results,
+                        pending_capacity,
+                    )
+                    .await;
+                    drop(_permit);
+                    cleanup();
+                    if let Some(ref cb) = capacity_cb {
+                        let available = semaphore_for_cb.available_permits();
+                        cb(
+                            u32::try_from(available).unwrap_or(u32::MAX),
+                            u32::try_from(max_concurrent).unwrap_or(u32::MAX),
+                        );
+                    }
+                    return;
+                }
+
                 tracing::debug!(task_id = ?task.id, "dispatching task");
 
+                // 硬超时由 ProcessTaskDispatcher 内部执行：dispatch 以
+                // `effective_timeout` 为硬上限，超时后立即强杀对应 worker 进程
+                // 并回收并发槽位（kill_and_replace，不等待取消宽限），返回
+                // `Err(ActantError::Timeout)`。Worker 侧不再套内层 tokio 超时。
                 // 用 catch_unwind 包裹 dispatcher future，避免 spawn 句柄被丢弃后
                 // panic 让 workflow 永久挂起。panic 时降级为 TaskCompletion::Failed。
                 use futures::future::FutureExt as _;
@@ -896,14 +1092,52 @@ impl Worker {
                     &task_name,
                     task_payload,
                     cancel_flag.clone(),
+                    effective_timeout,
                 ))
                 .catch_unwind();
 
-                let dispatch_result = tokio::time::timeout(effective_timeout, dispatched).await;
+                let dispatch_result = dispatched.await;
 
-                if dispatch_result.is_err() {
-                    tracing::warn!(task_id = ?task.id, "task timed out, signalling cancel");
-                    cancel_flag.store(true, std::sync::atomic::Ordering::Release);
+                // 崩溃故障转移：worker 进程崩溃（非逻辑失败、非硬超时）属于基础设施级失败，
+                // 将任务清空 target_node 重新入队，由路由器重选本地或远端节点执行。
+                // 受 `crash_failover_max_attempts` 上限约束，防止持久性崩溃无限重路由：
+                // 仅在 `attempt + 1 < max` 时重路由（首次执行 attempt=0）；达到上限后
+                // 才降级为 TaskCompletion::Failed，让 workflow 按正常失败路径推进。
+                if is_worker_crash(&dispatch_result) && task.attempt + 1 < crash_failover_max {
+                    crate::metrics::inc_task_forward_reroute();
+                    tracing::warn!(
+                        task_id = ?task.id,
+                        next_attempt = task.attempt + 1,
+                        max_attempts = crash_failover_max,
+                        "worker crashed while executing task; re-enqueueing for crash failover"
+                    );
+                    drop(_permit);
+                    cleanup();
+                    if let Some(ref cb) = capacity_cb {
+                        let available = semaphore_for_cb.available_permits();
+                        cb(
+                            u32::try_from(available).unwrap_or(u32::MAX),
+                            u32::try_from(max_concurrent).unwrap_or(u32::MAX),
+                        );
+                    }
+                    // 退避由独立 spawn 触发，主循环不阻塞。target_node 已清空，
+                    // 重新入队后由路由器选择新的执行节点（本地或远端）。
+                    let scheduler = scheduler_for_failover.clone();
+                    let delay = failover_delay;
+                    let mut rerouted = task;
+                    rerouted.attempt += 1;
+                    rerouted.target_node = None;
+                    let rerouted_id = rerouted.id.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        if let Err(e) = scheduler.enqueue(rerouted).await {
+                            tracing::warn!(
+                                task_id = %rerouted_id.as_str(),
+                                "failed to re-enqueue crashed task for failover: {e}"
+                            );
+                        }
+                    });
+                    return;
                 }
 
                 // 三种结果：Ok(Ok(Ok(output))) | Ok(Ok(Err(e))) | Ok(Err(panic)) | Err(timeout)
@@ -932,7 +1166,10 @@ impl Worker {
 
                 if let Some(ref cb) = capacity_cb {
                     let available = semaphore_for_cb.available_permits();
-                    cb(available as u32, max_concurrent as u32);
+                    cb(
+                        u32::try_from(available).unwrap_or(u32::MAX),
+                        u32::try_from(max_concurrent).unwrap_or(u32::MAX),
+                    );
                 }
             });
         }
@@ -975,15 +1212,11 @@ impl Worker {
         tracing::info!("node {} entering drain mode", self.node_id.as_str());
     }
 
-    /// Publish a worker lifecycle event asynchronously.
+    /// Publish a worker lifecycle event.
     ///
-    /// Uses the stored tokio handle so this works even when called
-    /// from a non-tokio thread (e.g. Python GIL thread).
+    /// `publish` 是同步非阻塞的，可在任意线程（含 Python GIL 线程）直接调用。
     fn publish_lifecycle(&self, event: BusEvent) {
-        let event_bus = self.event_bus.clone();
-        self.tokio_handle.spawn(async move {
-            event_bus.publish(event).await;
-        });
+        self.event_bus.publish(event);
     }
 
     pub fn running_task_count(&self) -> usize {
@@ -1001,16 +1234,20 @@ impl Worker {
         if let Some(ref cb) = self.capacity_callback {
             let available = self.running_tasks.available_permits();
             cb(
-                available as u32,
-                self.max_concurrent_tasks
-                    .load(std::sync::atomic::Ordering::Acquire) as u32,
+                u32::try_from(available).unwrap_or(u32::MAX),
+                u32::try_from(
+                    self.max_concurrent_tasks
+                        .load(std::sync::atomic::Ordering::Acquire),
+                )
+                .unwrap_or(u32::MAX),
             );
         }
     }
 
     fn select_remote_target(&self) -> Option<(NodeId, String)> {
         let failover = self.failover.as_ref()?;
-        let local_available = self.running_tasks.available_permits() as u32;
+        let local_available =
+            u32::try_from(self.running_tasks.available_permits()).unwrap_or(u32::MAX);
         // 心跳 TTL 过滤：排除心跳超时的 peer，避免将任务路由到
         // 已失联的节点。使用 failover 的 failure_timeout_ms 作为 TTL 阈值。
         let now_ms = crate::common::epoch_millis();
@@ -1077,11 +1314,22 @@ impl Worker {
 }
 
 /// dispatcher.dispatch 的结果类型别名，避免在 spawn 与测试中长期写嵌套 Result。
+///
+/// 无 `Elapsed` 外层：硬超时由 `ProcessTaskDispatcher` 内部强杀 worker 后
+/// 返回 `Err(ActantError::Timeout)`，不再依赖外层 tokio 超时。
 type PanicPayload = Box<dyn std::any::Any + Send>;
-type DispatchResult = std::result::Result<
-    std::result::Result<std::result::Result<Vec<u8>, ActantError>, PanicPayload>,
-    tokio::time::error::Elapsed,
->;
+type DispatchResult = std::result::Result<std::result::Result<Vec<u8>, ActantError>, PanicPayload>;
+
+/// 判定一次派发是否为**进程崩溃**（worker 子进程异常退出），而非业务失败或硬超时。
+///
+/// `Ok(Err(ActantError::Worker(_)))`：dispatcher 在读取结果帧时读到 EOF / 写入失败 /
+/// worker 被强杀，即 worker 进程本身死亡。这是基础设施级失败，区别于
+/// `Ok(Err(ActantError::Timeout))`（硬超时）与 Python 内抛出的业务异常（同样以
+/// `Ok(Err(_))` 返回但非 `Worker` 变体）。崩溃是该类唯一需要触发"故障转移重路由"的信号，
+/// 超时与业务失败应保持原有失败语义。
+fn is_worker_crash(result: &DispatchResult) -> bool {
+    matches!(result, Ok(Err(ActantError::Worker(_))))
+}
 
 /// 将任务派发结果转换为 ``TaskCompletion``。
 ///
@@ -1098,7 +1346,7 @@ fn build_completion_from_dispatch_result(
         .clone()
         .unwrap_or_else(|| WorkflowId::from("".to_string()));
     match dispatch_result {
-        Ok(Ok(Ok(result))) => {
+        Ok(Ok(result)) => {
             crate::metrics::inc_tasks_completed();
             crate::metrics::dec_running_tasks();
             crate::metrics::observe_task_duration_ms(
@@ -1112,23 +1360,46 @@ fn build_completion_from_dispatch_result(
                 target_node: task.target_node.clone(),
             }
         }
-        Ok(Ok(Err(e))) => {
-            crate::metrics::inc_tasks_failed();
-            crate::metrics::dec_running_tasks();
-            crate::metrics::observe_task_duration_ms(
-                crate::common::epoch_millis().saturating_sub(dispatch_start_ms),
-            );
-            TaskCompletion::Failed {
-                workflow_id,
-                task_id: task.id.clone(),
-                task_name: task.name.clone(),
-                error: format_error_kind("task", &e.to_string()),
-                target_node: task.target_node.clone(),
+        Ok(Err(e)) => {
+            // 硬超时由 dispatcher 内部强杀 worker 并回收槽位后返回
+            // `ActantError::Timeout`，计入超时指标；其余错误按任务失败处理。
+            if let ActantError::Timeout(_) = e {
+                crate::metrics::inc_tasks_timeout();
+                crate::metrics::dec_running_tasks();
+                crate::metrics::observe_task_duration_ms(
+                    crate::common::epoch_millis().saturating_sub(dispatch_start_ms),
+                );
+                TaskCompletion::Failed {
+                    workflow_id,
+                    task_id: task.id.clone(),
+                    task_name: task.name.clone(),
+                    error: format_error_kind(
+                        "timeout",
+                        &format!("task timed out after {}ms", effective_timeout.as_millis()),
+                    ),
+                    target_node: task.target_node.clone(),
+                }
+            } else {
+                crate::metrics::inc_tasks_failed();
+                crate::metrics::dec_running_tasks();
+                crate::metrics::observe_task_duration_ms(
+                    crate::common::epoch_millis().saturating_sub(dispatch_start_ms),
+                );
+                TaskCompletion::Failed {
+                    workflow_id,
+                    task_id: task.id.clone(),
+                    task_name: task.name.clone(),
+                    error: format_error_kind("task", &e.to_string()),
+                    target_node: task.target_node.clone(),
+                }
             }
         }
-        Ok(Err(panic_payload)) => {
-            // dispatcher panic：提取 panic 消息，降级为 Failed，
-            // 让 workflow 能继续推进而非永久挂起。
+        Err(panic_payload) => {
+            // dispatcher panic：提取 panic 消息仅用于本地日志（含可能的敏感
+            // 路径 / 变量值），**不**透传到 wire —— TaskCompletion::Failed.error
+            // 会被序列化为 WireTaskOutcome::Failed(String) 发往 orchestrator 节点，
+            // panic 原文不应跨节点泄露。降级为 Failed 让 workflow 能继续推进而非
+            // 永久挂起。
             crate::metrics::inc_tasks_failed();
             crate::metrics::dec_running_tasks();
             crate::metrics::observe_task_duration_ms(
@@ -1154,28 +1425,49 @@ fn build_completion_from_dispatch_result(
                 workflow_id,
                 task_id: task.id.clone(),
                 task_name: task.name.clone(),
-                error: format_error_kind("internal", &format!("dispatcher panicked: {panic_msg}")),
-                target_node: task.target_node.clone(),
-            }
-        }
-        Err(_) => {
-            crate::metrics::inc_tasks_timeout();
-            crate::metrics::dec_running_tasks();
-            crate::metrics::observe_task_duration_ms(
-                crate::common::epoch_millis().saturating_sub(dispatch_start_ms),
-            );
-            TaskCompletion::Failed {
-                workflow_id,
-                task_id: task.id.clone(),
-                task_name: task.name.clone(),
-                error: format_error_kind(
-                    "timeout",
-                    &format!("task timed out after {}ms", effective_timeout.as_millis()),
-                ),
+                error: format_error_kind("internal", "dispatcher panicked"),
                 target_node: task.target_node.clone(),
             }
         }
     }
+}
+
+/// 为 drain 时被丢弃的排队/inflight 任务发布 Cancelled 完成事件。
+///
+/// drain 后这些任务不会被执行，复用 [`publish_task_completion`] 走既有投递
+/// 路径：远端任务（origin != 本节点）直连回传 Cancelled 结果给 origin 节点，
+/// 本地任务发布 `BusEvent::TaskCancelled` 给事件总线订阅者。
+async fn publish_drained_task_cancellation(
+    task: TaskDefinition,
+    node_id: &NodeId,
+    network: &dyn crate::runtime::network::Transport,
+    event_bus: &EventBus,
+    pending_results: &tokio::sync::mpsc::Sender<PendingResult>,
+    pending_capacity: usize,
+) {
+    tracing::info!(
+        task_id = %task.id.as_str(),
+        "dropping queued task during drain, publishing cancellation"
+    );
+    let completion = TaskCompletion::Cancelled {
+        workflow_id: task
+            .workflow_id
+            .clone()
+            .unwrap_or_else(|| WorkflowId::from(String::new())),
+        task_id: task.id.clone(),
+        task_name: task.name.clone(),
+        target_node: task.target_node.clone(),
+    };
+    publish_task_completion(
+        completion,
+        &task,
+        node_id,
+        network,
+        event_bus,
+        pending_results,
+        pending_capacity,
+    )
+    .await;
 }
 
 /// 将任务完成结果发布到事件总线或回传给远端 orchestrator。
@@ -1252,7 +1544,7 @@ async fn publish_task_completion(
                             ),
                             target_node: task.target_node.clone(),
                         };
-                        event_bus.publish(BusEvent::TaskFailed(failed)).await;
+                        event_bus.publish(BusEvent::TaskFailed(failed));
                     }
                 }
                 Ok(_) => {
@@ -1282,7 +1574,7 @@ async fn publish_task_completion(
                             ),
                             target_node: task.target_node.clone(),
                         };
-                        event_bus.publish(BusEvent::TaskFailed(failed)).await;
+                        event_bus.publish(BusEvent::TaskFailed(failed));
                     }
                 }
                 Err(e) => {
@@ -1313,7 +1605,7 @@ async fn publish_task_completion(
                             ),
                             target_node: task.target_node.clone(),
                         };
-                        event_bus.publish(BusEvent::TaskFailed(failed)).await;
+                        event_bus.publish(BusEvent::TaskFailed(failed));
                     }
                 }
             }
@@ -1327,7 +1619,7 @@ async fn publish_task_completion(
             TaskCompletion::Skipped { .. } => BusEvent::TaskSkipped(completion),
             TaskCompletion::Completed { .. } => BusEvent::TaskCompleted(completion),
         };
-        event_bus.publish(bus_event).await;
+        event_bus.publish(bus_event);
     }
 }
 

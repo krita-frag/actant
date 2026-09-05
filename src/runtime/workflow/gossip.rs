@@ -302,23 +302,38 @@ impl DagGossip {
 
         crate::metrics::inc_gossip_updates_received();
 
-        let entry = SeenEntry {
-            inserted_at: std::time::Instant::now(),
-            hlc_timestamp: update.hlc_timestamp,
-            state_priority: incoming_priority,
-        };
-        self.seen
-            .entry(dedup_key)
-            .and_modify(|existing| {
-                if existing.is_superseded_by(&update.hlc_timestamp, incoming_priority) {
-                    *existing = entry.clone();
-                }
-            })
-            .or_insert_with(|| entry);
+        // 去重登记放在 apply 成功之后：若 apply 失败（如 WorkflowActor 暂时
+        // 不可用、序列化错误），不登记 seen，重传的更新不会被误判为重复，
+        // 更新得以重放。`NotFound`（本节点未托管该 workflow）视为已处理。
+        match self.apply_to_workflow(&update).await {
+            Ok(()) => {
+                let entry = SeenEntry {
+                    inserted_at: std::time::Instant::now(),
+                    hlc_timestamp: update.hlc_timestamp,
+                    state_priority: incoming_priority,
+                };
+                self.seen
+                    .entry(dedup_key)
+                    .and_modify(|existing| {
+                        if existing.is_superseded_by(&update.hlc_timestamp, incoming_priority) {
+                            *existing = entry.clone();
+                        }
+                    })
+                    .or_insert_with(|| entry);
 
-        self.evict_seen();
+                self.evict_seen();
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
 
-        match update.task_state {
+    /// 将远端 DAG 状态更新落地到本地 WorkflowActor。
+    ///
+    /// `NotFound`（本节点未托管该 workflow）被规范化为 `Ok`：gossip 是广播
+    /// 语义，节点不持有某 workflow 属正常情况。其他错误向上传播。
+    async fn apply_to_workflow(&self, update: &WireDagStateUpdate) -> crate::common::Result<()> {
+        match &update.task_state {
             WireTaskState::Running => {
                 if let Err(e) = self
                     .call_workflow_void(
@@ -341,7 +356,7 @@ impl DagGossip {
                 if let Err(e) = self
                     .call_workflow_void(
                         workflow_methods::COMPLETE_TASK,
-                        (&update.workflow_id, &update.task_id, result),
+                        (&update.workflow_id, &update.task_id, result.clone()),
                     )
                     .await
                 {
@@ -361,7 +376,7 @@ impl DagGossip {
                         (
                             &update.workflow_id,
                             &update.task_id,
-                            error,
+                            error.clone(),
                             crate::runtime::workflow::FailureScope::WorkflowLevel,
                         ),
                     )

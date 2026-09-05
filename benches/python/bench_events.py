@@ -14,7 +14,7 @@ from __future__ import annotations
 import pytest
 
 import actant
-from actant.task._helpers import _EventBatcher, _EventBatcherScope
+from actant.task._helpers import _EventBatcherScope
 
 
 @pytest.mark.benchmark(group="events", min_rounds=20, warmup=5)

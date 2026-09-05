@@ -6,12 +6,14 @@
 
 from __future__ import annotations
 
-import logging
-import threading
-import time
 import asyncio
 import functools
 import inspect
+import logging
+import pickle
+import struct
+import threading
+import time
 from collections.abc import Callable
 from typing import Any, Literal, cast
 
@@ -42,6 +44,16 @@ _logger = logging.getLogger("actant.task")
 # 暴露为模块常量便于测试覆盖超时分支（避免每次测试等待 5s）。
 _EVENT_BATCHER_CLOSE_JOIN_TIMEOUT: float = 5.0
 
+# Dispatch 载荷版本字节（与 `actant/task/_worker.py` 保持一致）。
+# v2：控制元数据内联为紧凑二进制头部，载荷仅序列化 (func, args, kwargs)。
+_PAYLOAD_VERSION = 0x02
+
+# worker 帧协议上限——正常任务载荷（cloudpickle 函数 + 参数）远小于该值，
+# 超限只可能是长度字段被腐蚀（按其读入体会造成无意义巨量分配）或载荷失控
+# 膨胀。提交侧（_safe_serialize）与 worker 读帧侧共用此上限：前者快速失败，
+# 后者按协议损坏处理。单点定义，worker（_worker.py）从这里导入。
+MAX_FRAME_BYTES = 256 * 1024 * 1024
+
 
 class _EventBatcher:
     """累积 TaskLifecycle 事件并按窗口/阈值批量派发。
@@ -58,17 +70,18 @@ class _EventBatcher:
         *,
         flush_interval_ms: int = 1,
         flush_threshold: int = 100,
+        render: Callable[[str, str, str, dict[str, Any]], None] | None = None,
     ) -> None:
         if flush_interval_ms < 0:
-            raise ValueError(
-                f"flush_interval_ms must be >= 0, got {flush_interval_ms}"
-            )
+            raise ValueError(f"flush_interval_ms must be >= 0, got {flush_interval_ms}")
         if flush_threshold < 1:
-            raise ValueError(
-                f"flush_threshold must be >= 1, got {flush_threshold}"
-            )
+            raise ValueError(f"flush_threshold must be >= 1, got {flush_threshold}")
         self._flush_interval = flush_interval_ms / 1000.0
         self._flush_threshold = flush_threshold
+        # 事件渲染器：``(kind, task_id, workflow_id, kwargs)``。用于 flush 发生在
+        # 后台线程时，调用方依赖的能力——如把 ``TaskLifecycle`` 事件绑定到某个
+        # Runtime 上下文中再 emit。``None`` 时使用默认 ``_emit_task_event``。
+        self._render = render
         # (kind, task_id, workflow_id, kwargs) 四元组列表。
         self._buffer: list[tuple[str, str, str, dict[str, Any]]] = []
         self._lock = threading.Lock()
@@ -96,7 +109,8 @@ class _EventBatcher:
                 self.flush()
             except Exception:
                 _logger.debug(
-                    "EventBatcher: background flush raised", exc_info=True,
+                    "EventBatcher: background flush raised",
+                    exc_info=True,
                 )
 
     def add(
@@ -120,7 +134,8 @@ class _EventBatcher:
                 self.flush()
             except Exception:
                 _logger.debug(
-                    "EventBatcher: threshold flush raised", exc_info=True,
+                    "EventBatcher: threshold flush raised",
+                    exc_info=True,
                 )
 
     def flush(self) -> None:
@@ -133,16 +148,27 @@ class _EventBatcher:
         # 在锁外派发，避免 emit 失败导致 buffer 锁死。
         # _bypass_batcher=True 防止事件回环：flush 调用 _emit_task_event 时
         # 若不绕过 batcher，事件会重新进 batcher.add（被 _closed 拒绝而丢失）。
+        # 当提供了 render（如 Runtime 绑定的生命周期事件渲染器）时，改由 render
+        # 负责在正确的运行时上下文中 emit；未提供时走默认 _emit_task_event。
         for kind, task_id, workflow_id, kwargs in events:
             try:
-                _emit_task_event(
-                    kind, task_id, workflow_id,
-                    on_error="log", _bypass_batcher=True, **kwargs,
-                )
+                if self._render is not None:
+                    self._render(kind, task_id, workflow_id, kwargs)
+                else:
+                    _emit_task_event(
+                        kind,
+                        task_id,
+                        workflow_id,
+                        on_error="log",
+                        _bypass_batcher=True,
+                        **kwargs,
+                    )
             except Exception:
                 _logger.debug(
                     "EventBatcher: emit event kind=%s task=%s raised",
-                    kind, task_id, exc_info=True,
+                    kind,
+                    task_id,
+                    exc_info=True,
                 )
 
     def close(self) -> None:
@@ -239,6 +265,39 @@ class _EventBatcherScope:
         self._owns_batcher = False
 
 
+# 进程级复用的 asyncio 事件循环：worker 子进程主线程首个 async 任务懒创建，
+# 后续任务复用，避免每任务 new_event_loop + close 的重复开销。
+_worker_reuse_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _get_worker_reuse_loop() -> asyncio.AbstractEventLoop:
+    """返回 worker 进程级复用的 asyncio 事件循环（懒创建）。"""
+    global _worker_reuse_loop
+    if _worker_reuse_loop is None:
+        _worker_reuse_loop = asyncio.new_event_loop()
+    return _worker_reuse_loop
+
+
+def _cancel_pending_loop_tasks(loop: asyncio.AbstractEventLoop) -> None:
+    """取消 loop 中遗留的 pending 任务并等待其结束，供下次复用前清理。
+
+    复用 loop 前必须取消宿主 ``run_until_complete`` 未能 await 的后台任务，
+    否则它们会残留到下一次执行，造成 "Task was destroyed but it is pending"
+    告警或意外的并发。
+    """
+    try:
+        pending = asyncio.all_tasks(loop)
+        for task in pending:
+            task.cancel()
+        if pending:
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+    except Exception:
+        # 清理失败不应向任务执行路径传播（coro 本身的结果/异常优先），但不可静默。
+        _logger.debug(
+            "_cancel_pending_loop_tasks: cleanup raised",
+            exc_info=True,
+        )
+
 
 def _is_coroutine_function(func: Any) -> bool:
     """检测 ``func`` 是否为 ``async def`` 函数。
@@ -261,12 +320,17 @@ def _is_coroutine_function(func: Any) -> bool:
 
 
 def _run_coroutine_on_worker_thread(coro: Any) -> Any:
-    """在 Worker 线程上同步执行 coroutine，返回结果或抛出异常。
+    """在 worker 子进程主线程上同步执行 coroutine，返回结果或抛出异常。
 
-    Worker 线程是 Rust tokio 线程池中的线程，无运行中的 asyncio event loop。
-    因此可安全创建新 loop 并 ``run_until_complete``。
+    worker 子进程是纯 Python 解释器，主线程无运行中的 asyncio event loop，
+    因此可创建临时 loop 并 ``run_until_complete``。
 
-    若当前线程已有运行中的 loop（不应在 Worker 线程发生，但防御性处理），
+    **性能：** 标准路径复用一条懒创建的进程级 loop（``_get_worker_reuse_loop``），
+    避免每个 async 任务都 ``new_event_loop`` + 清理 + ``close`` 的重复开销；
+    每次执行后由 ``_cancel_pending_loop_tasks`` 取消宿主 task 遗留的后台任务，
+    保证下次复用前 loop 干净。
+
+    若当前线程已有运行中的 loop（防御性处理，worker 主线程正常不会发生），
     在独立线程中执行 coroutine，避免嵌套 ``run_until_complete`` 报错。
 
     Args:
@@ -285,24 +349,16 @@ def _run_coroutine_on_worker_thread(coro: Any) -> Any:
         running_loop = None
 
     if running_loop is None:
-        # 标准路径：Worker 线程无运行 loop，直接创建临时 loop
-        loop = asyncio.new_event_loop()
+        # 标准路径：worker 主线程无运行 loop，复用懒创建的进程级 loop。
+        loop = _get_worker_reuse_loop()
         try:
             return loop.run_until_complete(coro)
         finally:
-            # 取消所有挂起任务，避免资源泄漏警告
-            try:
-                pending = asyncio.all_tasks(loop)
-                for task in pending:
-                    task.cancel()
-                if pending:
-                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-            except Exception:
-                pass
-            loop.close()
+            # 取消宿主 task 遗留的后台任务并等待其结束，避免污染下一次复用。
+            _cancel_pending_loop_tasks(loop)
     else:
         # 已有运行 loop：在独立线程中执行，避免嵌套 run_until_complete
-        # 此路径不应在 Worker 线程触发，仅为防御性处理
+        # 此路径不应在 worker 主线程触发，仅为防御性处理
         result_box: list[Any] = [None]
         error_box: list[BaseException] = []
 
@@ -329,44 +385,39 @@ def _run_with_timeout(
     kwargs: dict[str, Any],
     timeout_ms: int,  # 保留以兼容调用方签名；超时由 Rust 侧强制执行。
 ) -> Any:
-    """在当前线程执行 ``func``，配合 Rust 侧的 ``tokio::time::timeout`` 完成超时治理。
+    """在 worker 子进程主线程同步执行 ``func``，仅承担协作取消检查点。
 
     执行模型：
-      - 本函数 **不** 在 Python 侧创建子线程或 ThreadPoolExecutor，也 **不** 在
-        Python 侧实施任何超时。``func`` 直接在调用方线程（即 Rust 线程池的
-        worker 线程）中同步执行。
-      - 超时 **完全由 Rust Worker 强制执行**：``runtime/workflow/runtime.rs`` 中
-        ``tokio::time::timeout(effective_timeout, dispatched)`` 包裹 dispatch
-        future，``effective_timeout`` 取自 Task spec 的 ``timeout_ms`` 字段
-        （由 Rust 直接读取，不经过本函数）。超时后：
-          1. Rust 设置 ``cancel_flag.store(true, Release)``；
-          2. dispatch future 被 drop（oneshot rx 释放）；
-          3. handler 完成时 ``tx.send(...)`` 返回 ``Err``，仅记录 warn 日志。
+      - 本函数 **不** 在 Python 侧创建子线程或实施任何超时。``func`` 直接在当前
+        worker 子进程的主线程中同步执行。
+      - 硬超时由 Rust 进程池强制：``ProcessTaskDispatcher.dispatch(...,
+        effective_timeout)`` 以 ``effective_timeout`` 为硬上限，超时后立即
+        ``terminate()``/``kill()`` 对应的 worker 子进程并回收并发槽位，返回
+        ``Err(ActantError::Timeout)``。worker 侧不再套内层超时。
       - Python 无法被强制中断，因此 ``func`` 内部应在长循环处调用
         ``get_task_context().is_cancelled()`` 或使用 ``_interruptible_sleep``
-        实现协作式取消。
+        实现协作式取消，以便在硬杀到来前干净退出。
 
-    本函数仅负责 **协作检查点**（不参与超时计时）：
-      1. 执行前检查取消标志——若已取消（例如 dispatch 启动前上层已超时），
+    本函数的职责只是 **协作检查点**：
+      1. 执行前检查取消标志——若已取消（例如 dispatch 启动前上层已取消），
          立即抛出 ``TaskCancelledError``，避免无效工作。
-      2. 执行后再次检查——若 ``func`` 期间 Rust 已设置取消标志，将结果丢弃
-         并抛出 ``TaskCancelledError``，防止超时任务返回"成功"结果。
+      2. 执行后再次检查——若 ``func`` 期间收到取消，将结果丢弃并抛出
+         ``TaskCancelledError``，防止被取消任务返回"成功"结果。
 
     **async def 支持**：若 ``func`` 是 coroutine function（``async def``），
-    在当前 Worker 线程上创建临时 event loop 执行 coroutine。Worker 线程
-    无运行中的 asyncio loop，因此 ``run_until_complete`` 可安全使用。
-    临时 loop 在执行完毕后立即关闭，避免资源泄漏。coroutine 内部可
-    ``await`` 任意 awaitable（包括 ``actant.perform_async`` /
-    ``ask_async`` / ``perform_batch_async``），实现与现代 asyncio 生态
-    （httpx/aiohttp/asyncpg 等）的无缝集成。
+    在当前 worker 主线程上复用懒创建的进程级 event loop（
+    ``_get_worker_reuse_loop``）执行 coroutine。worker 主线程无运行中的
+    asyncio loop，因此 ``run_until_complete`` 可安全使用；loop 执行完毕后
+    **不关闭**（供后续任务复用），仅由 ``_cancel_pending_loop_tasks`` 清理
+    遗留的 pending 任务。本函数不做任何超时实施——硬超时统一由 Rust
+    进程池对 worker 子进程强杀完成。
 
     Args:
         func: 待执行的业务函数（已反序列化）。可以是普通函数或 ``async def``。
         args: 位置参数。
         kwargs: 关键字参数。
-        timeout_ms: **未使用**。超时由 Rust Worker 直接从 Task spec 读取并
-            通过 ``tokio::time::timeout`` 强制执行。此参数仅为保持调用方签名
-            稳定而保留，未来若引入 Python 侧的协同时钟可启用。
+        timeout_ms: **未使用**。硬超时由进程池经 ``effective_timeout`` 强制执行。
+            此参数仅为保持调用方签名稳定而保留。
 
     Returns:
         ``func`` 的返回值（对于 ``async def``，是 coroutine 的 return 值，
@@ -380,8 +431,9 @@ def _run_with_timeout(
     if ctx is not None and ctx.is_cancelled():
         raise TaskCancelledError(f"task {ctx.task_id!r} was cancelled before start")
     if _is_coroutine_function(func):
-        # async def 函数：在当前 Worker 线程上创建临时 event loop 执行。
-        # Worker 线程无运行中的 asyncio loop，因此 run_until_complete 安全。
+        # async def 函数：复用进程级 event loop 在当前 worker 主线程执行（见
+        # _run_coroutine_on_worker_thread）；loop 不关闭、本函数不做超时，
+        # 硬超时由 Rust 进程池强杀实施。
         coro = func(*args, **kwargs)
         result = _run_coroutine_on_worker_thread(coro)
     else:
@@ -419,6 +471,147 @@ def _interruptible_sleep(
         time.sleep(min(interval, remaining))
 
 
+def _execute_with_retries(
+    func: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    timeout_ms: int,
+    retries: int,
+    retry_delay_ms: int,
+    task_id: str,
+    workflow_id: str,
+    cancel_token: Any,
+    *,
+    silent: bool = False,
+) -> tuple[bool, Any]:
+    """执行任务函数并处理重试/取消/超时。
+
+    重试循环：每次尝试前检查取消，调用 ``_run_with_timeout`` 执行函数。
+    失败时若仍有重试次数，则等待可中断的 ``retry_delay_ms`` 后重试；
+    否则返回异常对象。成功时返回结果对象。
+
+    执行位置：worker 子进程主线程（``actant.task._worker`` 的唯一执行路径）。
+
+    Args:
+        silent: ``True`` 时跳过所有 TaskLifecycle 事件发布。
+
+    Returns:
+        ``(success, payload)`` 元组：
+        - 成功：``(True, result_obj)`` —— result_obj 是任务返回值（未序列化）。
+        - 失败：``(False, exc_obj)`` —— exc_obj 是异常对象（已通过
+          ``_ensure_picklable`` 处理，确保可序列化）。
+
+        调用方负责序列化（``cloudpickle.dumps``）以跨 Rust 边界传递。
+    """
+    attempt = 0
+    while True:
+        # 协作式取消检查
+        if cancel_token.is_cancelled():
+            cancel_exc = TaskCancelledError(f"task {task_id!r} was cancelled")
+            _emit_task_event(
+                "cancelled",
+                task_id,
+                workflow_id,
+                attempt=attempt,
+                error=f"{type(cancel_exc).__name__}: {cancel_exc}",
+                silent=silent,
+            )
+            return False, _ensure_picklable(cancel_exc)
+        try:
+            result = _run_with_timeout(func, args, kwargs, timeout_ms)
+        except TaskCancelledError as exc:
+            _logger.warning("task %s: cancelled", task_id)
+            _emit_task_event(
+                "cancelled",
+                task_id,
+                workflow_id,
+                attempt=attempt,
+                error=f"{type(exc).__name__}: {exc}",
+                silent=silent,
+            )
+            return False, _ensure_picklable(exc)
+        except Exception as exc:
+            if attempt < retries:
+                _logger.warning(
+                    "task %s: attempt %d failed (%s: %s), retrying",
+                    task_id,
+                    attempt,
+                    type(exc).__name__,
+                    exc,
+                )
+                _emit_task_event(
+                    "retried",
+                    task_id,
+                    workflow_id,
+                    attempt=attempt,
+                    next_attempt=attempt + 1,
+                    error=f"{type(exc).__name__}: {exc}",
+                    silent=silent,
+                )
+                if retry_delay_ms > 0:
+                    # 可中断的重试延迟：分段轮询 cancel_token，
+                    # 避免重试延迟期间无法响应取消请求。
+                    _interruptible_sleep(
+                        retry_delay_ms / 1000,
+                        cancel_token,
+                        interval=0.05,
+                    )
+                attempt += 1
+                continue
+            _logger.error(
+                "task %s: failed after %d attempt(s)", task_id, attempt + 1, exc_info=True
+            )
+            _emit_task_event(
+                "failed",
+                task_id,
+                workflow_id,
+                attempt=attempt,
+                error=f"{type(exc).__name__}: {exc}",
+                silent=silent,
+            )
+            return False, _ensure_picklable(exc)
+        _emit_task_event("completed", task_id, workflow_id, attempt=attempt, silent=silent)
+        return True, result
+
+
+def _build_v2_envelope(
+    func: Callable[..., Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    options: dict[str, Any],
+    task_id: str,
+) -> bytes:
+    """构建 v2 Dispatch 正文：紧凑控制头部 + ``cloudpickle(func, args, kwargs)``。
+
+    头部布局（小端，与 ``actant/task/_worker.py::_parse_dispatch_payload`` 一致）：:
+
+        u8   version   = ``_PAYLOAD_VERSION`` (0x02)
+        u32  retries
+        u32  retry_delay_ms
+        u16  task_id_len ; N 字节 task_id (utf-8)
+        u16  workflow_id_len ; N 字节 workflow_id (utf-8)
+        其余 = ``cloudpickle(func, args, kwargs)``
+
+    把控制元数据迁出 cloudpickle 载荷：worker 侧用 ``struct`` 单遍解析头部，只需对
+    ``(func,args,kwargs)`` 反序列化，省去每任务 ``options`` dict 的编解码与字典构造。
+    ``timeout_ms`` 为死参数（硬超时由 Rust 进程池强杀负责）不进入头部。
+    """
+    retries = int(options.get("retries", 0))
+    retry_delay_ms = int(options.get("retry_delay_ms", 0))
+    tid = str(options.get("task_id") or task_id).encode("utf-8")
+    wid = str(options.get("workflow_id") or "").encode("utf-8")
+    header = b"".join(
+        [
+            struct.pack("<BIIH", _PAYLOAD_VERSION, retries, retry_delay_ms, len(tid)),
+            tid,
+            struct.pack("<H", len(wid)),
+            wid,
+        ]
+    )
+    triplet = cast(bytes, cloudpickle.dumps((func, args, kwargs)))
+    return header + triplet
+
+
 def _safe_serialize(
     func: Callable[..., Any],
     args: tuple[Any, ...],
@@ -432,9 +625,16 @@ def _safe_serialize(
     cloudpickle 失败时原始错误消息（如 ``"can't pickle _thread.lock object"``）
     不指明是哪个参数。此函数逐个尝试序列化 func/各 args/各 kwargs values，
     在错误消息中包含参数索引/名称与 repr，帮助用户定位问题。
+
+    返回 v2 envelope：``(_build_v2_envelope)``。控制元数据（retries/retry_delay_ms/
+    task_id/workflow_id）内联为紧凑头部，仅 ``(func,args,kwargs)`` 走 cloudpickle。
+
+    envelope 超过 ``MAX_FRAME_BYTES``（worker 帧协议上限）时抛 ``SerializationError``：
+    超限载荷会被 worker 以协议损坏拒绝并触发无意义的 crash-failover 重试，在提交侧
+    快速失败并指明上限更可诊断。大载荷应经 ``Ref``/对象存储引用传递（路线图阶段 4）。
     """
     try:
-        return cast(bytes, cloudpickle.dumps((func, args, kwargs, options)))
+        envelope = _build_v2_envelope(func, args, kwargs, options, task_id)
     except (TypeError, AttributeError, ValueError, RecursionError) as overall:
         # 整体失败：逐个定位不可序列化的项
         bad: list[str] = []
@@ -456,6 +656,13 @@ def _safe_serialize(
         raise SerializationError(
             f"task {task_id!r}: cannot serialize payload. Unserializable components: {detail}"
         ) from overall
+    if len(envelope) > MAX_FRAME_BYTES:
+        raise SerializationError(
+            f"task {task_id!r}: serialized payload is {len(envelope)} bytes, exceeding the "
+            f"{MAX_FRAME_BYTES} worker frame limit. Pass large data by reference "
+            "(path/URL/object-store key) instead of embedding it in the payload."
+        )
+    return envelope
 
 
 def _pickle_exception(exc: BaseException) -> bytes:
@@ -519,28 +726,37 @@ def _invoke_callbacks(
     """
     errors: list[Exception] = []
     for fn in callbacks:
-        caught = _invoke_callback(fn, *args, label=f"{label}/{getattr(fn, '__name__', fn)}", policy=policy)
+        caught = _invoke_callback(
+            fn, *args, label=f"{label}/{getattr(fn, '__name__', fn)}", policy=policy
+        )
         if caught is not None:
             errors.append(caught)
     if policy == "collect" and errors:
-        raise ActantError(
-            f"{label}: {len(errors)} callback(s) failed; first: {errors[0]!r}"
-        )
+        raise ActantError(f"{label}: {len(errors)} callback(s) failed; first: {errors[0]!r}")
     return errors
 
 
 class _suppress_pickle_errors:
     """cloudpickle 反序列化失败时静默返回（用于 exception() 的 best-effort 解码）。
 
-    仅抑制 ``Exception`` 子类（如 ``pickle.UnpicklingError``），
+    仅抑制 pickle 反序列化相关的异常类型（``pickle.UnpicklingError`` /
+    ``TypeError`` / ``AttributeError`` / ``ValueError``——cloudpickle.loads 对
+    损坏载荷、不可解析的全局引用与错误码流抛出的类型族），其余异常照常抛出，
     不抑制 ``KeyboardInterrupt`` / ``SystemExit`` 等 ``BaseException``。
     """
+
+    _SUPPRESSED = (
+        pickle.UnpicklingError,
+        TypeError,
+        AttributeError,
+        ValueError,
+    )
 
     def __enter__(self) -> _suppress_pickle_errors:
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> bool:
-        return exc_type is not None and issubclass(exc_type, Exception)
+        return exc_type is not None and issubclass(exc_type, self._SUPPRESSED)
 
 
 def _emit_task_event(
@@ -584,8 +800,12 @@ def _emit_task_event(
         batcher = _get_event_batcher()
         if batcher is not None:
             batcher.add(
-                kind, task_id, workflow_id,
-                attempt=attempt, next_attempt=next_attempt, error=error,
+                kind,
+                task_id,
+                workflow_id,
+                attempt=attempt,
+                next_attempt=next_attempt,
+                error=error,
             )
             return None
     try:
@@ -607,7 +827,10 @@ def _emit_task_event(
         if on_error == "raise":
             raise
         _logger.warning(
-            "task %s: TaskLifecycle emit (%s) failed", task_id, kind, exc_info=True,
+            "task %s: TaskLifecycle emit (%s) failed",
+            task_id,
+            kind,
+            exc_info=True,
         )
         if on_error == "collect":
             return e
@@ -621,6 +844,8 @@ __all__ = [
     "_EventBatcher",
     "_EventBatcherScope",
     "_emit_task_event",
+    "_ensure_picklable",
+    "_execute_with_retries",
     "_interruptible_sleep",
     "_invoke_callback",
     "_invoke_callbacks",

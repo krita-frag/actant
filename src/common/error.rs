@@ -74,6 +74,21 @@ pub enum ActantError {
 
 pub type Result<T> = std::result::Result<T, ActantError>;
 
+impl ActantError {
+    /// 返回该错误的稳定 kind 字符串（snake_case）。
+    ///
+    /// kind 映射以 `ActorErrorEnvelope::from(&ActantError)` 为单一真相来源
+    /// （编译器强制穷尽），与 Python `actant.exceptions` 的 kind 表对齐。
+    /// 用于 emit 聚合错误等需要跨语言保真 kind 的场景：调用方将 kind 编码进
+    /// 错误消息前缀（见 [`format_error_kind`]），Python 侧
+    /// `decode_error_kind` 解析前缀重建对应异常子类。
+    pub fn kind_str(&self) -> &'static str {
+        crate::common::model::ActorErrorEnvelope::from(self)
+            .kind
+            .as_str()
+    }
+}
+
 impl From<Arc<std::io::Error>> for ActantError {
     fn from(e: Arc<std::io::Error>) -> Self {
         match Arc::try_unwrap(e) {

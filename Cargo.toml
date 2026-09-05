@@ -24,6 +24,15 @@ fs-err = "3.3.0"
 futures = "0.3"
 iroh = { version = "1.0", default-features = false, features = ["tls-ring"] }
 iroh-gossip = { version = "0.101", default-features = false, features = ["net"] }
+# spike/0.3.2-iroh-blobs：内容寻址 blob 原语前置 spike，仅 `--features spike-blobs` 时编译。
+# 不进默认构建，0.3.2 裁决后决定去留。feature 取舍：
+#   fs-store = redb 落盘 store（生产需要；spike 测试用 MemStore，若去掉可省 2 个 crate）
+#   rpc      = 进程内 BlobRpc 客户端（irpc local channel），+0 crate（noq 已在 iroh 树内）
+#   hide-proto-docs = 仅文档裁剪，零成本
+iroh-blobs = { version = "0.103", optional = true, default-features = false, features = ["fs-store", "rpc", "hide-proto-docs"] }
+# bao-tree：spike 流式拉取路径需要解构 BaoContentItem（iroh-blobs 未 re-export）；
+# 与 iroh-blobs 内部依赖同版本 0.16，仅 spike-blobs feature 激活，无额外编译成本。
+bao-tree = { version = "0.16", optional = true, default-features = false }
 blake3 = "1.8.5"
 subtle = "2"
 data-encoding = "2.11.0"
@@ -48,6 +57,11 @@ dhat = { version = "0.3.3", optional = true }
 console-subscriber = { version = "0.4", optional = true }
 
 
+# Worker 子进程 IPC 辅助 FFI（最小绑定，已在依赖树中，零新增编译成本）：
+#   - libc：Unix 侧 dup/fcntl——取消帧独立写端（dup stdin + O_NONBLOCK，见 dispatcher.rs）
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3.24.0"
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -63,6 +77,8 @@ dhat-heap = ["dep:dhat"]
 python = ["dep:pyo3", "dep:pyo3-log"]
 # tokio-console 支持（ACTANT_TOKIO_CONSOLE=1 激活）
 tokio-console = ["dep:console-subscriber"]
+# 0.3.2 前置 spike：iroh-blobs 贴合度验证（不进默认构建，不合并主线）
+spike-blobs = ["dep:iroh-blobs", "dep:bao-tree"]
 default = ["python"]
 
 [lib]
@@ -110,12 +126,6 @@ required-features = []
 [[bench]]
 name = "store"
 path = "benches/rust/store.rs"
-harness = false
-required-features = []
-
-[[bench]]
-name = "actor_messaging"
-path = "benches/rust/actor_messaging.rs"
 harness = false
 required-features = []
 

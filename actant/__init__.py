@@ -1,7 +1,7 @@
 """Actant - 基于 Actor 模型的跨平台通用分布式任务编排引擎。
 
 采用 Effect-Resource-Handler 统一扩展架构：所有扩展点（Routing、Scheduling、
-Transport、Store、Actor、Lifecycle）统一为 `Capability`（能力声明）+ `Handler`
+Transport、Store、Lifecycle）统一为 `Capability`（能力声明）+ `Handler`
 （能力实现）+ `Layer`（handler 组合）+ `Effect`（请求能力）。
 
 典型用法::
@@ -35,9 +35,6 @@ from actant._runtime import Layer, Runtime, get_current_runtime, require_runtime
 from actant.actant import get_version
 from actant.actant import prometheus_text as metrics_text
 from actant.capabilities import (
-    ACTOR_LIFECYCLE,
-    ACTOR_MESSAGING,
-    ACTOR_SUPERVISION,
     BUILTIN_CAPABILITIES,
     EXECUTE,
     NODE_LIFECYCLE,
@@ -51,12 +48,6 @@ from actant.capabilities import (
     TASK_LIFECYCLE,
     TRANSPORT,
     WORKFLOW_LIFECYCLE,
-    ActorEvent,
-    ActorFailureCtx,
-    ActorLifecycleHandler,
-    ActorMessageReq,
-    ActorMessagingHandler,
-    ActorSupervisionHandler,
     CapabilityMeta,
     EffectKind,
     ExecuteCtx,
@@ -118,9 +109,6 @@ from actant.task import (
 __version__ = get_version()
 
 __all__ = [
-    "ACTOR_LIFECYCLE",
-    "ACTOR_MESSAGING",
-    "ACTOR_SUPERVISION",
     "BUILTIN_CAPABILITIES",
     "EXECUTE",
     "NODE_LIFECYCLE",
@@ -137,12 +125,6 @@ __all__ = [
     "ActantError",
     "ActantTimeoutError",
     "ActorError",
-    "ActorEvent",
-    "ActorFailureCtx",
-    "ActorLifecycleHandler",
-    "ActorMessageReq",
-    "ActorMessagingHandler",
-    "ActorSupervisionHandler",
     "AlreadyExistsError",
     "AsyncResult",
     "CapabilityMeta",

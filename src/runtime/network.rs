@@ -26,7 +26,7 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use crate::common::discovery_mode;
 use crate::common::model::{NodeId, TaskId, WorkflowId};
 use crate::common::wire::WireTaskOutcome;
-use crate::common::{ActantError, NetworkConfig, RemoteReplyAddress};
+use crate::common::{ActantError, NetworkConfig};
 
 /// `Transport::listen_addresses()` 的结构化结果。
 #[derive(Debug, Clone)]
@@ -388,27 +388,6 @@ pub enum DirectRequest {
         workflow_id: WorkflowId,
         requesting_node: NodeId,
     },
-    /// 远端 Actor 方法调用（点对点）。
-    ActorCall {
-        target: crate::common::ActorId,
-        method: String,
-        payload: Vec<u8>,
-        reply_to: RemoteReplyAddress,
-    },
-    /// 按 actor 类型发起的远端调用（A2 路由）。
-    ///
-    /// 与 [`DirectRequest::ActorCall`] 不同：调用方不指定具体 ActorId，
-    /// 而是按 actor 类型字符串由接收方在本节点上选择一个匹配实例。
-    ///
-    /// 由 [`crate::runtime::actor::ActorSystem::call_by_type`] 触发，
-    /// 接收方在 [`crate::runtime::workflow::runtime::network_router::NetworkEventRouter`]
-    /// 中通过 `ActorSystem::find_local_actor_by_type` 选择本地实例并调用。
-    ActorCallByType {
-        actor_type: String,
-        method: String,
-        payload: Vec<u8>,
-        reply_to: RemoteReplyAddress,
-    },
 }
 
 /// 直接响应-请求协议类型，用于点对点通信。
@@ -423,11 +402,6 @@ pub enum DirectResponse {
         dag: Option<Vec<u8>>,
         execution: Option<Vec<u8>>,
         pending: Option<Vec<u8>>,
-    },
-    /// 远端 Actor 调用的响应。
-    ActorCallResult {
-        /// postcard 编码的 ActorMessageResult。
-        result: Vec<u8>,
     },
     /// 服务端无法投递或处理请求时返回的错误响应。
     ///
@@ -631,17 +605,19 @@ impl NetworkManager {
 
     /// 订阅 gossip topic 并启动对应的接收任务。
     ///
-    /// 重复订阅同一 topic 是 no-op。
+    /// 重复订阅同一 topic 是 no-op。检查与插入在同一把写锁内完成，
+    /// 并发订阅同一 topic 时严格只执行一次 gossip.subscribe，不会产生
+    /// 被覆盖插入后泄漏的 sender/receiver。
     ///
     /// # Errors
     ///
     /// 如果 iroh gossip 订阅失败，返回错误。
     pub async fn subscribe(&self, topic: &str) -> crate::common::Result<()> {
-        {
-            let subs = self.topic_subscriptions.read().await;
-            if subs.contains_key(topic) {
-                return Ok(());
-            }
+        // 写锁覆盖整个 check-then-insert：iroh gossip.subscribe 内部不回调
+        // topic_subscriptions，持锁跨该 await 不会构成环，仅串行化并发订阅。
+        let mut subs = self.topic_subscriptions.write().await;
+        if subs.contains_key(topic) {
+            return Ok(());
         }
 
         let topic_id = topic_id_from_str(topic);
@@ -654,10 +630,8 @@ impl NetworkManager {
             .map_err(|e| ActantError::Network(format!("gossip subscribe failed: {e}")))?
             .split();
 
-        {
-            let mut subs = self.topic_subscriptions.write().await;
-            subs.insert(topic.to_string(), (topic_id, sender));
-        }
+        subs.insert(topic.to_string(), (topic_id, sender));
+        drop(subs);
 
         let event_tx = self.event_tx.clone();
         let topic_name = topic.to_string();
@@ -942,35 +916,7 @@ impl NetworkManager {
         let max_message_size = self.max_message_size;
         tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
-                match event {
-                    DirectEvent::Request {
-                        peer_id,
-                        request,
-                        channel,
-                    } => {
-                        let request_size = postcard::to_allocvec(&request)
-                            .map(|v| v.len())
-                            .unwrap_or(0);
-                        if request_size > max_message_size {
-                            tracing::warn!(
-                                "direct request from {} exceeds size limit: {} > {}, dropping",
-                                peer_id,
-                                request_size,
-                                max_message_size
-                            );
-                            continue;
-                        }
-                        if let Err(mpsc::error::TrySendError::Full(_)) =
-                            event_tx.try_send(NetworkEvent::DirectRequest {
-                                peer_id,
-                                request: Box::new(request),
-                                channel,
-                            })
-                        {
-                            tracing::warn!("network event channel full, dropping direct request");
-                        }
-                    }
-                }
+                route_direct_request(&event_tx, max_message_size, event).await;
             }
         });
     }
@@ -1042,6 +988,68 @@ enum DirectEvent {
         request: DirectRequest,
         channel: DirectResponseChannel,
     },
+}
+
+/// [`DirectEvent`] 路由结果，供单元测试断言丢弃分支（不依赖真实 iroh 流）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectRouteOutcome {
+    /// 请求已转发到 network event channel。
+    Forwarded,
+    /// 请求超尺寸被拒绝。
+    RejectedOversize,
+    /// network event channel 已满，请求被丢弃。
+    ChannelFull,
+}
+
+/// 将单个直连请求路由到 network event channel。
+///
+/// 两条丢弃路径（超尺寸、channel 满）都会在 [`DirectResponseChannel`] 仍可写时
+/// 回送 `DirectResponse::Error`，让对端**快速失败**而非阻塞等待自身
+/// `direct_request_timeout`（默认 30s）。回送失败仅记录日志——此时对端只能
+/// 依赖自身超时，与 [`DirectResponseChannel::send_error`] 的契约一致。
+async fn route_direct_request(
+    event_tx: &mpsc::Sender<NetworkEvent>,
+    max_message_size: usize,
+    event: DirectEvent,
+) -> DirectRouteOutcome {
+    let DirectEvent::Request {
+        peer_id,
+        request,
+        channel,
+    } = event;
+    let request_size = postcard::to_allocvec(&request)
+        .map(|v| v.len())
+        .unwrap_or(0);
+    if request_size > max_message_size {
+        tracing::warn!(
+            "direct request from {} exceeds size limit: {} > {}, rejecting with error response",
+            peer_id,
+            request_size,
+            max_message_size
+        );
+        channel
+            .send_error(format!(
+                "direct request rejected: size {request_size} exceeds limit {max_message_size}"
+            ))
+            .await;
+        return DirectRouteOutcome::RejectedOversize;
+    }
+    let event = NetworkEvent::DirectRequest {
+        peer_id,
+        request: Box::new(request),
+        channel,
+    };
+    if let Err(mpsc::error::TrySendError::Full(event)) = event_tx.try_send(event) {
+        tracing::warn!("network event channel full, rejecting direct request with error response");
+        // try_send 满时把事件（连同 channel 所有权）原样返回，借此收回 channel 回错。
+        if let NetworkEvent::DirectRequest { channel, .. } = event {
+            channel
+                .send_error("node busy: network event channel full")
+                .await;
+        }
+        return DirectRouteOutcome::ChannelFull;
+    }
+    DirectRouteOutcome::Forwarded
 }
 
 /// Gossip 事件处理结果，将 ``subscribe`` 中的后台循环逻辑抽出为可单元测试的纯函数。
@@ -1166,6 +1174,11 @@ impl DirectProtocolHandler {
                 Ok(bytes) => bytes,
                 Err(e) => {
                     tracing::warn!("failed to read direct request from {}: {}", remote_id, e);
+                    // 连接尚可写时回送错误，让对端快速失败；发送失败仅记录日志
+                    //（连接本身已损坏时对端只能依赖自身超时）。
+                    DirectResponseChannel::new(send)
+                        .send_error(format!("failed to read direct request: {e}"))
+                        .await;
                     continue;
                 }
             };
@@ -1178,12 +1191,15 @@ impl DirectProtocolHandler {
                         remote_id,
                         e
                     );
+                    DirectResponseChannel::new(send)
+                        .send_error(format!("failed to decode direct request: {e}"))
+                        .await;
                     continue;
                 }
             };
 
             let channel = DirectResponseChannel::new(send);
-            if let Err(mpsc::error::TrySendError::Full(_)) =
+            if let Err(mpsc::error::TrySendError::Full(event)) =
                 self.event_tx.try_send(DirectEvent::Request {
                     peer_id: remote_id.clone(),
                     request,
@@ -1191,9 +1207,15 @@ impl DirectProtocolHandler {
                 })
             {
                 tracing::warn!(
-                    "direct event channel full, dropping request from {}",
+                    "direct event channel full, rejecting request from {} with error response",
                     remote_id
                 );
+                // try_send 满时原样返回事件，收回 channel 回错，避免对端等超时。
+                // DirectEvent 当前仅 Request 一个变体，直接解构。
+                let DirectEvent::Request { channel, .. } = event;
+                channel
+                    .send_error("node busy: direct event channel full")
+                    .await;
             }
 
             drop(permit);
@@ -1251,7 +1273,14 @@ fn parse_endpoint_addr(s: &str) -> crate::common::Result<EndpointAddr> {
 }
 
 async fn write_length_prefixed(send: &mut SendStream, data: &[u8]) -> crate::common::Result<()> {
-    let len = data.len() as u32;
+    // 长度前缀用 u32 BE 编码。data.len() > u32::MAX 时显式失败，
+    // 否则 `as u32` 会静默截断，使对端按截断后的长度读取导致协议失步。
+    let len = u32::try_from(data.len()).map_err(|_| {
+        ActantError::Network(format!(
+            "write_length_prefixed: data len {} exceeds u32::MAX",
+            data.len()
+        ))
+    })?;
     send.write_all(&len.to_be_bytes())
         .await
         .map_err(|e| ActantError::Network(format!("write length prefix: {e}")))?;

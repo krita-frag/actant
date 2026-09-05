@@ -70,6 +70,9 @@ impl Orchestrator {
         if let Some(mut slot) = self.state.slots.get_mut(&workflow_id) {
             slot.execution.set_deadline_ms(timeout_ms);
         }
+        // deadline 设置晚于 submit 的同步落盘，必须标记脏，否则在后台 flush
+        // 触发前崩溃会丢失 deadline，重启后工作流失去超时保护。
+        self.state.mark_dirty(&workflow_id);
         Ok(())
     }
 
@@ -148,8 +151,12 @@ impl Orchestrator {
         task_id: &TaskId,
         result: Vec<u8>,
     ) -> Result<(Vec<TaskDefinition>, Vec<(TaskId, String)>, bool)> {
-        // 阶段 1：更新执行状态、计算 ready 与 conditional_edges、判断终态。
-        let info = self.complete_task(workflow_id, task_id, result).await?;
+        // 结果通路（WireTaskResult / WireDagStateUpdate / COMPLETE_TASK actor
+        // 载荷）尚未携带派发代数（wire.rs 本批次冻结），传 `None` 放行 attempt
+        // fencing；待协议扩展后由调用方传入结果的 attempt 即接入 fencing。
+        let info = self
+            .complete_task(workflow_id, task_id, result, None)
+            .await?;
         if info.workflow_terminal {
             crate::metrics::inc_workflows_completed();
             crate::metrics::dec_active_workflows();
@@ -172,8 +179,12 @@ impl Orchestrator {
     /// 若 `condition_evaluator` 已设置，对每条条件边求值：
     /// - 激活 → 减少后继 pending 计数，可能加入 ready
     /// - 不激活 → 级联跳过该后继分支，可能产生新的 ready
+    /// - 求值出错 → 记录 warn 日志，该边**原样保留**并返回给调用方外部评估。
+    ///   已就绪任务照常返回，保证单条边的求值失败不会让整个完成事件失败、
+    ///   也不会丢弃已 ready 的后继（否则重试同一完成消息会因任务已终态
+    ///   被守卫拒绝而永久卡死）。
     ///
-    /// 求值后返回空列表（所有条件边已在内部处理）。
+    /// 全部边求值成功后返回空列表（所有条件边已在内部处理）。
     ///
     /// 若未设置 evaluator，原样返回条件边列表，由调用方（如 Python 编排循环）外部评估。
     ///
@@ -187,18 +198,34 @@ impl Orchestrator {
     ) -> Result<Vec<(TaskId, String)>> {
         let mut conditional_edges = conditional_edges;
         if let Some(evaluator) = self.condition_evaluator.as_ref() {
+            let mut deferred: Vec<(TaskId, String)> = Vec::new();
             for (succ_id, condition) in &conditional_edges {
-                let activate = evaluator.evaluate(workflow_id, task_id, condition).await?;
-                if activate {
-                    if let Some(task) = self.activate_conditional_successor(workflow_id, succ_id)? {
-                        ready.push(task);
+                match evaluator.evaluate(workflow_id, task_id, condition).await {
+                    Ok(true) => {
+                        if let Some(task) =
+                            self.activate_conditional_successor(workflow_id, succ_id)?
+                        {
+                            ready.push(task);
+                        }
                     }
-                } else {
-                    let cascade_ready = self.skip_conditional_branch(workflow_id, succ_id).await?;
-                    ready.extend(cascade_ready);
+                    Ok(false) => {
+                        let cascade_ready =
+                            self.skip_conditional_branch(workflow_id, succ_id).await?;
+                        ready.extend(cascade_ready);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            workflow = %workflow_id.as_str(),
+                            task = %task_id.as_str(),
+                            successor = %succ_id.as_str(),
+                            error = %e,
+                            "condition evaluation failed, deferring edge to caller"
+                        );
+                        deferred.push((succ_id.clone(), condition.clone()));
+                    }
                 }
             }
-            conditional_edges = Vec::new();
+            conditional_edges = deferred;
         }
         Ok(conditional_edges)
     }
@@ -497,7 +524,7 @@ impl Orchestrator {
             }
         }
 
-        self.notify_terminal();
+        self.notify_terminal(workflow_id);
         Ok(())
     }
 
@@ -535,6 +562,7 @@ impl Orchestrator {
         let state = self.state.clone();
         let store = self.store.clone();
         let network = self.network.clone();
+        let event_log = self.event_log.clone();
         let poll_interval =
             std::time::Duration::from_millis(self.config.workflow.state_poll_interval_ms);
 
@@ -576,9 +604,31 @@ impl Orchestrator {
                                     crate::metrics::dec_active_workflows();
                                     tracing::warn!("workflow {} timed out, marked as failed", wf_id.as_str());
 
-                                    if let Ok(exec_bytes) = serialize_rkyv(&slot.execution) {
-                                        persist_batch.push((exec_key(&wf_id), exec_bytes));
+                                    match serialize_rkyv(&slot.execution) {
+                                        Ok(exec_bytes) => {
+                                            persist_batch.push((exec_key(&wf_id), exec_bytes));
+                                        }
+                                        Err(e) => {
+                                            // 序列化失败不得静默丢弃：记录 error 并重新标记脏，
+                                            // 让后台 flush 在下一轮重试落盘。
+                                            tracing::error!(
+                                                workflow = %wf_id.as_str(),
+                                                error = %e,
+                                                "failed to serialize timed-out workflow execution"
+                                            );
+                                            state.mark_dirty(&wf_id);
+                                        }
                                     }
+
+                                    // 对齐 fail_task 路径：超时失败的工作流写入 Failed 事件，
+                                    // 供订阅者观测（事件写入失败不阻断状态推进）。
+                                    super::persistence::append_event(
+                                        event_log.as_ref(),
+                                        WorkflowEventPayload::Failed {
+                                            workflow_id: wf_id.clone(),
+                                            error: "workflow timeout exceeded".into(),
+                                        },
+                                    );
 
                                     to_fire.push(wf_id);
                                 }
@@ -692,6 +742,8 @@ impl Orchestrator {
                 workflow_id.as_str()
             ))
         })?;
+        // increment_attempt=true：故障转移重派发推进派发代数（TaskState.attempt），
+        // 新一代 TaskDefinition 携带递增后的 attempt，用于区分旧代在途执行的迟到结果。
         slot.execution.reset_task(task_id, false, true);
         Ok(())
     }
@@ -779,7 +831,9 @@ impl Orchestrator {
                     workflow_id.as_str()
                 ))
             })?;
-            slot.execution.fail_task(task_id, error, mode);
+            // 结果通路未携带派发代数（wire.rs 本批次冻结），传 `None` 放行
+            // attempt fencing；待协议扩展后由调用方传入即接入 fencing。
+            slot.execution.fail_task(task_id, error, mode, None);
             slot.execution.is_terminal()
         };
 
@@ -812,7 +866,7 @@ impl Orchestrator {
             });
             crate::metrics::inc_workflows_failed();
             crate::metrics::dec_active_workflows();
-            self.notify_terminal();
+            self.notify_terminal(workflow_id);
         } else {
             // Non-terminal: defer to background flush
             self.state.mark_dirty(workflow_id);
@@ -825,8 +879,9 @@ impl Orchestrator {
         workflow_id: &WorkflowId,
         task_id: &TaskId,
         result: Vec<u8>,
+        result_attempt: Option<u32>,
     ) -> Result<CompletionInfo> {
-        let is_terminal = {
+        let (skipped, is_terminal) = {
             let mut slot = self.state.slots.get_mut(workflow_id).ok_or_else(|| {
                 crate::common::ActantError::NotFound(format!(
                     "workflow {} not found",
@@ -839,9 +894,35 @@ impl Orchestrator {
                     workflow_id.as_str()
                 )));
             }
-            slot.execution.mark_task_completed(task_id, result);
-            slot.execution.is_terminal()
+            if !slot.execution.can_transition_task(task_id) {
+                // 迟到/重复的完成结果：工作流或任务已终态（含 Cancelled/Failed），
+                // 拒绝改写，仅记录 debug 级日志，不产生事件、不推进状态。
+                tracing::debug!(
+                    workflow = %workflow_id.as_str(),
+                    task = %task_id.as_str(),
+                    "ignoring completion for already-terminal workflow/task"
+                );
+                (true, false)
+            } else if !slot
+                .execution
+                .attempt_fencing_passes(task_id, result_attempt)
+            {
+                // 过期派发代数的迟到结果：丢弃，不推进状态、不发事件。
+                (true, false)
+            } else {
+                slot.execution
+                    .mark_task_completed(task_id, result, result_attempt);
+                (false, slot.execution.is_terminal())
+            }
         };
+
+        if skipped {
+            return Ok(CompletionInfo {
+                workflow_terminal: false,
+                ready_successors: vec![],
+                conditional_edges: vec![],
+            });
+        }
 
         if is_terminal {
             let exec_snapshot = {
@@ -895,7 +976,7 @@ impl Orchestrator {
             if matches!(exec_snapshot.state, Phase::Completed) {
                 let results: Vec<Vec<u8>> = exec_snapshot.collected_results();
                 if !results.is_empty() {
-                    let result_bytes = crate::common::pack_group(&results);
+                    let result_bytes = crate::common::pack_group(&results)?;
                     batch.push((result_key(workflow_id), result_bytes));
                 }
             }
@@ -913,7 +994,7 @@ impl Orchestrator {
             });
         }
 
-        self.notify_terminal();
+        self.notify_terminal(workflow_id);
         Ok(CompletionInfo {
             workflow_terminal: true,
             ready_successors: vec![],
@@ -923,18 +1004,12 @@ impl Orchestrator {
 
     /// Notify waiters that a workflow has reached a terminal state.
     /// Fires the per-workflow oneshot channel for instant wake-up.
-    fn notify_terminal(&self) {
-        // 查找所有终态 workflow 并触发其 oneshot
-        let terminal_ids: Vec<WorkflowId> = self
-            .state
-            .slots
-            .iter()
-            .filter(|entry| entry.value().execution.is_terminal())
-            .map(|entry| entry.key().clone())
-            .collect();
-        for id in &terminal_ids {
-            self.state.fire_terminal_oneshot(id);
-        }
+    ///
+    /// 只触发当前 workflow 的 oneshot：其他已终态工作流的等待者在注册时
+    /// 已由 `register_terminal_waiter` 的"注册后检查"立即解决，无需在此
+    /// 全量扫描兜底。
+    fn notify_terminal(&self, workflow_id: &WorkflowId) {
+        self.state.fire_terminal_oneshot(workflow_id);
     }
 
     fn compute_ready_successors(
@@ -1007,7 +1082,7 @@ impl Orchestrator {
             }
         }
 
-        self.notify_terminal();
+        self.notify_terminal(workflow_id);
         Ok(())
     }
 
@@ -1025,9 +1100,20 @@ impl Orchestrator {
         self.build_ready_tasks_from_slot(&slot, workflow_id, task_ids)
     }
 
-    /// After recovery, returns all tasks with pending_count == 0 (ready to run)
-    /// for every non-terminal workflow. The caller should enqueue these into
-    /// the scheduler so they can be dispatched.
+    /// After recovery, returns all tasks that are ready to run for every
+    /// non-terminal workflow: only tasks whose persisted state is
+    /// [`Phase::Pending`] **and** whose pending counter has reached 0.
+    ///
+    /// 状态过滤不可省略——`Orchestrator::recover`（`orchestrator/persistence.rs`）
+    /// 会把非终态工作流的 Running 任务重置为 Pending，而 Completed/Failed/
+    /// Cancelled/Skipped 任务保持原状态；仅按 `pending == 0` 过滤会把已完成
+    /// 任务也重建派发，导致副作用重复执行（根任务的 pending 恒为 0）。
+    ///
+    /// ## 接线约定
+    ///
+    /// 本方法只做重建，**不负责派发**。生产接线位于 `builder.rs`：节点启动时
+    /// 先于 Worker 事件循环调用本方法（此时 Orchestrator 仍独占引用），返回的
+    /// 任务经 `SchedulerActor::enqueue_batch` 快路径交给调度器。
     pub fn recover_ready_tasks(&self) -> Vec<TaskDefinition> {
         let mut all_ready = Vec::new();
         for entry in self.state.slots.iter() {
@@ -1041,7 +1127,14 @@ impl Orchestrator {
             let ready_ids: Vec<TaskId> = slot
                 .pending
                 .iter()
-                .filter(|(_, &count)| count == 0)
+                .filter(|(tid, &count)| {
+                    count == 0
+                        && slot
+                            .execution
+                            .tasks
+                            .get(tid)
+                            .is_some_and(|t| t.state == Phase::Pending)
+                })
                 .map(|(tid, _)| tid.clone())
                 .collect();
 
@@ -1049,14 +1142,29 @@ impl Orchestrator {
                 continue;
             }
 
-            if let Ok(tasks) = self.build_ready_tasks_from_slot(slot, workflow_id, &ready_ids) {
-                tracing::info!(
-                    "recovered workflow {} with {} ready tasks",
-                    workflow_id.as_str(),
-                    tasks.len()
-                );
-                all_ready.extend(tasks);
+            match self.build_ready_tasks_from_slot(slot, workflow_id, &ready_ids) {
+                Ok(tasks) => {
+                    tracing::info!(
+                        "recovered workflow {} with {} ready tasks",
+                        workflow_id.as_str(),
+                        tasks.len()
+                    );
+                    all_ready.extend(tasks);
+                }
+                Err(e) => {
+                    tracing::error!(
+                        workflow = %workflow_id.as_str(),
+                        error = %e,
+                        "failed to rebuild ready tasks for recovered workflow"
+                    );
+                }
             }
+        }
+        if !all_ready.is_empty() {
+            tracing::debug!(
+                count = all_ready.len(),
+                "recovered ready tasks rebuilt; caller (builder) enqueues them into the scheduler"
+            );
         }
         all_ready
     }
@@ -1077,8 +1185,9 @@ impl Orchestrator {
             let pred_count = slot.dag.predecessor_count(task_id);
 
             // 普通 task 重试使用 reset_task 并 increment_retry=true。
-            // 这同时处理 Failed → Pending 的状态转换。
-            slot.execution.reset_task(task_id, true, false);
+            // 这同时处理 Failed → Pending 的状态转换。attempt 同步递增：
+            // 每次重派发都推进派发代数，使重试结果可与其他代区分（fencing 前提）。
+            slot.execution.reset_task(task_id, true, true);
 
             // 验证 task 是否确实被重置（可能由于状态不匹配，
             // 例如处于 Completed 等不可重置状态）。

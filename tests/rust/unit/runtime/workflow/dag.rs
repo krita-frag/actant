@@ -125,7 +125,7 @@ fn mark_task_completed_triggers_workflow_completion() {
         vec![TaskId::from("a".to_string())],
     );
     wf.mark_running();
-    wf.mark_task_completed(&TaskId::from("a"), b"ok".to_vec());
+    wf.mark_task_completed(&TaskId::from("a"), b"ok".to_vec(), None);
     assert_eq!(wf.state, Phase::Completed);
 }
 
@@ -152,6 +152,7 @@ fn fail_task_with_fail_fast_strategy() {
         &TaskId::from("a"),
         "boom".into(),
         FailureScope::WorkflowLevel,
+        None,
     );
     assert_eq!(wf.state, Phase::Failed);
     assert!(wf.error.as_deref().unwrap().contains("boom"));
@@ -169,12 +170,13 @@ fn fail_task_with_continue_strategy_keeps_running() {
         &TaskId::from("a"),
         "boom".into(),
         FailureScope::WorkflowLevel,
+        None,
     );
     // 工作流未完成，因为 task b 仍在运行
     assert!(!wf.state.is_terminal());
 
     // task b 完成 → 工作流转 Failed
-    wf.mark_task_completed(&TaskId::from("b"), b"ok".to_vec());
+    wf.mark_task_completed(&TaskId::from("b"), b"ok".to_vec(), None);
     assert_eq!(wf.state, Phase::Failed);
 }
 
@@ -186,7 +188,12 @@ fn fail_task_with_task_only_scope_does_not_trigger_workflow() {
     )
     .with_failure_strategy(FailureStrategy::FailFast);
     wf.mark_running();
-    wf.fail_task(&TaskId::from("a"), "boom".into(), FailureScope::TaskOnly);
+    wf.fail_task(
+        &TaskId::from("a"),
+        "boom".into(),
+        FailureScope::TaskOnly,
+        None,
+    );
     // TaskOnly 不触发 workflow 级别状态转换
     assert_eq!(wf.state, Phase::Running);
 }
@@ -203,11 +210,13 @@ fn fail_task_idempotent_when_already_terminal() {
         &TaskId::from("a"),
         "first".into(),
         FailureScope::WorkflowLevel,
+        None,
     );
     wf.fail_task(
         &TaskId::from("a"),
         "second".into(),
         FailureScope::WorkflowLevel,
+        None,
     );
     // 第二次调用不应修改错误消息
     assert!(wf.error.as_deref().unwrap().contains("first"));
@@ -224,6 +233,7 @@ fn reset_task_from_failed_state() {
         &TaskId::from("a"),
         "boom".into(),
         FailureScope::WorkflowLevel,
+        None,
     );
     wf.reset_task(&TaskId::from("a"), true, false);
     let task = &wf.tasks[&TaskId::from("a")];
@@ -239,7 +249,7 @@ fn reset_task_idempotent_for_completed_task() {
         vec![TaskId::from("a".to_string())],
     );
     wf.mark_running();
-    wf.mark_task_completed(&TaskId::from("a"), b"ok".to_vec());
+    wf.mark_task_completed(&TaskId::from("a"), b"ok".to_vec(), None);
     wf.reset_task(&TaskId::from("a"), false, true);
     let task = &wf.tasks[&TaskId::from("a")];
     assert_eq!(task.state, Phase::Completed);
@@ -304,9 +314,9 @@ fn collected_results_sorts_by_task_id() {
         ],
     );
     wf.mark_running();
-    wf.mark_task_completed(&TaskId::from("c"), b"result-c".to_vec());
-    wf.mark_task_completed(&TaskId::from("a"), b"result-a".to_vec());
-    wf.mark_task_completed(&TaskId::from("b"), b"result-b".to_vec());
+    wf.mark_task_completed(&TaskId::from("c"), b"result-c".to_vec(), None);
+    wf.mark_task_completed(&TaskId::from("a"), b"result-a".to_vec(), None);
+    wf.mark_task_completed(&TaskId::from("b"), b"result-b".to_vec(), None);
     let results = wf.collected_results();
     assert_eq!(results.len(), 3);
     // 应按 task_id 升序：a,b,c
@@ -589,4 +599,199 @@ fn nodes_iterator_visits_all_nodes() {
     let dag = make_linear_dag();
     let count = dag.nodes().count();
     assert_eq!(count, 3);
+}
+
+// --- 终态守卫（can_transition_task）测试 ---
+
+/// 取消后迟到的完成结果不得把 Cancelled 任务改写为 Completed，
+/// 也不得把 Cancelled 工作流"复活"为 Completed。
+#[test]
+fn late_completion_after_cancel_does_not_revive_workflow() {
+    let mut wf = WorkflowExecution::new(
+        WorkflowId::from("wf-1".to_string()),
+        vec![TaskId::from("a".to_string()), TaskId::from("b".to_string())],
+    );
+    wf.mark_running();
+    wf.mark_task_running(&TaskId::from("a".to_string()));
+    wf.mark_cancelled();
+    assert_eq!(wf.state, Phase::Cancelled);
+
+    // 迟到完成：被守卫拒绝，返回 false，状态不发生任何变化。
+    let applied = wf.mark_task_completed(&TaskId::from("a".to_string()), b"r".to_vec(), None);
+    assert!(!applied, "late completion must be rejected");
+    assert_eq!(wf.state, Phase::Cancelled, "workflow must stay Cancelled");
+    let task = wf.tasks.get(&TaskId::from("a".to_string())).unwrap();
+    assert_eq!(task.state, Phase::Cancelled, "task must stay Cancelled");
+    assert!(task.result.is_none(), "no result may be attached");
+    assert_eq!(wf.succeeded_count(), 0);
+}
+
+/// 失败（FailFast 工作流级失败）后迟到的完成结果不得把 Failed 工作流
+/// 复活为 Completed，也不得覆盖 Failed 任务状态。
+#[test]
+fn late_completion_after_failure_does_not_revive_workflow() {
+    let mut wf = WorkflowExecution::new(
+        WorkflowId::from("wf-1".to_string()),
+        vec![TaskId::from("a".to_string()), TaskId::from("b".to_string())],
+    );
+    wf.mark_running();
+    wf.mark_task_running(&TaskId::from("a".to_string()));
+    wf.fail_task(
+        &TaskId::from("a".to_string()),
+        "boom".to_string(),
+        FailureScope::WorkflowLevel,
+        None,
+    );
+    assert_eq!(wf.state, Phase::Failed, "FailFast must fail the workflow");
+
+    let applied = wf.mark_task_completed(&TaskId::from("a".to_string()), b"r".to_vec(), None);
+    assert!(!applied, "late completion must be rejected");
+    assert_eq!(wf.state, Phase::Failed, "workflow must stay Failed");
+    let task = wf.tasks.get(&TaskId::from("a".to_string())).unwrap();
+    assert_eq!(task.state, Phase::Failed);
+    assert_eq!(task.error.as_deref(), Some("boom"));
+}
+
+/// 已 Completed 的任务重复完成仍被拒绝（幂等），且不重复累计 succeeded_count。
+#[test]
+fn duplicate_completion_is_idempotent_and_returns_false() {
+    let mut wf = WorkflowExecution::new(
+        WorkflowId::from("wf-1".to_string()),
+        vec![TaskId::from("a".to_string())],
+    );
+    wf.mark_running();
+    assert!(wf.mark_task_completed(&TaskId::from("a".to_string()), b"r1".to_vec(), None));
+    assert!(wf.is_terminal());
+
+    let applied = wf.mark_task_completed(&TaskId::from("a".to_string()), b"r2".to_vec(), None);
+    assert!(!applied, "duplicate completion must be rejected");
+    assert_eq!(
+        wf.succeeded_count(),
+        1,
+        "succeeded_count must not double count"
+    );
+    let task = wf.tasks.get(&TaskId::from("a".to_string())).unwrap();
+    assert_eq!(task.result.as_deref(), Some(b"r1".as_slice()));
+}
+
+/// can_transition_task 的判定口径：终态工作流一律拒绝；
+/// 非终态工作流下，终态任务拒绝、Pending/Running 任务放行。
+#[test]
+fn can_transition_task_guards_workflow_and_task_terminal_states() {
+    let mut wf = WorkflowExecution::new(
+        WorkflowId::from("wf-1".to_string()),
+        vec![TaskId::from("a".to_string()), TaskId::from("b".to_string())],
+    );
+    wf.mark_running();
+    wf.mark_task_running(&TaskId::from("a".to_string()));
+
+    assert!(wf.can_transition_task(&TaskId::from("a".to_string())));
+    assert!(wf.can_transition_task(&TaskId::from("b".to_string())));
+
+    // 任务终态 → 拒绝
+    wf.mark_task_completed(&TaskId::from("b".to_string()), b"r".to_vec(), None);
+    assert!(!wf.can_transition_task(&TaskId::from("b".to_string())));
+
+    // 工作流终态 → 全部拒绝
+    wf.cancel_task(&TaskId::from("a".to_string()));
+    wf.mark_cancelled();
+    assert!(wf.is_terminal());
+    assert!(!wf.can_transition_task(&TaskId::from("a".to_string())));
+    assert!(!wf.can_transition_task(&TaskId::from("b".to_string())));
+}
+
+// --- attempt fencing（结果接受侧派发代数校验）测试 ---
+
+/// 过期派发代数（attempt 0）的迟到完成结果在代数推进（重派发 → attempt 1）后
+/// 被丢弃：任务状态、结果与 succeeded_count 均不变；同代（attempt 1）结果正常接受。
+#[test]
+fn stale_attempt_result_is_dropped_and_current_attempt_accepted() {
+    let mut wf = WorkflowExecution::new(
+        WorkflowId::from("wf-1".to_string()),
+        vec![TaskId::from("a".to_string())],
+    );
+    wf.mark_running();
+    wf.mark_task_running(&TaskId::from("a".to_string()));
+    // 故障转移重派发：attempt 0 → 1
+    wf.reset_task(&TaskId::from("a".to_string()), false, true);
+    assert_eq!(wf.tasks[&TaskId::from("a".to_string())].attempt(), 1);
+
+    // 旧代在途执行的迟到结果 → 丢弃
+    let applied =
+        wf.mark_task_completed(&TaskId::from("a".to_string()), b"stale".to_vec(), Some(0));
+    assert!(!applied, "stale-generation result must be dropped");
+    let task = wf.tasks.get(&TaskId::from("a".to_string())).unwrap();
+    assert_eq!(task.state, Phase::Pending, "task must stay Pending");
+    assert!(task.result.is_none(), "no stale result may be attached");
+    assert_eq!(wf.succeeded_count(), 0);
+
+    // 当代结果 → 接受
+    assert!(wf.mark_task_completed(&TaskId::from("a".to_string()), b"fresh".to_vec(), Some(1)));
+    let task = wf.tasks.get(&TaskId::from("a".to_string())).unwrap();
+    assert_eq!(task.state, Phase::Completed);
+    assert_eq!(task.result.as_deref(), Some(b"fresh".as_slice()));
+    assert_eq!(wf.succeeded_count(), 1);
+}
+
+/// 更新一代（attempt 大于当前记录）的结果不高于任何守卫拦截——fencing 只拒绝
+/// 落后代数，超前代数（如调度侧已推进但本节点状态滞后）放行。
+#[test]
+fn newer_attempt_result_is_accepted() {
+    let mut wf = WorkflowExecution::new(
+        WorkflowId::from("wf-1".to_string()),
+        vec![TaskId::from("a".to_string())],
+    );
+    wf.mark_running();
+    assert!(wf.mark_task_completed(&TaskId::from("a".to_string()), b"r".to_vec(), Some(7)));
+    assert_eq!(wf.state, Phase::Completed);
+}
+
+/// 结果通路未携带派发代数（`None`）时 fencing 放行——向后兼容：
+/// 协议扩展前所有结果都走该路径，不得被误拒。
+#[test]
+fn unknown_attempt_result_is_accepted_for_backward_compat() {
+    let mut wf = WorkflowExecution::new(
+        WorkflowId::from("wf-1".to_string()),
+        vec![TaskId::from("a".to_string())],
+    );
+    wf.mark_running();
+    wf.reset_task(&TaskId::from("a".to_string()), false, true);
+    assert!(wf.mark_task_completed(&TaskId::from("a".to_string()), b"r".to_vec(), None));
+    assert_eq!(wf.state, Phase::Completed);
+}
+
+/// 过期派发代数的失败报告同样被 fencing 丢弃；同代失败报告正常生效。
+#[test]
+fn stale_attempt_failure_report_is_dropped() {
+    let mut wf = WorkflowExecution::new(
+        WorkflowId::from("wf-1".to_string()),
+        vec![TaskId::from("a".to_string())],
+    )
+    .with_failure_strategy(FailureStrategy::Continue);
+    wf.mark_running();
+    wf.reset_task(&TaskId::from("a".to_string()), false, true);
+
+    let applied_before = wf.tasks[&TaskId::from("a".to_string())].clone();
+    wf.fail_task(
+        &TaskId::from("a".to_string()),
+        "stale boom".to_string(),
+        FailureScope::TaskOnly,
+        Some(0),
+    );
+    let task = wf.tasks.get(&TaskId::from("a".to_string())).unwrap();
+    assert_eq!(
+        task.state, applied_before.state,
+        "stale failure must be dropped"
+    );
+    assert!(task.error.is_none(), "stale failure must not record error");
+
+    wf.fail_task(
+        &TaskId::from("a".to_string()),
+        "fresh boom".to_string(),
+        FailureScope::TaskOnly,
+        Some(1),
+    );
+    let task = wf.tasks.get(&TaskId::from("a".to_string())).unwrap();
+    assert_eq!(task.state, Phase::Failed);
+    assert_eq!(task.error.as_deref(), Some("fresh boom"));
 }

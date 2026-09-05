@@ -26,23 +26,20 @@ def cap_rt() -> _CapabilityRuntime:
 
 
 class TestCapabilityMetadata:
-    """Rust `builtin_capabilities()` 返回 10 个 capability（不含策略型）。"""
+    """Rust `builtin_capabilities()` 返回 7 个 capability（不含策略型）。"""
 
     def test_builtin_capabilities_excludes_python_only(self, cap_rt: _CapabilityRuntime) -> None:
         """Rust 不暴露 Routing/Scheduling/RetryPolicy——它们是纯 Python 策略。"""
         names = {name for name, _ in cap_rt.builtin_capabilities()}
-        # Rust 暴露的 10 个 capability
+        # Rust 暴露的 7 个 capability
         expected = {
             "Serialization",
             "Transport",
             "Store",
             "Execute",
-            "ActorMessaging",
-            "ActorSupervision",
             "TaskLifecycle",
             "WorkflowLifecycle",
             "NodeLifecycle",
-            "ActorLifecycle",
         }
         assert names == expected
         # 策略型不在 Rust 暴露集合中
@@ -57,7 +54,7 @@ class TestCapabilityMetadata:
         capability 都有 layer entry（无 handler），确保 `bind_actor_system` 能为
         它们 spawn CapabilityActor。因此 count 等于内置 capability 数量。
         """
-        assert cap_rt.capability_count == 10
+        assert cap_rt.capability_count == 7
 
     def test_registered_capabilities_empty_without_handlers(
         self, cap_rt: _CapabilityRuntime
@@ -69,7 +66,7 @@ class TestCapabilityMetadata:
 
 
 class TestAskDispatch:
-    """Rust 仅支持 ActorSupervision ask；Routing/Scheduling 不支持。"""
+    """Rust 不支持任何 ask capability（ask 注册表为空）；Routing/Scheduling 是纯 Python。"""
 
     def test_routing_not_supported_by_rust(self, cap_rt: _CapabilityRuntime) -> None:
         """Routing 是纯 Python 策略，Rust 抛 ValueError。"""

@@ -341,9 +341,14 @@ fn hlc_merge_with_stale_remote_uses_local() {
 fn hlc_merge_with_equal_wall_time_uses_logical() {
     let hlc = HybridLogicalClock::new();
     let local = hlc.tick();
+    // 远端与本地历史 wall_time 相同、logical 更高。merge 时本地物理时钟
+    // 可能已前进：此时 Kulkarni 标准算法将 logical 清零，输出 (P2, 0)
+    // 仍严格大于 local 与 remote；若物理时钟未前进，则落入并列主导分支
+    // 取 max(local, remote) + 1。两种情况输出都严格大于双方，单调性保持。
     let remote = HlcTimestamp::from_parts(local.wall_time(), local.logical() + 10);
     let merged = hlc.merge(&remote);
-    assert!(merged.logical() > 0);
+    assert!(merged > local);
+    assert!(merged > remote);
 }
 
 #[test]

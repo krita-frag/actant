@@ -6,11 +6,20 @@ use crate::common::wire::TOPIC_CANCEL;
 use crate::common::{ActantConfig, ActorId, NodeId};
 use crate::runtime::actor::ActorSystem;
 use crate::runtime::capability::CapabilityRuntime;
-use crate::runtime::dispatcher::TaskRegistry;
+use crate::runtime::dispatcher::{ProcessTaskDispatcher, TaskDispatcher};
 use crate::runtime::event_bus::EventBus;
 use crate::runtime::state::{LmdbStore, Store};
 use crate::test_support::MockTransport;
 use tempfile::tempdir;
+
+/// 构造一个不拉取 worker 子进程的进程池分发器，供 `Runtime::new` 传递
+/// （运行时存储调度器，测试中不真正派发任务）。
+fn hermetic_dispatcher() -> Arc<dyn TaskDispatcher> {
+    Arc::new(
+        ProcessTaskDispatcher::new(0, "python3".to_string(), 1, Vec::new(), Vec::new())
+            .expect("process task dispatcher init"),
+    )
+}
 
 fn make_runtime(node_id: &str) -> (Runtime, Arc<MockTransport>) {
     let transport = Arc::new(MockTransport::new(node_id));
@@ -22,9 +31,7 @@ fn make_runtime(node_id: &str) -> (Runtime, Arc<MockTransport>) {
     let workflow_actor_id = ActorId::workflow(&NodeId::from(node_id.to_string()));
     let capability = Arc::new(CapabilityRuntime::new());
     let event_bus = EventBus::new();
-    let dispatcher = TaskRegistry::new(1, 8, Vec::new())
-        .expect("TaskRegistry init")
-        .into_dispatcher();
+    let dispatcher = hermetic_dispatcher();
     let rt = Runtime::new(
         NodeId::from(node_id.to_string()),
         ActantConfig::default(),
