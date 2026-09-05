@@ -31,14 +31,15 @@ Actant 采用 **Rust + iroh** 构建核心运行时，通过 **PyO3** 暴露给 
 | `perform` | 副作用型 | 调用最后注册的 handler | handler 返回值 |
 | `emit` | 反应型 | 顺序调用所有 handler | `None` |
 
-后注册的 handler 优先级更高（`ask` 逆序决策，自定义覆盖默认）。内置 10 个 capability：策略型 `Routing`/`Scheduling`/`RetryPolicy`（纯 Python），其余由 Rust 核心提供 codec 与默认 handler、Python 可覆盖。
+后注册的 handler 优先级更高（`ask` 逆序决策，自定义覆盖默认）。内置 11 个 capability：策略型 `Routing`/`Scheduling`/`RetryPolicy`（纯 Python）与 `ValueStore`（默认 handler 为 Python→Rust blob 桥，Python 可覆盖），其余由 Rust 核心提供 codec 与默认 handler、Python 可覆盖。
 
 ## 高层 API（@task / @flow）
 
 `@task` 和 `@flow` 是面向用户的便捷 API，底层基于 ERH 的 `Execute` capability 实现：
 
 - **`@task`**：将函数包装为 `Task` 对象，支持同步调用（直接执行）和异步提交（`submit()`/`delay()` 返回 `AsyncResult`）。支持 `retries`/`retry_delay_ms`/`timeout_ms` 参数。
-- **`AsyncResult`**：任务句柄，提供 `result()`/`exception()`/`state`/`done()`。作为下游 `submit()` 参数时自动阻塞等待（依赖解析递归处理 `list`/`tuple`/`dict`）。
+- **`AsyncResult`**：任务句柄，提供 `result()`/`exception()`/`state`/`done()`/`ref()`。作为下游 `submit()` 参数时自动阻塞等待（依赖解析递归处理 `list`/`tuple`/`dict`）。大结果（超 `REF_INLINE_THRESHOLD`，1MB）经 `ValueStore` capability 落本节点内容寻址 blob store，句柄内部以 `Ref` 表示，`result()` 透明拉取反序列化。
+- **`Ref`**（`actant.task._ref`）：内容寻址值引用句柄（blake3 hash + 来源节点），`result()` 按需拉取；可直接作为 `submit()` 参数，提交方父进程解析为帧内联字节（worker 不感知网络）。
 - **`@flow`**：工作流编排装饰器，校验活跃 Runtime 并广播 `WorkflowLifecycle` 事件（`submitted` → `started` → `completed`/`failed`）。
 - **`Runtime`**：任务经 Rust `ProcessTaskDispatcher` 进程池执行（worker 子进程、每进程单任务），维护任务注册表（`list_tasks`/`get_task`/`cancel_task`）。
 
@@ -116,14 +117,15 @@ actant/
 │   ├── _effects.py               # ask / perform / emit / effect / impossible
 │   ├── task/                     # @task 装饰器、Task、AsyncResult
 │   │   ├── __init__.py           # 公共 API re-export
-│   │   ├── _async_result.py      # AsyncResult、_resolve_value（依赖解析）
+│   │   ├── _async_result.py      # AsyncResult（小结果对象缓存 / 大结果 Ref 两态）、_collect_dep_ids（依赖解析）
 │   │   ├── _context.py           # TaskContext、get_task_context（协作式取消）
 │   │   ├── _gather.py            # gather 并行等待原语
 │   │   ├── _helpers.py           # dispatch 桥接复用件：_execute_with_retries、_safe_serialize、_run_with_timeout、_EventBatcher 等
+│   │   ├── _ref.py               # Ref 值引用句柄、REF_INLINE_THRESHOLD 降级、_RefArg 哨兵（0.3.2 R3）
 │   │   ├── _task_obj.py          # Task 类、@task 装饰器
 │   │   └── _worker.py            # worker 子进程循环（`python -m actant.task._worker` 入口）
 │   ├── flow.py                   # @flow 工作流编排装饰器（动态 DAG 记录 + 提交 Rust Orchestrator + 生命周期事件广播）
-│   ├── capabilities.py           # 内置 13 capability 声明、ctx dataclass、Handler Protocol、capability 常量
+│   ├── capabilities.py           # 内置 11 capability 声明、ctx dataclass、Handler Protocol、capability 常量
 │   ├── exceptions.py             # ActantError 层级（19 个异常类），kind 镜像 Rust
 │   ├── cli.py                    # `actant worker` CLI 入口（--log-level / --max-concurrent-tasks 等参数）
 │   ├── actant.pyi                # PyO3 模块类型存根

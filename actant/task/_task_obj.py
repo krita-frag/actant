@@ -236,6 +236,32 @@ class Task:
         from actant.flow import current_workflow_id, is_flow_cancelled
 
         workflow_id = current_workflow_id() or ""
+
+        # 值引用降级（0.3.2 R3b，均发生在提交方父进程）：
+        # 1. 参数树中的 Ref（上游大结果 / 用户显式传入）→ _RefArg 帧内联字节
+        #    （blob 字节原样搬运，无对象级序列化，见 plans/REF_DESIGN.md）。
+        # 2. 直传大值（> REF_INLINE_THRESHOLD）→ 落 blob + _RefArg。
+        from actant.task._ref import _degrade_large_values, _materialize_refs
+
+        def _fetch(rb: bytes) -> bytes:
+            from actant.task._ref import _value_fetch
+
+            return _value_fetch(rb, runtime=runtime)
+
+        def _store(data: bytes) -> bytes:
+            from actant.task._ref import _value_store
+
+            return _value_store(data, runtime=runtime)
+
+        resolved_args = tuple(_materialize_refs(a, _fetch) for a in resolved_args)
+        resolved_kwargs = {
+            k: _materialize_refs(v, _fetch) for k, v in resolved_kwargs.items()
+        }
+        resolved_args = tuple(_degrade_large_values(a, _store) for a in resolved_args)
+        resolved_kwargs = {
+            k: _degrade_large_values(v, _store) for k, v in resolved_kwargs.items()
+        }
+
         options = {
             "retries": self._retries,
             "retry_delay_ms": self._retry_delay_ms,

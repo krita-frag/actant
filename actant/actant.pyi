@@ -397,3 +397,9 @@ class _RuntimeCore:
     def get_workflow_state(self, workflow_id: str) -> dict[str, Any] | None: ...
     def list_workflows(self) -> list[str]: ...
     def register_task_result_callback(self, callback: Callable[[_TaskCompletion], None]) -> None: ...
+    def value_store(self, data: bytes) -> bytes:
+        """将字节存入本节点内容寻址 blob 存储，返回 BlobRef wire 编码（0.3.2 R2）。"""
+    def value_fetch(self, ref_bytes: bytes) -> bytes:
+        """按 BlobRef wire 编码取回值字节：本地命中优先，未命中跨节点流式拉取。"""
+    def value_ref_parts(self, ref_bytes: bytes) -> tuple[str, str]:
+        """解码 BlobRef wire 编码为 (hash_hex, node)。"""

@@ -172,6 +172,41 @@ pub trait Transport: Send + Sync + 'static {
     async fn discover_peers(&self) -> crate::common::Result<Vec<PeerId>>;
     /// 关闭传输并释放底层 endpoint。
     async fn shutdown(&self) -> crate::common::Result<()>;
+
+    // ── blob 原语（0.3.2 R2）──
+    // 默认未启用（返回 Config 错误 / None）：由 with_blob_store 装配的
+    // NetworkManager 覆盖；测试 mock 等其他实现无需实现。
+
+    /// blob 存储句柄；未启用 blob 原语的传输返回 `None`。
+    fn blobs(&self) -> Option<&Arc<BlobStore>> {
+        None
+    }
+
+    /// 将数据写入本地 blob 存储，返回内容寻址 hash。
+    ///
+    /// # Errors
+    ///
+    /// 未启用 blob 原语或存储写入失败时返回错误。
+    async fn blob_store(&self, _data: Vec<u8>) -> crate::common::Result<BlobHash> {
+        Err(ActantError::Config(
+            "blob store not enabled on this transport".into(),
+        ))
+    }
+
+    /// 从指定节点流式拉取 blob，返回逐块（已校验）读取句柄。
+    ///
+    /// # Errors
+    ///
+    /// 未启用 blob 原语、节点不可达或 hash 不存在时返回错误。
+    async fn blob_fetch(
+        &self,
+        _node: &NodeId,
+        _hash: BlobHash,
+    ) -> crate::common::Result<BlobFetch> {
+        Err(ActantError::Config(
+            "blob fetch not enabled on this transport".into(),
+        ))
+    }
 }
 
 #[derive(Debug)]
@@ -1055,6 +1090,20 @@ impl Transport for NetworkManager {
 
     async fn shutdown(&self) -> crate::common::Result<()> {
         self.shutdown().await
+    }
+
+    // blob 原语（0.3.2 R2）：委托给同名固有方法（固有方法优先，显式转发消歧）。
+
+    fn blobs(&self) -> Option<&Arc<BlobStore>> {
+        NetworkManager::blobs(self)
+    }
+
+    async fn blob_store(&self, data: Vec<u8>) -> crate::common::Result<BlobHash> {
+        NetworkManager::blob_store(self, data).await
+    }
+
+    async fn blob_fetch(&self, node: &NodeId, hash: BlobHash) -> crate::common::Result<BlobFetch> {
+        NetworkManager::blob_fetch(self, node, hash).await
     }
 }
 

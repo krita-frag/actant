@@ -113,7 +113,7 @@ def test_cancel_task_unknown() -> None:
 def test_cancel_task_completed() -> None:
     rt = Runtime()
     handle = AsyncResult("t1")
-    handle._set_result(__import__("cloudpickle").dumps(1))
+    handle._set_result(1)
     rt.register_task("t1", handle)
     assert rt.cancel_task("t1") is False
 

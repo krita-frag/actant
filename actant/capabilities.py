@@ -31,6 +31,9 @@ TRANSPORT = "Transport"
 STORE = "Store"
 EXECUTE = "Execute"
 
+#: 副作用型（默认 handler 为 Python→Rust blob 桥，Python 可覆盖，如 S3 后端）
+VALUE_STORE = "ValueStore"
+
 #: 反应型（Rust 事件总线广播，Python 可订阅）
 TASK_LIFECYCLE = "TaskLifecycle"
 WORKFLOW_LIFECYCLE = "WorkflowLifecycle"
@@ -126,6 +129,20 @@ class ExecuteOutcome:
     result_payload: bytes
     error_payload: bytes = b""
 
+
+@dataclass
+class ValueStoreReq:
+    """`ValueStore` capability 的请求（0.3.2 R2 值引用原语）。
+
+    内容寻址存储：同一次 ``store`` 的数据字节决定 ``ref``（BlobRef wire 编码，
+    内含 blake3 hash 与来源节点）；``fetch`` 按 ``ref`` 取回原始字节，跨节点时
+    经 blob 协议流式拉取（逐块校验）。
+    """
+
+    op: Literal["store", "fetch"]
+    data: bytes = b""
+    ref: bytes = b""
+
 @dataclass
 class TaskEvent:
     """`TaskLifecycle` capability 的事件。"""
@@ -208,6 +225,18 @@ class ExecuteHandler(Protocol):
 
 
 @runtime_checkable
+class ValueStoreHandler(Protocol):
+    """副作用型：值引用存取（0.3.2 R2）。
+
+    ``op="store"`` 返回 BlobRef wire 编码字节（``ref``）；``op="fetch"`` 返回
+    取回的原始字节。默认 handler 走本节点 Rust blob 桥（`_RuntimeCore.
+    value_store` / `value_fetch`），可覆盖为 S3 等外部对象存储后端。
+    """
+
+    def __call__(self, req: ValueStoreReq) -> bytes: ...
+
+
+@runtime_checkable
 class TaskLifecycleHandler(Protocol):
     """反应型：任务生命周期事件订阅。"""
 
@@ -234,8 +263,12 @@ class NodeLifecycleHandler(Protocol):
 #: - `Routing` / `Scheduling` / `RetryPolicy`：策略型，**仅 Python 层**实现，
 #:   Rust 核心不提供默认 handler。用户必须通过 `rt.layer(name).chain(handler)`
 #:   或 `Runtime.with_defaults()` 注册 Python handler，否则 ask 返回 None。
-#: - 其余 7 个：Rust 核心提供 codec（`register_defaults`），具体 handler 由
-#:   `RuntimeBuilder` 注入（如 StoreHandler / ExecuteHandler）或 Python 层覆盖。
+#: - `Serialization` / `Transport` / `Store` / `Execute`：Rust 核心提供 codec
+#:   （`register_defaults`），具体 handler 由 `RuntimeBuilder` 注入（如
+#:   StoreHandler / ExecuteHandler）或 Python 层覆盖。
+#: - `ValueStore`：默认 handler 为 Python 层的 Rust blob 桥
+#:   （`Runtime.start()` 时链入），Rust capability registry 不含该 capability。
+#: - `TaskLifecycle` 等 emit 型：Rust 事件总线广播，Python 可订阅。
 BUILTIN_CAPABILITIES: dict[str, CapabilityMeta] = {
     # ── 策略型（Python-only，无 Rust fallback）──
     "Routing": CapabilityMeta("Routing", "ask"),
@@ -246,18 +279,25 @@ BUILTIN_CAPABILITIES: dict[str, CapabilityMeta] = {
     "Transport": CapabilityMeta("Transport", "perform"),
     "Store": CapabilityMeta("Store", "perform"),
     "Execute": CapabilityMeta("Execute", "perform"),
+    # ── 副作用型（默认 handler 为 Python→Rust blob 桥，Python 可覆盖）──
+    "ValueStore": CapabilityMeta("ValueStore", "perform"),
     # ── 反应型（Rust 事件总线广播，Python 可订阅）──
     "TaskLifecycle": CapabilityMeta("TaskLifecycle", "emit"),
     "WorkflowLifecycle": CapabilityMeta("WorkflowLifecycle", "emit"),
     "NodeLifecycle": CapabilityMeta("NodeLifecycle", "emit"),
 }
 
-#: 仅 Python 层实现的策略型 capability（无 Rust fallback）。
+#: 仅 Python 层实现的 capability（无 Rust fallback）。
+#: `Routing`/`Scheduling`/`RetryPolicy` 为策略型；`ValueStore` 的默认 handler
+#: 是 Python→Rust blob 桥（`_DefaultValueStoreHandler`），Rust capability
+#: registry 不含该 capability——若缺失 handler 时回退 Rust 分发会直接报
+#: "not supported"，故归入本集合。
 #: 单点维护：``RUST_BACKED_CAPABILITIES`` 从 ``BUILTIN_CAPABILITIES`` 与此集合派生。
 PYTHON_ONLY_CAPABILITIES: frozenset[str] = frozenset({
     "Routing",
     "Scheduling",
     "RetryPolicy",
+    "ValueStore",
 })
 
 #: Rust 核心通过 `capability_registry!` 注册的 capability 名称集合。
@@ -305,6 +345,7 @@ __all__ = [
     "STORE",
     "TASK_LIFECYCLE",
     "TRANSPORT",
+    "VALUE_STORE",
     "WORKFLOW_LIFECYCLE",
     "CapabilityMeta",
     "EffectKind",
@@ -327,6 +368,8 @@ __all__ = [
     "TaskLifecycleHandler",
     "TransportHandler",
     "TransportReq",
+    "ValueStoreHandler",
+    "ValueStoreReq",
     "WorkflowEvent",
     "WorkflowLifecycleHandler",
     "get_builtin_capability_meta",

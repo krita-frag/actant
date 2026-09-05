@@ -631,7 +631,9 @@ def _safe_serialize(
 
     envelope 超过 ``MAX_FRAME_BYTES``（worker 帧协议上限）时抛 ``SerializationError``：
     超限载荷会被 worker 以协议损坏拒绝并触发无意义的 crash-failover 重试，在提交侧
-    快速失败并指明上限更可诊断。大载荷应经 ``Ref``/对象存储引用传递（路线图阶段 4）。
+    快速失败并指明上限更可诊断。大载荷应经 ``Ref``/``ValueStore`` 值引用传递
+    （0.3.2 R2/R3；超过 ``REF_INLINE_THRESHOLD`` 的参数已自动降级，见
+    ``actant/task/_ref.py``）。
     """
     try:
         envelope = _build_v2_envelope(func, args, kwargs, options, task_id)

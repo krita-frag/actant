@@ -53,6 +53,7 @@ from actant.task._helpers import (
     MAX_FRAME_BYTES,
     _execute_with_retries,
 )
+from actant.task._ref import _resolve_ref_arg
 
 # 帧类型常量（与 Rust `ProcessTaskDispatcher` 保持一致）。
 FRAME_DISPATCH = 0x01
@@ -370,6 +371,10 @@ def _run_dispatch(payload: bytes, cancel_event: threading.Event) -> bytes:
             payload
         )
         func, args, kwargs = _reuse_unpack(func_payload)
+        # 解值引用参数哨兵（0.3.2 R3b）：提交方父进程已把大值字节内联进帧，
+        # worker 只做 loads 还原（结果帧约定取 [1]，见 plans/REF_DESIGN.md）。
+        args = _resolve_ref_arg(args)
+        kwargs = _resolve_ref_arg(kwargs)
     except Exception as exc:  # 头解析 / 反序列化失败：返回可序列化的错误
         from actant.exceptions import ActantError
 

@@ -19,6 +19,13 @@
 跨 handle 等待（``gather``）则借助一个 *共享* future：将所有 handle
 的完成信号汇聚到单个 ``threading.Event``，``gather`` 仅等待该 event
 一次，避免 N 次 ``wait_for`` 累加延迟。
+
+## 结果内部形态（0.3.2 R4 统一）
+
+``_result`` 单字段两态：小结果为对象缓存（``result()`` 直接返回）；大结果
+（结果帧 > ``REF_INLINE_THRESHOLD``）为 ``Ref``（``result()`` 经 ValueStore
+透明拉取反序列化）。访问路径只有 ``result()`` 一个方法；``ref()`` 暴露大
+结果的 ``Ref`` 句柄。``__await__`` 经完成回调直通 event loop（无等待线程）。
 """
 
 from __future__ import annotations
@@ -41,20 +48,13 @@ from actant.task._helpers import (
     _invoke_callbacks,
     _suppress_pickle_errors,
 )
+from actant.task._ref import Ref
 
 _logger = logging.getLogger("actant.task")
 
 # 任务终态集合：完成协议在持锁时先置终态、锁外才 set future，因此判断"是否
 # 已完成"必须以 _state 终态为准而非 _future.is_set()（后者存在窗口）。
 _TERMINAL_STATES = frozenset(("completed", "failed", "cancelled"))
-
-# 并发阻塞等待线程数上限：``__await__`` 与 ``gather_async`` 每次等待派生一个
-# daemon 线程，无界并发会随挂起的 await 数放大线程总量；32 远超典型事件循环
-# 中同时挂起的任务等待数。不用共享 ``ThreadPoolExecutor``：其工作线程非
-# daemon，阻塞在 ``result()`` 上的等待会阻止解释器退出，改变现有 daemon 线程
-# 随进程即时回收的语义。
-_AWAIT_CONCURRENCY_LIMIT = 32
-_await_slots = threading.BoundedSemaphore(_AWAIT_CONCURRENCY_LIMIT)
 
 
 class _CompletionFuture:
@@ -142,6 +142,8 @@ class AsyncResult:
     - ``add_done_callback``：intrusive linked-list 注册，O(1) 插入。
     - ``gather`` 跨 handle 等待：所有 handle 完成信号汇聚到单个共享
       ``threading.Event``，``gather`` 仅等待该 event 一次。
+    - ``__await__``：完成回调直通 event loop（``call_soon_threadsafe``），
+      无每次等待的守护线程。
     """
 
     __slots__ = (
@@ -150,8 +152,7 @@ class AsyncResult:
         "_error_payload",
         "_future",
         "_lock",
-        "_result_is_obj",
-        "_result_payload",
+        "_result",
         "_state",
         "_workflow_id",
         "task_id",
@@ -168,13 +169,10 @@ class AsyncResult:
         self._context = context
         self._workflow_id = workflow_id
         self._future = _CompletionFuture()
-        # _result_payload 存储成功结果：
-        # - bytes（跨节点传播路径，需 cloudpickle.loads）
-        # - 任意对象（本地 dispatch 路径，P2-9 优化，直接返回）
-        # _result_is_obj=True 明确标记直传对象路径，避免 bytes 返回值被误
-        # 当作序列化结果（如 echo(b"x") 返回 b"xxx" 不应被 loads）。
-        self._result_payload: Any = b""
-        self._result_is_obj: bool = False
+        # _result 单字段两态（0.3.2 R4 统一，见模块 docstring）：
+        # - 小结果：结果对象本身（worker 结果帧反序列化产物，含 bytes 返回值）。
+        # - 大结果：Ref（结果帧字节已落本节点 blob store）。
+        self._result: Any = None
         self._error_payload: bytes = b""
         self._state: TaskState = "pending"
         self._callbacks: list[Callable[[AsyncResult], None]] = []
@@ -208,9 +206,8 @@ class AsyncResult:
             timeout: 最大等待秒数，``None`` 表示无限等待。
 
         Returns:
-            任务的返回值。若 ``_result_payload`` 是 bytes（跨节点传播路径），
-            先 ``cloudpickle.loads`` 反序列化；若是对象（本地 dispatch 路径），
-            直接返回，省去 1 次 loads。
+            任务的返回值。大结果（内部为 :class:`Ref`）时透明经 ValueStore
+            拉取反序列化，首次调用后缓存。
 
         Raises:
             ActantTimeoutError: 等待超时。
@@ -222,8 +219,7 @@ class AsyncResult:
         with self._lock:
             state = self._state
             error_payload = self._error_payload
-            result_payload = self._result_payload
-            result_is_obj = self._result_is_obj
+            result = self._result
         if state == "cancelled":
             raise TaskCancelledError(f"task {self.task_id!r} was cancelled")
         if error_payload:
@@ -234,15 +230,21 @@ class AsyncResult:
                     f"task {self.task_id!r} failed (error payload undecodable)"
                 ) from e
             raise exc
-        # _result_is_obj=True 表示 dispatch 直传对象（P2-9 优化路径），
-        # 直接返回，省去 cloudpickle.loads 往返。
-        # _result_is_obj=False 表示跨节点传播的 bytes，需 cloudpickle.loads。
-        # 这避免了 bytes 返回值（如 echo(b"x")）被误当作序列化结果。
-        if result_is_obj:
-            return result_payload
-        if isinstance(result_payload, (bytes, bytearray)):
-            return cloudpickle.loads(result_payload)
-        return result_payload
+        # 单一访问路径：内部两态（对象缓存 / Ref）在此收敛。
+        if isinstance(result, Ref):
+            return result.result()
+        return result
+
+    def ref(self) -> Ref | None:
+        """返回本结果的 :class:`Ref` 句柄（大结果时），小结果返回 ``None``。
+
+        结果帧超过 ``REF_INLINE_THRESHOLD`` 时结果已落本节点 blob store，
+        ``Ref`` 可直接作为下游 ``submit`` 参数（提交方自动解析），或经
+        ``Ref.result()`` 显式拉取。
+        """
+        with self._lock:
+            result = self._result
+        return result if isinstance(result, Ref) else None
 
     def exception(self, timeout: float | None = None) -> BaseException | None:
         """阻塞等待并返回任务异常，无异常返回 ``None``。
@@ -392,19 +394,17 @@ class AsyncResult:
             if self._state == "pending":
                 self._state = "running"
 
-    def _set_result(self, result_payload: Any) -> None:
-        """设置任务成功结果并触发回调。
+    def _set_result(self, result_obj: Any) -> None:
+        """设置任务成功结果（对象缓存态）并触发回调。
 
         Args:
-            result_payload: 成功结果。可为：
-                - ``bytes``：跨节点传播路径，result() 时需 cloudpickle.loads。
-                - 任意对象：测试或非 dispatch 路径，result() 时检查类型决定。
+            result_obj: 任务返回值（worker 结果帧反序列化产物，任意类型，
+                包括 bytes）。
         """
         with self._lock:
             if self._future.is_set():
                 return
-            self._result_payload = result_payload
-            self._result_is_obj = False
+            self._result = result_obj
             self._state = "completed"
             callbacks = list(self._callbacks)
             self._callbacks.clear()
@@ -417,21 +417,16 @@ class AsyncResult:
             label=f"AsyncResult {self.task_id}: done callback",
         )
 
-    def _set_result_obj(self, result_obj: Any) -> None:
-        """设置任务成功结果（dispatch 直传对象路径，P2-9 优化）。
-
-        与 ``_set_result`` 区别：标记 ``_result_is_obj=True``，``result()``
-        直接返回对象，跳过 ``cloudpickle.loads``。这避免了任务返回 bytes
-        时被误当作序列化结果（如 ``echo(b"x")`` 返回 ``b"xxx"``）。
+    def _set_result_ref(self, ref_bytes: bytes) -> None:
+        """设置任务成功结果为 ``Ref``（大结果态，0.3.2 R4）并触发回调。
 
         Args:
-            result_obj: 任务返回值（任意类型，包括 bytes）。
+            ref_bytes: 结果帧字节落 blob 后的 BlobRef wire 编码。
         """
         with self._lock:
             if self._future.is_set():
                 return
-            self._result_payload = result_obj
-            self._result_is_obj = True
+            self._result = Ref(ref_bytes)
             self._state = "completed"
             callbacks = list(self._callbacks)
             self._callbacks.clear()
@@ -491,7 +486,10 @@ class AsyncResult:
 
         Returns:
             ``(success, result_bytes)``：
-            - 成功：``(True, cloudpickle.dumps(返回值))``（与跨节点传播路径一致）。
+            - 成功（对象缓存态）：``(True, cloudpickle.dumps(返回值))``。
+            - 成功（Ref 态，大结果）：``(True, BlobRef wire 编码)``——回灌引用
+              而非值字节，避免大值在 Orchestrator 持久化与查询面二次膨胀；
+              消费方经 ``Ref.result()`` 解析。
             - 失败：``(False, 错误消息 UTF-8 字节)``——Orchestrator ``FAIL_TASK``
               期望错误字符串，而非序列化异常。
             - 取消/其他非成功终态：``(False, b"task cancelled")``。
@@ -501,8 +499,7 @@ class AsyncResult:
         with self._lock:
             state = self._state
             if state == "completed":
-                result_payload = self._result_payload
-                result_is_obj = self._result_is_obj
+                result = self._result
             elif state == "failed":
                 error_payload = self._error_payload
             else:
@@ -510,11 +507,9 @@ class AsyncResult:
                 # Cancelled 状态回灌由后续阶段细化）。
                 return False, b"task cancelled"
         if state == "completed":
-            if result_is_obj:
-                return True, cloudpickle.dumps(result_payload)
-            if isinstance(result_payload, (bytes, bytearray)):
-                return True, bytes(result_payload)
-            return True, cloudpickle.dumps(result_payload)
+            if isinstance(result, Ref):
+                return True, result._ref_bytes
+            return True, cloudpickle.dumps(result)
         # failed：错误负载是序列化异常，提取消息字符串（解码失败时给通用错误）。
         try:
             exc = cloudpickle.loads(error_payload)
@@ -531,12 +526,40 @@ class AsyncResult:
     def __repr__(self) -> str:
         return f"AsyncResult(task_id={self.task_id!r}, state={self.state!r})"
 
+    def _bridge_to_loop(self, loop: asyncio.AbstractEventLoop) -> asyncio.Future[Any]:
+        """把任务完成信号桥接为 ``loop`` 上的 ``asyncio.Future``（0.3.2 R5）。
+
+        经 ``add_done_callback`` 注册回调：回调在完成触发线程（Rust 事件回调
+        线程）中取值并 ``call_soon_threadsafe`` 直通 event loop——无每次等待
+        的守护线程、不阻塞循环。反序列化（含大结果 unpickle）发生在回调线程
+        而非 loop 线程。loop 已关闭时投递失败由完成回调的错误策略记录。
+        """
+        aio_future: asyncio.Future[Any] = loop.create_future()
+
+        if self.done():
+            # Fast path：已完成，直接设置结果（同步，无需跨线程投递）。
+            try:
+                aio_future.set_result(self.result(timeout=0))
+            except BaseException as exc:
+                aio_future.set_exception(exc)
+            return aio_future
+
+        def _on_done(_handle: AsyncResult) -> None:
+            try:
+                value = self.result(timeout=0)
+            except BaseException as exc:
+                loop.call_soon_threadsafe(_set_aio_result, aio_future, None, exc)
+            else:
+                loop.call_soon_threadsafe(_set_aio_result, aio_future, value, None)
+
+        self.add_done_callback(_on_done)
+        return aio_future
+
     def __await__(self) -> Any:
         """使 ``AsyncResult`` 可在 ``async def`` 中直接 ``await``。
 
-        在独立守护线程执行同步 ``result()``，通过 ``call_soon_threadsafe``
-        将结果投递回 event loop。线程在 ``Condition.wait()`` 中阻塞时释放
-        GIL，使 Rust worker 线程能获取 GIL 执行 dispatch handler。
+        完成回调直通 event loop（见 :meth:`_bridge_to_loop`）：任务完成时在
+        回调线程取值，经 ``call_soon_threadsafe`` 唤醒 await 方，无需守护线程。
 
         用法::
 
@@ -548,44 +571,10 @@ class AsyncResult:
             任务的返回值（与 ``result()`` 一致）。
 
         Raises:
-            ActantTimeoutError: 任务未完成（无超时，无限等待）。
             ActantError: 任务执行失败。
             TaskCancelledError: 任务被取消。
         """
-        loop = asyncio.get_running_loop()
-        aio_future: asyncio.Future[Any] = loop.create_future()
-
-        # Fast path：已完成则直接设置结果。
-        if self.done():
-            try:
-                aio_future.set_result(self.result(timeout=0))
-            except BaseException as exc:
-                aio_future.set_exception(exc)
-            return aio_future.__await__()
-
-        def _worker() -> None:
-            """在独立线程中等待任务完成，投递结果到 event loop。"""
-            try:
-                value = self.result()
-                loop.call_soon_threadsafe(_set_aio_result, aio_future, value, None)
-            except BaseException as exc:
-                loop.call_soon_threadsafe(_set_aio_result, aio_future, None, exc)
-            finally:
-                _await_slots.release()
-
-        # 有界信号量限制并发等待线程数（见模块级 _await_slots 注释）。极端情况下
-        # （> _AWAIT_CONCURRENCY_LIMIT 个挂起等待）本调用会短暂阻塞 event loop
-        # 线程直至有空闲槽位；槽位由等待线程完成后释放，不依赖 loop 推进，无死锁。
-        _await_slots.acquire()
-        try:
-            t = threading.Thread(target=_worker, daemon=True, name="actant-await")
-            t.start()
-        except BaseException:
-            # 线程创建失败（资源耗尽等）：释放槽位，否则泄漏的槽位会让
-            # 后续 await 永久阻塞在 acquire 上。
-            _await_slots.release()
-            raise
-        return aio_future.__await__()
+        return self._bridge_to_loop(asyncio.get_running_loop()).__await__()
 
 
 def _set_aio_result(future: Any, value: Any, exc: Any) -> None:
@@ -604,11 +593,18 @@ def _collect_dep_ids(value: Any, seen: set[str], ids: list[str]) -> Any:
     遍历规则与 ``_resolve_value`` 一致（list / tuple / dict 递归），但把"解析
     结果"与"收集依赖 id"合并到一次遍历，避免两遍遍历的重复递归与规则漂移。
     ``seen``/``ids`` 由调用方持有，保证跨 ``args``/``kwargs`` 全局去重。
+
+    大结果（内部为 ``Ref``）**不在此处取值**：``result()`` 会把大值反序列化到
+    提交方内存再随 envelope 重新序列化；保留 ``Ref`` 由 ``_submit`` 解析为
+    ``_RefArg`` 帧内联字节（0.3.2 R3b，见 plans/REF_DESIGN.md）。
     """
     if isinstance(value, AsyncResult):
         if value.task_id not in seen:
             seen.add(value.task_id)
             ids.append(value.task_id)
+        ref = value.ref()
+        if ref is not None:
+            return ref
         return value.result()
     if isinstance(value, list):
         return [_collect_dep_ids(v, seen, ids) for v in value]

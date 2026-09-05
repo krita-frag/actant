@@ -12,8 +12,8 @@ use parking_lot::Mutex;
 use pyo3::prelude::*;
 
 use crate::common::{
-    ActantConfig, ActantError, NodeId, RetryPolicy, TaskCompletion, TaskDefinition, TaskId,
-    WorkflowId,
+    decode_blob_ref, encode_blob_ref, ActantConfig, ActantError, BlobRef, NodeId, RetryPolicy,
+    TaskCompletion, TaskDefinition, TaskId, WorkflowId,
 };
 use crate::runtime::builder::RuntimeBuilder;
 use crate::runtime::event_bus::{BusEvent, Topic as BusTopic};
@@ -613,6 +613,83 @@ impl PyRuntimeCore {
         Ok(worker.max_concurrent_tasks())
     }
 
+    /// 将字节存入本节点内容寻址 blob 存储，返回 `BlobRef` wire 编码（0.3.2 R2）。
+    ///
+    /// `BlobRef.node` 记为本节点 endpoint_addr，供跨节点 [`Self::value_fetch`]
+    /// 寻址。经 `ValueStore` capability 的默认 handler 调用。
+    #[tracing::instrument(name = "py.value_store", level = "debug", skip(self, py, data))]
+    fn value_store(&self, py: Python<'_>, data: Vec<u8>) -> PyResult<Vec<u8>> {
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))?;
+        let tokio = self.tokio.lock().clone().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("tokio runtime unavailable")
+        })?;
+        let network = runtime.network().clone();
+        let node = self.local_endpoint_addr(py)?;
+        py.detach(move || {
+            tokio.block_on(async move {
+                let hash = network.blob_store(data).await?;
+                encode_blob_ref(&BlobRef {
+                    hash,
+                    node: NodeId::new(node),
+                })
+            })
+        })
+        .map_err(PyErr::from)
+    }
+
+    /// 按 `BlobRef` wire 编码取回值字节（0.3.2 R2）。
+    ///
+    /// 解析顺序：先本地 blob store（内容寻址下本地命中即真——Ref 在 blob 所属
+    /// 节点上解析零网络；本地未命中的 `get_bytes` Err 是预期的未命中探测，
+    /// 不是吞错误），未命中再按 `ref.node` 跨节点流式拉取（逐 leaf 已校验）。
+    #[tracing::instrument(name = "py.value_fetch", level = "debug", skip(self, py, ref_bytes))]
+    fn value_fetch(&self, py: Python<'_>, ref_bytes: Vec<u8>) -> PyResult<Vec<u8>> {
+        let r = decode_blob_ref(&ref_bytes).map_err(PyErr::from)?;
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))?;
+        let tokio = self.tokio.lock().clone().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("tokio runtime unavailable")
+        })?;
+        let network = runtime.network().clone();
+        py.detach(move || {
+            tokio.block_on(async move {
+                if let Some(store) = network.blobs() {
+                    if let Ok(data) = store.get_bytes(&r.hash).await {
+                        return Ok(data);
+                    }
+                }
+                let mut fetch = network.blob_fetch(&r.node, r.hash).await?;
+                let mut data = Vec::new();
+                while let Some(chunk) = fetch.next_chunk().await {
+                    match chunk {
+                        Ok(bytes) => data.extend_from_slice(&bytes),
+                        Err(e) => {
+                            fetch.close();
+                            return Err(e);
+                        }
+                    }
+                }
+                fetch.close();
+                Ok(data)
+            })
+        })
+        .map_err(PyErr::from)
+    }
+
+    /// 解码 `BlobRef` wire 编码为 ``(hash_hex, node)``（0.3.2 R2）。
+    ///
+    /// 供 Python `Ref.hash` / `.node` 展示使用，避免在 Python 侧引入 postcard
+    /// 解码器。
+    fn value_ref_parts(&self, ref_bytes: Vec<u8>) -> PyResult<(String, String)> {
+        let r = decode_blob_ref(&ref_bytes).map_err(PyErr::from)?;
+        Ok((r.hash.to_string(), r.node.as_str().to_string()))
+    }
+
     /// 提交任务到本地 Worker 调度器执行（分布式任务提交入口）。
     ///
     /// 将 ``_TaskDef`` 转换为 Rust ``TaskDefinition`` 并入队到 Worker 的调度器。
@@ -635,17 +712,7 @@ impl PyRuntimeCore {
         let node_id = runtime.node_id().clone();
 
         // endpoint_addr lazy 缓存：节点启动后 iroh endpoint 不会变。
-        // 首次调用计算并 cache（hex+postcard 编码 ~50μs），后续直接 clone。
-        let endpoint_addr = {
-            let mut cache = self.endpoint_addr_cache.lock();
-            if let Some(addr) = cache.as_ref() {
-                Some(addr.clone())
-            } else {
-                let addrs = runtime.network().listen_addresses().map_err(PyErr::from)?;
-                *cache = Some(addrs.endpoint_addr.clone());
-                Some(addrs.endpoint_addr)
-            }
-        };
+        let endpoint_addr = self.local_endpoint_addr(py)?;
 
         let task_def = TaskDefinition {
             id: TaskId::new(task.task_id),
@@ -660,7 +727,7 @@ impl PyRuntimeCore {
             attempt: 0,
             enqueued_at_ms: 0,
             target_endpoint_addr: task.target_endpoint_addr,
-            origin_endpoint_addr: endpoint_addr,
+            origin_endpoint_addr: Some(endpoint_addr),
         };
 
         // 通过 unbounded channel 投递给后台 task，避免 block_on 跨 GIL 同步阻塞。
@@ -704,16 +771,7 @@ impl PyRuntimeCore {
             .as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))?;
         let node_id = runtime.node_id().clone();
-        let endpoint_addr = {
-            let mut cache = self.endpoint_addr_cache.lock();
-            if let Some(addr) = cache.as_ref() {
-                addr.clone()
-            } else {
-                let addrs = runtime.network().listen_addresses().map_err(PyErr::from)?;
-                *cache = Some(addrs.endpoint_addr.clone());
-                addrs.endpoint_addr
-            }
-        };
+        let endpoint_addr = self.local_endpoint_addr(py)?;
         let task_defs: Vec<TaskDefinition> = tasks
             .into_iter()
             .map(|t| TaskDefinition {
@@ -1191,6 +1249,23 @@ impl PyRuntimeCore {
 }
 
 impl PyRuntimeCore {
+    /// 返回本节点的 endpoint_addr（hex postcard 编码），lazy 缓存。
+    ///
+    /// 节点启动后 iroh endpoint 不会变：首次调用计算并缓存，后续直接 clone。
+    fn local_endpoint_addr(&self, _py: Python<'_>) -> PyResult<String> {
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))?;
+        let mut cache = self.endpoint_addr_cache.lock();
+        if let Some(addr) = cache.as_ref() {
+            return Ok(addr.clone());
+        }
+        let addrs = runtime.network().listen_addresses().map_err(PyErr::from)?;
+        *cache = Some(addrs.endpoint_addr.clone());
+        Ok(addrs.endpoint_addr)
+    }
+
     /// 调用本地 `WorkflowActor` 的方法并解码返回 payload。
     ///
     /// GIL 在 `block_on` 期间释放（与其它网络/actor 调用一致），避免

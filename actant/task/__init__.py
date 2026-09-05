@@ -78,10 +78,13 @@ from actant.task._helpers import (  # noqa: F401
     _safe_serialize,
     _suppress_pickle_errors,
 )
+from actant.task._ref import REF_INLINE_THRESHOLD, Ref
 from actant.task._task_obj import Task, task
 
 __all__ = [
+    "REF_INLINE_THRESHOLD",
     "AsyncResult",
+    "Ref",
     "Task",
     "TaskContext",
     "TaskState",

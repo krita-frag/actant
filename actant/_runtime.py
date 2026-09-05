@@ -42,11 +42,13 @@ from actant.capabilities import (
     BUILTIN_CAPABILITIES,
     RUST_BACKED_CAPABILITIES,
     TASK_LIFECYCLE,
+    VALUE_STORE,
     CapabilityMeta,
     EffectKind,
     RetryCtx,
     RouteCtx,
     ScheduleCtx,
+    ValueStoreReq,
 )
 from actant.exceptions import ActantError, InvalidStateError, NotFoundError, reconstruct_error
 
@@ -830,6 +832,10 @@ class Runtime:
             core = self._rust_core
             if core is not None:
                 core.register_task_result_callback(self._on_task_result)
+                # ValueStore 默认 handler（Python→Rust blob 桥，0.3.2 R2）。
+                # 用户预注册的 handler 优先（perform 取链末位），仅链为空时链入。
+                if not self._layers.get(VALUE_STORE):
+                    self._layers[VALUE_STORE].append(_DefaultValueStoreHandler(self))
             self._started = True
             # 创建 TaskLifecycle 事件批处理器。flush 发生在后台线程，经
             # _publish_task_event 把本 Runtime 绑定到该线程上下文后再 emit，
@@ -963,10 +969,31 @@ class Runtime:
                 self.unregister_task(task_id)
                 return
             if success:
-                # 直接传对象给 _set_result_obj，避免再 dumps/loads 往返。
-                # 使用 _set_result_obj 而非 _set_result：标记 _result_is_obj=True，
-                # 避免任务返回 bytes（如 echo(b"x")）被 result() 误当作序列化结果。
-                handle._set_result_obj(payload_obj)
+                # 结果侧降级（0.3.2 R3/R4）：结果帧超阈值时原样字节落 blob
+                # （0 次重序列化，见 plans/REF_DESIGN.md），句柄内部持 Ref。
+                # 落 blob 失败降级为内联对象并 warning——任务已成功完成，
+                # 值引用基建故障不翻转任务语义。
+                from actant.task._ref import REF_INLINE_THRESHOLD, _value_store
+
+                ref_bytes: bytes | None = None
+                if len(raw) > REF_INLINE_THRESHOLD:
+                    try:
+                        ref_bytes = _value_store(raw, runtime=self)
+                    except Exception:
+                        # 降级原因经 exc_info 日志承载，不静默。
+                        _logger.warning(
+                            "task %s: result (%d bytes) failed to store as blob ref; "
+                            "falling back to inline result",
+                            task_id,
+                            len(raw),
+                            exc_info=True,
+                        )
+                if ref_bytes is not None:
+                    handle._set_result_ref(ref_bytes)
+                else:
+                    # 内联对象路径：直接存对象避免 dumps/loads 往返；任务返回
+                    # bytes（如 echo(b"x")）也按对象存储，不会被误当作序列化结果。
+                    handle._set_result(payload_obj)
                 self._emit_batch("completed", task_id, handle.workflow_id)
             else:
                 # 失败：payload_obj 是异常对象。
@@ -1527,6 +1554,28 @@ class DefaultRetryPolicy:
         if ctx.attempt < ctx.max_retries:
             return True
         return None
+
+
+class _DefaultValueStoreHandler:
+    """`ValueStore` capability 的默认 handler：桥接本节点 Rust blob 原语。
+
+    ``store`` → ``_RuntimeCore.value_store``（blob_store + BlobRef 编码）；
+    ``fetch`` → ``value_fetch``（本地 get_bytes 优先，未命中按 ref.node 跨节点
+    流式拉取）。由 ``Runtime.start()`` 在 handler 链为空时链入；用户可在
+    start() 前预注册自定义 handler（如 S3 后端）完全替换——perform 取链末位，
+    内部 Ref 解析同样经该链分发，覆盖全局生效。
+    """
+
+    def __init__(self, runtime: Runtime) -> None:
+        self._runtime = runtime
+
+    def __call__(self, req: ValueStoreReq) -> bytes:
+        core = self._runtime._rust_core
+        if core is None:
+            raise InvalidStateError("ValueStore requires a started Runtime")
+        if req.op == "store":
+            return cast(bytes, core.value_store(req.data))
+        return cast(bytes, core.value_fetch(req.ref))
 
 
 def _register_default_handlers(rt: Runtime) -> None:

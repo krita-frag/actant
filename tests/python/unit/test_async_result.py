@@ -69,8 +69,7 @@ def test_set_running_transitions_from_pending() -> None:
 
 def test_set_result() -> None:
     h = AsyncResult("t1")
-    payload = cloudpickle.dumps(42)
-    h._set_result(payload)
+    h._set_result(42)
     assert h.state == "completed"
     assert h.done()
     assert h.result(timeout=0) == 42
@@ -147,7 +146,7 @@ def test_cancel_rust_core_failure_logged_but_continues(
 
 def test_cancel_completed_returns_false() -> None:
     h = AsyncResult("t1")
-    h._set_result(cloudpickle.dumps(42))
+    h._set_result(42)
     assert h.cancel() is False
 
 
@@ -188,7 +187,7 @@ def test_wait_until_done() -> None:
         import time
 
         time.sleep(0.05)
-        h._set_result(cloudpickle.dumps(42))
+        h._set_result(42)
 
     import threading
 
@@ -199,15 +198,15 @@ def test_wait_until_done() -> None:
 
 def test_resolve_value_asyncresult() -> None:
     h = AsyncResult("t1")
-    h._set_result(cloudpickle.dumps(42))
+    h._set_result(42)
     assert _resolve_value(h) == 42
 
 
 def test_resolve_value_nested_containers() -> None:
     h1 = AsyncResult("t1")
     h2 = AsyncResult("t2")
-    h1._set_result(cloudpickle.dumps(1))
-    h2._set_result(cloudpickle.dumps(2))
+    h1._set_result(1)
+    h2._set_result(2)
     value = _resolve_value({"items": [h1, (h2,)]})
     assert value == {"items": [1, (2,)]}
 
@@ -253,7 +252,7 @@ def _race_round(round_index: int) -> None:
 
     def _completer() -> None:
         barrier.wait()
-        h._set_result(cloudpickle.dumps(round_index))
+        h._set_result(round_index)
 
     threads = [
         threading.Thread(target=_adder, args=(i,), daemon=True)

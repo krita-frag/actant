@@ -7,7 +7,7 @@ import threading
 from typing import Any
 
 from actant.exceptions import ActantTimeoutError, TaskCancelledError
-from actant.task._async_result import AsyncResult, _await_slots, _set_aio_result
+from actant.task._async_result import AsyncResult
 
 
 def gather(
@@ -112,17 +112,14 @@ async def gather_async(
     """异步并行等待多个 ``AsyncResult`` 完成。
 
     与 ``gather`` 语义一致，但返回 coroutine，可在 ``async def`` 函数中
-    ``await``。在单个独立守护线程中执行同步 ``gather``，通过
-    ``call_soon_threadsafe`` 将结果投递回 event loop。该线程在
-    ``Condition.wait`` / ``Event.wait`` 中阻塞时释放 GIL，使 Rust worker
-    线程能获取 GIL 执行 dispatch handler。event loop 线程不被阻塞。
-
-    使用单线程执行 ``gather``（而非每个 handle 一个线程）避免多线程
-    ``Condition.wait`` 之间的 GIL 竞争死锁。
+    ``await``。等待经 ``AsyncResult`` 完成回调直通 event loop（0.3.2 R5）：
+    每个 handle 桥接为一个 ``asyncio.Future``，``asyncio.wait`` 一次性等待——
+    无守护线程、不阻塞循环。
 
     Args:
         *handles: 一个或多个 ``AsyncResult``。
-        timeout: 整体最大等待秒数，``None`` 表示无限等待。
+        timeout: 整体最大等待秒数，``None`` 表示无限等待。超时抛
+            ``ActantTimeoutError`` 并取消剩余等待。
         return_exceptions: ``True`` 时失败任务的结果为异常对象而非抛出。
 
     Returns:
@@ -144,40 +141,26 @@ async def gather_async(
         raise ValueError("gather_async() requires at least one AsyncResult")
 
     loop = asyncio.get_running_loop()
-    aio_future: asyncio.Future[list[Any]] = loop.create_future()
-
-    # Fast path：若所有 handle 已完成，直接返回结果。
+    # Fast path：全部完成直接取结果。
     if all(h.done() for h in handles):
         return gather(*handles, timeout=0, return_exceptions=return_exceptions)
 
-    def _worker() -> None:
-        """在独立线程中执行同步 gather，投递结果到 event loop。"""
-        try:
-            value = gather(
-                *handles,
-                timeout=timeout,
-                return_exceptions=return_exceptions,
-            )
-            loop.call_soon_threadsafe(_set_aio_result, aio_future, value, None)
-        except BaseException as exc:
-            loop.call_soon_threadsafe(_set_aio_result, aio_future, None, exc)
-        finally:
-            _await_slots.release()
-
-    # 有界信号量限制并发等待线程数（与 AsyncResult.__await__ 共享，见
-    # _async_result._await_slots 注释）。槽位由等待线程完成后释放，不依赖
-    # loop 推进，无死锁。
-    _await_slots.acquire()
-    try:
-        # 单线程执行 gather，避免多线程 GIL 竞争。
-        t = threading.Thread(target=_worker, daemon=True, name="actant-await")
-        t.start()
-    except BaseException:
-        # 线程创建失败（资源耗尽等）：释放槽位，否则泄漏的槽位会让
-        # 后续 gather_async 永久阻塞在 acquire 上。
-        _await_slots.release()
-        raise
-    return await aio_future
+    futures = [h._bridge_to_loop(loop) for h in handles]
+    done, pending = await asyncio.wait(futures, timeout=timeout)
+    if pending:
+        # 取消未完成桥接（释放完成回调引用；迟到完成时 _set_aio_result
+        # 对已取消 future 的投递是 no-op）。
+        for f in pending:
+            f.cancel()
+        raise ActantTimeoutError(
+            f"gather_async: at least one handle did not complete within {timeout}s"
+        )
+    # 消费已完成桥接 future 上的异常，避免 "exception was never retrieved" 告警
+    # ——真实失败语义由下方 gather(timeout=0) 统一抛出。
+    for f in done:
+        if f.done() and not f.cancelled():
+            f.exception()
+    return gather(*handles, timeout=0, return_exceptions=return_exceptions)
 
 
 __all__ = ["gather", "gather_async"]
