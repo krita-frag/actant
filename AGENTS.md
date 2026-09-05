@@ -187,6 +187,14 @@ Worker 行为由 `actant.actant._ActantConfig` 控制。高层 `Runtime`/`Runtim
 
 任务超时、重试、崩溃故障转移、远程回退由 Worker 与 `FailoverActor`、`SchedulerActor` 协同处理；Python 层通过 `Execute` capability 覆盖执行行为，通过 `RetryPolicy` 覆盖重试决策。`WorkerError` 异常镜像 Rust 侧 Worker 运行时错误。
 
+## Rust 嵌入
+
+核心扩展缝全部是公开 trait：`Capability`/`Handler`（ERH）、`Scheduler`、`TaskDispatcher`、
+`Transport`、`Discovery`、`ConditionEvaluator`；Rust 侧可用 `RuntimeBuilder` 直接组装
+Runtime（见 `tests/rust/unit/runtime/builder.rs`）。这是嵌入实现细节，**无稳定性承诺**、
+不做 dylib/WASM 插件（裁决 J4，见 plans/ROADMAP.md）；任务执行默认绑定 Python 进程池，
+Rust 原生执行器需自行实现 `TaskDispatcher`。
+
 ## 技术栈
 
 - **Rust**：tokio、iroh、iroh-blobs（内容寻址 blob 传输）、heed/LMDB、rkyv、postcard、PyO3
