@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::Semaphore;
 
@@ -74,29 +74,57 @@ struct WorkerProc {
     stdin: ChildStdin,
     /// 取消帧的独立写端（dup(2) of stdin），仅供 `spawn_cancel_poller` 使用。
     cancel_stdin: Option<tokio::fs::File>,
-    /// 发送帧用的头缓存（4B 长度 + 1B 类型）。栈上固定 5 字节数组，省一次
-    /// `Vec::with_capacity` 分配 + memcpy，供 `write_vectored` 组合 iovec。
-    header_buf: [u8; FRAME_HEADER_LEN + 1],
     /// stdout 由当前在途的分发独占读取；空闲时缓存于此供复用。
     stdout: ChildStdout,
 }
 
-impl WorkerProc {
-    /// 向子进程发送一帧：``[4B 长度][1B 类型][正文]`` 连续写入 pipe。
-    ///
-    /// 空正文（Cancel）：只写 5 字节帧头；否则用 vectored I/O 让帧头与正文
-    /// 一次 `write_vectored` 落入 pipe，正文按 pipe 容量分多轮短写推进。
-    async fn send_frame(&mut self, msg_type: u8, body: &[u8]) -> Result<(), ActantError> {
-        let frame_len: u32 = (1 + body.len()) as u32;
-        self.header_buf[..FRAME_HEADER_LEN].copy_from_slice(&frame_len.to_le_bytes());
-        self.header_buf[FRAME_HEADER_LEN] = msg_type;
-        let iov = [IoSlice::new(&self.header_buf), IoSlice::new(body)];
-        self.stdin
-            .write_vectored(&iov)
+/// 把一帧（``[4B 长度][1B 类型][正文]``）完整写入 `writer`。
+///
+/// `write_vectored` 是**单次写入尝试**：pipe 容量（默认 64KB）小于帧大小时
+/// 只写入前缀就返回短写计数，剩余字节必须按已写偏移显式推进——否则 worker
+/// 的 `read_exact` 会永久等待一条被截断的帧（大载荷 Dispatch 挂死的根源）。
+/// 首次 `write_vectored` 保住小帧（≤ pipe 容量）的单 syscall 快路径；短写后
+/// 剩余正文经 `write_all` 循环推进。
+///
+/// 独立为自由函数以便注入任意 `AsyncWrite`（tokio duplex 等）做封闭测试。
+async fn write_frame<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    msg_type: u8,
+    body: &[u8],
+) -> Result<(), ActantError> {
+    let mut header = [0u8; FRAME_HEADER_LEN + 1];
+    let frame_len: u32 = (1 + body.len()) as u32;
+    header[..FRAME_HEADER_LEN].copy_from_slice(&frame_len.to_le_bytes());
+    header[FRAME_HEADER_LEN] = msg_type;
+    let total = header.len() + body.len();
+    let iov = [IoSlice::new(&header), IoSlice::new(body)];
+    let mut written = writer
+        .write_vectored(&iov)
+        .await
+        .map_err(map_io("worker stdin"))?;
+    if written < total {
+        // 短写推进：先补齐帧头剩余字节（仅当 writev 连帧头都未写完），再
+        // `write_all` 剩余正文（write_all 内部循环处理后续短写）。
+        if written < header.len() {
+            writer
+                .write_all(&header[written..])
+                .await
+                .map_err(map_io("worker stdin"))?;
+            written = header.len();
+        }
+        writer
+            .write_all(&body[written - header.len()..])
             .await
             .map_err(map_io("worker stdin"))?;
-        self.stdin.flush().await.map_err(map_io("worker stdin"))?;
-        Ok(())
+    }
+    writer.flush().await.map_err(map_io("worker stdin"))?;
+    Ok(())
+}
+
+impl WorkerProc {
+    /// 向子进程发送一帧：``[4B 长度][1B 类型][正文]`` 连续写入 pipe。
+    async fn send_frame(&mut self, msg_type: u8, body: &[u8]) -> Result<(), ActantError> {
+        write_frame(&mut self.stdin, msg_type, body).await
     }
 
     /// 异步地从 stdout 读结果帧正文。
@@ -325,7 +353,6 @@ impl ProcessTaskDispatcher {
             child,
             stdin,
             cancel_stdin,
-            header_buf: [0u8; FRAME_HEADER_LEN + 1],
             stdout,
         })
     }

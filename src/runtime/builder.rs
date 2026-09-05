@@ -210,7 +210,7 @@ pub async fn init_worker(params: WorkerInitParams<'_>) -> Result<Worker, ActantE
     let actor_scheduler = Arc::new(ActorScheduler::with_fast_path(
         scheduler_actor_id.clone(),
         params.actor_system.clone(),
-        fast_inner,
+        fast_inner.clone(),
     ));
 
     let failover_cb = params.failover.clone();
@@ -224,6 +224,7 @@ pub async fn init_worker(params: WorkerInitParams<'_>) -> Result<Worker, ActantE
         params.tokio_handle,
     )
     .with_actor_system(params.actor_system.clone())
+    .with_fast_scheduler(fast_inner)
     .with_scheduler_actor_id(scheduler_actor_id)
     .with_capacity_callback(Arc::new(move |available, max| {
         failover_cb.update_local_capacity(available, max);

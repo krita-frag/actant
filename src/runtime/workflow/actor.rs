@@ -288,10 +288,12 @@ pub mod scheduler_methods {
 
 /// 调度器内部队列状态。
 ///
-/// `pub(crate)` 以允许 [`crate::runtime::workflow::ActorScheduler`] 通过
-/// `Arc<InnerScheduler>` 共享直接访问 `enqueue` 快路径，绕过 Actor 消息往返。
-/// `dequeue` / `close` 等仍由 `SchedulerActor` 通过消息协议处理，保证
-/// 单消费者语义与 Worker 唤醒协调。
+/// `pub(crate)` 以允许 [`crate::runtime::workflow::ActorScheduler`] 与 Worker
+/// 通过 `Arc<InnerScheduler>` 直接访问 `enqueue`/`dequeue` 系列方法，绕过
+/// Actor 消息往返。直接出队是大载荷路径的必需品：`TaskDefinition` 内嵌任务
+/// 载荷，经 Actor 消息回传时受 `decode_postcard` 的 4MiB 上限约束，超限任务
+/// 会在出队响应解码时被丢弃。单消费者语义由「仅 Worker 主循环调用 dequeue」
+/// 保证，与消息协议路径一致。
 pub(crate) enum InnerScheduler {
     Fifo {
         queue: parking_lot::Mutex<std::collections::VecDeque<TaskDefinition>>,
@@ -446,7 +448,7 @@ impl InnerScheduler {
     /// `SchedulerActor` 对本方法套用 [`DEQUEUE_ACTOR_TIMEOUT`] 超时保护；
     /// 生产消费路径（Worker 主循环）应使用 [`Self::try_dequeue`] + Notify
     /// 信号驱动，而非依赖本方法的长等待。
-    async fn dequeue(&self) -> Option<TaskDefinition> {
+    pub(crate) async fn dequeue(&self) -> Option<TaskDefinition> {
         loop {
             let task = match self {
                 Self::Fifo { queue, .. } => queue.lock().pop_front(),
@@ -476,7 +478,7 @@ impl InnerScheduler {
         }
     }
 
-    fn try_dequeue(&self) -> Option<TaskDefinition> {
+    pub(crate) fn try_dequeue(&self) -> Option<TaskDefinition> {
         match self {
             Self::Fifo { queue, .. } => queue.lock().pop_front(),
             Self::Priority { queues, .. } => {
@@ -488,7 +490,7 @@ impl InnerScheduler {
         }
     }
 
-    fn dequeue_batch(&self, limit: usize) -> Vec<TaskDefinition> {
+    pub(crate) fn dequeue_batch(&self, limit: usize) -> Vec<TaskDefinition> {
         match self {
             Self::Fifo { queue, .. } => {
                 let mut q = queue.lock();

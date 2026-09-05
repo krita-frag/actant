@@ -2101,7 +2101,7 @@ async fn wait_for_task_returns_task_immediately_when_available() {
 
     let result = tokio::time::timeout(
         Duration::from_millis(100),
-        wait_for_task(&scheduler, &notify),
+        wait_for_task(&scheduler, None, &notify),
     )
     .await
     .expect("should return quickly");
@@ -2129,7 +2129,7 @@ async fn wait_for_task_wakes_on_notify_after_empty_dequeue() {
 
     let result = tokio::time::timeout(
         Duration::from_millis(500),
-        wait_for_task(&scheduler, &notify),
+        wait_for_task(&scheduler, None, &notify),
     )
     .await
     .expect("should return within timeout");

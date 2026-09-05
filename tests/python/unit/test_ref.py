@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import threading
+from typing import Any
 
 import cloudpickle
 import pytest
@@ -246,6 +247,48 @@ def test_collect_dep_ids_keeps_ref_for_large_result() -> None:
     assert ids == ["up-1", "up-2"]
     assert isinstance(resolved["big"], Ref)
     assert resolved["n"] == 42
+
+
+def test_collect_dep_ids_pending_large_result_keeps_ref(monkeypatch) -> None:
+    """R6：下游提交早于上游完成时（eager flow 常态），大结果同样保留 Ref。
+
+    ``Ref`` 只在结果抵达回调中产生；修复前 pending handle 直接落 ``result()``
+    阻塞等待后会把大值整体反序列化进提交方（随后再被
+    ``_degrade_large_values`` 二次落 blob + 重 pickle）。此处令 ``Ref.result``
+    抛错——解析路径一旦触碰对象级反序列化即失败。
+    """
+    h = AsyncResult("up-pending")
+
+    def _boom(self: Ref, timeout: float | None = None) -> Any:
+        raise AssertionError("Ref.result() must not be called during dep resolution")
+
+    monkeypatch.setattr(Ref, "result", _boom)
+    timer = threading.Timer(0.05, lambda: h._set_result_ref(b"ref-pending"))
+    timer.start()
+    try:
+        ids: list[str] = []
+        resolved = _collect_dep_ids([h], set(), ids)
+    finally:
+        timer.join()
+    assert ids == ["up-pending"]
+    assert isinstance(resolved[0], Ref)
+    assert resolved[0]._ref_bytes == b"ref-pending"
+
+
+def test_collect_dep_ids_pending_failure_propagates() -> None:
+    """pending 上游失败：等待后经 result() 抛出原异常（与既有小结果语义一致）。"""
+    h = AsyncResult("up-fail")
+
+    def _fail_later() -> None:
+        h._set_error(ValueError("upstream boom"))
+
+    timer = threading.Timer(0.05, _fail_later)
+    timer.start()
+    try:
+        with pytest.raises(ValueError, match="upstream boom"):
+            _collect_dep_ids([h], set(), [])
+    finally:
+        timer.join()
 
 
 # ───────────────────────── R5：__await__ 去线程化 ─────────────────────────

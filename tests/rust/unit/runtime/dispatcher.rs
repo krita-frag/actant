@@ -115,6 +115,78 @@ fn cancel_frame_bytes_layout() {
     assert_eq!(FRAME_DISPATCH, 0x01);
 }
 
+// ───────────────────────── send_frame 短写推进（大载荷回归） ─────────────────────
+//
+// `write_vectored` 是单次写入尝试：pipe 容量（64KB）小于正文时只写入前缀。
+// 修复前剩余字节被静默丢弃，worker 的 `read_exact` 永久等待截断帧 → 大载荷
+// Dispatch（>1MB 参数内联，0.3.2 R3b/R6）30s 硬超时被杀。以下用小缓冲的
+// tokio duplex 模拟 pipe 容量约束，验证帧字节完整可达。
+
+mod send_frame {
+    use super::*;
+    use tokio::io::{AsyncReadExt, DuplexStream};
+
+    /// 1MB 确定性正文：远超任何 pipe / duplex 缓冲容量，强制多次短写。
+    fn big_body(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// 读完整帧（阻塞到写端关闭产生 EOF），返回读到的原始字节。
+    async fn drain(mut reader: DuplexStream) -> Vec<u8> {
+        let mut received = Vec::new();
+        reader
+            .read_to_end(&mut received)
+            .await
+            .expect("read to end");
+        received
+    }
+
+    #[tokio::test]
+    async fn write_frame_delivers_body_beyond_write_buffer() {
+        let body = big_body(1024 * 1024);
+        let body_expected = body.clone();
+        // 4KB 缓冲：每次 poll_write 最多推进 4KB，write_frame 必须自行推进到写完。
+        let (reader, mut writer) = tokio::io::duplex(4096);
+        let expected_len = FRAME_HEADER_LEN + 1 + body.len();
+        let handle =
+            tokio::spawn(async move { write_frame(&mut writer, FRAME_DISPATCH, &body).await });
+        let received = drain(reader).await;
+        // JoinHandle 是 Future（tokio ≥1.39 无 inherent join）：await 得到
+        // Result<Result<(), ActantError>, JoinError>，两层分别对应 panic 与 IO 错误。
+        handle
+            .await
+            .expect("write_frame task must not panic")
+            .expect("write_frame must succeed");
+        assert_eq!(received.len(), expected_len);
+        // 帧头：长度 = 1 + body_len（小端），类型 = Dispatch。
+        let frame_len = (1 + body_expected.len()) as u32;
+        assert_eq!(&received[..FRAME_HEADER_LEN], &frame_len.to_le_bytes());
+        assert_eq!(received[FRAME_HEADER_LEN], FRAME_DISPATCH);
+        // 正文逐字节一致（无截断 / 无重复）。
+        assert_eq!(&received[FRAME_HEADER_LEN + 1..], &body_expected[..]);
+    }
+
+    #[tokio::test]
+    async fn write_frame_small_body_single_path() {
+        // 小帧（< PIPE_BUF）：一次 writev 写完，结果与大帧路径逐字节一致。
+        let body = b"tiny payload".to_vec();
+        let value = body.clone();
+        let (reader, mut writer) = tokio::io::duplex(4096);
+        let handle =
+            tokio::spawn(async move { write_frame(&mut writer, FRAME_CANCEL, &value).await });
+        let received = drain(reader).await;
+        handle
+            .await
+            .expect("write_frame task must not panic")
+            .expect("write_frame must succeed");
+        let frame_len = (1 + body.len()) as u32;
+        let mut expected = frame_len.to_le_bytes().to_vec();
+        expected.push(FRAME_CANCEL);
+        expected.extend_from_slice(&body);
+        assert_eq!(received, expected);
+    }
+}
+
 // ───────────────────────── 取消轮询器契约（TOCTOU 回归） ─────────────────────────
 //
 // 取消轮询器契约（TOCTOU 防护）：若结果臂在 poller「检查 active 之后、写 Cancel 帧之前」

@@ -33,6 +33,7 @@ use crate::runtime::actor::ActorSystem;
 use crate::runtime::dispatcher::{new_cancel_flag, CancelFlag, TaskDispatcher};
 use crate::runtime::event_bus::{BusEvent, EventBus};
 use crate::runtime::network::Transport;
+use crate::runtime::workflow::actor::InnerScheduler;
 use crate::runtime::workflow::Scheduler;
 
 mod cancel;
@@ -79,9 +80,17 @@ use crate::runtime::network::DirectResponseChannel;
 /// Worker 进入循环后立即在 notify 上 await。
 async fn wait_for_task(
     scheduler: &Arc<dyn Scheduler>,
+    fast: Option<&Arc<InnerScheduler>>,
     notify: &Arc<tokio::sync::Notify>,
 ) -> TaskDefinition {
     loop {
+        // 直连路径：与 SchedulerActor 共享同一 InnerScheduler，出队不经过
+        // Actor 消息回传（大载荷 TaskDefinition 会超出响应解码上限）。
+        if let Some(inner) = fast {
+            if let Some(task) = inner.dequeue().await {
+                return task;
+            }
+        }
         let dequeue_result = scheduler.try_dequeue().await;
         if let Some(task) = dequeue_result {
             return task;
@@ -114,17 +123,22 @@ async fn wait_for_task(
 /// 返回值：始终返回非空 Vec（队列为空时阻塞直到有任务）。
 async fn prefetch_tasks(
     scheduler: &Arc<dyn Scheduler>,
+    fast: Option<&Arc<InnerScheduler>>,
     notify: &Arc<tokio::sync::Notify>,
     limit: usize,
 ) -> Vec<TaskDefinition> {
     if limit == 0 {
         // limit=0 退化为单任务模式：拉一个返回。
-        return vec![wait_for_task(scheduler, notify).await];
+        return vec![wait_for_task(scheduler, fast, notify).await];
     }
     loop {
         // 先尝试批量拉取：若队列有积压，一次拉满 limit。
         // dequeue_batch 在队列为空时返回空 Vec（不阻塞），故需配合信号等待。
-        let batch = scheduler.dequeue_batch(limit).await;
+        let batch = if let Some(inner) = fast {
+            inner.dequeue_batch(limit)
+        } else {
+            scheduler.dequeue_batch(limit).await
+        };
         if !batch.is_empty() {
             return batch;
         }
@@ -171,6 +185,11 @@ pub struct Worker {
     node_id: NodeId,
     network: Arc<dyn Transport>,
     scheduler: Arc<dyn Scheduler>,
+    /// 调度器共享内部状态（与 SchedulerActor 同一 Arc）。出队直连路径：
+    /// `TaskDefinition` 内嵌任务载荷，经 Actor 消息回传受 `decode_postcard`
+    /// 4MiB 上限约束，超限任务的出队响应会解码失败——直连共享队列绕过该
+    /// 限制。`None`（无 fast path 的测试桩调度器）时退化为 Actor 消息协议。
+    fast_scheduler: Option<Arc<InnerScheduler>>,
     /// SchedulerActor 的 id，用于 shutdown 时同步等待 Actor 退出。
     /// `None` 表示 Worker 未绑定 SchedulerActor（仅用于不启动 Actor 系统的测试路径）。
     scheduler_actor_id: Option<crate::common::ActorId>,
@@ -258,6 +277,7 @@ impl Worker {
             node_id,
             network,
             scheduler,
+            fast_scheduler: None,
             scheduler_actor_id: None,
             event_bus,
             task_dispatcher,
@@ -407,6 +427,20 @@ impl Worker {
     }
 
     /// 返回 scheduler 的 `Arc` 克隆，供其他子系统（如 FailoverManager）共享调度入口。
+    /// drain/关闭路径的出队：优先直连共享队列（大载荷安全），否则退化 trait。
+    async fn try_dequeue_drain(&self) -> Option<TaskDefinition> {
+        if let Some(inner) = &self.fast_scheduler {
+            return inner.try_dequeue();
+        }
+        self.scheduler.try_dequeue().await
+    }
+
+    /// 注入调度器共享内部状态（大载荷直连出队路径，见 [`Worker::fast_scheduler`]）。
+    pub(crate) fn with_fast_scheduler(mut self, inner: Arc<InnerScheduler>) -> Self {
+        self.fast_scheduler = Some(inner);
+        self
+    }
+
     pub fn scheduler_clone(&self) -> Arc<dyn Scheduler> {
         self.scheduler.clone()
     }
@@ -665,7 +699,7 @@ impl Worker {
                 // 排空剩余排队 task — 由于 scheduler 已关闭，新入队会被拒绝，
                 // 已排队任务直接丢弃。每个被丢弃任务必须发布 Cancelled 完成事件：
                 // 排队任务不会被执行，若不通知 origin，远端提交方会永久等待结果。
-                while let Some(dropped) = self.scheduler.try_dequeue().await {
+                while let Some(dropped) = self.try_dequeue_drain().await {
                     publish_drained_task_cancellation(
                         dropped,
                         &node_id,
@@ -742,7 +776,7 @@ impl Worker {
                         // 与 Draining 主循环分支一致：关闭 scheduler 并排空残留
                         // 排队/inflight 任务，逐个发布 Cancelled 完成事件通知 origin。
                         self.scheduler.close();
-                        while let Some(dropped) = self.scheduler.try_dequeue().await {
+                        while let Some(dropped) = self.try_dequeue_drain().await {
                             publish_drained_task_cancellation(
                                 dropped,
                                 &node_id,
@@ -771,7 +805,7 @@ impl Worker {
                         let _ = state_sender.send_replace(WorkerState::Stopped);
                         return Ok(());
                     }
-                    batch = prefetch_tasks(&self.scheduler, task_enqueued_notify, prefetch_limit) => batch,
+                    batch = prefetch_tasks(&self.scheduler, self.fast_scheduler.as_ref(), task_enqueued_notify, prefetch_limit) => batch,
                 };
                 // prefetch_tasks 返回非空 batch（内部保证）。
                 // 第一个任务作为当前任务，剩余入 inflight 供后续循环快速取用。

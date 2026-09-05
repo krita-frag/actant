@@ -85,6 +85,35 @@
     roundtrip/篡改/截断测试覆盖）。接入 submit/边传播为 R3/R6，本批不改
     AsyncResult/flow。
 
+### 新增（0.3.2 值引用）
+
+- **核心 blob 原语（R1）**：`BlobStore`（iroh-blobs FsStore 落盘 `data_dir/blobs/`）+
+  `BlobFetch`（按 hash 跨节点流式拉取，Drop/显式 close 即时取消）；`BlobHash`/`BlobRef`
+  wire 编码；Router accept 链注册 blobs 协议（与 gossip/直连共存）。吸收 0.3.2 spike。
+- **ValueStore capability（第 11 个，R2）**：perform 语义 store/fetch，默认 handler 走
+  Rust 桥，Python 可覆盖（S3 等）。
+- **`Ref` 类型（R3）**：内容寻址值引用句柄；参数 >`REF_INLINE_THRESHOLD`（1MB）自动
+  blob 化 + 帧内联哨兵，结果 >1MB 原样落 blob（0 次重序列化）；消费方父进程代取
+  （过渡语义，演进见 plans/REF_DESIGN.md）。
+- **`AsyncResult` 统一（R4，D5）**：删除 `_result_payload`/`_result_is_obj` 双语义与
+  `result()` 三分支；新增 `ref()`。
+- **`__await__`/gather 去线程化（R5，D6）**：删除 `_await_slots` 与每次 await 的
+  daemon 线程，完成回调直通 event loop。
+- **flow 依赖边携带 Ref（R6，D2 地基）**：flow 内大值生产→消费全程字节级搬运。
+- **验收**：`tests/python/e2e/test_ref_transfer.py`——100MB 双节点 4.8s、提交方零对象级
+  反序列化（`Ref.result` monkeypatch 反向断言）、小结果回归、悬空 Ref 语义化 NotFound。
+
+### 修复（0.3.2 执行中发现）
+
+- **出队路径 4MiB 隐形上限**：`DEQUEUE` 的 Actor 消息回传受 `decode_postcard` 的
+  `MAX_DECODE_SIZE`（4MiB）约束——内嵌 ≥4MB 载荷的 `TaskDefinition` 在出队响应解码时
+  被静默丢弃（`.ok().flatten()`），任务永久 pending。修复：Worker 直连共享
+  `InnerScheduler` 出队（`with_fast_scheduler`），绕过 Actor 消息回传；慢路径解码失败
+  由静默改为 `tracing::error!`。
+- **大帧派发挂死**：`send_frame` 单次 `write_vectored` 不推进短写——超过 pipe 容量
+  （64KB）的派发帧只写出前缀，worker `read_exact` 永久等待。修复：短写显式推进
+  （vectored 首写保住小帧快路径 + `write_all` 推进剩余正文）。
+
 ### 基座硬化（0.3.1）
 
 - **毒消息 bounded-redelivery**：mailbox pending 记录增加 `delivery_count`，`recover_pending` 重投时递增回写；超过 `MAX_PENDING_REDELIVERIES`（5）的确定性失败消息删除记录并 `tracing::error!`（供后续 DLQ capability 消费），不再无限重投、不再随重启全量重放。

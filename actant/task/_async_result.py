@@ -596,12 +596,18 @@ def _collect_dep_ids(value: Any, seen: set[str], ids: list[str]) -> Any:
 
     大结果（内部为 ``Ref``）**不在此处取值**：``result()`` 会把大值反序列化到
     提交方内存再随 envelope 重新序列化；保留 ``Ref`` 由 ``_submit`` 解析为
-    ``_RefArg`` 帧内联字节（0.3.2 R3b，见 plans/REF_DESIGN.md）。
+    ``_RefArg`` 帧内联字节（0.3.2 R3b/R6，见 plans/REF_DESIGN.md）。
+
+    两态判定必须先等终态：``Ref`` 只在结果抵达回调（``_set_result_ref``）中
+    才存在。eager flow 里下游 ``submit`` 通常早于上游完成，此时 ``ref()``
+    恒为 ``None``，若直接落 ``result()`` 会把大值整体反序列化进提交方并触发
+    ``_degrade_large_values`` 二次落 blob——正是 R6 要消除的"钉内存"残余。
     """
     if isinstance(value, AsyncResult):
         if value.task_id not in seen:
             seen.add(value.task_id)
             ids.append(value.task_id)
+        value.wait()
         ref = value.ref()
         if ref is not None:
             return ref
