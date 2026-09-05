@@ -263,6 +263,8 @@ fn count_events(event_log: &MemoryEventLog, wf_id: &WorkflowId) -> HashMap<Strin
         let payload: WorkflowEventPayload = postcard::from_bytes(&entry.payload).unwrap();
         let name = match payload {
             WorkflowEventPayload::Submitted { .. } => "Submitted",
+            WorkflowEventPayload::NodeAdded { .. } => "NodeAdded",
+            WorkflowEventPayload::TaskDispatched { .. } => "TaskDispatched",
             WorkflowEventPayload::Started { .. } => "Started",
             WorkflowEventPayload::TaskRunning { .. } => "TaskRunning",
             WorkflowEventPayload::TaskCompleted { .. } => "TaskCompleted",
@@ -270,6 +272,9 @@ fn count_events(event_log: &MemoryEventLog, wf_id: &WorkflowId) -> HashMap<Strin
             WorkflowEventPayload::TaskCancelled { .. } => "TaskCancelled",
             WorkflowEventPayload::Completed { .. } => "Completed",
             WorkflowEventPayload::Failed { .. } => "Failed",
+            WorkflowEventPayload::WaitPointRegistered { .. } => "WaitPointRegistered",
+            WorkflowEventPayload::SignalReceived { .. } => "SignalReceived",
+            WorkflowEventPayload::TimerFired { .. } => "TimerFired",
             WorkflowEventPayload::Recovered { .. } => "Recovered",
         };
         *counts.entry(name.to_string()).or_default() += 1;

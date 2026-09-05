@@ -652,6 +652,44 @@ impl Terminal for WorkflowExecution {
     }
 }
 
+/// 等待点条件（S1 持久化等待点原语）。
+///
+/// 纯数据结构，与 [`Dag`]/[`Phase`] 同层：不解释条件语义、不触发唤醒，
+/// 唤醒由 `Orchestrator` 的等待点 API 追加事件后推进状态机。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum WaitCondition {
+    /// 外部信号触发（S2 经 Signals capability 递交）。
+    Signal {
+        /// 信号名。与 wait_key 相互独立：wait_key 是注册表键，name 是信号语义名。
+        name: String,
+    },
+    /// 定时到期唤醒。`deadline_ms` 为绝对 epoch 毫秒，与工作流级超时
+    /// watcher（`is_expired` / `epoch_millis`）使用同一时钟基准。
+    Timer { deadline_ms: u64 },
+}
+
+/// 等待点当前状态。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum WaitPointState {
+    /// 等待条件满足。
+    Waiting,
+    /// 已被唤醒（signal 递交或 timer 到期），携带唤醒时附带的 payload。
+    Signaled { payload: Vec<u8> },
+}
+
+/// 单个持久化等待点：`(workflow_id, wait_key)` 唯一标识，条件 + 状态。
+///
+/// 事实源是 `workflow:{id}` topic 的等待点事件（WaitPointRegistered /
+/// SignalReceived / TimerFired）；随快照落盘的等待点条目（`orch:wait:{id}`）
+/// 是重放加速缓存，与 exec/pending 快照同批写入。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaitPoint {
+    pub condition: WaitCondition,
+    pub state: WaitPointState,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Archive, rkyv::Serialize, rkyv::Deserialize)]
 #[rkyv(bytecheck())]
 pub struct DagNode {

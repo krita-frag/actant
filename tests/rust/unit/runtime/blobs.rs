@@ -1,7 +1,7 @@
 //! Unit tests for `src/runtime/blobs.rs`（0.3.2 R1，spike 用例改写为正式单测）。
 //! Compiled via `#[path]` attribute — retains `super::` access to private items.
 //!
-//! 原 spike 验证（plans/SPIKE_0.3.2_BLOBS.md）：三协议共存往返、10MB 流式
+//! 原 spike 验证（plans/archive/SPIKE_0.3.2_BLOBS.md）：三协议共存往返、10MB 流式
 //! 读取（峰值 ≤16KiB）、中途取消不悬挂。此处以生产装配路径
 //! `NetworkManager::with_blob_store`（gossip + 直连 + blobs 同一 Router）重写。
 

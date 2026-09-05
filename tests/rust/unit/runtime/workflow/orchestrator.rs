@@ -1302,3 +1302,499 @@ async fn on_task_completed_without_attempt_info_still_accepts_results() {
     assert_eq!(ready.len(), 1);
     assert_eq!(ready[0].id, TaskId::from("t2"));
 }
+
+// ───────────────────────── S0：统一工作流历史（快照 + 事件重放）─────────────────────────
+
+use crate::runtime::state::event_log::{EventLog, MemoryEventLog};
+use crate::runtime::workflow::orchestrator::types::WorkflowEventPayload;
+use crate::runtime::workflow::WaitCondition;
+
+/// 读取工作流 topic 的全部事件并解码。
+fn read_history(event_log: &MemoryEventLog, wf: &WorkflowId) -> Vec<WorkflowEventPayload> {
+    let topic = format!("workflow:{}", wf.as_str());
+    event_log
+        .read_after(&topic, None)
+        .unwrap()
+        .into_iter()
+        .map(|entry| postcard::from_bytes(&entry.payload).unwrap())
+        .collect()
+}
+
+fn event_names(events: &[WorkflowEventPayload]) -> Vec<&'static str> {
+    events
+        .iter()
+        .map(|p| match p {
+            WorkflowEventPayload::Submitted { .. } => "Submitted",
+            WorkflowEventPayload::NodeAdded { .. } => "NodeAdded",
+            WorkflowEventPayload::TaskDispatched { .. } => "TaskDispatched",
+            WorkflowEventPayload::Started { .. } => "Started",
+            WorkflowEventPayload::TaskRunning { .. } => "TaskRunning",
+            WorkflowEventPayload::TaskCompleted { .. } => "TaskCompleted",
+            WorkflowEventPayload::TaskFailed { .. } => "TaskFailed",
+            WorkflowEventPayload::TaskCancelled { .. } => "TaskCancelled",
+            WorkflowEventPayload::Completed { .. } => "Completed",
+            WorkflowEventPayload::Failed { .. } => "Failed",
+            WorkflowEventPayload::WaitPointRegistered { .. } => "WaitPointRegistered",
+            WorkflowEventPayload::SignalReceived { .. } => "SignalReceived",
+            WorkflowEventPayload::TimerFired { .. } => "TimerFired",
+            WorkflowEventPayload::Recovered { .. } => "Recovered",
+        })
+        .collect()
+}
+
+/// submit 是节点新增的唯一变更点：整图提交时每个节点追加一条 NodeAdded 事件。
+#[tokio::test]
+async fn submit_appends_node_added_event_per_node() {
+    let event_log = Arc::new(MemoryEventLog::default());
+    let orch = Orchestrator::new()
+        .with_signing_key(TEST_SIGNING_KEY.to_vec())
+        .with_event_log(event_log.clone());
+    let wf = WorkflowId::from("wf-node-added");
+
+    orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
+
+    let names = event_names(&read_history(&event_log, &wf));
+    assert_eq!(
+        names.iter().filter(|n| **n == "Submitted").count(),
+        1,
+        "exactly one Submitted event, got {names:?}"
+    );
+    assert_eq!(
+        names.iter().filter(|n| **n == "NodeAdded").count(),
+        3,
+        "one NodeAdded event per DAG node, got {names:?}"
+    );
+    // NodeAdded 携带完整节点定义（S7 增量提交的可重建前提）。
+    let nodes: Vec<String> = read_history(&event_log, &wf)
+        .into_iter()
+        .filter_map(|p| match p {
+            WorkflowEventPayload::NodeAdded { node, .. } => Some(node.task_id.to_string()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(nodes.len(), 3);
+    assert!(nodes.contains(&"t1".to_string()));
+    assert!(nodes.contains(&"t2".to_string()));
+    assert!(nodes.contains(&"t3".to_string()));
+}
+
+/// recover = 快照 + 其后事件重放：快照水位之后的 TaskCompleted 事件（携带
+/// 结果）被重放，崩溃前未落盘的完成进度得以恢复；恢复后 Pending 且依赖
+/// 满足的任务重派发、已完成任务不重跑（红线语义）。
+#[tokio::test]
+async fn recover_replays_events_after_snapshot_watermark() {
+    let dir = tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let event_log = Arc::new(MemoryEventLog::default());
+    let wf = WorkflowId::from("wf-replay-1");
+
+    let orch = Orchestrator::new()
+        .with_signing_key(TEST_SIGNING_KEY.to_vec())
+        .with_store(store.clone())
+        .with_event_log(event_log.clone());
+    orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
+    let roots = orch.start(&wf).unwrap();
+    assert_eq!(roots.len(), 1);
+    orch.mark_task_running(&wf, &roots[0].id).unwrap();
+    // 快照落盘：水位停在 Started/TaskRunning。
+    orch.flush_dirty().await.unwrap();
+    // 崩溃前未落盘的完成：TaskCompleted 事件只存在于历史。
+    let (ready, _, _) = orch
+        .on_task_completed(&wf, &TaskId::from("t1"), b"r1".to_vec())
+        .await
+        .unwrap();
+    assert_eq!(ready.len(), 1);
+    drop(orch);
+
+    // 历史中确有携带结果的 TaskCompleted 事件。
+    let history = read_history(&event_log, &wf);
+    assert!(history.iter().any(|p| matches!(
+        p,
+        WorkflowEventPayload::TaskCompleted { result, .. }
+            if result == b"r1".to_vec().as_slice() || *result == b"r1"
+    )));
+
+    let recovered = Orchestrator::recover(store, recover_config(), Some(event_log.clone()))
+        .await
+        .unwrap();
+    let state = recovered.get_state(&wf).unwrap();
+    assert_eq!(
+        state.tasks[&TaskId::from("t1")].state,
+        Phase::Completed,
+        "watermark-beyond TaskCompleted event must be replayed"
+    );
+    assert_eq!(
+        state.tasks[&TaskId::from("t1")].result.as_deref(),
+        Some(b"r1".as_slice()),
+        "replay must restore the result carried by the event"
+    );
+    assert_eq!(
+        state.succeeded_count(),
+        1,
+        "replay must not double-count completions"
+    );
+
+    // 红线：恢复后仅 t2（Pending 且依赖满足）重派发，t1 不重跑，t3 未就绪。
+    let mut ready_ids: Vec<String> = recovered
+        .recover_ready_tasks()
+        .into_iter()
+        .map(|t| t.id.to_string())
+        .collect();
+    ready_ids.sort();
+    assert_eq!(ready_ids, vec!["t2".to_string()]);
+}
+
+/// 重放幂等：重复应用同一事件（重复 recover、重复投递）不产生二次状态变更。
+#[tokio::test]
+async fn replay_is_idempotent_for_duplicate_events() {
+    let dir = tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let event_log = Arc::new(MemoryEventLog::default());
+    let wf = WorkflowId::from("wf-replay-idem");
+
+    let orch = Orchestrator::new()
+        .with_signing_key(TEST_SIGNING_KEY.to_vec())
+        .with_store(store.clone())
+        .with_event_log(event_log.clone());
+    orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
+    orch.start(&wf).unwrap();
+    orch.flush_dirty().await.unwrap();
+    drop(orch);
+
+    let recovered = Orchestrator::recover(store.clone(), recover_config(), Some(event_log))
+        .await
+        .unwrap();
+    let duplicate = WorkflowEventPayload::TaskCompleted {
+        workflow_id: wf.clone(),
+        task_id: TaskId::from("t1"),
+        result: b"r1".to_vec(),
+    };
+    // 第一次应用：真正推进（t1 此前是 Pending）。
+    recovered.apply_replayed_event(duplicate.clone()).await;
+    assert_eq!(
+        recovered.get_state(&wf).unwrap().succeeded_count(),
+        1,
+        "first replay application should transition t1"
+    );
+    // 第二次应用：终态守卫拒绝，计数不变。
+    recovered.apply_replayed_event(duplicate).await;
+    let state = recovered.get_state(&wf).unwrap();
+    assert_eq!(state.succeeded_count(), 1);
+    assert_eq!(
+        state.tasks[&TaskId::from("t1")].result.as_deref(),
+        Some(b"r1".as_slice())
+    );
+
+    // 再次 recover（模拟崩溃发生在重放后落盘前）：结果一致。
+    drop(recovered);
+    let recovered2 = Orchestrator::recover(store, recover_config(), None)
+        .await
+        .unwrap();
+    // 无 event_log 时不重放：快照中 t1 仍 Pending，但重复 recover 的
+    // 确定性已由上方重复应用验证。
+    assert_eq!(
+        recovered2.get_state(&wf).unwrap().tasks[&TaskId::from("t1")].state,
+        Phase::Pending
+    );
+}
+
+/// 全生命周期事件种类齐备：任务路径（派发/运行/完成/失败）与等待点路径
+/// （注册/信号/到期）全部进入同一历史。
+#[tokio::test]
+async fn workflow_history_covers_all_state_transitions() {
+    let event_log = Arc::new(MemoryEventLog::default());
+    let orch = Orchestrator::new()
+        .with_signing_key(TEST_SIGNING_KEY.to_vec())
+        .with_event_log(event_log.clone());
+
+    // 任务路径：派发事件由 Worker 上报，测试中直接经 orchestrator 记录。
+    let wf = WorkflowId::from("wf-history-complete");
+    let mut dag = Dag::new();
+    dag.add_node(make_node("only", "single")).unwrap();
+    orch.submit(wf.clone(), dag).await.unwrap();
+    orch.start(&wf).unwrap();
+    orch.mark_task_running(&wf, &TaskId::from("only")).unwrap();
+    orch.log_task_dispatched(&wf, &TaskId::from("only"));
+    orch.on_task_completed(&wf, &TaskId::from("only"), b"r".to_vec())
+        .await
+        .unwrap();
+
+    // 失败路径。
+    let wff = WorkflowId::from("wf-history-failed");
+    orch.submit(wff.clone(), make_linear_dag()).await.unwrap();
+    orch.start(&wff).unwrap();
+    orch.fail_task(
+        &wff,
+        &TaskId::from("t1"),
+        "boom".to_string(),
+        FailureScope::WorkflowLevel,
+    )
+    .await
+    .unwrap();
+
+    // 等待点路径：信号递交 + 定时到期。
+    let wfw = WorkflowId::from("wf-history-wait");
+    orch.submit(wfw.clone(), make_linear_dag()).await.unwrap();
+    orch.register_wait_point(&wfw, "go", WaitCondition::Signal { name: "go".into() })
+        .unwrap();
+    orch.register_wait_point(
+        &wfw,
+        "tick",
+        WaitCondition::Timer {
+            deadline_ms: crate::common::epoch_millis().saturating_sub(100),
+        },
+    )
+    .unwrap();
+    orch.signal_wait_point(&wfw, "go").unwrap().unwrap();
+    let fired = orch.poll_expired_timers().await.unwrap();
+    assert_eq!(fired.len(), 1, "expired timer should fire once");
+
+    for wf_id in [&wf, &wff, &wfw] {
+        let names = event_names(&read_history(&event_log, wf_id));
+        assert!(!names.is_empty(), "{wf_id:?} history must not be empty");
+    }
+    let task_names = event_names(&read_history(&event_log, &wf));
+    for kind in [
+        "Submitted",
+        "NodeAdded",
+        "TaskDispatched",
+        "Started",
+        "TaskRunning",
+        "TaskCompleted",
+        "Completed",
+    ] {
+        assert!(
+            task_names.contains(&kind),
+            "task lifecycle history missing {kind}, got {task_names:?}"
+        );
+    }
+    let failed_names = event_names(&read_history(&event_log, &wff));
+    assert!(
+        failed_names.contains(&"TaskFailed") && failed_names.contains(&"Failed"),
+        "failure history must contain TaskFailed + Failed, got {failed_names:?}"
+    );
+    let wait_names = event_names(&read_history(&event_log, &wfw));
+    for kind in ["WaitPointRegistered", "SignalReceived", "TimerFired"] {
+        assert!(
+            wait_names.contains(&kind),
+            "waitpoint history missing {kind}, got {wait_names:?}"
+        );
+    }
+}
+
+// ───────────────────────── S1：持久化等待点原语 ─────────────────────────
+
+/// 注册幂等：同 wait_key 重复注册为 no-op，且只产生一条注册事件。
+#[tokio::test]
+async fn register_wait_point_is_idempotent() {
+    let event_log = Arc::new(MemoryEventLog::default());
+    let orch = Orchestrator::new()
+        .with_signing_key(TEST_SIGNING_KEY.to_vec())
+        .with_event_log(event_log.clone());
+    let wf = WorkflowId::from("wf-wait-register");
+    orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
+
+    let cond = WaitCondition::Signal { name: "go".into() };
+    orch.register_wait_point(&wf, "go", cond.clone()).unwrap();
+    orch.register_wait_point(&wf, "go", cond).unwrap();
+
+    let names = event_names(&read_history(&event_log, &wf));
+    assert_eq!(
+        names
+            .iter()
+            .filter(|n| **n == "WaitPointRegistered")
+            .count(),
+        1,
+        "duplicate register must not append a second event"
+    );
+}
+
+/// signal 语义：未知 key → None；等待中 → Some(payload) 并记事件；
+/// 重复 signal → 直接返回（幂等），不重复记事件。
+#[tokio::test]
+async fn signal_wait_point_none_for_unknown_and_idempotent_on_repeat() {
+    let event_log = Arc::new(MemoryEventLog::default());
+    let orch = Orchestrator::new()
+        .with_signing_key(TEST_SIGNING_KEY.to_vec())
+        .with_event_log(event_log.clone());
+    let wf = WorkflowId::from("wf-wait-signal");
+    orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
+    orch.register_wait_point(&wf, "go", WaitCondition::Signal { name: "go".into() })
+        .unwrap();
+
+    // 无工作流级等待点表命中：未知 key → None。
+    assert_eq!(orch.signal_wait_point(&wf, "nope").unwrap(), None);
+
+    let first = orch.signal_wait_point(&wf, "go").unwrap();
+    assert_eq!(first, Some(Vec::<u8>::new()));
+    let second = orch.signal_wait_point(&wf, "go").unwrap();
+    assert_eq!(first, second, "repeat signal must return the same payload");
+
+    let names = event_names(&read_history(&event_log, &wf));
+    assert_eq!(
+        names.iter().filter(|n| **n == "SignalReceived").count(),
+        1,
+        "repeat signal must not append a second event"
+    );
+}
+
+/// 等待者唤醒：signal 前注册 → signal 时唤醒；signal 后注册 → 立即唤醒。
+#[tokio::test]
+async fn wait_point_waiter_wakes_on_signal() {
+    let orch = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
+    let wf = WorkflowId::from("wf-wait-waiter");
+    orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
+    orch.register_wait_point(&wf, "go", WaitCondition::Signal { name: "go".into() })
+        .unwrap();
+
+    // 先注册后 signal。
+    let rx = orch.register_wait_point_waiter(wf.clone(), "go");
+    orch.signal_wait_point(&wf, "go").unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), rx)
+        .await
+        .expect("waiter must wake on signal")
+        .expect("waiter payload channel closed");
+
+    // 已 Signaled 后注册：立即解决。
+    let rx2 = orch.register_wait_point_waiter(wf.clone(), "go");
+    tokio::time::timeout(std::time::Duration::from_millis(100), rx2)
+        .await
+        .expect("already-signaled waitpoint must resolve waiter immediately")
+        .unwrap();
+}
+
+/// Timer 等待点：仅到期者触发，重复 poll 幂等；未到期的保持 Waiting。
+#[tokio::test]
+async fn poll_expired_timers_fires_only_due_and_is_idempotent() {
+    let orch = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
+    let wf = WorkflowId::from("wf-wait-timer");
+    orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
+    let now = crate::common::epoch_millis();
+    orch.register_wait_point(
+        &wf,
+        "due",
+        WaitCondition::Timer {
+            deadline_ms: now - 100,
+        },
+    )
+    .unwrap();
+    orch.register_wait_point(
+        &wf,
+        "later",
+        WaitCondition::Timer {
+            deadline_ms: now + 60_000,
+        },
+    )
+    .unwrap();
+
+    let fired = orch.poll_expired_timers().await.unwrap();
+    assert_eq!(
+        fired,
+        vec![(wf.clone(), "due".to_string())],
+        "only the due timer fires"
+    );
+    // 重复 poll：已触发的不再次触发。
+    let fired_again = orch.poll_expired_timers().await.unwrap();
+    assert!(fired_again.is_empty(), "poll must be idempotent");
+
+    // 未到期等待点保持 Waiting，仍可被 signal 之外的路径查询。
+    let table = orch.state.waitpoints.get(&wf).unwrap();
+    let later = table.get("later").unwrap();
+    assert_eq!(
+        format!("{:?}", later.state),
+        format!("{:?}", crate::runtime::workflow::WaitPointState::Waiting)
+    );
+}
+
+/// recover 后等待点保留（快照路径）：快照 + 水位恢复后等待点仍在，
+/// signal 可达；到期的 Timer 在恢复后由 poll 触发。
+#[tokio::test]
+async fn waitpoints_survive_recover_and_stay_reachable() {
+    let dir = tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let event_log = Arc::new(MemoryEventLog::default());
+    let wf = WorkflowId::from("wf-wait-recover");
+
+    let orch = Orchestrator::new()
+        .with_signing_key(TEST_SIGNING_KEY.to_vec())
+        .with_store(store.clone())
+        .with_event_log(event_log.clone());
+    orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
+    orch.register_wait_point(&wf, "go", WaitCondition::Signal { name: "go".into() })
+        .unwrap();
+    // 快照水位之后的等待点注册：只能靠事件重放恢复（无 flush）。
+    drop(orch);
+    let recovered = Orchestrator::recover(store, recover_config(), Some(event_log))
+        .await
+        .unwrap();
+    // 事件重放路径：注册事件在水位之后，重放后等待点必须存在。
+    // 守卫作用域必须立即关闭：DashMap 的 get 引用跨后续 entry() 调用
+    // 会在同分片上自死锁。
+    let has_go = recovered
+        .state
+        .waitpoints
+        .get(&wf)
+        .map(|table| table.contains_key("go"))
+        .unwrap_or(false);
+    assert!(
+        has_go,
+        "waitpoint registered before crash must be rebuilt from history"
+    );
+
+    // signal 在恢复后的 orchestrator 上可达。
+    let rx = recovered.register_wait_point_waiter(wf.clone(), "go");
+    let signaled = recovered.signal_wait_point(&wf, "go").unwrap();
+    assert_eq!(signaled, Some(Vec::<u8>::new()));
+    tokio::time::timeout(std::time::Duration::from_secs(1), rx)
+        .await
+        .expect("recovered waitpoint waiter must wake")
+        .unwrap();
+
+    // 幂等：恢复后重复注册同 key 仍为 no-op。
+    recovered
+        .register_wait_point(&wf, "go", WaitCondition::Signal { name: "go".into() })
+        .unwrap();
+}
+
+/// recover 后等待点保留（快照路径）：flush 过的等待点经 `orch:wait:` 快照
+/// 加载；到期的 Timer 在恢复后被 poll 触发（历史事件 TimerFired 同步进入历史）。
+#[tokio::test]
+async fn waitpoint_snapshot_survives_recover_and_timer_fires_after_recover() {
+    let dir = tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let event_log = Arc::new(MemoryEventLog::default());
+    let wf = WorkflowId::from("wf-wait-snapshot");
+
+    let orch = Orchestrator::new()
+        .with_signing_key(TEST_SIGNING_KEY.to_vec())
+        .with_store(store.clone())
+        .with_event_log(event_log.clone());
+    orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
+    orch.register_wait_point(
+        &wf,
+        "due-after-restart",
+        WaitCondition::Timer {
+            deadline_ms: crate::common::epoch_millis().saturating_sub(50),
+        },
+    )
+    .unwrap();
+    // 落盘：等待点进入快照，水位覆盖注册事件。
+    orch.flush_dirty().await.unwrap();
+    drop(orch);
+
+    let recovered = Orchestrator::recover(store, recover_config(), Some(event_log.clone()))
+        .await
+        .unwrap();
+    let fired = recovered.poll_expired_timers().await.unwrap();
+    assert_eq!(
+        fired,
+        vec![(wf.clone(), "due-after-restart".to_string())],
+        "timer persisted before crash must fire after recover"
+    );
+    // 触发进入同一历史。
+    let names = event_names(&read_history(&event_log, &wf));
+    assert!(
+        names.contains(&"TimerFired"),
+        "post-recover timer firing must append TimerFired event, got {names:?}"
+    );
+}

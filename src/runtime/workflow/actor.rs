@@ -76,6 +76,8 @@ pub mod workflow_methods {
     /// 任务结果回灌唯一入口（远端直连与 gossip 路径统一走此方法）。
     pub const ON_TASK_RESULT: &str = "on_task_result";
     pub const MARK_TASK_RUNNING: &str = "mark_task_running";
+    /// 任务被本地 Worker 接受执行（S0 派发事件，Worker fire-and-forget 上报）。
+    pub const TASK_DISPATCHED: &str = "task_dispatched";
     pub const GET_STATE: &str = "get_state";
     pub const ACTIVE_WORKFLOW_IDS: &str = "active_workflow_ids";
     pub const ADOPT_WORKFLOW: &str = "adopt_workflow";
@@ -335,6 +337,12 @@ impl Actor for WorkflowActor {
                 let (workflow_id, task_id): (WorkflowId, TaskId) = decode(&msg.payload)?;
                 self.orchestrator
                     .mark_task_running(&workflow_id, &task_id)?;
+                Ok(ok_result(msg_id))
+            }
+            workflow_methods::TASK_DISPATCHED => {
+                let (workflow_id, task_id): (WorkflowId, TaskId) = decode(&msg.payload)?;
+                self.orchestrator
+                    .log_task_dispatched(&workflow_id, &task_id);
                 Ok(ok_result(msg_id))
             }
             workflow_methods::GET_STATE => {

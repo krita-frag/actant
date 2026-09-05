@@ -371,7 +371,7 @@ class AsyncResult:
         完成判定以锁内 ``_state`` 终态为准（而非 ``_future.is_set()``）：
         ``_set_*`` 在持锁时先置终态、释放锁后才 ``set`` future，若检查
         ``is_set()`` 会在该窗口内把回调 append 进已被清空的 ``_callbacks``
-        而永久丢失（docs/CODE_QUALITY_REPORT.md P0-6）。
+        而永久丢失——回调注册必须与完成协议共用同一终态判定源。
         """
         with self._lock:
             if self._state not in _TERMINAL_STATES:

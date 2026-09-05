@@ -941,3 +941,46 @@ fn checkpoint_key_orders_lexicographically() {
     assert!(k1 < k2);
     assert!(k2 < k10);
 }
+
+// ───────────────────────── X1：store 格式版本（fmt_version）─────────────────────────
+
+#[test]
+fn store_writes_fmt_version_on_first_open() {
+    let dir = tempdir().unwrap();
+    let store = LmdbStore::open(dir.path()).unwrap();
+    // 首次创建即写入当前版本（u64 LE）。
+    let raw = store.get(STORE_FMT_VERSION_KEY).unwrap();
+    assert_eq!(
+        raw,
+        Some(STORE_FMT_VERSION.to_le_bytes().to_vec()),
+        "first open must stamp the current store format version"
+    );
+
+    // 重开同一 store：版本匹配，正常打开。
+    drop(store);
+    assert!(
+        LmdbStore::open(dir.path()).is_ok(),
+        "matching version must reopen"
+    );
+}
+
+#[test]
+fn store_rejects_mismatched_fmt_version() {
+    let dir = tempdir().unwrap();
+    {
+        let store = LmdbStore::open(dir.path()).unwrap();
+        // 模拟由更高（不兼容）版本写入的数据。
+        store
+            .put(STORE_FMT_VERSION_KEY, &999u64.to_le_bytes())
+            .unwrap();
+    }
+    let err = match LmdbStore::open(dir.path()) {
+        Err(e) => e,
+        Ok(_) => panic!("mismatched format version must be rejected"),
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("format version"),
+        "mismatched format version must produce a semantic error, got: {msg}"
+    );
+}

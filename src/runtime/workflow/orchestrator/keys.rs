@@ -4,7 +4,8 @@
 //! 以及在有前驱依赖时构造带 MAC 签名的 task payload。
 
 use crate::common::{
-    Result, TaskId, WorkflowId, STORE_KEY_DAG, STORE_KEY_EXEC, STORE_KEY_PENDING, STORE_KEY_RESULT,
+    Result, TaskId, WorkflowId, STORE_KEY_DAG, STORE_KEY_EVENT_SEQ, STORE_KEY_EXEC,
+    STORE_KEY_PENDING, STORE_KEY_RESULT, STORE_KEY_WAIT,
 };
 use crate::runtime::workflow::{Dag, WorkflowExecution};
 
@@ -22,6 +23,14 @@ pub(super) fn pending_key(wf_id: &WorkflowId) -> String {
 
 pub(super) fn result_key(wf_id: &WorkflowId) -> String {
     format!("{}{}", STORE_KEY_RESULT, wf_id.as_str())
+}
+
+pub(super) fn wait_key(wf_id: &WorkflowId) -> String {
+    format!("{}{}", STORE_KEY_WAIT, wf_id.as_str())
+}
+
+pub(super) fn event_seq_key(wf_id: &WorkflowId) -> String {
+    format!("{}{}", STORE_KEY_EVENT_SEQ, wf_id.as_str())
 }
 
 /// 构造带 MAC 签名的 task payload：有前驱依赖时，把所有已产出结果的前驱

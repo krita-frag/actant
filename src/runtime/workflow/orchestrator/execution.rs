@@ -53,7 +53,22 @@ impl Orchestrator {
         self.state
             .insert_workflow(workflow_id.clone(), dag, execution, pending);
 
-        self.log_event(WorkflowEventPayload::Submitted { workflow_id });
+        self.log_event(WorkflowEventPayload::Submitted {
+            workflow_id: workflow_id.clone(),
+        });
+        // S0：节点新增事件。当前节点唯一变更点是整图提交；S7 增量提交后
+        // 每个节点在其写入点单独追加。携带完整节点定义使历史可重建 DAG。
+        {
+            let slot = self.state.slots.get(&workflow_id);
+            if let Some(slot) = slot {
+                for node in slot.dag.nodes() {
+                    self.log_event(WorkflowEventPayload::NodeAdded {
+                        workflow_id: workflow_id.clone(),
+                        node: node.clone(),
+                    });
+                }
+            }
+        }
 
         crate::metrics::inc_workflows_submitted();
         crate::metrics::inc_active_workflows();
@@ -639,13 +654,15 @@ impl Orchestrator {
 
                                     // 对齐 fail_task 路径：超时失败的工作流写入 Failed 事件，
                                     // 供订阅者观测（事件写入失败不阻断状态推进）。
-                                    super::persistence::append_event(
+                                    if let Some(id) = super::persistence::append_event(
                                         event_log.as_ref(),
                                         WorkflowEventPayload::Failed {
                                             workflow_id: wf_id.clone(),
                                             error: "workflow timeout exceeded".into(),
                                         },
-                                    );
+                                    ) {
+                                        state.record_event_seq(&wf_id, id);
+                                    }
 
                                     to_fire.push(wf_id);
                                 }
@@ -934,7 +951,15 @@ impl Orchestrator {
                 (true, false)
             } else {
                 slot.execution
-                    .mark_task_completed(task_id, result, result_attempt);
+                    .mark_task_completed(task_id, result.clone(), result_attempt);
+                // 任务完成事件在终态判定之前追加：末任务完成使工作流进入
+                // 终态时，complete_terminal 早退路径不得吞掉 per-task 事件，
+                // 否则历史缺失 TaskCompleted（重放/审计无法重建任务终态）。
+                self.log_event(WorkflowEventPayload::TaskCompleted {
+                    workflow_id: workflow_id.clone(),
+                    task_id: task_id.clone(),
+                    result: result.clone(),
+                });
                 (false, slot.execution.is_terminal())
             }
         };
@@ -966,11 +991,6 @@ impl Orchestrator {
 
         // Non-terminal: defer persistence to background flush
         self.state.mark_dirty(workflow_id);
-
-        self.log_event(WorkflowEventPayload::TaskCompleted {
-            workflow_id: workflow_id.clone(),
-            task_id: task_id.clone(),
-        });
 
         Ok(CompletionInfo {
             workflow_terminal: false,

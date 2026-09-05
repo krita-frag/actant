@@ -38,7 +38,10 @@ pub use actor::{
     FAILOVER_ACTOR_TYPE, SCHEDULER_ACTOR_TYPE, WORKFLOW_ACTOR_TYPE,
 };
 pub(crate) use dag::WorkflowExecution;
-pub use dag::{Dag, DagNode, FailureScope, FailureStrategy, Phase, TaskState, Terminal};
+pub use dag::{
+    Dag, DagNode, FailureScope, FailureStrategy, Phase, TaskState, Terminal, WaitCondition,
+    WaitPoint, WaitPointState,
+};
 pub use failover::{FailoverManager, PeerInfo};
 pub use gossip::DagGossip;
 pub(crate) use orchestrator::Orchestrator;

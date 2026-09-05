@@ -53,9 +53,9 @@ pub use model::{
 };
 // 协议类型 — crate 内部
 pub(crate) use wire::{
-    OrchestratorClaim, Topic, WireTaskResult, STORE_KEY_DAG, STORE_KEY_EXEC, STORE_KEY_LEASE,
-    STORE_KEY_PENDING, STORE_KEY_RESULT, TOPIC_FAILOVER, TOPIC_HEADS, TOPIC_HEARTBEAT,
-    TOPIC_WORKFLOW_STATE_REQ,
+    OrchestratorClaim, Topic, WireTaskResult, STORE_KEY_DAG, STORE_KEY_EVENT_SEQ, STORE_KEY_EXEC,
+    STORE_KEY_LEASE, STORE_KEY_PENDING, STORE_KEY_RESULT, STORE_KEY_WAIT, TOPIC_FAILOVER,
+    TOPIC_HEADS, TOPIC_HEARTBEAT, TOPIC_WORKFLOW_STATE_REQ,
 };
 // 请求-响应协议所需类型（公共 API）
 pub use payload::{

@@ -1035,6 +1035,42 @@ impl Worker {
                 });
             }
 
+            // S0：派发事件。任务被本地接受执行时经 WorkflowActor 追加
+            // TaskDispatched 到工作流统一历史；fire-and-forget，失败仅告警。
+            if let Some(dispatched_wf) = task.workflow_id.clone() {
+                if let (Some(system), Some(actor_id)) =
+                    (self.actor_system.clone(), self.workflow_actor_id.clone())
+                {
+                    match crate::runtime::workflow::messaging::encode(&(
+                        dispatched_wf,
+                        task.id.clone(),
+                    )) {
+                        Ok(payload) => {
+                            let msg = crate::common::ActorMessage::new(
+                                actor_id.clone(),
+                                crate::runtime::workflow::workflow_methods::TASK_DISPATCHED
+                                    .to_string(),
+                                payload,
+                            );
+                            if let Err(e) = system.send(&actor_id, msg).await {
+                                tracing::warn!(
+                                    task_id = ?task.id,
+                                    error = %e,
+                                    "failed to report task dispatch to workflow actor"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                task_id = ?task.id,
+                                error = %e,
+                                "failed to encode task dispatch report"
+                            );
+                        }
+                    }
+                }
+            }
+
             if task.enqueued_at_ms > 0 {
                 let latency = dispatch_start_ms.saturating_sub(task.enqueued_at_ms);
                 crate::metrics::observe_scheduling_latency_ms(latency);

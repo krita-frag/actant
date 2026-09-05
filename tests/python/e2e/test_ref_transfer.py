@@ -217,12 +217,11 @@ class TestRefTransfer:
             assert ref is not None
         assert isinstance(ref, Ref)
 
-        with actant.use_runtime(rt_b):
-            with pytest.raises(NotFoundError):
-                # 悬空 hash 必须包成 Ref 对象随参数提交：解析发生在提交方
-                # 父进程（方案①），_materialize_refs 对 Ref 调 value_fetch
-                # 才触发取值路径；裸 bytes 参数不会触发解析。
-                task(rt.consume_sha256).submit(Ref(_dangling_ref(ref._ref_bytes)))
+        with actant.use_runtime(rt_b), pytest.raises(NotFoundError):
+            # 悬空 hash 必须包成 Ref 对象随参数提交：解析发生在提交方
+            # 父进程（方案①），_materialize_refs 对 Ref 调 value_fetch
+            # 才触发取值路径；裸 bytes 参数不会触发解析。
+            task(rt.consume_sha256).submit(Ref(_dangling_ref(ref._ref_bytes)))
 
         # 两节点存活：故障后小任务正常收敛（不因值引用基建故障降级）。
         with actant.use_runtime(rt_a):

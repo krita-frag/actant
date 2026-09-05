@@ -27,7 +27,6 @@ from typing import Any
 
 import pytest
 
-import actant
 from actant import Runtime, flow, task
 from actant.task._ref import REF_INLINE_THRESHOLD, Ref
 

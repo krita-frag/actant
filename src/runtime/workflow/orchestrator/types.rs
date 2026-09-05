@@ -10,18 +10,34 @@ use dashmap::{DashMap, DashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::common::{Result, TaskId, WorkflowId};
-use crate::runtime::workflow::{Dag, Terminal, WorkflowExecution};
+use crate::runtime::workflow::{
+    Dag, DagNode, Terminal, WaitCondition, WaitPoint, WorkflowExecution,
+};
 
 /// 工作流级别事件，写入 `EventLog` 的 `workflow:{workflow_id}` topic。
 ///
-/// 仅记录状态变迁元数据，不携带完整 DAG/Execution，避免事件体积过大。
-/// 完整状态仍由 `Store` 持久化。所有变体由 orchestrator 在内部状态变迁时
-/// 构造；Python 侧通过 EventLog 读取 API 观测这些事件（不透明字节），
+/// 记录每次状态迁移，是工作流历史的唯一事实源（S0）：recover = 执行快照
+/// （重放加速缓存）+ 其后事件重放。除 [`WorkflowEventPayload::TaskCompleted`]
+/// 携带结果字节（重放需要恢复结果）与 [`WorkflowEventPayload::NodeAdded`]
+/// 携带节点定义（S7 增量提交的节点可由历史重建）外，不携带完整
+/// DAG/Execution，避免事件体积过大。所有变体由 orchestrator 在内部状态
+/// 变迁时构造；Python 侧通过 EventLog 读取 API 观测这些事件（不透明字节），
 /// 不依赖其 Rust 类型定义。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WorkflowEventPayload {
     Submitted {
         workflow_id: WorkflowId,
+    },
+    /// 节点进入 DAG。当前唯一变更点是 `submit`（整图提交）；S7 增量提交
+    /// 后每个节点在写入点单独追加，携带完整 [`DagNode`] 使历史可重建 DAG。
+    NodeAdded {
+        workflow_id: WorkflowId,
+        node: DagNode,
+    },
+    /// 任务由 Worker 接受本地执行（派发确认）。
+    TaskDispatched {
+        workflow_id: WorkflowId,
+        task_id: TaskId,
     },
     Started {
         workflow_id: WorkflowId,
@@ -30,9 +46,12 @@ pub enum WorkflowEventPayload {
         workflow_id: WorkflowId,
         task_id: TaskId,
     },
+    /// 任务完成。携带结果字节：历史是结果的事实源（S7 重放"已完成返回
+    /// 记录结果"、S8 回灌均读同一历史）。
     TaskCompleted {
         workflow_id: WorkflowId,
         task_id: TaskId,
+        result: Vec<u8>,
     },
     TaskFailed {
         workflow_id: WorkflowId,
@@ -50,6 +69,24 @@ pub enum WorkflowEventPayload {
         workflow_id: WorkflowId,
         error: String,
     },
+    /// 等待点注册（S1）。幂等：同 wait_key 重复注册不追加此事件。
+    WaitPointRegistered {
+        workflow_id: WorkflowId,
+        wait_key: String,
+        condition: WaitCondition,
+    },
+    /// 信号等待点被唤醒（S1）。payload 预留给 S2 Signals capability 携带
+    /// 信号数据；当前 `signal_wait_point` 递交空 payload。
+    SignalReceived {
+        workflow_id: WorkflowId,
+        wait_key: String,
+        payload: Vec<u8>,
+    },
+    /// 定时等待点到期唤醒（S1）。
+    TimerFired {
+        workflow_id: WorkflowId,
+        wait_key: String,
+    },
     /// 节点重启后从持久化存储恢复工作流时发出。
     ///
     /// `task_count` 为恢复后 slot 中的任务总数（含已完成、待执行、跳过）。
@@ -66,6 +103,8 @@ impl WorkflowEventPayload {
     pub fn workflow_id(&self) -> &WorkflowId {
         match self {
             Self::Submitted { workflow_id }
+            | Self::NodeAdded { workflow_id, .. }
+            | Self::TaskDispatched { workflow_id, .. }
             | Self::Started { workflow_id }
             | Self::TaskRunning { workflow_id, .. }
             | Self::TaskCompleted { workflow_id, .. }
@@ -73,6 +112,9 @@ impl WorkflowEventPayload {
             | Self::TaskCancelled { workflow_id, .. }
             | Self::Completed { workflow_id }
             | Self::Failed { workflow_id, .. }
+            | Self::WaitPointRegistered { workflow_id, .. }
+            | Self::SignalReceived { workflow_id, .. }
+            | Self::TimerFired { workflow_id, .. }
             | Self::Recovered { workflow_id, .. } => workflow_id,
         }
     }
@@ -202,6 +244,54 @@ impl TerminalWaiterRegistry {
     }
 }
 
+/// Per-(workflow, wait_key) 等待点唤醒句柄注册表（S1）。
+///
+/// 扩展 [`TerminalWaiterRegistry`] 模式：每个等待点一条 oneshot 通道，
+/// 精确唤醒一次，`fire` 后条目移除。供后续 S7 flow 线程在等待点 park，
+/// signal/timer 到期时被唤醒。
+pub(crate) struct WaiterRegistry {
+    waiters: DashMap<(WorkflowId, String), tokio::sync::oneshot::Sender<Vec<u8>>>,
+}
+
+impl WaiterRegistry {
+    fn new() -> Self {
+        Self {
+            waiters: DashMap::new(),
+        }
+    }
+
+    /// 注册 oneshot 唤醒句柄，条件满足时收到 payload。
+    ///
+    /// **必须由调用方在注册后检查条件是否已满足**（与
+    /// [`TerminalWaiterRegistry::register`] 相同的"先注册后检查"次序关闭
+    /// 竞态窗口）。
+    fn register(
+        &self,
+        workflow_id: WorkflowId,
+        wait_key: &str,
+    ) -> tokio::sync::oneshot::Receiver<Vec<u8>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.waiters.insert((workflow_id, wait_key.to_string()), tx);
+        rx
+    }
+
+    /// 唤醒指定等待点的一个等待者并携带 payload；无等待者时 no-op。
+    fn fire(&self, workflow_id: &WorkflowId, wait_key: &str, payload: Vec<u8>) {
+        if let Some((_, tx)) = self
+            .waiters
+            .remove(&(workflow_id.clone(), wait_key.to_string()))
+        {
+            // send 失败仅当等待者已放弃（receiver drop），通知无人接收。
+            let _ = tx.send(payload);
+        }
+    }
+
+    /// 移除某工作流的全部等待点等待者（工作流被移除时的清理）。
+    fn remove_workflow(&self, workflow_id: &WorkflowId) {
+        self.waiters.retain(|(wf, _), _| wf != workflow_id);
+    }
+}
+
 /// 跟踪需要持久化但尚未写入存储的 workflow ID。
 ///
 /// 后台 flush 任务周期性调用 `drain` 批量持久化。
@@ -239,14 +329,20 @@ impl DirtyTracker {
 /// Eliminates the global RwLock bottleneck: different workflows can be
 /// read and modified concurrently without contention.
 ///
-/// 由三个独立职责的子结构组合而成：
+/// 由六个独立职责的子结构组合而成：
 /// - `slots`：workflow → WorkflowSlot 的并发映射
 /// - `terminal_waiters`：终态等待者 oneshot 注册表
+/// - `wait_waiters`：等待点唤醒句柄注册表（S1）
+/// - `waitpoints`：workflow → 等待点表的并发映射（S1）
 /// - `dirty_tracker`：脏 workflow 跟踪器
+/// - `event_seqs`：workflow → 最近一次追加事件的 `EventId`（S0 事件水位）
 pub struct OrchestratorState {
     pub(crate) slots: DashMap<WorkflowId, WorkflowSlot>,
     pub(crate) terminal_waiters: TerminalWaiterRegistry,
+    pub(crate) wait_waiters: WaiterRegistry,
+    pub(crate) waitpoints: DashMap<WorkflowId, DashMap<String, WaitPoint>>,
     pub(crate) dirty_tracker: DirtyTracker,
+    pub(crate) event_seqs: DashMap<WorkflowId, crate::runtime::state::event_log::EventId>,
 }
 
 impl Default for OrchestratorState {
@@ -260,7 +356,10 @@ impl OrchestratorState {
         Self {
             slots: DashMap::new(),
             terminal_waiters: TerminalWaiterRegistry::new(),
+            wait_waiters: WaiterRegistry::new(),
+            waitpoints: DashMap::new(),
             dirty_tracker: DirtyTracker::new(),
+            event_seqs: DashMap::new(),
         }
     }
 
@@ -346,6 +445,62 @@ impl OrchestratorState {
         self.slots.remove(workflow_id);
         self.dirty_tracker.remove(workflow_id);
         self.terminal_waiters.remove(workflow_id);
+        self.waitpoints.remove(workflow_id);
+        self.event_seqs.remove(workflow_id);
+        self.wait_waiters.remove_workflow(workflow_id);
+    }
+
+    /// 记录工作流最近一次成功追加的事件 ID（S0 事件水位）。
+    ///
+    /// flush 在序列化快照**之前**读取水位写入 store：保证任何已计入水位
+    /// 的状态变更必然已包含在快照中；反向窗口（变更在水位居捕获后、序列化
+    /// 前发生）由重放幂等守卫兜底——该事件重放时被终态守卫拒绝。
+    pub(crate) fn record_event_seq(
+        &self,
+        workflow_id: &WorkflowId,
+        id: crate::runtime::state::event_log::EventId,
+    ) {
+        self.event_seqs.insert(workflow_id.clone(), id);
+    }
+
+    /// 返回工作流当前事件水位（flush 时随快照落盘）。
+    pub(crate) fn event_seq(
+        &self,
+        workflow_id: &WorkflowId,
+    ) -> Option<crate::runtime::state::event_log::EventId> {
+        self.event_seqs.get(workflow_id).map(|e| *e)
+    }
+
+    /// 返回工作流等待点表的克隆（flush 时序列化；无等待点返回 `None`）。
+    pub(crate) fn clone_waitpoints(
+        &self,
+        workflow_id: &WorkflowId,
+    ) -> Option<std::collections::HashMap<String, WaitPoint>> {
+        self.waitpoints.get(workflow_id).map(|table| {
+            table
+                .iter()
+                .map(|wp| (wp.key().clone(), wp.value().clone()))
+                .collect()
+        })
+    }
+
+    /// 注册等待点唤醒句柄（先注册，调用方随后检查是否已 Signaled）。
+    pub(crate) fn register_wait_waiter(
+        &self,
+        workflow_id: WorkflowId,
+        wait_key: &str,
+    ) -> tokio::sync::oneshot::Receiver<Vec<u8>> {
+        self.wait_waiters.register(workflow_id, wait_key)
+    }
+
+    /// 唤醒等待点的等待者（oneshot，携带 payload）；无等待者时 no-op。
+    pub(crate) fn fire_wait_waiter(
+        &self,
+        workflow_id: &WorkflowId,
+        wait_key: &str,
+        payload: Vec<u8>,
+    ) {
+        self.wait_waiters.fire(workflow_id, wait_key, payload);
     }
 
     pub(crate) fn contains_workflow(&self, workflow_id: &WorkflowId) -> bool {
