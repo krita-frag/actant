@@ -183,6 +183,85 @@ fn empty_data_rejected_with_key() {
     assert!(verify(b"key", b"").is_err());
 }
 
+// ───────────────────────── BlobRef（0.3.2 R1 值引用 wire 编码）─────────────────────────
+
+#[test]
+fn blob_ref_roundtrip() {
+    let r = BlobRef {
+        hash: crate::common::model::BlobHash::from_bytes([7u8; 32]),
+        node: crate::common::model::NodeId::new("node-a".into()),
+    };
+    let bytes = encode_blob_ref(&r).unwrap();
+    assert_eq!(decode_blob_ref(&bytes).unwrap(), r);
+}
+
+#[test]
+fn blob_ref_hash_is_raw_32_bytes_on_wire() {
+    let r = BlobRef {
+        hash: crate::common::model::BlobHash::from_bytes([0xAB; 32]),
+        node: crate::common::model::NodeId::new("node-a".into()),
+    };
+    let bytes = encode_blob_ref(&r).unwrap();
+    // postcard 编码 [u8;32] 为裸 32 字节，无长度前缀。
+    assert!(bytes.windows(32).any(|w| w == [0xAB; 32]));
+}
+
+/// 篡改编码字节的任意 bit 后，要么解码失败，要么解出与原引用不同的值（可检出）。
+#[test]
+fn blob_ref_tampering_is_detectable() {
+    let r = BlobRef {
+        hash: crate::common::model::BlobHash::from_bytes([3u8; 32]),
+        node: crate::common::model::NodeId::new("node-b".into()),
+    };
+    let bytes = encode_blob_ref(&r).unwrap();
+    for i in 0..bytes.len() {
+        for bit in 0..8 {
+            let mut tampered = bytes.clone();
+            tampered[i] ^= 1 << bit;
+            match decode_blob_ref(&tampered) {
+                Err(_) => {}
+                Ok(decoded) => assert_ne!(
+                    decoded, r,
+                    "tamper at byte {i} bit {bit} silently decoded to original"
+                ),
+            }
+        }
+    }
+}
+
+#[test]
+fn blob_ref_truncated_rejected() {
+    let r = BlobRef {
+        hash: crate::common::model::BlobHash::from_bytes([1u8; 32]),
+        node: crate::common::model::NodeId::new("node-c".into()),
+    };
+    let bytes = encode_blob_ref(&r).unwrap();
+    for len in 0..bytes.len() {
+        assert!(
+            decode_blob_ref(&bytes[..len]).is_err(),
+            "truncated length {len} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn blob_hash_hex_display_and_parse_roundtrip() {
+    use std::str::FromStr;
+    let hash = crate::common::model::BlobHash::from_bytes([
+        0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0xFF,
+    ]);
+    let text = hash.to_string();
+    assert_eq!(text.len(), 64);
+    assert_eq!(
+        crate::common::model::BlobHash::from_str(&text).unwrap(),
+        hash
+    );
+    // 非 hex / 错误长度均拒绝。
+    assert!(crate::common::model::BlobHash::from_str("xyz").is_err());
+    assert!(crate::common::model::BlobHash::from_str(&"aa".repeat(31)).is_err());
+}
+
 // ───────────────────────── wire_mac / verify_wire_mac 属性测试（H1）─────────────────────────
 //
 // `wire_mac` / `verify_wire_mac` 是 `payload.rs` 内的 pub 函数，但未在

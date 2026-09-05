@@ -311,11 +311,25 @@ impl RuntimeBuilder {
             self.config.payload_signing_key.clone(),
         );
 
+        let data_dir = self
+            .data_dir
+            .clone()
+            .ok_or_else(|| ActantError::Config("RuntimeBuilder requires data_dir".into()))?;
+        // 拒绝指向系统目录等危险路径，尽早失败（blob 存储也落在此目录下）。
+        validate_data_dir(&data_dir)?;
+        // blob 原语（0.3.2 R1）：FsStore 落盘 data_dir/blobs，随节点持久化。
+        let blob_dir = Path::new(&data_dir).join("blobs");
+        let blob_store = Arc::new(crate::runtime::blobs::BlobStore::open(&blob_dir).await?);
+
         tracing::info!("build: NetworkManager::new enter");
         let network: Arc<dyn Transport> = Arc::new(
-            NetworkManager::new(self.node_id.clone(), self.config.network.clone())
-                .await
-                .map_err(|e| ActantError::Network(format!("network init failed: {}", e)))?,
+            NetworkManager::with_blob_store(
+                self.node_id.clone(),
+                self.config.network.clone(),
+                blob_store.clone(),
+            )
+            .await
+            .map_err(|e| ActantError::Network(format!("network init failed: {}", e)))?,
         );
         tracing::info!("build: NetworkManager::new done");
 
@@ -335,12 +349,6 @@ impl RuntimeBuilder {
             actor_system.start_compaction_task();
         }
 
-        let data_dir = self
-            .data_dir
-            .clone()
-            .ok_or_else(|| ActantError::Config("RuntimeBuilder requires data_dir".into()))?;
-        // 拒绝指向系统目录等危险路径，尽早失败。
-        validate_data_dir(&data_dir)?;
         let store_path = Path::new(&data_dir).join("store");
         // 主存储使用配置中的 StoreConfig（map_size / max_dbs / sync_mode），
         // 不再隐式退回默认配置。open_with_config 内部创建目录。
@@ -447,6 +455,7 @@ impl RuntimeBuilder {
             capability.clone(),
             event_bus.clone(),
             task_dispatcher.clone(),
+            Some(blob_store),
         ));
         runtime.subscribe_cancel().await?;
         failover.subscribe_topics().await?;

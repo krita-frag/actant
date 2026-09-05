@@ -24,9 +24,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Mutex, RwLock};
 
 use crate::common::discovery_mode;
-use crate::common::model::{NodeId, TaskId, WorkflowId};
+use crate::common::model::{BlobHash, NodeId, TaskId, WorkflowId};
 use crate::common::wire::WireTaskOutcome;
 use crate::common::{ActantError, NetworkConfig};
+use crate::runtime::blobs::{BlobFetch, BlobStore};
 
 /// `Transport::listen_addresses()` 的结构化结果。
 #[derive(Debug, Clone)]
@@ -439,16 +440,44 @@ pub struct NetworkManager {
     max_message_size: usize,
     allowed_peer_ids: Arc<HashSet<String>>,
     direct_request_timeout: Duration,
+    /// blob 原语 facade；`None` = 未启用（`blob_store` 返回明确错误）。
+    blobs: Option<Arc<BlobStore>>,
 }
 
 impl NetworkManager {
     /// 创建 iroh endpoint、gossip router 和 direct request 处理循环。
+    ///
+    /// 不启用 blob 原语；生产装配走 [`Self::with_blob_store`]（RuntimeBuilder）。
     ///
     /// # Errors
     ///
     /// 如果配置校验失败、发现策略未知、endpoint bind 失败、router 启动失败，
     /// 或 bootstrap peer 解析失败，返回错误。
     pub async fn new(node_id: NodeId, config: NetworkConfig) -> crate::common::Result<Self> {
+        Self::build(node_id, config, None).await
+    }
+
+    /// 创建启用了 blob 原语的 [`NetworkManager`]。
+    ///
+    /// blob 存储由调用方打开（生产装配为 `data_dir/blobs` 下的 FsStore），
+    /// 并与 gossip / 直连协议在同一个 Router 上 accept `iroh_blobs::ALPN`。
+    ///
+    /// # Errors
+    ///
+    /// 同 [`Self::new`]。
+    pub async fn with_blob_store(
+        node_id: NodeId,
+        config: NetworkConfig,
+        blobs: Arc<BlobStore>,
+    ) -> crate::common::Result<Self> {
+        Self::build(node_id, config, Some(blobs)).await
+    }
+
+    async fn build(
+        node_id: NodeId,
+        config: NetworkConfig,
+        blobs: Option<Arc<BlobStore>>,
+    ) -> crate::common::Result<Self> {
         let _span = tracing::info_span!("network.new", node = %node_id).entered();
         tracing::info!(
             discovery_mode = %config.discovery_mode.as_str(),
@@ -516,11 +545,17 @@ impl NetworkManager {
             max_message_size,
         });
 
+        // blob 原语（0.3.2 R1）：存储由调用方随 data_dir 打开；未传入的
+        // 装配路径（直连 `new`，如纯嵌入/测试）不启用，blob_store 返回明确错误。
         tracing::info!("network.new: spawning router");
-        let router = Router::builder(endpoint.clone())
+        let mut router_builder = Router::builder(endpoint.clone())
             .accept(iroh_gossip::ALPN, gossip.clone())
-            .accept(ACTANT_DIRECT_ALPN, direct_handler.clone())
-            .spawn();
+            .accept(ACTANT_DIRECT_ALPN, direct_handler.clone());
+        router_builder = match &blobs {
+            Some(store) => router_builder.accept(iroh_blobs::ALPN, store.protocol_handler()),
+            None => router_builder,
+        };
+        let router = router_builder.spawn();
         tracing::info!("network.new: router spawned");
 
         if !config.bootstrap_nodes.is_empty()
@@ -576,6 +611,7 @@ impl NetworkManager {
             max_message_size,
             allowed_peer_ids,
             direct_request_timeout,
+            blobs,
         };
 
         manager.spawn_direct_event_loop(direct_event_rx);
@@ -812,6 +848,47 @@ impl NetworkManager {
     /// 返回本 Actant 节点 ID。
     pub fn node_id(&self) -> &NodeId {
         &self.node_id
+    }
+
+    /// blob 存储 facade 句柄；未启用时返回 `None`。
+    pub fn blobs(&self) -> Option<&Arc<BlobStore>> {
+        self.blobs.as_ref()
+    }
+
+    /// 将数据写入本地 blob 存储，返回内容寻址 hash（blake3 32 字节）。
+    ///
+    /// # Errors
+    ///
+    /// 节点未启用 blob 存储（直连 [`Self::new`] 构造）时返回
+    /// [`ActantError::Config`]；存储写入失败时返回 [`ActantError::Storage`]。
+    pub async fn blob_store(&self, data: Vec<u8>) -> crate::common::Result<BlobHash> {
+        let Some(blobs) = self.blobs.as_ref() else {
+            return Err(ActantError::Config(
+                "blob store not enabled on this node: construct NetworkManager with \
+                 with_blob_store (RuntimeBuilder does this when data_dir is set)"
+                    .into(),
+            ));
+        };
+        blobs.store(data).await
+    }
+
+    /// 从指定节点流式拉取 blob，返回逐块（≤16KiB leaf，已校验）读取句柄。
+    ///
+    /// 取消语义：drop 句柄或显式 [`BlobFetch::close`] 都会立即关闭底层连接。
+    ///
+    /// # Errors
+    ///
+    /// 节点地址无效或不可达（[`ActantError::Network`]）、hash 不存在
+    /// （[`ActantError::NotFound`]）时返回错误。
+    pub async fn blob_fetch(
+        &self,
+        node: &NodeId,
+        hash: BlobHash,
+    ) -> crate::common::Result<BlobFetch> {
+        let addr = parse_endpoint_addr(node.as_str()).map_err(|e| {
+            ActantError::Network(format!("invalid blob source node '{}': {e}", node.as_str()))
+        })?;
+        BlobFetch::start(&self.endpoint, addr, hash).await
     }
 
     /// 发送一次直连请求并等待响应。

@@ -30,6 +30,8 @@
 //! 所有任务 payload 在序列化后签名，反序列化前验证。
 //! 防止被攻破的节点向集群投递恶意 cloudpickle payload。
 
+use serde::{Deserialize, Serialize};
+
 /// 位置参数调用标签（仅用于 `unpack_payload` 内部校验）。
 const TAG_SINGLE: u8 = 0x00;
 /// 组结果调用标签（仅用于 `unpack_payload` 内部校验）。
@@ -175,6 +177,41 @@ pub fn unpack_payload(data: &[u8]) -> crate::common::Result<Vec<Vec<u8>>> {
             data[0]
         ))),
     }
+}
+
+/// 值引用（Ref）wire 类型：指向某节点 blob 存储中的内容寻址数据。
+///
+/// 作为"值引用"出现在 DAG 边载荷/任务参数中时的编码形态（R3/R6 接入消费）。
+/// 完整性由两层保证：内容侧 blake3/bao 逐块校验（`runtime::blobs`），传输侧
+/// wire MAC；本类型自身只携带 `hash + node` 两个事实，不引入额外签名。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobRef {
+    /// 内容寻址 blake3 哈希（32 字节）。
+    pub hash: crate::common::model::BlobHash,
+    /// 持有该 blob 的来源节点（endpoint 地址字符串，同直连协议的 peer 寻址）。
+    pub node: crate::common::model::NodeId,
+}
+
+/// 将 [`BlobRef`] 编码为 wire 字节（postcard）。
+///
+/// # Errors
+///
+/// 序列化失败时返回 [`crate::common::ActantError::Serialization`]。
+pub fn encode_blob_ref(r: &BlobRef) -> crate::common::Result<Vec<u8>> {
+    crate::common::encode_postcard(r)
+}
+
+/// 从 wire 字节解码 [`BlobRef`]。
+///
+/// 解码仅校验结构完整性（长度/字段边界）；hash 与实际内容的匹配由消费方
+/// 在取回数据后经 blake3 校验——引用字节本身被篡改会表现为解码失败或
+/// hash/node 与预期不符，调用方应比对预期值。
+///
+/// # Errors
+///
+/// 长度超限、字节被截断或字段解码失败时返回错误，不吞。
+pub fn decode_blob_ref(bytes: &[u8]) -> crate::common::Result<BlobRef> {
+    crate::common::decode_postcard(bytes)
 }
 
 /// MAC 标签长度（BLAKE3 输出 256 位 = 32 字节）。

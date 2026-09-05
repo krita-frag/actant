@@ -8,6 +8,7 @@ use std::sync::Arc;
 use crate::common::wire::{CancelBroadcast, TOPIC_CANCEL};
 use crate::common::{ActantConfig, ActantError, ActorId, NodeId};
 use crate::runtime::actor::ActorSystem;
+use crate::runtime::blobs::BlobStore;
 use crate::runtime::capability::CapabilityRuntime;
 use crate::runtime::dispatcher::TaskDispatcher;
 use crate::runtime::event_bus::EventBus;
@@ -39,6 +40,8 @@ pub struct Runtime {
     capability: Arc<CapabilityRuntime>,
     event_bus: EventBus,
     task_dispatcher: Arc<dyn TaskDispatcher>,
+    /// blob 原语 facade（0.3.2 R1）；未启用 blob 存储时为 `None`。
+    blobs: Option<Arc<BlobStore>>,
     /// 非 Actor 化后台任务（如 capability gossip）的取消句柄集合。
     background_loop_cancels: Arc<BackgroundCancels>,
 }
@@ -56,6 +59,7 @@ impl Runtime {
         capability: Arc<CapabilityRuntime>,
         event_bus: EventBus,
         task_dispatcher: Arc<dyn TaskDispatcher>,
+        blobs: Option<Arc<BlobStore>>,
     ) -> Self {
         Self {
             node_id,
@@ -68,6 +72,7 @@ impl Runtime {
             capability,
             event_bus,
             task_dispatcher,
+            blobs,
             background_loop_cancels: Arc::new(BackgroundCancels::new(Vec::new())),
         }
     }
@@ -122,6 +127,11 @@ impl Runtime {
 
     pub fn task_dispatcher(&self) -> &Arc<dyn TaskDispatcher> {
         &self.task_dispatcher
+    }
+
+    /// blob 原语 facade 句柄；未启用 blob 存储时为 `None`。
+    pub fn blobs(&self) -> Option<&Arc<BlobStore>> {
+        self.blobs.as_ref()
     }
 
     /// 订阅跨节点任务取消广播话题。

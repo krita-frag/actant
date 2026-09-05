@@ -2,7 +2,7 @@
 name = "actant"
 version = "0.3.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.91"
 description = "基于 Actor 模型的跨平台通用分布式任务编排引擎 — 0.3.0"
 
 [dependencies]
@@ -24,15 +24,15 @@ fs-err = "3.3.0"
 futures = "0.3"
 iroh = { version = "1.0", default-features = false, features = ["tls-ring"] }
 iroh-gossip = { version = "0.101", default-features = false, features = ["net"] }
-# spike/0.3.2-iroh-blobs：内容寻址 blob 原语前置 spike，仅 `--features spike-blobs` 时编译。
-# 不进默认构建，0.3.2 裁决后决定去留。feature 取舍：
-#   fs-store = redb 落盘 store（生产需要；spike 测试用 MemStore，若去掉可省 2 个 crate）
+# 内容寻址 blob 原语（0.3.2 R1，spike/0.3.2-iroh-blobs 裁决吸收）：bao/blake3 逐块
+# 校验流式传输。feature 取舍（spike Q4，+32 crates 约 +10%）：
+#   fs-store = redb 落盘 store（生产需要持久化，Ref 可能跨重启消费）
 #   rpc      = 进程内 BlobRpc 客户端（irpc local channel），+0 crate（noq 已在 iroh 树内）
 #   hide-proto-docs = 仅文档裁剪，零成本
-iroh-blobs = { version = "0.103", optional = true, default-features = false, features = ["fs-store", "rpc", "hide-proto-docs"] }
-# bao-tree：spike 流式拉取路径需要解构 BaoContentItem（iroh-blobs 未 re-export）；
-# 与 iroh-blobs 内部依赖同版本 0.16，仅 spike-blobs feature 激活，无额外编译成本。
-bao-tree = { version = "0.16", optional = true, default-features = false }
+iroh-blobs = { version = "0.103", default-features = false, features = ["fs-store", "rpc", "hide-proto-docs"] }
+# bao-tree：流式拉取路径需要解构 BaoContentItem（iroh-blobs 未 re-export）；
+# 与 iroh-blobs 内部依赖同版本 0.16，无额外编译成本。
+bao-tree = { version = "0.16", default-features = false }
 blake3 = "1.8.5"
 subtle = "2"
 data-encoding = "2.11.0"
@@ -77,8 +77,6 @@ dhat-heap = ["dep:dhat"]
 python = ["dep:pyo3", "dep:pyo3-log"]
 # tokio-console 支持（ACTANT_TOKIO_CONSOLE=1 激活）
 tokio-console = ["dep:console-subscriber"]
-# 0.3.2 前置 spike：iroh-blobs 贴合度验证（不进默认构建，不合并主线）
-spike-blobs = ["dep:iroh-blobs", "dep:bao-tree"]
 default = ["python"]
 
 [lib]

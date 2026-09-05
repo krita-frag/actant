@@ -88,6 +88,50 @@ impl_id_type!(ActorId);
 impl_id_type!(NodeId);
 impl_id_type!(MessageId);
 
+/// 内容寻址 blob 标识：blake3 32 字节哈希。
+///
+/// blob 原语（`runtime::blobs`）与 `BlobRef` wire 编码共用的值引用标识。
+/// `#[serde(transparent)]` 使 postcard/wire 编码为裸 32 字节，无额外头部。
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct BlobHash([u8; 32]);
+
+impl BlobHash {
+    /// 从 32 字节原始哈希构造。
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// 读取原始 32 字节哈希。
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for BlobHash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&data_encoding::HEXLOWER.encode(&self.0))
+    }
+}
+
+impl std::str::FromStr for BlobHash {
+    type Err = crate::common::ActantError;
+
+    /// 从 64 字符小写 hex 解析。
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let bytes = data_encoding::HEXLOWER.decode(s.as_bytes()).map_err(|e| {
+            crate::common::ActantError::Serialization(format!("invalid blob hash hex '{s}': {e}"))
+        })?;
+        let arr: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
+            crate::common::ActantError::Serialization(format!(
+                "blob hash must be 32 bytes, got {}",
+                v.len()
+            ))
+        })?;
+        Ok(Self(arr))
+    }
+}
+
 impl ActorId {
     /// Workflow orchestrator actor for a node.
     pub fn workflow(node_id: &NodeId) -> Self {

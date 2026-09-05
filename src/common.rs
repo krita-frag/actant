@@ -49,7 +49,7 @@ pub use wire::TopicRoute;
 // 领域类型 — 公共 API
 pub use model::{
     ActorErrorEnvelope, ActorErrorKind, ActorId, ActorMessage, ActorMessageResult, ActorStatus,
-    MessageId, NodeId, RetryPolicy, TaskCompletion, TaskDefinition, TaskId, WorkflowId,
+    BlobHash, MessageId, NodeId, RetryPolicy, TaskCompletion, TaskDefinition, TaskId, WorkflowId,
 };
 // 协议类型 — crate 内部
 pub(crate) use wire::{
@@ -59,8 +59,8 @@ pub(crate) use wire::{
 };
 // 请求-响应协议所需类型（公共 API）
 pub use payload::{
-    pack_group, pack_single, pack_upstream_prefix, sign, unpack_payload, verify,
-    TAG_UPSTREAM_PREFIX,
+    decode_blob_ref, encode_blob_ref, pack_group, pack_single, pack_upstream_prefix, sign,
+    unpack_payload, verify, BlobRef, TAG_UPSTREAM_PREFIX,
 };
 pub use serialization::MAX_DECODE_SIZE;
 pub use serialization::{decode_postcard, deserialize_rkyv_value, encode_postcard, serialize_rkyv};

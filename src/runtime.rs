@@ -10,19 +10,19 @@
 //! - [`state`] 提供持久化与时间戳基础设施。
 //! - [`capability`] 提供 ERH 扩展点和 capability actor 化执行。
 //! - [`network`] 封装 iroh P2P 传输。
+//! - [`blobs`] 提供内容寻址 blob 存取与流式传输原语。
 //! - [`workflow`] 在上述基础上实现 DAG 编排、Worker 执行、调度与 failover。
 //! - [`dispatcher`] 是 Worker 调用本地任务 handler 的最后一跳。
 //! - [`event_bus`] 在运行时内部广播生命周期、网络和 workflow 事件。
 
 pub mod actor;
+pub mod blobs;
 pub mod builder;
 pub mod capability;
 pub mod context;
 pub mod dispatcher;
 pub mod event_bus;
 pub mod network;
-#[cfg(feature = "spike-blobs")]
-pub mod spike_blobs;
 pub mod state;
 pub mod workflow;
 

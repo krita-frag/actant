@@ -57,6 +57,34 @@
 
 - **Python-facing Actor API 移除（0.3.1 剪裁 T3/T4/T5/T6，capability 13 → 10）**：`_ActorCore`（`spawn_actor`/`call_method` 等全部方法，全仓零调用方）、`PythonActor`、`ActorMessaging`/`ActorSupervision`/`ActorLifecycle` 三个 capability 及其 ctx dataclass 与 Handler Protocol、`_Event.orchestration()`/`_Event.supervision()`（无构造路径）、`_RuntimeCore.retry_policy`/`set_retry_policy`（零调用）、`register_python_dispatch_handler`（no-op）全部删除；`_NetworkConfig.actor_router_strategy`/`actor_registry_gossip_interval_ms` 同步摘除。内置 capability 收敛为 10 个（策略型 Routing/Scheduling/RetryPolicy + Rust-backed Serialization/Transport/Store/Execute/TaskLifecycle/WorkflowLifecycle/NodeLifecycle）。本地 `ActorSystem`（spawn/mailbox/at-least-once/取消/持久化）保留，仍是四类系统 actor 的生产底座；`ActorError` 异常保留（本地 ActorSystem 仍产生 `actor` kind）。另删除 `observability::shutdown()` no-op 与未实现的 relay map 配置字段。
 
+### 新增
+
+- **核心 blob 原语（0.3.2 R1，吸收 `spike/0.3.2-iroh-blobs` spike 结论并删除验证代码）**：
+  新增 `src/runtime/blobs.rs`，对仓内暴露 store / fetch / hash 三个能力的薄封装，
+  不泄漏 iroh-blobs 类型：
+  - `NetworkManager::with_blob_store` 在与 gossip / 直连协议同一个 Router 上
+    `.accept(iroh_blobs::ALPN, ...)`（spike 已验证多协议共存）；blob 传输走独立
+    ALPN 连接，不受直连帧 `max_message_size` 上限约束。
+  - `blob_store(data) -> BlobHash`：数据落本地 FsStore（`data_dir/blobs/`，随节点
+    持久化，Ref 可能跨重启消费；持久 tag + 默认不回收双重保护）。
+  - `blob_fetch(node, hash) -> BlobFetch`：从指定节点流式拉取，逐 blake3 leaf
+    （≤16KiB，已 bao 校验）产出，峰值缓冲受通道容量约束，不整块缓冲；取消语义
+    按 spike 结论——`Drop` 与显式 `close()` 均立即关闭底层 QUIC 连接，清理从
+    idle timeout（30s 级）缩短到即时。
+  - 失败路径语义化：provider 无此 hash → `NotFound`，节点不可达 → `Network`，
+    未启用 blob 存储 → `Config`，不吞。
+  - **依赖**：`iroh-blobs 0.103`（default-features=false，features `fs-store` +
+    `rpc` + `hide-proto-docs`）与 `bao-tree 0.16`（fsm 流式路径解构
+    `BaoContentItem` 所需，与 iroh-blobs 内部依赖同版本）从 spike optional 转为
+    正式依赖，增量 +32 crates（约 +10%，构成见 `plans/SPIKE_0.3.2_BLOBS.md` §四）；
+    `spike-blobs` feature 与 `src/runtime/spike_blobs.rs` 删除，验证用例改写为
+    正式单测。`rust-version` 声明从 1.75 修正为 1.91（基线 iroh 1.0 实际要求，
+    与 spike 结论一致）。
+  - **wire**：`common::model::BlobHash`（blake3 32B newtype，hex Display/FromStr）
+    与 `common::payload::BlobRef`（32B hash + 来源 NodeId 的 encode/decode，
+    roundtrip/篡改/截断测试覆盖）。接入 submit/边传播为 R3/R6，本批不改
+    AsyncResult/flow。
+
 ### 基座硬化（0.3.1）
 
 - **毒消息 bounded-redelivery**：mailbox pending 记录增加 `delivery_count`，`recover_pending` 重投时递增回写；超过 `MAX_PENDING_REDELIVERIES`（5）的确定性失败消息删除记录并 `tracing::error!`（供后续 DLQ capability 消费），不再无限重投、不再随重启全量重放。

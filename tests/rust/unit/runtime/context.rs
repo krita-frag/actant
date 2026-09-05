@@ -43,6 +43,7 @@ fn make_runtime(node_id: &str) -> (Runtime, Arc<MockTransport>) {
         capability,
         event_bus,
         dispatcher,
+        None,
     );
     (rt, transport)
 }

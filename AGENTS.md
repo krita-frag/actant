@@ -51,7 +51,7 @@ actant/
 │   │   ├── backoff.rs            # 统一指数退避 ExponentialBackoff（gossip 广播重试）
 │   │   ├── config.rs             # ActantConfig / NetworkConfig / FailoverConfig / GossipConfig / WorkerConfig
 │   │   ├── error.rs              # ActantError 枚举与 Result 别名
-│   │   ├── model.rs              # TaskId / WorkflowId / NodeId / RetryPolicy / TaskCompletion 等领域类型
+│   │   ├── model.rs              # TaskId / WorkflowId / NodeId / BlobHash / RetryPolicy / TaskCompletion 等领域类型
 │   │   ├── payload.rs            # payload 打包/解包与 MAC 签名/验证
 │   │   ├── serialization.rs      # rkyv 序列化与 postcard 编解码
 │   │   └── wire.rs               # Wire message / Topic / 跨节点协议
@@ -62,6 +62,7 @@ actant/
 │   │   │   ├── mailbox.rs        # MailboxRegistry + 持久化待发消息
 │   │   │   ├── persistence.rs    # ActorPersistence（检查点 + WAL + 定期压缩）
 │   │   │   ├── system.rs         # ActorSystem facade + RunningActor 执行循环
+│   │   ├── blobs.rs              # 内容寻址 blob 原语：store/fetch/hash 薄封装（iroh-blobs FsStore 落盘 data_dir/blobs，流式拉取 + 显式取消关闭连接）
 │   │   ├── builder.rs            # RuntimeBuilder：按 network → store → actor → workflow → capability → worker 装配
 │   │   ├── capability.rs         # ERH 核心：Capability、Handler、Layer、Runtime、capability_registry!
 │   │   ├── context.rs            # Runtime 上下文：CapabilityRuntime + ActorSystem + State + Iroh + shutdown
@@ -186,7 +187,7 @@ Worker 行为由 `actant.actant._ActantConfig` 控制。高层 `Runtime`/`Runtim
 
 ## 技术栈
 
-- **Rust**：tokio、iroh、heed/LMDB、rkyv、postcard、PyO3
+- **Rust**：tokio、iroh、iroh-blobs（内容寻址 blob 传输）、heed/LMDB、rkyv、postcard、PyO3
 - **Python**：>=3.10、cloudpickle
 
 ## 常用命令
