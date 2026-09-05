@@ -117,10 +117,10 @@ fn cancel_frame_bytes_layout() {
 
 // ───────────────────────── send_frame 短写推进（大载荷回归） ─────────────────────
 //
-// `write_vectored` 是单次写入尝试：pipe 容量（64KB）小于正文时只写入前缀。
-// 修复前剩余字节被静默丢弃，worker 的 `read_exact` 永久等待截断帧 → 大载荷
-// Dispatch（>1MB 参数内联，0.3.2 R3b/R6）30s 硬超时被杀。以下用小缓冲的
-// tokio duplex 模拟 pipe 容量约束，验证帧字节完整可达。
+// `write_vectored` 是单次写入尝试：pipe 容量（64KB）小于正文时只写入前缀，
+// 剩余字节必须按已写偏移显式推进——否则 worker 的 `read_exact` 永久等待
+// 截断帧。以下用小缓冲的 tokio duplex 模拟 pipe 容量约束，验证帧字节
+// 完整可达（覆盖 >1MB 参数内联的大载荷 Dispatch）。
 
 mod send_frame {
     use super::*;

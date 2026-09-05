@@ -133,6 +133,23 @@ impl Orchestrator {
         Ok(roots)
     }
 
+    /// 结果接受决策（attempt fencing）的唯一查询入口，供
+    /// `WorkflowActor::on_task_result` 在推进状态前判定结果所属派发代数是否
+    /// 仍可被接受。workflow 不存在时放行（NotFound 由后续状态推进路径返回）。
+    pub fn result_attempt_accepted(
+        &self,
+        workflow_id: &WorkflowId,
+        task_id: &TaskId,
+        result_attempt: Option<u32>,
+    ) -> bool {
+        match self.state.slots.get(workflow_id) {
+            Some(slot) => slot
+                .execution
+                .attempt_fencing_passes(task_id, result_attempt),
+            None => true,
+        }
+    }
+
     /// Handles a task completion, decrements dependent task counters, and
     /// returns any successor tasks that have become ready.
     ///
@@ -824,24 +841,30 @@ impl Orchestrator {
         mode: FailureScope,
     ) -> Result<()> {
         let error_for_event = error.clone();
-        let is_terminal = {
+        // 终态守卫拒绝（workflow/task 已终态）时状态未变：不追加 TaskFailed
+        // 事件、不重复终态收尾——同一失败的重复/迟到投递（本地通道 / 远端
+        // 直连 / gossip 三路回灌）必须产生一致的状态与历史。attempt fencing
+        // 由 `WorkflowActor::on_task_result` 在进入本方法前统一裁决（当前
+        // 协议传 `None` 放行，DAG 层 `fail_task` 内部校验保留为最终防线）。
+        let (accepted, is_terminal) = {
             let mut slot = self.state.slots.get_mut(workflow_id).ok_or_else(|| {
                 crate::common::ActantError::NotFound(format!(
                     "workflow {} not found",
                     workflow_id.as_str()
                 ))
             })?;
-            // 结果通路未携带派发代数（wire.rs 本批次冻结），传 `None` 放行
-            // attempt fencing；待协议扩展后由调用方传入即接入 fencing。
+            let accepted = slot.execution.can_transition_task(task_id);
             slot.execution.fail_task(task_id, error, mode, None);
-            slot.execution.is_terminal()
+            (accepted, accepted && slot.execution.is_terminal())
         };
 
-        self.log_event(WorkflowEventPayload::TaskFailed {
-            workflow_id: workflow_id.clone(),
-            task_id: task_id.clone(),
-            error: error_for_event,
-        });
+        if accepted {
+            self.log_event(WorkflowEventPayload::TaskFailed {
+                workflow_id: workflow_id.clone(),
+                task_id: task_id.clone(),
+                error: error_for_event,
+            });
+        }
 
         if is_terminal {
             // Terminal: persist immediately for crash safety

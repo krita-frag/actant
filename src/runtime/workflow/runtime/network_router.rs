@@ -16,6 +16,7 @@ use crate::runtime::actor::ActorSystem;
 use crate::runtime::dispatcher::CancelFlag;
 use crate::runtime::event_bus::{BusEvent, EventBus};
 use crate::runtime::network::{DirectResponseChannel, NetworkEvent, Transport};
+use crate::runtime::workflow::actor::{ResultSource, TaskResultOutcome};
 use crate::runtime::workflow::messaging::encode;
 use crate::runtime::workflow::Scheduler;
 use tracing::Instrument;
@@ -407,8 +408,10 @@ impl NetworkEventRouter {
 
     /// 将远程 TaskResult 路由到本地 WorkflowActor。
     ///
-    /// 根据 outcome 类型分别调用 COMPLETE_TASK / FAIL_TASK / CANCEL_TASK。
-    /// 返回 `true` 表示已成功提交给 WorkflowActor（不保证 workflow 状态更新成功）。
+    /// 统一经 `ON_TASK_RESULT` 单入口回灌：失败语义（FailureScope）与
+    /// attempt fencing 与失败语义均由 `WorkflowActor::on_task_result` 裁决，
+    /// 本路径不做 scope 决策。返回 `true` 表示已成功提交给 WorkflowActor（不保证
+    /// workflow 状态更新成功）。
     pub(super) async fn handle_task_result(
         &self,
         workflow_id: WorkflowId,
@@ -454,57 +457,13 @@ impl NetworkEventRouter {
             return true;
         };
 
-        let call_result = match outcome {
+        // wire 协议尚未携带派发代数，attempt 传 `None`（入口 fencing 放行）。
+        let outcome = match outcome {
             WireTaskOutcome::Completed(result_payload) => {
-                let payload = match encode(&(workflow_id.clone(), task_id.clone(), result_payload))
-                {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::error!("failed to encode COMPLETE_TASK message: {}", e);
-                        return false;
-                    }
-                };
-                actor_system
-                    .call(
-                        workflow_actor_id,
-                        crate::runtime::workflow::workflow_methods::COMPLETE_TASK,
-                        payload,
-                    )
-                    .await
+                TaskResultOutcome::Completed(result_payload)
             }
-            WireTaskOutcome::Failed(error) => {
-                let scope = crate::runtime::workflow::dag::FailureScope::TaskOnly;
-                let payload = match encode(&(workflow_id.clone(), task_id.clone(), error, scope)) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::error!("failed to encode FAIL_TASK message: {}", e);
-                        return false;
-                    }
-                };
-                actor_system
-                    .call(
-                        workflow_actor_id,
-                        crate::runtime::workflow::workflow_methods::FAIL_TASK,
-                        payload,
-                    )
-                    .await
-            }
-            WireTaskOutcome::Cancelled => {
-                let payload = match encode(&(workflow_id.clone(), task_id.clone())) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::error!("failed to encode CANCEL_TASK message: {}", e);
-                        return false;
-                    }
-                };
-                actor_system
-                    .call(
-                        workflow_actor_id,
-                        crate::runtime::workflow::workflow_methods::CANCEL_TASK,
-                        payload,
-                    )
-                    .await
-            }
+            WireTaskOutcome::Failed(error) => TaskResultOutcome::Failed(error),
+            WireTaskOutcome::Cancelled => TaskResultOutcome::Cancelled,
             WireTaskOutcome::Skipped => {
                 tracing::warn!(
                     workflow_id = %workflow_id.as_str(),
@@ -514,6 +473,26 @@ impl NetworkEventRouter {
                 return false;
             }
         };
+        let payload = match encode(&(
+            workflow_id.clone(),
+            task_id.clone(),
+            outcome,
+            None::<u32>,
+            ResultSource::Remote,
+        )) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!("failed to encode ON_TASK_RESULT message: {}", e);
+                return false;
+            }
+        };
+        let call_result = actor_system
+            .call(
+                workflow_actor_id,
+                crate::runtime::workflow::workflow_methods::ON_TASK_RESULT,
+                payload,
+            )
+            .await;
 
         match call_result {
             Ok(result) => {

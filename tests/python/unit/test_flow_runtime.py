@@ -188,8 +188,9 @@ def test_flow_timeout_body_not_reexecuted_while_orphan_alive(
 ) -> None:
     """超时后孤儿线程未结束时不得重试——流程体不并发重复执行。
 
-    孤儿线程睡眠 1s 远超缩短后的 join 上限（0.2s）：若旧实现直接重试，
-    计数会达到 2；修复后放弃等待并直接抛出，函数体只执行一次。
+    孤儿线程睡眠 1s 远超缩短后的 join 上限（0.2s）：join 超时的正确行为是
+    放弃等待并直接抛出（不重试）——若实现错误地在孤儿存活时重试，计数会
+    达到 2。断言函数体只执行一次。
     """
     monkeypatch.setattr(_flow_module, "_FLOW_ORPHAN_JOIN_TIMEOUT_S", 0.2)
     calls = {"count": 0}

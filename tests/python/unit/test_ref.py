@@ -252,10 +252,10 @@ def test_collect_dep_ids_keeps_ref_for_large_result() -> None:
 def test_collect_dep_ids_pending_large_result_keeps_ref(monkeypatch) -> None:
     """R6：下游提交早于上游完成时（eager flow 常态），大结果同样保留 Ref。
 
-    ``Ref`` 只在结果抵达回调中产生；修复前 pending handle 直接落 ``result()``
-    阻塞等待后会把大值整体反序列化进提交方（随后再被
-    ``_degrade_large_values`` 二次落 blob + 重 pickle）。此处令 ``Ref.result``
-    抛错——解析路径一旦触碰对象级反序列化即失败。
+    ``Ref`` 只在结果抵达回调中产生；pending handle 不允许落 ``result()``——
+    那会把大值整体反序列化进提交方（随后再被 ``_degrade_large_values``
+    二次落 blob + 重 pickle）。此处令 ``Ref.result`` 抛错——解析路径一旦
+    触碰对象级反序列化即失败。
     """
     h = AsyncResult("up-pending")
 

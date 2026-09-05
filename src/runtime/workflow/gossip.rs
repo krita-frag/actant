@@ -12,6 +12,7 @@ use crate::runtime::actor::ActorSystem;
 use crate::runtime::network::Transport;
 use crate::runtime::state::HybridLogicalClock;
 use crate::runtime::workflow::actor::workflow_methods;
+use crate::runtime::workflow::actor::{ResultSource, TaskResultOutcome};
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
 struct SeenKey(WorkflowId, TaskId);
@@ -330,6 +331,10 @@ impl DagGossip {
 
     /// 将远端 DAG 状态更新落地到本地 WorkflowActor。
     ///
+    /// 终态结果（Completed / Failed / Cancelled）统一经 `ON_TASK_RESULT`
+    /// 单入口回灌——本方法只做结果同步通道，失败语义（FailureScope）与
+    /// attempt fencing 均由入口裁决，apply 侧不做任何 scope 决策。
+    ///
     /// `NotFound`（本节点未托管该 workflow）被规范化为 `Ok`：gossip 是广播
     /// 语义，节点不持有某 workflow 属正常情况。其他错误向上传播。
     async fn apply_to_workflow(&self, update: &WireDagStateUpdate) -> crate::common::Result<()> {
@@ -353,11 +358,15 @@ impl DagGossip {
                 }
             }
             WireTaskState::Completed { result } => {
+                let payload = (
+                    &update.workflow_id,
+                    &update.task_id,
+                    TaskResultOutcome::Completed(result.clone()),
+                    None::<u32>,
+                    ResultSource::Gossip,
+                );
                 if let Err(e) = self
-                    .call_workflow_void(
-                        workflow_methods::COMPLETE_TASK,
-                        (&update.workflow_id, &update.task_id, result.clone()),
-                    )
+                    .call_workflow_void(workflow_methods::ON_TASK_RESULT, payload)
                     .await
                 {
                     if !matches!(e, crate::common::ActantError::NotFound(_)) {
@@ -370,16 +379,15 @@ impl DagGossip {
                 }
             }
             WireTaskState::Failed { error } => {
+                let payload = (
+                    &update.workflow_id,
+                    &update.task_id,
+                    TaskResultOutcome::Failed(error.clone()),
+                    None::<u32>,
+                    ResultSource::Gossip,
+                );
                 if let Err(e) = self
-                    .call_workflow_void(
-                        workflow_methods::FAIL_TASK,
-                        (
-                            &update.workflow_id,
-                            &update.task_id,
-                            error.clone(),
-                            crate::runtime::workflow::FailureScope::WorkflowLevel,
-                        ),
-                    )
+                    .call_workflow_void(workflow_methods::ON_TASK_RESULT, payload)
                     .await
                 {
                     if !matches!(e, crate::common::ActantError::NotFound(_)) {
@@ -392,11 +400,15 @@ impl DagGossip {
                 }
             }
             WireTaskState::Cancelled => {
+                let payload = (
+                    &update.workflow_id,
+                    &update.task_id,
+                    TaskResultOutcome::Cancelled,
+                    None::<u32>,
+                    ResultSource::Gossip,
+                );
                 if let Err(e) = self
-                    .call_workflow_void(
-                        workflow_methods::CANCEL_TASK,
-                        (&update.workflow_id, &update.task_id),
-                    )
+                    .call_workflow_void(workflow_methods::ON_TASK_RESULT, payload)
                     .await
                 {
                     if !matches!(e, crate::common::ActantError::NotFound(_)) {

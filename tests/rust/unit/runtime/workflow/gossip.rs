@@ -1229,7 +1229,7 @@ impl crate::runtime::actor::Actor for FlakyCompleteActor {
         &mut self,
         msg: crate::common::ActorMessage,
     ) -> crate::common::Result<crate::common::ActorMessageResult> {
-        let fail = msg.method == "complete_task"
+        let fail = msg.method == "on_task_result"
             && self
                 .fails_left
                 .fetch_update(AtomicOrdering::SeqCst, AtomicOrdering::SeqCst, |n| {

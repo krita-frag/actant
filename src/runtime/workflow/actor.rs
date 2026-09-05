@@ -38,6 +38,31 @@ pub struct TaskCompletionResponse {
 
 pub const WORKFLOW_ACTOR_TYPE: &str = "WorkflowActor";
 
+/// 任务终态结果载荷：[`WorkflowActor::on_task_result`] 唯一入口的 `outcome` 参数。
+///
+/// 由三条结果回灌路径统一构造：本地完成通道（legacy `COMPLETE_TASK` /
+/// `FAIL_TASK` 消息）、远端 TaskResult 直连（network_router）、gossip 状态
+/// 同步（DagGossip apply_remote_update）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TaskResultOutcome {
+    Completed(Vec<u8>),
+    Failed(String),
+    Cancelled,
+}
+
+/// 结果回灌来源。仅用于日志与指标，不参与任何状态语义决策——状态推进
+/// 只由 `outcome` 与 orchestrator 内部状态（终态守卫、attempt fencing、
+/// failure_strategy）决定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResultSource {
+    /// 本节点产生（flow 本地回灌，legacy `COMPLETE_TASK` / `FAIL_TASK` 消息）。
+    Local,
+    /// 执行节点经 TaskResult 直连回传（network_router）。
+    Remote,
+    /// gossip DAG 状态同步（DagGossip apply_remote_update）。
+    Gossip,
+}
+
 /// WorkflowActor 支持的方法名。
 pub mod workflow_methods {
     pub const SUBMIT: &str = "submit";
@@ -48,6 +73,8 @@ pub mod workflow_methods {
     pub const SKIP_CONDITIONAL_BRANCH: &str = "skip_conditional_branch";
     pub const FAIL_TASK: &str = "fail_task";
     pub const CANCEL_TASK: &str = "cancel_task";
+    /// 任务结果回灌唯一入口（远端直连与 gossip 路径统一走此方法）。
+    pub const ON_TASK_RESULT: &str = "on_task_result";
     pub const MARK_TASK_RUNNING: &str = "mark_task_running";
     pub const GET_STATE: &str = "get_state";
     pub const ACTIVE_WORKFLOW_IDS: &str = "active_workflow_ids";
@@ -77,6 +104,82 @@ impl WorkflowActor {
             orchestrator,
             timeout_cancel: None,
             persist_cancel: None,
+        }
+    }
+
+    /// 任务结果回灌唯一入口（S8 单路化）。
+    ///
+    /// 三条路径（本地完成通道 / 远端 TaskResult 直连 / gossip 状态同步）全部
+    /// 收敛于此：attempt fencing、失败语义（FailureScope）决策、终态推进均在
+    /// 此处统一定夺，调用方不再各自决定。
+    ///
+    /// - **attempt fencing**：`attempt` 为结果所属派发代数。入口先经
+    ///   `Orchestrator::result_attempt_accepted` 做唯一接受决策，过期代数的
+    ///   结果直接丢弃（返回 `Ok(None)`，不推进状态、不发事件）。wire 协议
+    ///   尚未携带派发代数，三条路径当前均传 `None`（fencing 放行），协议
+    ///   扩展后无需改动入口签名。DAG 写入方法内部的 fencing 校验保留为防
+    ///   绕过的最终防线（recover / 重派发等不经本入口的写入路径）。
+    ///
+    /// - **失败语义统一裁决**：任务失败一律按工作流级失败语义处理（内部固定
+    ///   `FailureScope::WorkflowLevel`），最终效果由 `failure_strategy` 决定：
+    ///   FailFast → 首个任务失败即工作流 Failed；Continue → 任务标 Failed，
+    ///   待全部任务终态且有失败时工作流 Failed。理由：到达 orchestrator 的
+    ///   失败已是重试耗尽后的最终结果（重试发生在 worker / 派发侧，核心不
+    ///   存在消费 TaskOnly 状态的重试路径）；FailFast 下 TaskOnly 会让工作流
+    ///   悬挂在非终态（只能等工作流 deadline 兜底），与 failure_strategy 的
+    ///   文档语义（"任何任务失败都立即标记工作流为失败"）矛盾。
+    ///   `FailureScope::TaskOnly` 保留在 DAG 层 API，供后续 orchestrator 驱动
+    ///   重试时在入口内部决策使用。
+    ///
+    /// - `source` 仅用于日志与指标，不影响状态语义。
+    ///
+    /// 返回 `Some(response)` 仅当 outcome 为 `Completed` 且未被 fencing 拒绝
+    /// （legacy `COMPLETE_TASK` 消息的响应载荷）；其余返回 `None`。
+    async fn on_task_result(
+        &mut self,
+        workflow_id: &WorkflowId,
+        task_id: &TaskId,
+        outcome: TaskResultOutcome,
+        attempt: Option<u32>,
+        source: ResultSource,
+    ) -> Result<Option<TaskCompletionResponse>> {
+        tracing::debug!(
+            workflow = %workflow_id.as_str(),
+            task = %task_id.as_str(),
+            source = ?source,
+            attempt = ?attempt,
+            "task result ingested via unified on_task_result entry"
+        );
+        // attempt fencing 唯一决策点：过期代数的结果在此丢弃。
+        if !self
+            .orchestrator
+            .result_attempt_accepted(workflow_id, task_id, attempt)
+        {
+            return Ok(None);
+        }
+        match outcome {
+            TaskResultOutcome::Completed(result) => {
+                let (ready, conditional, workflow_terminal) = self
+                    .orchestrator
+                    .on_task_completed(workflow_id, task_id, result)
+                    .await?;
+                Ok(Some(TaskCompletionResponse {
+                    workflow_terminal,
+                    ready_successors: ready,
+                    conditional_edges: conditional,
+                }))
+            }
+            TaskResultOutcome::Failed(error) => {
+                // 失败语义在此统一（见方法文档）：所有来源一律 WorkflowLevel。
+                self.orchestrator
+                    .fail_task(workflow_id, task_id, error, FailureScope::WorkflowLevel)
+                    .await?;
+                Ok(None)
+            }
+            TaskResultOutcome::Cancelled => {
+                self.orchestrator.cancel_task(workflow_id, task_id)?;
+                Ok(None)
+            }
         }
     }
 }
@@ -156,15 +259,22 @@ impl Actor for WorkflowActor {
             workflow_methods::COMPLETE_TASK => {
                 let (workflow_id, task_id, result): (WorkflowId, TaskId, Vec<u8>) =
                     decode(&msg.payload)?;
-                let (ready, conditional, workflow_terminal) = self
-                    .orchestrator
-                    .on_task_completed(&workflow_id, &task_id, result)
-                    .await?;
-                let response = TaskCompletionResponse {
-                    workflow_terminal,
-                    ready_successors: ready,
-                    conditional_edges: conditional,
-                };
+                // 本地完成通道：经唯一入口回灌。fencing 拒绝或非完成结果时
+                // 返回空响应（与拒绝路径的响应形状一致）。
+                let response = self
+                    .on_task_result(
+                        &workflow_id,
+                        &task_id,
+                        TaskResultOutcome::Completed(result),
+                        None,
+                        ResultSource::Local,
+                    )
+                    .await?
+                    .unwrap_or(TaskCompletionResponse {
+                        workflow_terminal: false,
+                        ready_successors: vec![],
+                        conditional_edges: vec![],
+                    });
                 Ok(payload_result(msg_id, encode(&response)?))
             }
             workflow_methods::ACTIVATE_CONDITIONAL => {
@@ -183,18 +293,40 @@ impl Actor for WorkflowActor {
                 Ok(payload_result(msg_id, encode(&ready)?))
             }
             workflow_methods::FAIL_TASK => {
-                let (workflow_id, task_id, error, scope): (
+                // `scope` 字段仅为 wire 兼容保留（py complete_workflow 载荷）；
+                // 失败语义由 on_task_result 入口统一决定，此处不读取该字段。
+                let (workflow_id, task_id, error, _scope): (
                     WorkflowId,
                     TaskId,
                     String,
                     FailureScope,
                 ) = decode(&msg.payload)?;
-                self.orchestrator
-                    .fail_task(&workflow_id, &task_id, error, scope)
+                self.on_task_result(
+                    &workflow_id,
+                    &task_id,
+                    TaskResultOutcome::Failed(error),
+                    None,
+                    ResultSource::Local,
+                )
+                .await?;
+                Ok(ok_result(msg_id))
+            }
+            workflow_methods::ON_TASK_RESULT => {
+                let (workflow_id, task_id, outcome, attempt, source): (
+                    WorkflowId,
+                    TaskId,
+                    TaskResultOutcome,
+                    Option<u32>,
+                    ResultSource,
+                ) = decode(&msg.payload)?;
+                self.on_task_result(&workflow_id, &task_id, outcome, attempt, source)
                     .await?;
                 Ok(ok_result(msg_id))
             }
             workflow_methods::CANCEL_TASK => {
+                // 取消指令路径（用户 / 控制面发起）与结果回灌分离；gossip /
+                // 远端的 Cancelled 结果走 ON_TASK_RESULT 单入口，二者最终都
+                // 落到 `Orchestrator::cancel_task` 同一写入路径。
                 let (workflow_id, task_id): (WorkflowId, TaskId) = decode(&msg.payload)?;
                 self.orchestrator.cancel_task(&workflow_id, &task_id)?;
                 Ok(ok_result(msg_id))

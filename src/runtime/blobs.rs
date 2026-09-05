@@ -4,19 +4,21 @@
 //! 封装——公共 API 只暴露 [`BlobHash`]（common 层 newtype）、[`BlobStore`]
 //! 与 [`BlobFetch`]，替换底层实现不波及调用方。接入点：[`crate::runtime::
 //! network::NetworkManager`] 在与 gossip / 直连协议同一个 `Router` 上
-//! `.accept(iroh_blobs::ALPN, ...)`（spike Q1 已验证多协议共存）。
+//! `.accept(iroh_blobs::ALPN, ...)`——iroh 的 protocol handler 模型允许单一
+//! Endpoint 并发挂载多协议（单测 `blob_roundtrip_with_direct_protocol_coexistence`
+//! 锁定该行为）。
 //!
 //! blob 传输走独立 ALPN 连接，不占用 `DirectRequest` 帧通道，因此不受
 //! `max_message_size` 帧上限约束——这是 0.3.2 "100MB 值仅一次序列化" 的
 //! 传输前提。
 //!
-//! ## 取消语义（spike Q3 结论）
+//! ## 取消语义
 //!
 //! 仅 drop 连接句柄时 QUIC 连接会存活到 idle timeout；[`BlobFetch`] 在
 //! `Drop` 与显式 [`close`](BlobFetch::close) 中都直接调用 `Connection::close`
 //! （同步），取消清理从 30s 级缩短到即时。
 //!
-//! ## 流式与内存（spike Q2 结论）
+//! ## 流式与内存
 //!
 //! 拉取经 `iroh_blobs::get::fsm` 状态机逐 blake3 leaf（≤16KiB chunk group）
 //! 产出已校验数据，峰值缓冲为通道缓冲容量 × 单 leaf，结构上不整块缓冲；
