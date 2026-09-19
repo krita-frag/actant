@@ -1,4 +1,4 @@
-"""值引用（0.3.2 R2–R5）单元测试：ValueStore capability、Ref、AsyncResult 双态、await 桥。
+"""值引用单元测试：ValueStore capability、Ref、AsyncResult 双态、await 桥。
 
 不依赖子进程 / 跨节点网络；Rust blob 桥经本地 ``Runtime()``（test 配置，临时
 data_dir）真实往返。跨节点 blob 传输由 e2e 覆盖。
@@ -38,7 +38,7 @@ from actant.task._ref import (
 ref_module = importlib.import_module("actant.task._ref")
 
 
-# ───────────────────────── R2：ValueStore capability ─────────────────────────
+# ───────────────────────── ValueStore capability ─────────────────────────
 
 
 def test_value_store_capability_declared() -> None:
@@ -86,7 +86,7 @@ def test_value_store_handler_override() -> None:
     assert len(calls) == 2
 
 
-# ───────────────────────── R3：Ref 类型 ─────────────────────────
+# ───────────────────────── Ref 类型 ─────────────────────────
 
 
 def _make_ref(rt: Runtime, value: object) -> Ref:
@@ -196,7 +196,7 @@ def test_materialize_refs_fetches_in_parent() -> None:
     assert out["b"] == ("keep",)
 
 
-# ───────────────────────── R4：AsyncResult 双态统一 ─────────────────────────
+# ───────────────────────── AsyncResult 双态统一 ─────────────────────────
 
 
 def test_small_result_inline_state() -> None:
@@ -205,9 +205,6 @@ def test_small_result_inline_state() -> None:
     h._set_result(b"echo-bytes")  # bytes 返回值不被误当作序列化结果
     assert h.result(timeout=0) == b"echo-bytes"
     assert h.ref() is None
-    # 回灌：对象态重新 pickle。
-    ok, payload = h._export_outcome()
-    assert ok and cloudpickle.loads(payload) == b"echo-bytes"
 
 
 def test_large_result_ref_state() -> None:
@@ -231,9 +228,7 @@ def test_large_result_ref_state() -> None:
         assert fetched == [ref_bytes]
     finally:
         ref_module._value_fetch = orig  # type: ignore[method-assign]
-    # 回灌：Ref 态原样返回 BlobRef 编码，不重序列化值。
-    ok, payload = h._export_outcome()
-    assert ok and payload == ref_bytes
+    # Ref 态即 BlobRef 编码句柄，值经 result() 透明反序列化（上方已断言）。
 
 
 def test_collect_dep_ids_keeps_ref_for_large_result() -> None:
@@ -250,7 +245,7 @@ def test_collect_dep_ids_keeps_ref_for_large_result() -> None:
 
 
 def test_collect_dep_ids_pending_large_result_keeps_ref(monkeypatch) -> None:
-    """R6：下游提交早于上游完成时（eager flow 常态），大结果同样保留 Ref。
+    """下游提交早于上游完成时（eager flow 常态），大结果同样保留 Ref。
 
     ``Ref`` 只在结果抵达回调中产生；pending handle 不允许落 ``result()``——
     那会把大值整体反序列化进提交方（随后再被 ``_degrade_large_values``
@@ -291,7 +286,7 @@ def test_collect_dep_ids_pending_failure_propagates() -> None:
         timer.join()
 
 
-# ───────────────────────── R5：__await__ 去线程化 ─────────────────────────
+# ───────────────────────── __await__ 去线程化 ─────────────────────────
 
 
 def _no_await_threads() -> None:

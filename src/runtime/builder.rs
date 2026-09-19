@@ -10,7 +10,7 @@ use std::time::Duration;
 use crate::common::scheduler_kind;
 use crate::common::{ActantConfig, ActantError, ActorId, NodeId, Topic};
 use crate::runtime::actor::ActorSystem;
-use crate::runtime::dispatcher::{ProcessTaskDispatcher, TaskDispatcher};
+use crate::runtime::dispatcher::{ProcessTaskDispatcher, TaskDispatcher, WorkerLaunchSpec};
 use crate::runtime::event_bus::EventBus;
 use crate::runtime::network::Transport;
 use crate::runtime::state::{CheckpointManager, LmdbStore, Store, WalWriter};
@@ -318,7 +318,7 @@ impl RuntimeBuilder {
             .ok_or_else(|| ActantError::Config("RuntimeBuilder requires data_dir".into()))?;
         // 拒绝指向系统目录等危险路径，尽早失败（blob 存储也落在此目录下）。
         validate_data_dir(&data_dir)?;
-        // blob 原语（0.3.2 R1）：FsStore 落盘 data_dir/blobs，随节点持久化。
+        // blob 原语：FsStore 落盘 data_dir/blobs，随节点持久化。
         let blob_dir = Path::new(&data_dir).join("blobs");
         let blob_store = Arc::new(crate::runtime::blobs::BlobStore::open(&blob_dir).await?);
 
@@ -360,10 +360,13 @@ impl RuntimeBuilder {
         let task_dispatcher: Arc<dyn TaskDispatcher> = Arc::new(
             ProcessTaskDispatcher::new(
                 self.config.worker.num_worker_processes.max(1),
-                self.config.worker.worker_program.clone(),
+                WorkerLaunchSpec::with_python_path(
+                    self.config.worker.worker_program.clone(),
+                    vec!["-m".into(), "actant.task._worker".into()],
+                    &self.config.worker.python_path,
+                ),
                 self.config.worker.worker_cancel_grace_ms,
                 self.config.payload_signing_key.clone(),
-                self.config.worker.python_path.clone(),
             )
             .map_err(|e| ActantError::Config(format!("failed to create task dispatcher: {}", e)))?,
         );
@@ -387,7 +390,7 @@ impl RuntimeBuilder {
         let workflow_actor_id = crate::common::ActorId::workflow(&self.node_id);
         let orchestrator =
             init_orchestrator(self.data_dir.as_deref(), &self.node_id, &self.config).await?;
-        // P0-5 接线：recover 完成后立即重建"Pending 且依赖已满足"的任务。
+        // recover 完成后立即重建"Pending 且依赖已满足"的任务。
         // 此处 WorkflowActor 尚未 spawn，Orchestrator 状态仍为独占引用，读取安全；
         // 返回的任务在 init_worker 产出调度器后重新入队（见下方 enqueue_batch）。
         // 若不接线，重启前处于可执行状态的任务会永久滞留。
@@ -403,6 +406,10 @@ impl RuntimeBuilder {
         };
         // B2：注入网络传输层，使工作流级硬超时监控可主动广播 CancelBroadcast。
         let orchestrator = orchestrator.with_network(network.clone());
+        // 句柄克隆留给 Runtime（供绑定层在 actor 之外做阻塞式等待点 park）。
+        // `Orchestrator: Clone` 只复制共享句柄（state 为 Arc），语义上是同一个
+        // 编排器，不产生第二份状态。
+        let orchestrator_handle = orchestrator.clone();
         actor_system
             .spawn(
                 workflow_actor_id.clone(),
@@ -414,12 +421,16 @@ impl RuntimeBuilder {
         // ── FailoverActor ──────────────────────────────────────────────
         // 接管心跳、故障检测、租约维护。start_background_loops 启动后台循环。
         tracing::info!("build: failover actor spawn enter");
-        let failover = Arc::new(FailoverManager::new(
-            self.node_id.clone(),
-            network.clone(),
-            actor_system.clone(),
-            workflow_actor_id.clone(),
-        ));
+        let failover = Arc::new(
+            FailoverManager::new(
+                self.node_id.clone(),
+                network.clone(),
+                actor_system.clone(),
+                workflow_actor_id.clone(),
+            )
+            // 失联时终结在途任务的发布出口（与远端结果回灌同一 event_bus）。
+            .with_event_bus(event_bus.clone()),
+        );
         let failover_actor_id = ActorId::failover(&self.node_id);
         actor_system
             .spawn(
@@ -516,12 +527,15 @@ impl RuntimeBuilder {
         // 引用计数变为 2，get_mut 永远返回 None → worker 从未注入。
         if let Some(rt) = Arc::get_mut(&mut runtime) {
             rt.set_worker(worker.clone());
+            rt.set_orchestrator(orchestrator_handle);
         } else {
-            tracing::warn!("build: runtime Arc has multiple owners, worker not injected");
+            tracing::warn!(
+                "build: runtime Arc has multiple owners, worker and orchestrator not injected"
+            );
         }
         // failover 拿到 scheduler（worker 的 actor_scheduler 句柄）。
         failover.set_scheduler(worker.scheduler_clone());
-        // P0-5 接线（续）：把恢复出的 ready 任务重新入队。经 SchedulerActor 的
+        // 把恢复出的 ready 任务重新入队。经 SchedulerActor 的
         // enqueue 快路径进入调度器，Worker 主循环随后按正常流程执行；
         // 终态任务不在此列（recover_ready_tasks 仅返回 Pending 且依赖已满足者）。
         if !recovered_ready_tasks.is_empty() {

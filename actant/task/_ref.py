@@ -1,8 +1,8 @@
-"""值引用（Ref）：内容寻址的大值句柄（0.3.2 R3）。
+"""值引用（Ref）：内容寻址的大值句柄。
 
 大数据（> ``REF_INLINE_THRESHOLD``）不再内联进任务 payload，而是经
 ``ValueStore`` capability 落本节点内容寻址 blob store，参数/边位置放
-``Ref``（几十字节），消费侧按需拉取。设计权衡见 ``plans/REF_DESIGN.md``。
+``Ref``（几十字节），消费侧按需拉取。
 
 blob 内容有两种来源约定（由 ``unwrap_frame`` 标志区分，不外泄）：
 
@@ -12,7 +12,7 @@ blob 内容有两种来源约定（由 ``unwrap_frame`` 标志区分，不外泄
 
 ## Intrusively-linked 数据流
 
-- 结果侧（R4）：父进程 ``_on_task_result`` 发现结果帧超阈值 → store →
+- 结果侧：父进程 ``_on_task_result`` 发现结果帧超阈值 → store →
   ``AsyncResult`` 内部持 ``Ref``；``result()`` 透明解析。
 - 参数侧（R3b）：``_collect_dep_ids`` 对大结果保留 ``Ref`` 不取值；
   提交方 ``_submit`` 把 ``Ref`` 解析为 ``_RefArg``（帧内联字节）传给 worker；
@@ -161,7 +161,7 @@ def _degrade_large_values(
 
 
 class Ref:
-    """内容寻址值引用句柄（0.3.2 R3 公开 API）。
+    """内容寻址值引用句柄（公开 API）。
 
     持有 ``BlobRef`` wire 编码（blake3 hash + 来源节点），可跨节点按需拉取。
     由 ``AsyncResult.ref()``（大结果时）产生，可直接作为下游 ``submit`` 参数

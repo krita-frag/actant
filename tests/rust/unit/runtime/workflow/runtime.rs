@@ -50,6 +50,7 @@ async fn pending_results_channel_rejects_when_full() {
 // ───────────────────────── Worker 纯逻辑测试 ─────────────────────────
 
 use crate::common::{NodeHeartbeat, WorkerConfig};
+use crate::runtime::dispatcher::WorkerLaunchSpec;
 use crate::runtime::event_bus::BusEvent;
 use crate::runtime::network::NetworkEvent;
 use crate::runtime::workflow::Scheduler;
@@ -63,9 +64,8 @@ fn make_worker(node_id: &str) -> Worker {
     let dispatcher = Arc::new(
         crate::runtime::dispatcher::ProcessTaskDispatcher::new(
             0,
-            "python3".to_string(),
+            WorkerLaunchSpec::default(),
             1,
-            Vec::new(),
             Vec::new(),
         )
         .expect("ProcessTaskDispatcher init"),
@@ -403,6 +403,25 @@ async fn worker_cancel_task_returns_false_for_unknown_task() {
     assert!(!worker.cancel_task("nonexistent-task"));
 }
 
+/// 本地取消必须登记「派发前取消」注册表。
+///
+/// 任务尚在调度器队列（无 `cancel_flag` 可置）时若只返回 false 而不登记，
+/// 取消请求会被静默丢弃——任务照常执行到完成，`propagate=True` 的级联取消
+/// 形同虚设。远端 `CancelBroadcast` 路径一直是「置 flag + 登记」双写，本地
+/// 路径此前缺了这一半。
+#[tokio::test]
+async fn worker_cancel_task_registers_pre_dispatch_cancellation() {
+    let worker = make_worker("node-cancel-pending");
+    assert!(
+        !worker.cancel_task("queued-task"),
+        "无运行中任务时仍返回 false（契约不变）"
+    );
+    assert!(
+        worker.cancelled_tasks.lock().contains_key("queued-task"),
+        "未进执行的任务必须登记到派发前取消注册表"
+    );
+}
+
 #[tokio::test]
 async fn worker_notify_stopped_sets_state() {
     let worker = make_worker("node-stop");
@@ -471,9 +490,8 @@ async fn worker_schedule_task_with_real_scheduler() {
     let dispatcher = Arc::new(
         crate::runtime::dispatcher::ProcessTaskDispatcher::new(
             0,
-            "python3".to_string(),
+            WorkerLaunchSpec::default(),
             1,
-            Vec::new(),
             Vec::new(),
         )
         .expect("ProcessTaskDispatcher init"),
@@ -1355,9 +1373,8 @@ fn make_worker_with_transport(node_id: &str, transport: Arc<dyn Transport>) -> W
     let dispatcher = Arc::new(
         crate::runtime::dispatcher::ProcessTaskDispatcher::new(
             0,
-            "python3".to_string(),
+            WorkerLaunchSpec::default(),
             1,
-            Vec::new(),
             Vec::new(),
         )
         .expect("ProcessTaskDispatcher init"),
@@ -1902,6 +1919,28 @@ fn build_completion_from_dispatch_error_returns_failed() {
             assert!(error.contains("dispatch failed"));
         }
         other => panic!("expected Failed, got {:?}", other),
+    }
+}
+
+/// 取消（`ActantError::Cancelled`）必须映射为取消终态而非失败。
+///
+/// 回归防护：映射为 Failed 会让已取消的任务进入重试裁决被重新入队执行
+/// （取消被"复活"），并在 fail-fast 策略下把工作流错误判为 Failed。
+#[test]
+fn build_completion_from_cancelled_dispatch_returns_cancelled() {
+    let task = make_task_for_completion("t-cancel", "cancel_task");
+    let result: DispatchResult = Ok(Err(ActantError::Cancelled("task cancelled".into())));
+    let completion = build_completion_from_dispatch_result(
+        result,
+        &task,
+        crate::common::epoch_millis(),
+        Duration::from_millis(1000),
+    );
+    match completion {
+        TaskCompletion::Cancelled { task_id, .. } => {
+            assert_eq!(task_id.as_str(), "t-cancel");
+        }
+        other => panic!("expected Cancelled, got {:?}", other),
     }
 }
 
@@ -2468,13 +2507,19 @@ async fn publish_drained_task_cancellation_publishes_local_cancelled_event() {
         origin_endpoint_addr: None,
     };
 
+    // 本地任务结算只发布事件：drain 丢弃的任务以 TaskCancelled
+    // 事件通知订阅者，不经 orchestrator 回灌（编排推进由 Python 事件泵经
+    // `Worker::report_task_result` 桥发起）。
+    let node_id = NodeId::from("node-drain-local".to_string());
     publish_drained_task_cancellation(
         task,
-        &NodeId::from("node-drain-local".to_string()),
-        network.as_ref(),
-        &event_bus,
-        &pending_tx,
-        4,
+        &DrainNotifyCtx {
+            node_id: &node_id,
+            network: network.as_ref(),
+            event_bus: &event_bus,
+            pending_results: &pending_tx,
+            pending_capacity: 4,
+        },
     )
     .await;
 
@@ -2512,13 +2557,18 @@ async fn publish_drained_task_cancellation_enqueues_remote_result_for_origin() {
         origin_endpoint_addr: None,
     };
 
+    // 远端任务（origin != 本节点）：结算经直连回传 origin 节点，本地不落
+    // orchestrator。
+    let node_id = NodeId::from("node-drain-remote".to_string());
     publish_drained_task_cancellation(
         task,
-        &NodeId::from("node-drain-remote".to_string()),
-        network.as_ref(),
-        &event_bus,
-        &pending_tx,
-        4,
+        &DrainNotifyCtx {
+            node_id: &node_id,
+            network: network.as_ref(),
+            event_bus: &event_bus,
+            pending_results: &pending_tx,
+            pending_capacity: 4,
+        },
     )
     .await;
 

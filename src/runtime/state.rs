@@ -37,15 +37,15 @@ pub(crate) struct LmdbStore {
     default_db: Database<Str, Bytes>,
 }
 
-/// store 格式版本 meta key（X1）。独立于任何业务键前缀（`orch:` / `event:` /
+/// store 格式版本 meta key。独立于任何业务键前缀（`orch:` / `event:` /
 /// `ckpt:` 等），仅由打开路径读写。
 const STORE_FMT_VERSION_KEY: &str = "meta:fmt_version";
 /// 当前 store 持久化格式版本。破坏性布局变更（如 rkyv 结构体字段增删）时递增。
-const STORE_FMT_VERSION: u64 = 1;
+const STORE_FMT_VERSION: u64 = 2;
 
 /// 校验（或首次创建时写入）store 格式版本 meta 条目。
 ///
-/// - 无 meta 条目 → 视为首次创建，写入当前版本（0.3.2 及更早的存量库无此
+/// - 无 meta 条目 → 视为首次创建，写入当前版本（存量库无此 meta 条目）。
 ///   条目，按首次创建对待并补写；0.x 里程碑本身不承诺向后兼容）；
 /// - 条目与当前版本匹配 → 放行；
 /// - 条目存在但不匹配 → 返回语义化 [`ActantError::Storage`]，拒绝启动——
@@ -121,7 +121,7 @@ impl LmdbStore {
         let default_db = env.create_database(&mut wtxn, Some("default"))?;
         wtxn.commit()?;
 
-        // X1：打开时校验（或首次创建时写入）store 格式版本，不匹配即拒绝启动。
+        // 打开时校验（或首次创建时写入）store 格式版本，不匹配即拒绝启动。
         ensure_fmt_version(&default_db, &env)?;
 
         // LMDB 在 env.open 时以默认模式（受 umask 影响）创建 data.mdb / lock.mdb。

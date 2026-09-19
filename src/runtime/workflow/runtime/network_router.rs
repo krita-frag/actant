@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::common::wire::CancelBroadcast;
+use crate::common::TaskDefinition;
 use crate::common::{
     NodeId, TaskCompletion, TaskId, Topic, WireEnvelope, WireMessage, WireTaskOutcome, WorkflowId,
 };
@@ -17,7 +18,7 @@ use crate::runtime::dispatcher::CancelFlag;
 use crate::runtime::event_bus::{BusEvent, EventBus};
 use crate::runtime::network::{DirectResponseChannel, NetworkEvent, Transport};
 use crate::runtime::workflow::actor::{ResultSource, TaskResultOutcome};
-use crate::runtime::workflow::messaging::encode;
+use crate::runtime::workflow::messaging::{decode, encode};
 use crate::runtime::workflow::Scheduler;
 use tracing::Instrument;
 
@@ -104,7 +105,22 @@ impl NetworkEventRouter {
     pub(crate) async fn handle_message(&self, topic_str: &str, payload: &[u8]) {
         let topic = Topic::from(topic_str);
         // 解码一次后在整个分发过程中复用。失败时直接返回（避免每个分支重复 decode）。
-        let decoded = WireEnvelope::decode(payload);
+        //
+        // 但**不是所有话题都走 `WireEnvelope`**：`Cancel` / `CapabilityGossip`
+        // 的载荷是裸 postcard（`CancelBroadcast` / `CapabilityGossipMsg`），
+        // 对它们尝试解包只会得到一条"failed to deserialize WireEnvelope"的
+        // WARN——而消息其实会被下面的分支正常处理。那是对每一条合法取消广播
+        // 的恒定误报（本节点自投递的取消也走这里，单机路径上同样出现），
+        // 会让人误以为消息被丢弃。故按话题路由决定是否需要解包。
+        let decoded = if matches!(
+            topic.classify(),
+            crate::common::wire::TopicRoute::Cancel
+                | crate::common::wire::TopicRoute::CapabilityGossip
+        ) {
+            None
+        } else {
+            WireEnvelope::decode(payload)
+        };
         let traceparent = decoded.as_ref().and_then(|(_, tp)| tp.clone());
         // C3：解析入站 W3C traceparent，若成功则：
         //   1. 创建 `wire.recv` span，把 traceparent 字符串与解析出的 trace-id/span-id
@@ -348,6 +364,17 @@ impl NetworkEventRouter {
                     tracing::warn!("failed to send TaskResultAck: {}", e);
                 }
             }
+            crate::runtime::network::DirectRequest::Ping => {
+                // 存活探测：无副作用，唯一作用是让探测方区分"对端仍在线"与
+                // "对端已失联"。供故障转移的在途转发腿使用（心跳视图不可用时）。
+                if let Err(e) = self
+                    .network
+                    .send_direct_response(channel, crate::runtime::network::DirectResponse::Pong)
+                    .await
+                {
+                    tracing::warn!("failed to send Pong: {}", e);
+                }
+            }
             other => {
                 // 点对点请求-响应不走 EventBus：直接由接收方处理或回送 Error 响应，
                 // 避免独占投递分支在无订阅者时让调用方永久阻塞。
@@ -420,6 +447,11 @@ impl NetworkEventRouter {
         outcome: WireTaskOutcome,
         worker_node: NodeId,
     ) -> bool {
+        // 远端已回报该任务的结果，本地对它的命运已有定论 → 清出"在途
+        // 转发"登记，避免该节点后续失联时对同一任务重复发布失败事件。
+        if let Some(failover) = self.failover.as_ref() {
+            failover.clear_outbound(task_id.as_str());
+        }
         if workflow_id.as_str().is_empty() {
             self.publish_remote_completion(
                 &workflow_id,
@@ -457,6 +489,7 @@ impl NetworkEventRouter {
             return true;
         };
 
+        let outcome_wire = outcome.clone();
         // wire 协议尚未携带派发代数，attempt 传 `None`（入口 fencing 放行）。
         let outcome = match outcome {
             WireTaskOutcome::Completed(result_payload) => {
@@ -503,10 +536,53 @@ impl NetworkEventRouter {
                         error = %error,
                         "workflow actor rejected task result"
                     );
-                    false
-                } else {
-                    true
+                    return false;
                 }
+                // 重试裁决：orchestrator 判定重试时随响应返回重派发任务，
+                // 由本节点调度器延迟入队（远端执行的 flow 任务其编排者在本
+                // 节点）；终局结果发布到 event_bus，使提交方 `AsyncResult`
+                // 解析（远端执行路径此前没有事件，flow 句柄无法跨节点解析）。
+                let retry: Option<(TaskDefinition, u64)> = if result.payload.is_empty() {
+                    None
+                } else {
+                    decode(&result.payload).unwrap_or_else(|e| {
+                        tracing::error!(
+                            workflow_id = %workflow_id.as_str(),
+                            task_id = %task_id.as_str(),
+                            error = %e,
+                            "failed to decode retry verdict from workflow actor"
+                        );
+                        None
+                    })
+                };
+                match retry {
+                    Some((task, delay_ms)) => {
+                        let scheduler = self.scheduler.clone();
+                        tokio::spawn(async move {
+                            if delay_ms > 0 {
+                                tokio::time::sleep(std::time::Duration::from_millis(delay_ms))
+                                    .await;
+                            }
+                            if let Err(e) = scheduler.enqueue(task).await {
+                                tracing::error!(
+                                    error = %e,
+                                    "failed to enqueue orchestrator-driven retry task"
+                                );
+                            }
+                        });
+                    }
+                    None => {
+                        self.publish_remote_completion(
+                            &workflow_id,
+                            &task_id,
+                            &task_name,
+                            &outcome_wire,
+                            &worker_node,
+                        )
+                        .await;
+                    }
+                }
+                true
             }
             Err(e) => {
                 tracing::error!(

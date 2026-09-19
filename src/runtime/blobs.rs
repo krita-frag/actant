@@ -1,4 +1,4 @@
-//! 内容寻址 blob 原语（0.3.2 R1）：store / fetch / hash 三个能力的薄封装。
+//! 内容寻址 blob 原语：store / fetch / hash 三个能力的薄封装。
 //!
 //! 底座为 iroh-blobs（bao/blake3 逐块校验流式传输），本模块对其类型完全
 //! 封装——公共 API 只暴露 [`BlobHash`]（common 层 newtype）、[`BlobStore`]
@@ -9,7 +9,7 @@
 //! 锁定该行为）。
 //!
 //! blob 传输走独立 ALPN 连接，不占用 `DirectRequest` 帧通道，因此不受
-//! `max_message_size` 帧上限约束——这是 0.3.2 "100MB 值仅一次序列化" 的
+//! `max_message_size` 帧上限约束——这是"100MB 值仅一次序列化"的
 //! 传输前提。
 //!
 //! ## 取消语义
@@ -45,7 +45,7 @@ const FETCH_CHANNEL_CAPACITY: usize = 64;
 
 /// 本地 blob 存储 facade：内容寻址存取 + iroh Router 接入。
 ///
-/// 存储后端选型（spike 五、R1 设计建议）：**FsStore 落盘**（`data_dir/blobs/`）
+/// 存储后端选型：**FsStore 落盘**（`data_dir/blobs/`）
 /// 而非内存 store——Ref 是可能跨重启消费的持久值引用，与 orchestrator/
 /// actor 存储随 `data_dir` 持久化的既有语义一致。FsStore 默认 `gc: None`
 /// （blob 永不回收），写入侧建立持久 tag 双重保护；后续需要 GC 策略时在

@@ -942,7 +942,7 @@ fn checkpoint_key_orders_lexicographically() {
     assert!(k2 < k10);
 }
 
-// ───────────────────────── X1：store 格式版本（fmt_version）─────────────────────────
+// ───────────────────────── store 格式版本（fmt_version）─────────────────────────
 
 #[test]
 fn store_writes_fmt_version_on_first_open() {

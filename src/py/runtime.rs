@@ -17,10 +17,13 @@ use crate::common::{
 };
 use crate::runtime::builder::RuntimeBuilder;
 use crate::runtime::event_bus::{BusEvent, Topic as BusTopic};
-use crate::runtime::workflow::actor::TaskCompletionResponse;
+use crate::runtime::workflow::actor::TaskResultOutcome;
 use crate::runtime::workflow::messaging::{decode, encode};
+use crate::runtime::workflow::orchestrator::types::WorkflowEventPayload;
+use crate::runtime::workflow::orchestrator::DagSnapshot;
 use crate::runtime::workflow::{
-    workflow_methods, Dag, DagNode, FailureScope, FailureStrategy, WorkflowExecution,
+    workflow_methods, AddNodeOutcome, Dag, DagNode, FailureStrategy, WaitCondition,
+    WorkflowExecution,
 };
 
 use super::capability::PyCapabilityRuntime;
@@ -54,10 +57,10 @@ fn shared_tokio_runtime() -> PyResult<Arc<tokio::runtime::Runtime>> {
 // 跨 PyO3 边界的 typed struct
 // ---------------------------------------------------------------------------
 
-/// DAG 节点定义，由 Python 层构造后通过 `submit_dag` 提交。
+/// DAG 节点定义，由 Python 层构造后通过 `add_workflow_node` 提交。
 ///
-/// `task_id` 是节点在 DAG 中的唯一标识（对应 Orchestrator 侧 `TaskId`），
-/// 由 FlowDAG 记录器设为被提交任务的 task_id；`name` 为人类可读名称。
+/// `task_id` 是节点在 DAG 中的唯一标识（对应 Orchestrator 侧 `TaskId`）；
+/// `name` 为人类可读名称。
 #[pyclass(name = "_DagNode", from_py_object)]
 #[derive(Clone)]
 pub struct PyNode {
@@ -613,7 +616,7 @@ impl PyRuntimeCore {
         Ok(worker.max_concurrent_tasks())
     }
 
-    /// 将字节存入本节点内容寻址 blob 存储，返回 `BlobRef` wire 编码（0.3.2 R2）。
+    /// 将字节存入本节点内容寻址 blob 存储，返回 `BlobRef` wire 编码。
     ///
     /// `BlobRef.node` 记为本节点 endpoint_addr，供跨节点 [`Self::value_fetch`]
     /// 寻址。经 `ValueStore` capability 的默认 handler 调用。
@@ -640,7 +643,7 @@ impl PyRuntimeCore {
         .map_err(PyErr::from)
     }
 
-    /// 按 `BlobRef` wire 编码取回值字节（0.3.2 R2）。
+    /// 按 `BlobRef` wire 编码取回值字节。
     ///
     /// 解析顺序：先本地 blob store（内容寻址下本地命中即真——Ref 在 blob 所属
     /// 节点上解析零网络；本地未命中的 `get_bytes` Err 是预期的未命中探测，
@@ -681,7 +684,7 @@ impl PyRuntimeCore {
         .map_err(PyErr::from)
     }
 
-    /// 解码 `BlobRef` wire 编码为 ``(hash_hex, node)``（0.3.2 R2）。
+    /// 解码 `BlobRef` wire 编码为 ``(hash_hex, node)``。
     ///
     /// 供 Python `Ref.hash` / `.node` 展示使用，避免在 Python 侧引入 postcard
     /// 解码器。
@@ -814,111 +817,416 @@ impl PyRuntimeCore {
         Ok(())
     }
 
-    /// 提交 DAG 工作流到 Rust Orchestrator。
+    /// 创建（或重置为）一个空的持久化工作流外壳（flow 提交路径第一步）。
     ///
-    /// ``nodes`` 为 ``_DagNode`` 列表（节点唯一标识为 ``task_id``）；
-    /// ``edges`` 为 ``[(from_task_id, to_task_id), ...]`` 依赖边。
-    /// ``failure_strategy`` 为 ``"fail_fast"``（默认）或 ``"continue"``；
-    /// ``default_retry_policy`` 应用于未自带重试策略的节点。
-    ///
-    /// 提交由 `WorkflowActor` 持久化（若配置了 store），重复提交同一
-    /// ``workflow_id`` 返回 ``AlreadyExists`` 错误。
-    #[pyo3(signature = (workflow_id, nodes, edges, failure_strategy=None, default_retry_policy=None))]
+    /// flow 函数体的首次 `task.submit()` 前调用：以空 DAG `submit` 持久化
+    /// 工作流，后续节点经 [`Self::add_workflow_node`] 增量加入。
+    /// ``timeout_ms > 0`` 时经 `submit_with_timeout` 设置工作流级 deadline。
+    /// ``failure_strategy`` 为 ``"fail_fast"``（默认）或 ``"continue"``。
+    #[pyo3(signature = (workflow_id, failure_strategy=None, timeout_ms=0))]
     #[tracing::instrument(
-        name = "py.submit_dag",
+        name = "py.submit_workflow",
         level = "info",
-        skip(self, py, nodes, edges, default_retry_policy),
-        fields(workflow_id = %workflow_id, node_count = nodes.len(), edge_count = edges.len())
+        skip(self, py),
+        fields(workflow_id = %workflow_id, timeout_ms)
     )]
-    fn submit_dag(
+    fn submit_workflow(
         &self,
         py: Python<'_>,
         workflow_id: String,
-        nodes: Vec<PyNode>,
-        edges: Vec<(String, String)>,
         failure_strategy: Option<String>,
-        default_retry_policy: Option<PyRetryPolicy>,
+        timeout_ms: u64,
     ) -> PyResult<()> {
         let mut dag = Dag::new();
-        for node in nodes {
-            dag.add_node(DagNode {
-                task_id: TaskId::new(node.task_id),
-                name: node.name,
-                payload: node.payload,
-                retry_policy: node.retry.map(RetryPolicy::from),
-                timeout_ms: node.timeout_ms,
-                priority: node.priority.unwrap_or(0),
-                metadata: node.metadata.unwrap_or_default(),
-            })
-            .map_err(PyErr::from)?;
-        }
-        for (from, to) in edges {
-            dag.add_edge(TaskId::new(from), TaskId::new(to))
-                .map_err(PyErr::from)?;
-        }
         dag.failure_strategy = match failure_strategy.as_deref() {
             None => FailureStrategy::default(),
-            // 显式传入但无法解析（如拼写错误）：报错而非静默落到默认值——
-            // Python 装饰器层有校验，直调 submit_dag 的调用方同样需要反馈。
             Some(s) => FailureStrategy::parse(s).ok_or_else(|| {
                 pyo3::exceptions::PyValueError::new_err(format!(
                     "invalid failure_strategy {s:?}: expected \"fail_fast\" or \"continue\""
                 ))
             })?,
         };
-        dag.default_retry_policy = default_retry_policy.map(RetryPolicy::from);
+        let wf = WorkflowId::from(workflow_id);
         crate::metrics::inc_workflows_submitted();
-        let payload = encode(&(WorkflowId::from(workflow_id), dag)).map_err(PyErr::from)?;
-        self.call_workflow_actor::<()>(py, workflow_methods::SUBMIT, payload)?;
+        if timeout_ms > 0 {
+            let payload = encode(&(wf, dag, timeout_ms)).map_err(PyErr::from)?;
+            self.call_workflow_actor::<()>(py, workflow_methods::SUBMIT_WITH_TIMEOUT, payload)?;
+        } else {
+            let payload = encode(&(wf, dag)).map_err(PyErr::from)?;
+            self.call_workflow_actor::<()>(py, workflow_methods::SUBMIT, payload)?;
+        }
         Ok(())
     }
 
-    /// 将 flow 已执行完成的任务结果回灌 Orchestrator，驱动状态机推进到终态。
+    /// 增量加入单个 DAG 节点（flow 提交路径核心）。
     ///
-    /// flow 采用 eager 执行模型：函数体运行期间任务已实际执行完毕，DAG 在函数体
-    /// 返回后才提交。此方法把每个任务的实际结果（成功字节或失败信息）按依赖序
-    /// 回灌给 Orchestrator，使持久化状态机从 Pending 推进到 Completed / Failed，
-    /// 从而让工作流生命周期事件与 Orchestrator 状态一致。
+    /// 每次函数体内 `task.submit()` 调用一次：节点在 orchestrator 内登记、
+    /// 建边、同步落盘（先持久化再派发），随后做重放裁决与派发裁决：
+    /// - 新节点且依赖已满足 → 返回的 `TaskDefinition` 已直接推入本节点的
+    ///   后台调度通道（与 `submit_task` 同路，经路由能力决定本地/远端执行）；
+    /// - 节点已存在（flow 重放命中历史）→ 返回其当前状态与已完成结果字节，
+    ///   Python 层据此重建句柄，不重新提交、不重跑；
+    /// - 节点已存在但定义不一致 → 抛 ``FlowReplayError``（提交序列指纹
+    ///   fail-fast）。
     ///
-    /// ``outcomes`` 为 ``[(task_id, success, result_bytes)]``，需按拓扑序传入
-    /// （依赖先于下游）；flow 的记录器按 eager 提交顺序保证这一点。成功项调用
-    /// ``COMPLETE_TASK``，失败项调用 ``FAIL_TASK``（WorkflowLevel 作用域，使
-    /// fail_fast 下工作流整体进入 Failed）。
-    #[pyo3(signature = (workflow_id, outcomes))]
+    /// 返回 dict：``{"created": bool, "state": str | None, "result": bytes | None,
+    /// "error": str | None}``（``created=False`` 时后三项为历史中的任务状态、
+    /// 结果与失败信息）。
+    #[pyo3(signature = (workflow_id, node, deps))]
     #[tracing::instrument(
-        name = "py.complete_workflow",
-        level = "info",
-        skip(self, py, outcomes),
-        fields(workflow_id = %workflow_id, task_count = outcomes.len())
+        name = "py.add_workflow_node",
+        level = "debug",
+        skip(self, py, node, deps),
+        fields(workflow_id = %workflow_id, task_id = %node.task_id)
     )]
-    fn complete_workflow(
+    fn add_workflow_node(
         &self,
         py: Python<'_>,
         workflow_id: String,
-        outcomes: Vec<(String, bool, Vec<u8>)>,
-    ) -> PyResult<()> {
-        let wf = WorkflowId::from(workflow_id);
-        for (task_id, success, result) in outcomes {
-            if success {
-                let payload =
-                    encode(&(wf.clone(), TaskId::new(task_id), result)).map_err(PyErr::from)?;
-                self.call_workflow_actor::<TaskCompletionResponse>(
-                    py,
-                    workflow_methods::COMPLETE_TASK,
-                    payload,
-                )?;
-            } else {
-                let payload = encode(&(
-                    wf.clone(),
-                    TaskId::new(task_id),
-                    String::from_utf8_lossy(&result).to_string(),
-                    FailureScope::WorkflowLevel,
-                ))
-                .map_err(PyErr::from)?;
-                self.call_workflow_actor::<()>(py, workflow_methods::FAIL_TASK, payload)?;
+        node: PyNode,
+        deps: Vec<String>,
+    ) -> PyResult<Py<PyAny>> {
+        let dag_node = DagNode {
+            task_id: TaskId::new(node.task_id.clone()),
+            name: node.name,
+            payload: node.payload,
+            retry_policy: node.retry.map(RetryPolicy::from),
+            timeout_ms: node.timeout_ms,
+            priority: node.priority.unwrap_or(0),
+            metadata: node.metadata.unwrap_or_default(),
+        };
+        let deps: Vec<TaskId> = deps.into_iter().map(TaskId::new).collect();
+        let payload =
+            encode(&(WorkflowId::from(workflow_id), dag_node, deps)).map_err(PyErr::from)?;
+        let outcome: AddNodeOutcome =
+            self.call_workflow_actor(py, workflow_methods::ADD_NODE, payload)?;
+        let dict = pyo3::types::PyDict::new(py);
+        match outcome {
+            AddNodeOutcome::Created { ready } => {
+                // 依赖已满足的新节点：推入与 submit_task 相同的后台调度通道，
+                // 复用路由 / 派发 / 结果回灌全链路。调度通道未启动（未 serve）
+                // 时显式失败——节点已持久化但无法派发，静默吞掉会造成 flow
+                // 永久悬挂。
+                if let Some(task_def) = ready.map(|b| *b) {
+                    let tx_guard = self.submit_tx.lock();
+                    let tx = tx_guard.as_ref().ok_or_else(|| {
+                        pyo3::exceptions::PyRuntimeError::new_err(
+                            "submit channel not started; call serve() first",
+                        )
+                    })?;
+                    tx.send(task_def).map_err(|_| {
+                        pyo3::exceptions::PyRuntimeError::new_err(
+                            "submit channel closed; runtime may have shut down",
+                        )
+                    })?;
+                    drop(tx_guard);
+                    py.detach(move || {
+                        std::hint::spin_loop();
+                    });
+                }
+                dict.set_item("created", true)?;
+                dict.set_item("state", Option::<String>::None)?;
+                dict.set_item("result", Option::<Vec<u8>>::None)?;
+            }
+            AddNodeOutcome::Existing {
+                state,
+                result,
+                error,
+            } => {
+                dict.set_item("created", false)?;
+                dict.set_item("state", state.as_str())?;
+                dict.set_item("result", result)?;
+                dict.set_item("error", error)?;
             }
         }
+        Ok(dict.into_any().unbind())
+    }
+
+    /// 取消整个工作流（flow 失败兜底路径）。
+    ///
+    /// 将工作流及运行中任务置为 Cancelled 终态；已终态的工作流为幂等 no-op。
+    #[tracing::instrument(name = "py.cancel_workflow", level = "info", skip(self, py), fields(workflow_id = %workflow_id))]
+    fn cancel_workflow(&self, py: Python<'_>, workflow_id: String) -> PyResult<()> {
+        let payload = encode(&WorkflowId::from(workflow_id)).map_err(PyErr::from)?;
+        self.call_workflow_actor::<()>(py, workflow_methods::CANCEL_WORKFLOW, payload)?;
         Ok(())
+    }
+
+    /// 注册持久化等待点。
+    ///
+    /// 等待点是 orchestrator 状态机的挂起原语：持久化
+    /// ``(workflow_id, wait_key, 条件)``，条件满足（信号递交 / 定时到期）时追加
+    /// 唤醒事件进入同一工作流历史。
+    ///
+    /// Args:
+    ///     workflow_id: 工作流标识。
+    ///     wait_key: 等待点注册表键（同一工作流内唯一）。
+    ///     kind: ``"signal"``（外部信号触发）或 ``"timer"``（定时到期）。
+    ///     name: ``kind="signal"`` 时的信号语义名；``None`` 时退化为 ``wait_key``。
+    ///     deadline_ms: ``kind="timer"`` 时的**绝对** epoch 毫秒到期时刻，必须 > 0。
+    ///
+    /// Raises:
+    ///     ValueError: ``kind`` 非法，或 ``kind="timer"`` 时 ``deadline_ms == 0``。
+    ///     KeyError/NotFound: 工作流不存在。
+    ///
+    /// Note:
+    ///     幂等：同 ``wait_key`` 重复注册为 no-op（不改写条件、不重复追加事件），
+    ///     这是重放体天然幂等的前提。
+    #[pyo3(signature = (workflow_id, wait_key, kind, name=None, deadline_ms=0))]
+    #[tracing::instrument(
+        name = "py.register_wait_point",
+        level = "debug",
+        skip(self, py),
+        fields(workflow_id = %workflow_id, wait_key = %wait_key, kind = %kind)
+    )]
+    fn register_wait_point(
+        &self,
+        py: Python<'_>,
+        workflow_id: String,
+        wait_key: String,
+        kind: String,
+        name: Option<String>,
+        deadline_ms: u64,
+    ) -> PyResult<()> {
+        let condition = match kind.as_str() {
+            "signal" => WaitCondition::Signal {
+                name: name.unwrap_or_else(|| wait_key.clone()),
+            },
+            "timer" => {
+                if deadline_ms == 0 {
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "register_wait_point: kind=\"timer\" requires deadline_ms > 0 \
+                         (absolute epoch milliseconds)",
+                    ));
+                }
+                WaitCondition::Timer { deadline_ms }
+            }
+            // 挂起条件。等待显式恢复（`resume_suspended`），与 `signal` 的区别是
+            // 语义来源——signal 等业务事件，suspend 等操作员的恢复指令。
+            "suspend" => WaitCondition::Suspend,
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "register_wait_point: unknown kind {other:?}: expected \"signal\", \
+                     \"timer\" or \"suspend\""
+                )))
+            }
+        };
+        let payload =
+            encode(&(WorkflowId::from(workflow_id), wait_key, condition)).map_err(PyErr::from)?;
+        self.call_workflow_actor::<()>(py, workflow_methods::REGISTER_WAIT_POINT, payload)?;
+        Ok(())
+    }
+
+    /// 递交信号，唤醒 ``wait_key`` 对应的等待点（Signals 出口）。
+    ///
+    /// **返回值**
+    ///
+    /// - ``bytes``：本次递交**唤醒了一个等待点**（或该等待点此前已唤醒）。
+    ///   重放体"已收到 → 直接返回"由此路径实现，重复 signal 幂等。
+    /// - ``None``：此刻**没有等待点可被唤醒**，信号已入缓冲——将来注册同一
+    ///   ``wait_key`` 的等待点会**立即生成为已唤醒态**，无需递交方重试。
+    ///
+    /// **抛出**
+    ///
+    /// - ``NotFoundError``：工作流不存在（递交方 id 写错）。
+    /// - ``ValueError``：``wait_key`` 为空。
+    /// - 工作流**已终态不报错**：递交方重试时，前一次递交可能已被缓冲命中、
+    ///   flow 已跑完并让工作流进入终态，此时拒绝会让"明明送到了"变成报错。
+    ///
+    /// **注意**
+    ///
+    /// 缓冲是**闩锁**：同一 ``wait_key`` 已有缓冲时重复递交不再追加历史、
+    /// 不覆盖，直接返回 ``None``——这让"按返回值重试"变安全（重试是 no-op）。
+    /// 缓冲与等待点快照同批落盘，故跨重启存活；事件重放已在恢复路径落地（recover = 快照 + 其后事件重放），信号缓冲亦随重放重建。
+    #[tracing::instrument(
+        name = "py.signal_wait_point",
+        level = "debug",
+        skip(self, py),
+        fields(workflow_id = %workflow_id, wait_key = %wait_key)
+    )]
+    fn signal_wait_point(
+        &self,
+        py: Python<'_>,
+        workflow_id: String,
+        wait_key: String,
+    ) -> PyResult<Option<Vec<u8>>> {
+        let payload = encode(&(WorkflowId::from(workflow_id), wait_key)).map_err(PyErr::from)?;
+        self.call_workflow_actor(py, workflow_methods::SIGNAL_WAIT_POINT, payload)
+    }
+
+    /// 恢复挂起：唤醒该工作流所有 `kind="suspend"` 且仍在等待的等待点。
+    ///
+    /// Returns:
+    ///     ``int``：本次唤醒的挂起点数量；``0`` 表示该工作流当前没有处于挂起中的
+    ///     挂起点（幂等——重复调用第二次返回 0）。
+    ///
+    /// Note:
+    ///     **只唤醒 `Suspend` 条件**，不触碰 `signal` / `timer` 等待点：
+    ///     `resume` 是操作员的恢复指令，不得冒名顶替一个业务信号
+    ///     按 ``workflow_id`` 而非按键
+    ///     唤醒，调用方无需知道 flow 内部给挂起点分配了什么键。
+    #[tracing::instrument(
+        name = "py.resume_suspended",
+        level = "info",
+        skip(self, py),
+        fields(workflow_id = %workflow_id)
+    )]
+    fn resume_suspended(&self, py: Python<'_>, workflow_id: String) -> PyResult<usize> {
+        let payload = encode(&WorkflowId::from(workflow_id)).map_err(PyErr::from)?;
+        self.call_workflow_actor(py, workflow_methods::RESUME_SUSPENDED, payload)
+    }
+
+    /// 阻塞等待等待点条件满足（flow 体 park 原语）。
+    ///
+    /// 与其它工作流方法不同，本方法**不经 actor 消息循环**：actor 消息处理是
+    /// 单线程顺序执行的，在 `handle_message` 内阻塞会让整个 WorkflowActor
+    /// （全部工作流）停摆。因此改为持有编排器只读句柄
+    /// （[`crate::runtime::context::Runtime::orchestrator_handle`]，与 actor 共享
+    /// 同一个 `Arc<OrchestratorState>`）在 actor 之外阻塞。
+    ///
+    /// **调用方必须先 `register_wait_point`**：注册是将等待点写入历史/快照的
+    /// 动作，本方法只负责 park。顺序为"先注册、后 park"，且
+    /// `register_wait_point_waiter` 内部"先注册句柄、再检查是否已 Signaled"
+    /// 关闭竞态窗口——信号在两步之间到达不会丢失。
+    ///
+    /// Args:
+    ///     workflow_id: 工作流标识。
+    ///     wait_key: 等待点注册表键。
+    ///     timeout_ms: 等待上界；``0`` 表示无限等待（直到被唤醒或工作流被移除）。
+    ///
+    /// Returns:
+    ///     ``bytes``：条件满足（signal 递交或 timer 到期）时的 payload。
+    ///     ``None``：等待超时，或等待期间工作流被移除/编排器未注入。
+    #[pyo3(signature = (workflow_id, wait_key, timeout_ms=0))]
+    #[tracing::instrument(
+        name = "py.wait_wait_point",
+        level = "debug",
+        skip(self, py),
+        fields(workflow_id = %workflow_id, wait_key = %wait_key, timeout_ms)
+    )]
+    fn wait_wait_point(
+        &self,
+        py: Python<'_>,
+        workflow_id: String,
+        wait_key: String,
+        timeout_ms: u64,
+    ) -> PyResult<Option<Vec<u8>>> {
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))?;
+        let Some(orchestrator) = runtime.orchestrator_handle().cloned() else {
+            return Ok(None);
+        };
+        let tokio = self.tokio.lock().clone().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("tokio runtime unavailable")
+        })?;
+        let wf = WorkflowId::from(workflow_id);
+        let rx = orchestrator.register_wait_point_waiter(wf, &wait_key);
+        // 阻塞期间释放 GIL：否则 tokio worker 的 pyo3_log 回调会与持 GIL 的
+        // 调用方互等（与 call_workflow_actor / report_task_result 同一考量）。
+        let outcome = py.detach(move || {
+            tokio.block_on(async move {
+                if timeout_ms == 0 {
+                    rx.await.ok()
+                } else {
+                    match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), rx)
+                        .await
+                    {
+                        Ok(Ok(payload)) => Some(payload),
+                        // 超时，或等待者被移除（sender 提前 drop）→ 无可交付结果。
+                        _ => None,
+                    }
+                }
+            })
+        });
+        Ok(outcome)
+    }
+
+    /// 封口工作流节点集（flow 函数体返回信号）。
+    ///
+    /// 封口后 orchestrator 才允许工作流终态判定；全部任务已终态时立即收尾。
+    #[tracing::instrument(name = "py.seal_workflow", level = "debug", skip(self, py), fields(workflow_id = %workflow_id))]
+    fn seal_workflow(&self, py: Python<'_>, workflow_id: String) -> PyResult<()> {
+        let payload = encode(&WorkflowId::from(workflow_id)).map_err(PyErr::from)?;
+        self.call_workflow_actor::<()>(py, workflow_methods::SEAL_WORKFLOW, payload)?;
+        Ok(())
+    }
+
+    /// 上报本地 flow 任务的终态结果（由 Python 事件泵调用）。
+    ///
+    /// worker 结果帧正文对 Rust 不透明（成功与业务失败都表现为 `Ok(Ok(body))`），
+    /// 故由 Python 侧解析 `dumps((success, payload))` 后经此上报；Rust 据此经
+    /// `ON_TASK_RESULT` 单入口回灌 orchestrator，并落实重试裁决
+    /// （裁决为重试时按延迟重新入队本节点调度器）。
+    ///
+    /// Args:
+    ///     workflow_id: 工作流标识。空串表示非编排任务（独立 ``@task``），直接
+    ///         返回无裁决。
+    ///     task_id: 节点标识。
+    ///     state: ``"Completed"`` / ``"Failed"`` / ``"Cancelled"``。
+    ///     result: Completed 时的结果字节。
+    ///     error: Failed 时的错误信息。
+    ///
+    /// Returns:
+    ///     ``{"retry": bool, "delay_ms": int}``：``retry`` 为真表示 orchestrator
+    ///     已排定重试（任务已按 ``delay_ms`` 延迟重新入队），提交方句柄应保持
+    ///     等待；为假表示终局，句柄按实际终态解析。
+    ///
+    /// Raises:
+    ///     ValueError: ``state`` 不是已知终态（fail-fast，避免静默错分）。
+    ///     RuntimeError: Runtime 未启动或 Worker 未初始化。
+    #[pyo3(signature = (workflow_id, task_id, state, result=None, error=None))]
+    #[tracing::instrument(
+        name = "py.report_task_result",
+        level = "debug",
+        skip(self, py, result),
+        fields(workflow_id = %workflow_id, task_id = %task_id, state = %state)
+    )]
+    fn report_task_result(
+        &self,
+        py: Python<'_>,
+        workflow_id: String,
+        task_id: String,
+        state: String,
+        result: Option<Vec<u8>>,
+        error: Option<String>,
+    ) -> PyResult<Py<PyAny>> {
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))?;
+        let worker = runtime
+            .worker()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("worker not initialized"))?
+            .clone();
+        let tokio = self.tokio.lock().clone().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("tokio runtime unavailable")
+        })?;
+        let outcome = match state.as_str() {
+            "Completed" => TaskResultOutcome::Completed(result.unwrap_or_default()),
+            "Failed" => TaskResultOutcome::Failed(
+                error.unwrap_or_else(|| "task failed (no detail reported)".to_string()),
+            ),
+            "Cancelled" => TaskResultOutcome::Cancelled,
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "report_task_result: unknown task state {other:?}: \
+                     expected one of: Completed, Failed, Cancelled"
+                )))
+            }
+        };
+        let wf = WorkflowId::from(workflow_id);
+        let tid = TaskId::new(task_id);
+        // GIL 在 block_on 期间释放（与其它 actor 调用一致），避免 pyo3_log
+        // 回调与持有 GIL 的调用方 block_on 互相等待。
+        let response = py
+            .detach(move || tokio.block_on(worker.report_task_result(&wf, &tid, outcome)))
+            .map_err(PyErr::from)?;
+        let dict = pyo3::types::PyDict::new(py);
+        dict.set_item("retry", response.retry)?;
+        dict.set_item("delay_ms", response.delay_ms)?;
+        Ok(dict.into_any().unbind())
     }
 
     /// 查询指定工作流的持久化执行状态。
@@ -953,6 +1261,124 @@ impl PyRuntimeCore {
         dict.set_item("failure_strategy", exec.failure_strategy.as_str())?;
         dict.set_item("error", exec.error.clone())?;
         Ok(dict.into_any().unbind())
+    }
+
+    /// 查询指定工作流的 DAG **结构**（暴露面）。
+    ///
+    /// 返回 ``None``（工作流不存在）或 dict：
+    /// ``workflow_id`` / ``failure_strategy`` / ``default_retry_policy`` /
+    /// ``nodes`` / ``edges``。``nodes`` 每项为
+    /// ``{task_id, name, deps, timeout_ms, priority, metadata, retry_policy}``；
+    /// ``edges`` 每项为 ``{from, to, condition}``。
+    ///
+    /// **不含 payload**：任务载荷是签名的 cloudpickle 字节，对 Rust 不透明且可能
+    /// 很大。需要任务**结果**用 :func:`get_workflow_state` 的 ``tasks[*].result``。
+    ///
+    /// ``default_retry_policy`` 一并暴露，否则节点 ``retry_policy`` 为 ``None``
+    /// 时无法在 Python 侧还原生效策略（``Dag::effective_retry_policy`` 的输入）。
+    #[tracing::instrument(name = "py.get_dag", level = "debug", skip(self, py), fields(workflow_id = %workflow_id))]
+    fn get_dag(&self, py: Python<'_>, workflow_id: String) -> PyResult<Py<PyAny>> {
+        let payload = encode(&WorkflowId::from(workflow_id)).map_err(PyErr::from)?;
+        let snapshot: Option<DagSnapshot> =
+            self.call_workflow_actor(py, workflow_methods::GET_DAG, payload)?;
+        let Some(snap) = snapshot else {
+            return Ok(py.None());
+        };
+        let dict = pyo3::types::PyDict::new(py);
+        dict.set_item("workflow_id", snap.workflow_id)?;
+        dict.set_item("failure_strategy", snap.failure_strategy)?;
+        dict.set_item(
+            "default_retry_policy",
+            retry_policy_to_py(py, snap.default_retry_policy.as_ref())?,
+        )?;
+        let nodes = pyo3::types::PyList::new(py, [] as [Py<PyAny>; 0])?;
+        for n in &snap.nodes {
+            let node = pyo3::types::PyDict::new(py);
+            node.set_item("task_id", &n.task_id)?;
+            node.set_item("name", &n.name)?;
+            node.set_item("deps", &n.deps)?;
+            node.set_item("timeout_ms", n.timeout_ms)?;
+            node.set_item("priority", n.priority)?;
+            let meta = pyo3::types::PyDict::new(py);
+            for (k, v) in &n.metadata {
+                meta.set_item(k, v)?;
+            }
+            node.set_item("metadata", meta)?;
+            node.set_item(
+                "retry_policy",
+                retry_policy_to_py(py, n.retry_policy.as_ref())?,
+            )?;
+            nodes.append(node)?;
+        }
+        dict.set_item("nodes", nodes)?;
+        let edges = pyo3::types::PyList::new(py, [] as [Py<PyAny>; 0])?;
+        for e in &snap.edges {
+            let edge = pyo3::types::PyDict::new(py);
+            edge.set_item("from", &e.from)?;
+            edge.set_item("to", &e.to)?;
+            edge.set_item("condition", e.condition.clone())?;
+            edges.append(edge)?;
+        }
+        dict.set_item("edges", edges)?;
+        Ok(dict.into_any().unbind())
+    }
+
+    /// 读取工作流的事件历史（审计出口）。
+    ///
+    /// 返回 list，每项为
+    /// ``{sequence, timestamp_ms, kind, task_id, error, payload}``：
+    ///
+    /// - ``kind`` / ``task_id`` / ``error`` 由 Rust 侧解出，供调用方**筛选**
+    ///   （``kind`` 取值如 ``"TaskCompleted"`` / ``"WaitPointRegistered"``…）；
+    /// - ``payload`` 是原始 postcard 字节，**不透明**——Python 不解释其布局，
+    ///   故 Rust 枚举的字段增减不会变成跨语言契约。
+    ///
+    /// ``after`` 为 ``(sequence, timestamp_ms)`` 形式的游标（来自上一项的
+    /// ``sequence``/``timestamp_ms``）或 ``None``（从头读取）。
+    /// 无 event_log 或工作流不存在时返回空列表——历史是**可选**的观测面。
+    #[tracing::instrument(name = "py.get_workflow_history", level = "debug", skip(self, py), fields(workflow_id = %workflow_id))]
+    // 显式签名：`after` 必须**可选且仅关键字**，与 `actant.pyi` 的声明一致
+    // （缺省时 PyO3 会把它变成必填位置参数，存根因此撒谎）。
+    #[pyo3(signature = (workflow_id, *, after=None))]
+    fn get_workflow_history(
+        &self,
+        py: Python<'_>,
+        workflow_id: String,
+        after: Option<(u64, u64)>,
+    ) -> PyResult<Py<PyAny>> {
+        use crate::runtime::state::event_log::EventId;
+        use crate::runtime::state::HlcTimestamp;
+
+        let cursor = after.map(|(sequence, timestamp_ms)| EventId {
+            timestamp: HlcTimestamp::from_parts(timestamp_ms, 0),
+            sequence,
+        });
+        let payload = encode(&(WorkflowId::from(workflow_id), cursor)).map_err(PyErr::from)?;
+        let entries: Vec<(EventId, Vec<u8>)> =
+            self.call_workflow_actor(py, workflow_methods::GET_HISTORY, payload)?;
+
+        let list = pyo3::types::PyList::new(py, [] as [Py<PyAny>; 0])?;
+        for (id, raw) in &entries {
+            let item = pyo3::types::PyDict::new(py);
+            item.set_item("sequence", id.sequence)?;
+            item.set_item("timestamp_ms", id.timestamp.wall_time())?;
+            item.set_item("payload", pyo3::types::PyBytes::new(py, raw))?;
+            match postcard::from_bytes::<WorkflowEventPayload>(raw) {
+                Ok(ev) => {
+                    item.set_item("kind", ev.kind_name())?;
+                    item.set_item("task_id", ev.task_id().map(|t| t.as_str().to_string()))?;
+                    item.set_item("error", ev.error().map(|s| s.to_string()))?;
+                }
+                Err(_) => {
+                    // 解码失败（历史格式变更）仍回传字节，但观测字段为 None。
+                    item.set_item("kind", py.None())?;
+                    item.set_item("task_id", py.None())?;
+                    item.set_item("error", py.None())?;
+                }
+            }
+            list.append(item)?;
+        }
+        Ok(list.into_any().unbind())
     }
 
     /// 返回当前在内存中活跃（已提交未淘汰）的工作流 ID 列表。
@@ -1319,6 +1745,22 @@ impl Drop for PyRuntimeCore {
 }
 
 /// 将 Rust ``TaskCompletion`` 转换为 Python ``_TaskCompletion``。
+/// 重试策略 → Python dict；``None`` → Python ``None``。
+///
+/// `DagSnapshot` 有两处策略字段（DAG 级默认 + 每节点），共用本函数以免
+/// "同一结构两处构造"漂移。
+fn retry_policy_to_py(py: Python<'_>, policy: Option<&RetryPolicy>) -> PyResult<Py<PyAny>> {
+    let Some(p) = policy else {
+        return Ok(py.None());
+    };
+    let d = pyo3::types::PyDict::new(py);
+    d.set_item("max_retries", p.max_retries)?;
+    d.set_item("delay_ms", p.delay_ms)?;
+    d.set_item("backoff_multiplier", p.backoff_multiplier)?;
+    d.set_item("max_delay_ms", p.max_delay_ms)?;
+    Ok(d.into_any().unbind())
+}
+
 fn task_completion_to_py(completion: &TaskCompletion) -> PyTaskCompletion {
     match completion {
         TaskCompletion::Completed {

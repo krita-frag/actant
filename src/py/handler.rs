@@ -1,8 +1,15 @@
 //! Python callable 注册为 Rust `CapabilityRuntime` handler。
 //!
-//! 本模块把 Python handler 包装成 `ErasedHandler`，通过 `Runtime::chain`
-//! 挂到 Rust 内置 capability 的 handler 链末尾。这样 Python 和 Rust handler
-//! 共享同一条分发路径，消除 Python 侧独立维护注册表的双分发。
+//! 本模块把 Python handler 包装成 `ErasedHandler`，**有能力**通过
+//! `Runtime::chain` 挂到 Rust 内置 capability 的 handler 链末尾，使 Python
+//! 与 Rust handler 共享同一条分发路径。
+//!
+//! **但当前默认并未接线**：Python 侧的 `Runtime.layer(name).chain(handler)`
+//! 只登记在 Python 自己的注册表里，不会调用到本模块的 `chain_python_handler`
+//! （后者经 `PyCapabilityRuntime` 暴露，需显式调用）。因此**双分发仍然存在**——
+//! Python handler 默认只在用户代码显式 `actant.ask/perform/emit` 时生效，
+//! 不参与 Rust 内部 dispatch。接线与否是一项独立决策，未接线前不要照本段
+//! 第一句的描述去推断运行时行为（审查 2026-09-18 修订）。
 
 use std::any::Any;
 use std::sync::Arc;
@@ -71,7 +78,7 @@ where
                     .call1(py, (&py_req,))
                     .map_err(|e| ActantError::Internal(format!("python handler: {}", e)))?
                     .into_bound(py);
-                crate::metrics::observe_python_handler_ms(t0.elapsed().as_millis() as u64);
+                crate::metrics::observe_task_handler_ms(t0.elapsed().as_millis() as u64);
                 let resp = Codec::decode_response(py, &py_resp)
                     .map_err(|e| ActantError::Internal(format!("decode response: {}", e)))?;
                 Ok(resp)
@@ -140,7 +147,7 @@ where
                     Ok(_) => (),
                     Err(e) => return Err(ActantError::Internal(format!("python handler: {}", e))),
                 }
-                crate::metrics::observe_python_handler_ms(t0.elapsed().as_millis() as u64);
+                crate::metrics::observe_task_handler_ms(t0.elapsed().as_millis() as u64);
                 Ok(())
             })
         })

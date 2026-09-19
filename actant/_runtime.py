@@ -75,6 +75,7 @@ TASK_STATE_SKIPPED = "Skipped"
 # "state" 字段，src/runtime/workflow/ 的持久化状态机）。
 WORKFLOW_STATE_COMPLETED = "Completed"
 WORKFLOW_STATE_FAILED = "Failed"
+WORKFLOW_STATE_CANCELLED = "Cancelled"
 
 
 def get_current_runtime() -> Runtime | None:
@@ -139,8 +140,11 @@ class Layer:
             ``actant.ask/perform/emit(name, ...)`` 时生效。
 
             如需覆盖 Rust 内部 dispatch 行为（如自定义任务执行逻辑），
-            请在 ``start()`` **之前** 通过 ``Runtime.layer(name).chain(handler)``
-            注册，或直接配置 Rust 侧 handler（参见 ``RuntimeBuilder``）。
+            ``Runtime.layer(name).chain(handler)`` **做不到**——它只登记在
+            Python 侧，不会桥接到 Rust（桥接能力 ``PyCapabilityRuntime``
+            的 ``chain_python_handler`` 存在，但 Python 层默认不调用它）。
+            要走通请用 Rust 侧配置（``RuntimeBuilder``），或在 Rust 嵌入场景
+            下显式 ``register_execute_handler`` 等注册函数。
 
             纯 Python capability（``Routing`` / ``Scheduling`` / ``RetryPolicy``）
             无此限制——它们始终走 Python 分发路径，``start()`` 后追加立即生效。
@@ -283,9 +287,6 @@ class Runtime:
         # 已取消任务集合（Python 端预取消标记），dispatch handler 启动时检查。
         # 用于在 Rust Worker 尚未拉取任务时实现本地取消。
         self._cancelled_tasks: set[str] = set()
-        # 活跃 flow 线程注册表：Runtime.stop() 时 join 它们，
-        # 避免子线程在 Runtime 关闭后继续访问已释放的资源。
-        self._flow_threads: list[threading.Thread] = []
         # TaskLifecycle 事件批处理器：start() 时创建、stop() 时关闭。
         # 父进程侧每任务 2 次 emit（started/completed/failed）在后台线程批量派发，
         # 降低高吞吐下 event_bus 的 publish 次数。未创建（未 start）时为 None。
@@ -811,8 +812,11 @@ class Runtime:
         tokio runtime 与 capability 句柄。
 
         分布式任务执行：启动时创建 Rust `_RuntimeCore` 并以进程池后端执行任务。
-        提交的任务由 Rust `ExecuteHandler` → `ProcessTaskDispatcher` 分发到
-        worker 子进程执行；注册结果回调，使 ``AsyncResult`` 能在任务完成时被解析。
+        提交的任务经 ``submit_task`` 投递到后台 channel，由 **scheduler
+        ``enqueue`` → ``ProcessTaskDispatcher``** 分发到 worker 子进程执行
+        （**不经过** ``Execute`` capability —— 默认的 ``register_defaults``
+        不注册 ``ExecuteHandler``，那是给 Rust 嵌入场景按需调用的公开 API）；
+        注册结果回调，使 ``AsyncResult`` 能在任务完成时被解析。
         """
         with self._lock:
             if self._started:
@@ -832,7 +836,7 @@ class Runtime:
             core = self._rust_core
             if core is not None:
                 core.register_task_result_callback(self._on_task_result)
-                # ValueStore 默认 handler（Python→Rust blob 桥，0.3.2 R2）。
+                # ValueStore 默认 handler（Python→Rust blob 桥）。
                 # 用户预注册的 handler 优先（perform 取链末位），仅链为空时链入。
                 if not self._layers.get(VALUE_STORE):
                     self._layers[VALUE_STORE].append(_DefaultValueStoreHandler(self))
@@ -933,6 +937,46 @@ class Runtime:
         with self._lock:
             return bool(self._layers.get(TASK_LIFECYCLE))
 
+    def _report_task_result_to_orchestrator(
+        self,
+        handle: Any,
+        state: str,
+        *,
+        result: bytes | None = None,
+        error: str | None = None,
+    ) -> bool:
+        """把编排任务终态上报 orchestrator，返回「orchestrator 是否已排定重试」。
+
+        非编排任务（``workflow_id`` 为空）直接返回 ``False``——任务队列语义下
+        orchestrator 不持有该任务。
+
+        上报失败（workflow 已终态/被淘汰、actor 不可用）**不向上抛**：句柄侧仍有
+        既有事件路径兜底，编排信息缺失不应让提交方永久悬挂。此时按「无裁决」
+        （``False``）处理，调用方照常终结句柄。
+        """
+        workflow_id = getattr(handle, "workflow_id", "") or ""
+        if not workflow_id:
+            return False
+        try:
+            verdict = self.report_task_result(
+                workflow_id,
+                handle.task_id,
+                state,
+                result=result,
+                error=error,
+            )
+        except Exception:
+            _logger.warning(
+                "task %s: failed to report %s to orchestrator (workflow %s); "
+                "finalizing handle without orchestration verdict",
+                handle.task_id,
+                state,
+                workflow_id,
+                exc_info=True,
+            )
+            return False
+        return bool(verdict.get("retry"))
+
     def _on_task_result(self, completion: Any) -> None:
         """任务结果回调：由 Rust event_bus 触发，解析对应的 ``AsyncResult``。
 
@@ -940,6 +984,11 @@ class Runtime:
         ``result`` 是 dispatch handler 返回的字节，编码为
         ``cloudpickle.dumps((success, payload_obj))``——payload_obj 是
         未序列化的 result 或 exc 对象（消除双层 dumps 优化）。
+
+        编排任务的终态在此解析后上报 orchestrator：payload 对 Rust 不
+        透明，本回调是唯一能区分「任务成功」与「任务业务失败」的一侧。上报返回
+        重试裁决且裁决为重试时，句柄保持等待（不发终态事件、移出注册表延后），
+        重试结果到达时经同一回调解析——与 worker 层重试的句柄语义一致。
         """
         import cloudpickle as _cp
 
@@ -964,13 +1013,21 @@ class Runtime:
             try:
                 success, payload_obj = _cp.loads(raw)
             except (pickle.UnpicklingError, ValueError, TypeError) as e:
-                # 无法解码：当作失败处理
-                handle._set_error(f"undecodable result for task {task_id!r}: {e}")
+                # 无法解码：当作失败处理（同样上报——否则编排节点会永久
+                # 停留在 Running，工作流无法封口收尾）。
+                msg = f"undecodable result for task {task_id!r}: {e}"
+                if self._report_task_result_to_orchestrator(handle, "Failed", error=msg):
+                    return
+                handle._set_error(msg)
                 self.unregister_task(task_id)
                 return
             if success:
-                # 结果侧降级（0.3.2 R3/R4）：结果帧超阈值时原样字节落 blob
-                # （0 次重序列化，见 plans/REF_DESIGN.md），句柄内部持 Ref。
+                # 编排任务的完成必须回灌 orchestrator（DAG 状态机由
+                # orchestrator 推进，seal 前全部任务终态才允许工作流终态判定）。
+                # 非编排任务（workflow_id 空）为 no-op。
+                self._report_task_result_to_orchestrator(handle, "Completed", result=raw)
+                # 结果侧降级：结果帧超阈值时原样字节落 blob
+                # （0 次重序列化），句柄内部持 Ref。
                 # 落 blob 失败降级为内联对象并 warning——任务已成功完成，
                 # 值引用基建故障不翻转任务语义。
                 from actant.task._ref import REF_INLINE_THRESHOLD, _value_store
@@ -1001,29 +1058,53 @@ class Runtime:
                 from actant.exceptions import TaskCancelledError as _TCE
 
                 if isinstance(payload_obj, _TCE):
+                    # 取消同为编排终态：上报后 orchestrator 才能收尾该节点。
+                    self._report_task_result_to_orchestrator(handle, "Cancelled")
                     handle._set_cancelled()
                 else:
+                    error_text = f"{type(payload_obj).__name__}: {payload_obj}"
+                    if self._report_task_result_to_orchestrator(
+                        handle, "Failed", error=error_text,
+                    ):
+                        # orchestrator 裁决为重试：句柄保持等待、不发失败事件、
+                        # 不移出注册表——重试结果到达时经同一回调解析。与 worker
+                        # 层重试的句柄语义一致（重试耗尽前提交方见不到失败）。
+                        _logger.info(
+                            "task %s: orchestrator scheduled retry; handle stays pending",
+                            task_id,
+                        )
+                        return
                     # _set_error 接受 BaseException，内部 dumps 存入 _error_payload。
                     handle._set_error(payload_obj)
                     self._emit_batch(
                         "failed",
                         task_id,
                         handle.workflow_id,
-                        error=f"{type(payload_obj).__name__}: {payload_obj}",
+                        error=error_text,
                     )
         elif state == TASK_STATE_FAILED:
             # error 字段是 Rust 端生成的字符串。通过 reconstruct_error 解析
             # kind 前缀（``[actant:KIND] message``）重建对应 Python 异常子类，
             # 保留错误类型（如 timeout → ActantTimeoutError）。
-
-            handle._set_error(reconstruct_error(completion.error or "unknown error"))
+            error_text = completion.error or "unknown error"
+            # Rust 侧失败（超时/崩溃耗尽/panic）同样是编排终态，须经
+            # orchestrator 裁决重试或终局。
+            if self._report_task_result_to_orchestrator(handle, "Failed", error=error_text):
+                _logger.info(
+                    "task %s: orchestrator scheduled retry; handle stays pending",
+                    task_id,
+                )
+                return
+            handle._set_error(reconstruct_error(error_text))
             self._emit_batch(
                 "failed",
                 task_id,
                 handle.workflow_id,
-                error=completion.error or "unknown error",
+                error=error_text,
             )
         elif state == TASK_STATE_CANCELLED:
+            # 取消同为编排终态：上报后 orchestrator 才能收尾该节点。
+            self._report_task_result_to_orchestrator(handle, "Cancelled")
             handle._set_cancelled()
         elif state == TASK_STATE_SKIPPED:
             handle._set_error("task skipped")
@@ -1036,47 +1117,12 @@ class Runtime:
         shutdown 失败时仍会清理线程上下文，避免后续 effect 调用卡在已损坏的
         Runtime 上；同时向上抛出首个错误，让调用方感知 shutdown 异常。
 
-        shutdown 前先 join 活跃 flow 线程，避免子线程在 Runtime 关闭后
-        继续访问已释放的 Rust 资源（如通过 ``Task.submit`` 调用已 shutdown
-        的 Worker）。
-
         Args:
             timeout: 等待在途任务的最长秒数（分布式任务由 Worker drain）。
                 ``None`` 表示无限等待。``0`` 表示立即关闭。
         """
         shutdown_err: Exception | None = None
 
-        # 先 join 活跃 flow 线程，避免子线程在 Rust runtime 关闭后访问它。
-        # timeout 语义：
-        #   None → 使用 config.drain_timeout_secs（默认 30），与 Rust Worker drain 对齐
-        #   0    → 跳过 join（立即关闭），log warning
-        #   >0   → 使用指定秒数
-        with self._lock:
-            flow_threads = list(self._flow_threads)
-            self._flow_threads.clear()
-        if timeout == 0:
-            if flow_threads:
-                _logger.warning(
-                    "stop(timeout=0): skipping join of %d active flow thread(s)",
-                    len(flow_threads),
-                )
-        else:
-            join_timeout = timeout
-            if join_timeout is None:
-                join_timeout = float(
-                    self._config.drain_timeout_secs
-                    if self._config is not None
-                    and getattr(self._config, "drain_timeout_secs", None)
-                    else 30
-                )
-            for t in flow_threads:
-                if t.is_alive() and t is not threading.current_thread():
-                    try:
-                        t.join(timeout=join_timeout)
-                    except Exception as e:
-                        _logger.warning("failed to join flow thread %s", t.name, exc_info=True)
-                        if shutdown_err is None:
-                            shutdown_err = e
         # 关闭事件批处理器：停止后台 flush 线程并派发剩余缓冲事件。须在
         # rust_runtime 释放之前执行，使 flush 能经 _publish_task_event 正常 emit。
         if self._event_batcher is not None:
@@ -1292,25 +1338,19 @@ class Runtime:
             self._cancelled_tasks.discard(task_id)
 
     def is_cancelled(self, task_id: str) -> bool:
-        """线程安全地查询任务是否已被标记为预取消。
+        """查询任务是否处于**取消在途**状态（线程安全）。
+
+        这是"取消已请求、尚未被消费"的标记，**不是任务的终态视图**：任务一旦到达
+        终态（含已取消）并被注册表回收（:meth:`unregister_task`），标记即清除。
+        因此对**已经取消完成**的任务本方法返回 ``False``。
+
+        三项查询的分工：能否取消看 :meth:`cancel_task` 的返回值；最终结果看
+        ``handle.result()``；本方法只用于判断在途取消是否尚未被消费。
 
         替代直接访问 ``runtime._cancelled_tasks``（无锁读取违反锁定纪律）。
         """
         with self._lock:
             return task_id in self._cancelled_tasks
-
-    def register_flow_thread(self, thread: threading.Thread) -> None:
-        """注册活跃 flow 线程，供 ``stop()`` 时 join。"""
-        with self._lock:
-            self._flow_threads.append(thread)
-
-    def unregister_flow_thread(self, thread: threading.Thread) -> None:
-        """移除已完成的 flow 线程。"""
-        with self._lock:
-            try:
-                self._flow_threads.remove(thread)
-            except ValueError:
-                _logger.debug("flow thread %s was already unregistered", thread.name)
 
     def list_tasks(self) -> list[str]:
         """返回所有已提交（本地）任务的 task_id 列表。"""
@@ -1363,26 +1403,24 @@ class Runtime:
             handle._set_cancelled()
         return cancelled
 
-    def submit_dag(
+    def submit_workflow(
         self,
         workflow_id: str,
-        nodes: list[Any],
-        edges: list[tuple[str, str]],
         *,
         failure_strategy: str | None = None,
-        default_retry_policy: Any = None,
+        timeout_ms: int = 0,
     ) -> None:
-        """将 ``@flow`` 执行期记录的 DAG 提交到 Rust Orchestrator 持久化。
+        """创建空持久化工作流外壳（flow 提交路径第一步）。
 
-        由 ``@flow`` 在函数体成功返回后调用。此后该 workflow 的状态由
-        Orchestrator 状态机驱动，可通过 :meth:`get_workflow_state` 查询。
+        flow 函数体首次 ``task.submit()`` 前调用：以空 DAG 持久化工作流，
+        后续节点经 :meth:`add_workflow_node` 增量加入。
+        ``timeout_ms > 0`` 时同步设置工作流级 deadline。
 
         Args:
             workflow_id: 工作流唯一标识（``@flow`` 生成）。
-            nodes: ``_DagNode`` 列表（由 ``FlowDAG.to_nodes`` 构造）。
-            edges: ``(upstream_task_id, downstream_task_id)`` 依赖边列表。
-            failure_strategy: 失败策略（``"fail_fast"`` / ``"continue"``）。
-            default_retry_policy: DAG 级默认重试策略（``_RetryPolicy``）。
+            failure_strategy: 失败策略（``"fail_fast"`` / ``"continue"``），
+                ``None`` 由 Rust 侧应用默认 FailFast。
+            timeout_ms: 工作流级 deadline 毫秒（0 表示不限制）。
 
         Raises:
             InvalidStateError: Runtime 未启动。
@@ -1390,29 +1428,43 @@ class Runtime:
         core = self._rust_core
         if core is None:
             raise InvalidStateError("Runtime not started: rust_core is None")
-        core.submit_dag(
-            workflow_id,
-            nodes,
-            edges,
-            failure_strategy,
-            default_retry_policy,
-        )
+        core.submit_workflow(workflow_id, failure_strategy, timeout_ms)
 
-    def complete_workflow(
+    def add_workflow_node(
         self,
         workflow_id: str,
-        outcomes: list[tuple[str, bool, bytes]],
-    ) -> None:
-        """把 flow 已执行完成的任务结果回灌 Orchestrator，驱动状态机推进到终态。
+        node: Any,
+        deps: list[str],
+    ) -> dict[str, Any]:
+        """增量加入单个 DAG 节点（flow 提交路径核心，先持久化再派发）。
 
-        由 ``@flow`` 在 DAG 提交后调用：成功项调用 ``COMPLETE_TASK``，失败项
-        调用 ``FAIL_TASK``（WorkflowLevel 作用域），使持久化工作流从 Pending
-        推进到 Completed / Failed，从而让生命周期事件与 Orchestrator 状态一致。
+        由 ``Task.submit`` 在 flow 上下文中调用。节点在 Orchestrator 内登记、
+        建边、同步落盘；重放命中历史时返回已有节点状态（不重新提交），
+        提交序列指纹不一致时抛 :class:`FlowReplayError`。
 
         Args:
-            workflow_id: 工作流唯一标识（``@flow`` 生成）。
-            outcomes: ``[(task_id, success, result_bytes)]``，需按拓扑序传入
-                （依赖先于下游）。
+            workflow_id: 工作流唯一标识。
+            node: ``_DagNode`` 节点定义。
+            deps: 参数树引用的上游 ``task_id`` 列表（外部依赖会被 Rust 侧过滤）。
+
+        Returns:
+            ``{"created": bool, "state": str | None, "result": bytes | None}``。
+            ``created=False`` 表示重放命中：``state``/``result`` 为历史中该
+            节点的当前状态与已完成结果字节。
+
+        Raises:
+            InvalidStateError: Runtime 未启动。
+            FlowReplayError: 提交序列指纹不一致。
+        """
+        core = self._rust_core
+        if core is None:
+            raise InvalidStateError("Runtime not started: rust_core is None")
+        return cast("dict[str, Any]", core.add_workflow_node(workflow_id, node, deps))
+
+    def cancel_workflow(self, workflow_id: str) -> None:
+        """取消整个工作流（flow 失败兜底）。
+
+        工作流及运行中任务置为 Cancelled 终态；已终态时幂等 no-op。
 
         Raises:
             InvalidStateError: Runtime 未启动。
@@ -1420,7 +1472,189 @@ class Runtime:
         core = self._rust_core
         if core is None:
             raise InvalidStateError("Runtime not started: rust_core is None")
-        core.complete_workflow(workflow_id, outcomes)
+        core.cancel_workflow(workflow_id)
+
+    def seal_workflow(self, workflow_id: str) -> None:
+        """封口工作流节点集（flow 函数体返回信号）。
+
+        封口后 orchestrator 才允许工作流终态判定（增量提交期间全部已知
+        节点终态不代表提交序列结束）；全部任务已终态时立即执行终态收尾。
+
+        Raises:
+            InvalidStateError: Runtime 未启动。
+        """
+        core = self._rust_core
+        if core is None:
+            raise InvalidStateError("Runtime not started: rust_core is None")
+        core.seal_workflow(workflow_id)
+
+    def register_wait_point(
+        self,
+        workflow_id: str,
+        wait_key: str,
+        *,
+        kind: str,
+        name: str | None = None,
+        deadline_ms: int = 0,
+    ) -> None:
+        """注册持久化等待点。
+
+        等待点是 orchestrator 的挂起原语：``(workflow_id, wait_key, 条件)``
+        随工作流快照落盘，条件满足（signal 递交 / timer 到期 / 挂起恢复）时
+        追加唤醒事件进入同一历史。**幂等**：同 ``wait_key`` 重复注册为 no-op，
+        这是重放体天然幂等的前提。
+
+        Args:
+            workflow_id: 工作流标识。
+            wait_key: 等待点注册表键（同一工作流内唯一）。
+            kind: ``"signal"``（外部信号）、``"timer"``（定时到期）或
+                ``"suspend"``（等待 :meth:`resume_suspended` 恢复）。
+            name: ``kind="signal"`` 的信号语义名；``None`` 时退化为 ``wait_key``。
+            deadline_ms: ``kind="timer"`` 的**绝对** epoch 毫秒到期时刻，须 > 0。
+
+        Raises:
+            InvalidStateError: Runtime 未启动。
+            ValueError: ``kind`` 非法或 timer 缺 ``deadline_ms``。
+        """
+        core = self._rust_core
+        if core is None:
+            raise InvalidStateError("Runtime not started: rust_core is None")
+        core.register_wait_point(workflow_id, wait_key, kind, name, deadline_ms)
+
+    def signal_wait_point(self, workflow_id: str, wait_key: str) -> bytes | None:
+        """递交信号唤醒等待点（Signals capability 出口）。
+
+        Returns:
+            ``bytes`` 表示本次递交**唤醒了一个等待点**（或该等待点此前已唤醒，
+            重放体"已收到 → 直接返回"由此实现，重复 signal 幂等）；
+            ``None`` 表示此刻**没有等待点可被唤醒**，信号已入缓冲——将来注册
+            同一 ``wait_key`` 的等待点会**立即生成为已唤醒态**。
+
+        Note:
+            **信号缓冲**：等待点注册前抵达的信号不会被丢弃——先入缓冲，待同一
+            ``wait_key`` 的等待点注册时**立即生成为已唤醒态**。缓冲是**闩锁**：同一
+            ``wait_key`` 已有缓冲时重复递交不再追加历史、不覆盖，直接返回
+            ``None``，故"按返回值重试"变安全（重试是 no-op）。
+
+            缓冲与等待点同批落盘，故**跨重启存活**（``recover`` = 快照 + 其后
+            事件重放）。唯一会丢的窗口是"缓冲写入后、尚未落盘就崩溃"。
+
+            无法区分"``wait_key`` 拼错"与"等待点尚未注册"——递交时无从得知调用
+            方将来会注册什么键。这是信息论限制，不是实现缺失。
+
+        Raises:
+            InvalidStateError: Runtime 未启动。
+            NotFoundError: 工作流不存在（递交方 id 写错）。
+            ValueError: ``wait_key`` 为空。
+        """
+        core = self._rust_core
+        if core is None:
+            raise InvalidStateError("Runtime not started: rust_core is None")
+        return cast("bytes | None", core.signal_wait_point(workflow_id, wait_key))
+
+    def resume_suspended(self, workflow_id: str) -> int:
+        """恢复挂起：唤醒该工作流所有等待中的 ``suspend`` 等待点。
+
+        与 :meth:`signal_wait_point` 的区别是**语义来源**：signal 等待一个具名
+        业务事件，suspend 等待操作员的恢复指令。本方法**只唤醒 ``suspend``
+        条件**，不触碰 ``signal`` / ``timer`` 等待点——恢复指令不得冒名顶替一个
+        业务信号。
+
+        按 ``workflow_id`` 而非按键唤醒，故调用方无需知道 flow 内部给挂起点分配
+        了什么键，且"挂起 → 恢复 → 再挂起 → 再恢复"天然成立。
+
+        Args:
+            workflow_id: 工作流标识。
+
+        Returns:
+            本次唤醒的挂起点数量；``0`` 表示该工作流当前没有处于挂起中的挂起点
+            （幂等——重复调用第二次返回 0）。
+
+        Raises:
+            InvalidStateError: Runtime 未启动。
+        """
+        core = self._rust_core
+        if core is None:
+            raise InvalidStateError("Runtime not started: rust_core is None")
+        return int(core.resume_suspended(workflow_id))
+
+    def wait_wait_point(
+        self,
+        workflow_id: str,
+        wait_key: str,
+        *,
+        timeout_ms: int = 0,
+    ) -> bytes | None:
+        """阻塞等待等待点条件满足（flow 体 park 原语）。
+
+        **调用方须先** :meth:`register_wait_point`：注册是把等待点写入历史的
+        动作，本方法只负责 park。两步之间的竞态由 Rust 侧"先注册句柄、再检查
+        是否已 Signaled"关闭——信号早到不会丢失。
+
+        与其它工作流方法不同，本方法**不经 actor 消息循环**（在 actor 内阻塞
+        会让全部工作流停摆），而是在 actor 之外阻塞，阻塞期间释放 GIL。
+
+        Args:
+            workflow_id: 工作流标识。
+            wait_key: 等待点注册表键。
+            timeout_ms: 等待上界；``0`` 表示无限等待。
+
+        Returns:
+            条件满足时的 payload；``None`` 表示超时，或**等待者被释放**（工作流
+            进入终态时 orchestrator 会释放该工作流的全部 park 等待者）。
+            这两种含义须由调用方区分——查 :meth:`get_workflow_state` 看工作流是否
+            已终态（``actant.flow`` 的 ``_park`` 就是这么做的），否则会把 abort
+            误当成"信号返回了空 payload"，让函数体在已死的工作流上继续跑。
+
+        Raises:
+            InvalidStateError: Runtime 未启动。
+        """
+        core = self._rust_core
+        if core is None:
+            raise InvalidStateError("Runtime not started: rust_core is None")
+        return cast(
+            "bytes | None", core.wait_wait_point(workflow_id, wait_key, timeout_ms)
+        )
+
+    def report_task_result(
+        self,
+        workflow_id: str,
+        task_id: str,
+        state: str,
+        *,
+        result: bytes | None = None,
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        """上报本地 flow 任务的终态结果给 Rust Orchestrator。
+
+        worker 结果帧正文对 Rust 不透明（业务失败被 worker 编码进正文，dispatcher
+        对成功与失败都返回 ``Ok(Ok(body))``），成功/失败只能由本层解析。解析后经
+        此上报，由 orchestrator 统一推进 DAG 状态机并做重试裁决。
+
+        Args:
+            workflow_id: 工作流标识。空串表示非编排任务（独立 ``@task``），
+                Rust 侧直接返回无裁决。
+            task_id: 节点标识。
+            state: ``"Completed"`` / ``"Failed"`` / ``"Cancelled"``。
+            result: ``Completed`` 时的结果字节。
+            error: ``Failed`` 时的错误信息。
+
+        Returns:
+            ``{"retry": bool, "delay_ms": int}``：``retry`` 为真表示 orchestrator
+            已排定重试（Rust 已按 ``delay_ms`` 延迟把重试任务入队调度器），提交方
+            句柄应继续等待。
+
+        Raises:
+            InvalidStateError: Runtime 未启动。
+            ValueError: ``state`` 不是已知终态。
+        """
+        core = self._rust_core
+        if core is None:
+            raise InvalidStateError("Runtime not started: rust_core is None")
+        return cast(
+            "dict[str, Any]",
+            core.report_task_result(workflow_id, task_id, state, result, error),
+        )
 
     def get_workflow_state(self, workflow_id: str) -> dict[str, Any] | None:
         """查询 Orchestrator 中 workflow 的持久化状态。
@@ -1436,6 +1670,70 @@ class Runtime:
         if core is None:
             raise InvalidStateError("Runtime not started: rust_core is None")
         return cast("dict[str, Any] | None", core.get_workflow_state(workflow_id))
+
+    def get_dag(self, workflow_id: str) -> dict[str, Any] | None:
+        """查询工作流的 DAG **结构**（Python 暴露面）。
+
+        与 :meth:`get_workflow_state` 的分工：后者是**执行**状态（每个任务的
+        ``state`` / ``result`` / ``error`` / ``retry_count`` / ``attempt``），
+        本方法是**结构**（节点、依赖边、重试策略、超时、优先级、元数据）。
+
+        Returns:
+            ``None``（工作流不存在）或 dict：
+
+            - ``workflow_id`` / ``failure_strategy``
+            - ``default_retry_policy``：DAG 级默认重试策略。节点自身
+              ``retry_policy`` 为 ``None`` 时生效的是它（对应 Rust 侧
+              ``Dag::effective_retry_policy``），故一并暴露。
+            - ``nodes``：每项 ``{task_id, name, deps, timeout_ms, priority,
+              metadata, retry_policy}``，``deps`` 为前驱 ``task_id`` 列表。
+            - ``edges``：每项 ``{from, to, condition}``。
+
+            **不含任务 payload**：它是签名的 cloudpickle 字节，对 Rust 不透明
+            且可能很大。需要任务结果请查 :meth:`get_workflow_state` 的
+            ``tasks[*]["result"]``。
+
+        Raises:
+            InvalidStateError: Runtime 未启动。
+        """
+        core = self._rust_core
+        if core is None:
+            raise InvalidStateError("Runtime not started: rust_core is None")
+        return cast("dict[str, Any] | None", core.get_dag(workflow_id))
+
+    def get_workflow_history(
+        self,
+        workflow_id: str,
+        *,
+        after: tuple[int, int] | None = None,
+    ) -> list[dict[str, Any]]:
+        """读取工作流的事件历史（审计出口）。
+
+        历史是**事实源**：``recover`` = 快照 + 其后事件重放，等待点与信号也以
+        事件形式进入同一历史。本方法是它的对外读取出口。
+
+        Args:
+            workflow_id: 工作流标识。
+            after: 游标 ``(sequence, timestamp_ms)``（取上一项的对应字段），
+                ``None`` 表示从头读取。
+
+        Returns:
+            每项 ``{sequence, timestamp_ms, kind, task_id, error, payload}``：
+            ``kind``（如 ``"TaskCompleted"``）/ ``task_id`` / ``error`` 供筛选；
+            ``payload`` 是原始编码字节，**不透明**——Python 不解释其布局。
+            无 event_log 或工作流不存在时返回空列表（历史是可选观测面，
+            缺失不构成错误）。
+
+        Raises:
+            InvalidStateError: Runtime 未启动。
+        """
+        core = self._rust_core
+        if core is None:
+            raise InvalidStateError("Runtime not started: rust_core is None")
+        return cast(
+            "list[dict[str, Any]]",
+            core.get_workflow_history(workflow_id, after=after),
+        )
 
     def list_workflows(self) -> list[str]:
         """列出 Orchestrator 中活跃 workflow 的 id 列表。

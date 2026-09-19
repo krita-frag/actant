@@ -2,8 +2,8 @@
 
 本示例演示动态 DAG 语义：flow 函数体以命令式方式调用 ``task.submit()``，
 依赖通过 ``AsyncResult`` 自动解析（下游 submit 阻塞等待上游结果）隐式表达。
-执行期由 ``FlowDAG`` 记录器捕获节点与依赖边，flow 返回后提交到 Rust
-Orchestrator 持久化，并把任务实际结果回灌驱动状态机推进到终态。
+每次 ``submit`` 立即在工作流中登记节点并建立依赖边（提交粒度重放），
+任务结果回灌驱动状态机推进到终态。
 
 数据流::
 
@@ -120,8 +120,8 @@ def main() -> None:
             terminated = False
 
         # 从生命周期事件捕获实际 workflow_id，按 ID 查询持久化终态状态。
-        # flow 采用 eager 执行，DAG 提交后经 complete_workflow 立即可达终态，
-        # 工作流已离开"活跃"列表（list_workflows 返回空属预期），但可按 ID 查询。
+        # 工作流到达终态后已离开"活跃"列表（list_workflows 返回空属预期），
+        # 但可按 ID 查询其持久化状态。
         wf_id = _event_wf_ids[-1] if _event_wf_ids else None
         if wf_id is None:
             print("\n未捕获到工作流生命周期事件")

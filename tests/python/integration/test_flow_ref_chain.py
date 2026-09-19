@@ -1,6 +1,6 @@
-"""R6：flow 依赖边携带 Ref——flow 内大值生产→消费链路集成测试。
+"""flow 依赖边携带 Ref——flow 内大值生产→消费链路集成测试。
 
-数据流口径（plans/REF_DESIGN.md 方案①）：
+数据流口径（方案①）：
 
 - 生产者 worker 一次 pickle 结果帧 → 父进程把帧字节原样落 blob →
   handle 持 Ref（对象不留在提交方）；
@@ -15,8 +15,8 @@
 2. 生产者大结果走 Ref 路径：``big.ref() is not None``（对象缓存态时为
    ``None``）。
 3. 提交方解析阶段无整对象反序列化：``Ref.result`` 被 monkeypatch 为抛错
-   ——flow 的依赖解析、DAG 回灌（``_export_outcome`` 对 Ref 态原样返回
-   引用字节）、终态广播全程若触碰对象级反序列化即失败。
+   ——flow 的依赖解析、节点提交（payload 序列化）、终态广播全程若触碰
+   对象级反序列化即失败。
 """
 
 from __future__ import annotations
@@ -62,7 +62,7 @@ def test_flow_large_value_chain_no_deserialization_in_submitter(
     def _boom(self: Ref, timeout: float | None = None) -> Any:
         raise AssertionError(
             "Ref.result() was called during the flow; the large value "
-            "reached the submitter as an object (R6 regression)"
+            "reached the submitter as an object (large-value regression)"
         )
 
     monkeypatch.setattr(Ref, "result", _boom)

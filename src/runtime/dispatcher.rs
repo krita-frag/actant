@@ -1,27 +1,34 @@
 //! 本模块负责将任务 payload 分发给 worker 子进程并管理进程池。
 //!
-//! 进程池是唯一的任务执行后端：每个任务由独立的 Python worker 子进程
-//! （`actant.task._worker`）执行，杀进程即精确终止一个任务，实现严格的
-//! 进程级隔离。与工作流编排无直接耦合，属于通用执行基础设施。
+//! 进程池是唯一的任务执行后端：每个任务由独立的 worker 子进程执行，杀进程即
+//! 精确终止一个任务，实现严格的进程级隔离。与工作流编排无直接耦合，属于通用
+//! 执行基础设施。
+//!
+//! 本模块**不感知 worker 的实现语言**：可执行文件、入口参数与环境变量全部由
+//! [`WorkerLaunchSpec`] 在构造时提供——Python 绑定层注入解释器路径与模块入口，
+//! Rust 嵌入方可注入任意可执行程序。核心侧不出现任何语言专有字面量。
 //!
 //! # 通信协议
 //!
-//! 与 `actant/task/_worker.py` 保持一致的长度前缀二进制帧；传输层为 stdio pipe：
-//! 每帧为 ``[4 字节小端长度][1 字节类型][正文]``，帧头与正文连续写入同一管道：
+//! 传输层为 stdio pipe 上的长度前缀二进制帧：每帧为
+//! ``[4 字节小端长度][1 字节类型][正文]``，帧头与正文连续写入同一管道：
 //!
 //! ```text
 //! pipe 上 [4 字节长度][1 字节类型][正文]
 //! ```
 //!
-//! - 父 → 子：`Dispatch`(0x01) 正文 = **v2 载荷**（紧凑控制头部 + cloudpickle 编码的
-//!   `(func, args, kwargs)`，头部承载 retries/retry_delay_ms/task_id/workflow_id，
-//!   见 `actant/task/_helpers.py::_build_v2_envelope`）；`Cancel`(0x02) 为空正文。
-//!   关闭时由 `shutdown` 直接强杀空闲 worker（不发送 `Shutdown` 帧）。
-//! - 子 → 父：`Result`(0x02) 正文 = cloudpickle 编码的 `(success, payload)`，
-//!   Python 封装层按此约定解包。
+//! - 父 → 子：`Dispatch`(0x01) 正文 = 不透明载荷（头部承载
+//!   retries/retry_delay_ms/task_id/workflow_id，编码由 worker 侧实现约定）；
+//!   `Cancel`(0x02) 为空正文。关闭时由 `shutdown` 直接强杀空闲 worker
+//!   （不发送关闭帧）。
+//! - 子 → 父：`Result`(0x02) 正文 = 不透明结果载荷，由绑定层按 worker 侧
+//!   约定解包。
 //!
 //! 本模块对正文格式不感知——payload 对 Rust 不透明，仅作字节校验与搬运。
+//! 帧类型字节与正文编码是**跨语言契约**：worker 侧实现（含绑定层）必须与此处
+//! 的常量保持一致。
 
+use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::io::IoSlice;
 use std::process::Stdio;
@@ -167,6 +174,79 @@ fn map_io(ctx: &'static str) -> impl Fn(std::io::Error) -> ActantError + 'static
     move |e| ActantError::Worker(format!("{ctx}: {e}"))
 }
 
+/// worker 子进程的启动规格。
+///
+/// 核心只认「可执行文件 + 参数 + 环境变量」三要素，**不感知任何语言语义**：
+/// 解释器路径、模块入口（形如 `-m <module>` 的入口参数）、语言专有的环境变量
+/// （如模块搜索路径）全部由绑定层或嵌入方在此提供。
+///
+/// # 构建方式
+///
+/// - **Python 绑定层**：由 `src/py/` 从运行中解释器提取并填充（`WorkerConfig`
+///   的 `worker_program` / `worker_args` / `worker_env` 三字段）。
+/// - **Rust 嵌入方**：直接构造本结构，指向任意遵循 stdio 帧协议的 worker
+///   可执行程序。
+#[derive(Debug, Clone)]
+#[cfg_attr(not(test), derive(Default))]
+pub struct WorkerLaunchSpec {
+    /// worker 可执行文件路径。不得为空白（构造时会校验）。
+    pub program: String,
+    /// 传给 `program` 的参数（**不含** `program` 自身）。
+    pub args: Vec<String>,
+    /// 注入 worker 子进程的环境变量。空表 = 完全继承父进程环境。
+    ///
+    /// 使用 `BTreeMap` 而非 `Vec`：键唯一且迭代顺序确定，避免重复键导致的
+    /// 静默覆盖与不可复现的 spawn 行为。
+    pub env: BTreeMap<String, String>,
+}
+
+impl WorkerLaunchSpec {
+    /// 由 worker 程序路径、入口参数与父解释器的 `sys.path` 构造启动规格。
+    ///
+    /// `python_path` 非空时注入 `PYTHONPATH`，条目以**平台路径列表分隔符**
+    /// （unix `:`／Windows `;`）拼接——不是路径内的目录分隔符。进程隔离下
+    /// 模块级任务函数（cloudpickle by-reference 序列化）需在 worker 子进程内
+    /// 再次导入，缺失该注入会以 `ModuleNotFoundError` 失败；空列表表示不注入，
+    /// worker 完全继承父进程环境。
+    ///
+    /// 条目无法拼接（例如 Windows 下某个路径含 `;`）时**不注入**并告警：一个
+    /// 畸形的 `PYTHONPATH` 比不注入更难排查。
+    pub fn with_python_path(program: String, args: Vec<String>, python_path: &[String]) -> Self {
+        let mut env = BTreeMap::new();
+        if !python_path.is_empty() {
+            match std::env::join_paths(python_path.iter()) {
+                Ok(joined) => {
+                    env.insert(
+                        "PYTHONPATH".to_string(),
+                        joined.to_string_lossy().into_owned(),
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "failed to join python_path into PYTHONPATH; \
+                         worker will inherit the parent environment instead"
+                    );
+                }
+            }
+        }
+        Self { program, args, env }
+    }
+}
+
+#[cfg(test)]
+impl Default for WorkerLaunchSpec {
+    fn default() -> Self {
+        // 测试缺省给非空 program（构造校验拒绝空 program；测试不真拉起
+        // 子进程，仅满足非空前提）。
+        Self {
+            program: "python3".to_string(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+        }
+    }
+}
+
 /// 进程池任务分发器。
 ///
 /// # 生命周期
@@ -198,10 +278,9 @@ pub trait TaskDispatcher: Send + Sync {
 }
 
 pub struct ProcessTaskDispatcher {
-    /// worker 启动 argv（生产：`[python, -m, actant.task._worker]`）。
-    worker_argv: Vec<String>,
-    /// worker 子进程的 `PYTHONPATH`，透传给 spawn 的 Command 环境。
-    python_path: Option<String>,
+    /// worker 拉起规格：可执行文件 + 参数 + 环境变量（语言无关，任意实现
+    /// 同一 stdio 帧协议的程序均可作为 worker）。
+    launch: WorkerLaunchSpec,
     /// 空闲 worker 队列。并发度由 `slots` 信号量保证，队列长度与之一致。
     free_workers: Mutex<VecDeque<WorkerProc>>,
     /// 并发槽位：容量 = 进程池大小，dispatch 据此公平领用空闲 worker。
@@ -217,51 +296,31 @@ pub struct ProcessTaskDispatcher {
 impl ProcessTaskDispatcher {
     /// 创建进程池任务分发器。
     ///
-    /// `worker_program` 为 worker 解释器路径（如 `sys.executable`），进程池
-    /// 以 `[worker_program, -m, actant.task._worker]` 拉起 worker 子进程。
-    /// `python_path` 若非空，透传给 worker 子进程作为 `PYTHONPATH`，保证
-    /// 模块级任务函数在子进程内可被 by-reference 再导入。
+    /// `launch` 完整描述如何拉起 worker 子进程（可执行文件 + 参数 + 环境变量），
+    /// 核心不解释其中任何语言语义；解释器路径、模块入口与环境变量的拼装由
+    /// 绑定层或嵌入方负责（见 [`WorkerLaunchSpec`]）。
     pub fn new(
         num_workers: usize,
-        worker_program: String,
+        launch: WorkerLaunchSpec,
         worker_cancel_grace_ms: u64,
         signing_key: Vec<u8>,
-        python_path: Vec<String>,
     ) -> crate::common::Result<Self> {
-        if worker_program.trim().is_empty() {
+        if launch.program.trim().is_empty() {
             return Err(ActantError::Config(
-                "worker_program must be a non-empty interpreter path".into(),
+                "worker launch spec must have a non-empty program path".into(),
             ));
         }
-        let argv = vec![
-            worker_program,
-            "-m".to_string(),
-            "actant.task._worker".to_string(),
-        ];
-        // PYTHONPATH 条目须以平台路径列表分隔符（unix `:`）拼接，而非路径内分隔符。
-        let python_env = if python_path.is_empty() {
-            None
-        } else {
-            std::env::join_paths(python_path.iter())
-                .ok()
-                .map(|p| p.to_string_lossy().into_owned())
-        };
         let cancel_grace = Duration::from_millis(worker_cancel_grace_ms.max(1));
         let dispatcher = Self {
-            worker_argv: argv.clone(),
-            python_path: python_env,
-            free_workers: Mutex::new(VecDeque::with_capacity(num_workers.max(0))),
+            launch,
+            free_workers: Mutex::new(VecDeque::with_capacity(num_workers)),
             slots: Arc::new(Semaphore::new(num_workers)),
             signing_key,
             cancel_grace,
             shutting_down: AtomicBool::new(false),
         };
         for _ in 0..num_workers {
-            let worker = ProcessTaskDispatcher::spawn_one(
-                &dispatcher.worker_argv,
-                dispatcher.python_path.as_deref(),
-                &dispatcher,
-            )?;
+            let worker = ProcessTaskDispatcher::spawn_one(&dispatcher.launch)?;
             dispatcher.free_workers.lock().push_back(worker);
         }
         Ok(dispatcher)
@@ -274,8 +333,7 @@ impl ProcessTaskDispatcher {
     #[cfg(test)]
     fn without_workers(signing_key: Vec<u8>) -> Self {
         Self {
-            worker_argv: Vec::new(),
-            python_path: None,
+            launch: WorkerLaunchSpec::default(),
             free_workers: Mutex::new(VecDeque::new()),
             slots: Arc::new(Semaphore::new(0)),
             signing_key,
@@ -321,19 +379,15 @@ impl ProcessTaskDispatcher {
     }
 
     /// 拉起单个 worker 子进程并把 stderr 转发到 tracing。
-    fn spawn_one(
-        argv: &[String],
-        python_path: Option<&str>,
-        _ctx: &ProcessTaskDispatcher,
-    ) -> Result<WorkerProc, ActantError> {
-        let mut cmd = Command::new(&argv[0]);
-        cmd.args(&argv[1..])
-            .stdin(Stdio::piped())
+    fn spawn_one(launch: &WorkerLaunchSpec) -> Result<WorkerProc, ActantError> {
+        let mut cmd = Command::new(&launch.program);
+        cmd.args(&launch.args);
+        for (k, v) in &launch.env {
+            cmd.env(k, v);
+        }
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        if let Some(pp) = python_path {
-            cmd.env("PYTHONPATH", pp);
-        }
         let mut child = cmd
             .spawn()
             .map_err(|e| ActantError::Worker(format!("failed to spawn worker: {e}")))?;
@@ -454,8 +508,7 @@ impl ProcessTaskDispatcher {
         if self.shutting_down.load(Ordering::Acquire) {
             return;
         }
-        match ProcessTaskDispatcher::spawn_one(&self.worker_argv, self.python_path.as_deref(), self)
-        {
+        match ProcessTaskDispatcher::spawn_one(&self.launch) {
             Ok(worker) => self.release_worker(worker),
             Err(e) => tracing::warn!(error = %e, "failed to respawn worker; pool shrunk"),
         }
@@ -548,22 +601,29 @@ impl ProcessTaskDispatcher {
     }
 }
 
-/// 指标边带行前缀：worker 经 stderr 单行上报从属计时指标（见 `_worker.py`）。
+/// 指标边带行前缀：worker 经 stderr 单行上报从属计时指标。
 const METRIC_LINE_PREFIX: &str = "actant_metric: ";
+
+/// worker 以 stderr 边带上报的「任务处理耗时」指标名。
+///
+/// **跨语言契约**：worker 侧实现必须发射同名指标（与帧类型字节一样，是两侧
+/// 必须同步的常量）。该名字同时是用户可观测面（Prometheus 抓取目标），
+/// 改名须两侧同步并记 CHANGELOG。
+const METRIC_TASK_HANDLER_MS: &str = "task.handler_ms";
 
 /// 将 worker stderr 逐行转发到 tracing，避免子进程日志丢失（隔离副产）。
 ///
 /// 同时识别从属指标边带：以 ``actant_metric:`` 开头、形如
 /// ``<name>=<value_ms>`` 的行，汇入对应 OTel histogram（当前仅
-/// ``python.handler_ms``）；其余行原样作为日志透传，不改变可观测性契约。
+/// [`METRIC_TASK_HANDLER_MS`]）；其余行原样作为日志透传，不改变可观测性契约。
 async fn drain_stderr(mut stderr: ChildStderr) {
     let mut lines = tokio::io::BufReader::new(&mut stderr).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         if let Some(value) = line.strip_prefix(METRIC_LINE_PREFIX) {
             if let Some((name, value_ms)) = value.split_once('=') {
                 if let Ok(ms) = value_ms.trim().parse::<u64>() {
-                    if name == "python.handler_ms" {
-                        crate::metrics::observe_python_handler_ms(ms);
+                    if name == METRIC_TASK_HANDLER_MS {
+                        crate::metrics::observe_task_handler_ms(ms);
                     }
                 }
             }

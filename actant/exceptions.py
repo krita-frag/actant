@@ -171,8 +171,27 @@ class WorkflowCancelledError(ActantError):
     """Workflow 被取消。"""
 
     def __init__(self, message: str) -> None:
-        hint = " The workflow was cancelled by a user call or a parent flow cancellation. Check cancel_event propagation in nested flows."
+        hint = (
+            " The workflow was cancelled — either via Runtime.cancel_workflow(), or as"
+            " part of a terminal transition (a parked flow body is released and"
+            " surfaces this error). This is terminal: the workflow will not resume;"
+            " start a new one if the work is still needed."
+        )
         super().__init__(message + " " + hint, kind="workflow_cancelled")
+
+
+class FlowReplayError(ActantError):
+    """flow 重放冲突（提交序列指纹 fail-fast）。
+
+    flow 体重放时第 n 次 ``task.submit()`` 与工作流历史中同序位节点的指纹
+    （name / payload / 超时 / 优先级 / 重试策略 / 依赖边集合）不一致——
+    提交序列确定性契约被破坏。重放模型要求 flow 体确定性（不得依赖
+    wall-clock / 随机数 / 非任务副作用决定提交序列），此异常表示该约束
+    在本次重放中被违反，显式失败而非静默错位。
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, kind="replay")
 
 
 # Rust ActantError variant → Python exception class
@@ -199,6 +218,7 @@ _KIND_TO_EXCEPTION: dict[str, type[ActantError]] = {
     "timeout": ActantTimeoutError,
     "cancelled": TaskCancelledError,
     "invalid_state": InvalidStateError,
+    "replay": FlowReplayError,
     "internal": InternalError,
 }
 

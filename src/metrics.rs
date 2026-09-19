@@ -39,6 +39,7 @@ struct Instruments {
     workflows_submitted: Counter<u64>,
     workflows_completed: Counter<u64>,
     workflows_failed: Counter<u64>,
+    workflows_cancelled: Counter<u64>,
     workflow_timeouts: Counter<u64>,
     workflows_recovered_corrupt: Counter<u64>,
     retry_scheduled: Counter<u64>,
@@ -52,6 +53,8 @@ struct Instruments {
     heartbeats_sent: Counter<u64>,
     failover_claims: Counter<u64>,
     failover_reschedules: Counter<u64>,
+    /// 因执行节点失联而被终结的在途任务数（失联扫描补腿）。
+    failover_node_lost_tasks: Counter<u64>,
 
     // -- Actor 计数器 --
     actors_spawned: Counter<u64>,
@@ -85,7 +88,7 @@ struct Instruments {
     scheduling_latency_ms: Histogram<u64>,
     payload_serialize_ms: Histogram<u64>,
     payload_deserialize_ms: Histogram<u64>,
-    python_handler_ms: Histogram<u64>,
+    task_handler_ms: Histogram<u64>,
     event_bridge_ms: Histogram<u64>,
     actor_handle_message_ms: Histogram<u64>,
     actor_save_state_ms: Histogram<u64>,
@@ -135,6 +138,10 @@ impl Instruments {
                 .u64_counter("actant.workflows.failed")
                 .with_description("Total workflows failed")
                 .build(),
+            workflows_cancelled: meter
+                .u64_counter("actant.workflows.cancelled")
+                .with_description("Total workflows terminated as cancelled")
+                .build(),
             workflow_timeouts: meter
                 .u64_counter("actant.workflows.timeouts")
                 .with_description("Workflows timed out")
@@ -174,6 +181,10 @@ impl Instruments {
             failover_reschedules: meter
                 .u64_counter("actant.failover.reschedules")
                 .with_description("Failover task reschedules")
+                .build(),
+            failover_node_lost_tasks: meter
+                .u64_counter("actant.failover.node_lost_tasks")
+                .with_description("In-flight tasks settled as failed because their executor node was lost")
                 .build(),
 
             // -- Actor 计数器 --
@@ -273,9 +284,9 @@ impl Instruments {
                 .u64_histogram("actant.payload.deserialize_ms")
                 .with_description("Payload deserialization latency in ms")
                 .build(),
-            python_handler_ms: meter
-                .u64_histogram("actant.python.handler_ms")
-                .with_description("Python task handler execution latency in ms")
+            task_handler_ms: meter
+                .u64_histogram("actant.task.handler_ms")
+                .with_description("Task handler execution latency in ms")
                 .build(),
             event_bridge_ms: meter
                 .u64_histogram("actant.event_bridge.latency_ms")
@@ -474,6 +485,11 @@ pub fn inc_workflows_failed() {
     instruments().workflows_failed.add(1, &[]);
 }
 
+/// 以取消收尾（全部节点终态、无失败、存在被取消节点）的工作流计数。
+pub fn inc_workflows_cancelled() {
+    instruments().workflows_cancelled.add(1, &[]);
+}
+
 pub fn inc_workflow_timeouts() {
     instruments().workflow_timeouts.add(1, &[]);
 }
@@ -509,6 +525,10 @@ pub fn inc_failover_claims() {
 
 pub fn inc_failover_reschedules() {
     instruments().failover_reschedules.add(1, &[]);
+}
+
+pub fn inc_failover_node_lost_tasks() {
+    instruments().failover_node_lost_tasks.add(1, &[]);
 }
 
 pub fn inc_actors_spawned() {
@@ -625,8 +645,8 @@ pub fn observe_payload_deserialize_ms(value: u64) {
     instruments().payload_deserialize_ms.record(value, &[]);
 }
 
-pub fn observe_python_handler_ms(value: u64) {
-    instruments().python_handler_ms.record(value, &[]);
+pub fn observe_task_handler_ms(value: u64) {
+    instruments().task_handler_ms.record(value, &[]);
 }
 
 pub fn observe_event_bridge_ms(value: u64) {

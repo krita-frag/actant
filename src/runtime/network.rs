@@ -128,6 +128,18 @@ pub trait Transport: Send + Sync + 'static {
     ///
     /// 如果底层传输无法订阅 topic，返回错误。
     async fn subscribe(&self, topic: &str) -> crate::common::Result<()>;
+    /// 把一条事件**投递给本节点自己**，如同它刚从网络收到。
+    ///
+    /// 存在的原因：gossip `broadcast` 只投递给邻居，**不发回发送者**。需要
+    /// "本节点也处理这条广播"时（工作流 deadline 到期的取消广播，见
+    /// `Orchestrator::start_timeout_watcher`），必须显式自投递，否则同一份
+    /// 语义在本地与远端表现不一致（远端节点取消、本地节点继续跑）。
+    ///
+    /// 返回 `false` 表示未能投递（事件通道已满或已关闭）。默认实现为
+    /// no-op 并返回 `false`：测试替身与无事件循环的传输无需实现。
+    fn inject_local_event(&self, _event: NetworkEvent) -> bool {
+        false
+    }
     /// 接收下一条网络事件。
     async fn recv_event(&self) -> Option<NetworkEvent>;
     /// 通过 endpoint address 建立直连，并把 peer 加入已有 gossip topic。
@@ -173,7 +185,7 @@ pub trait Transport: Send + Sync + 'static {
     /// 关闭传输并释放底层 endpoint。
     async fn shutdown(&self) -> crate::common::Result<()>;
 
-    // ── blob 原语（0.3.2 R2）──
+    // ── blob 原语 ──
     // 默认未启用（返回 Config 错误 / None）：由 with_blob_store 装配的
     // NetworkManager 覆盖；测试 mock 等其他实现无需实现。
 
@@ -321,7 +333,7 @@ impl Discovery for DnsDiscovery {
 ///
 /// 等价于 n0 预设但显式启用 `RelayMode::Default`，确保 NAT 穿透场景下
 /// 节点可通过 n0 公共 relay 中继。若需使用自定义 relay 集群，请扩展
-/// `NetworkConfig` 增加自定义 relay map（暂未实现，0.4 计划）。
+/// `NetworkConfig` 增加自定义 relay map（暂未实现）。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RelayDiscovery;
 
@@ -424,6 +436,15 @@ pub enum DirectRequest {
         workflow_id: WorkflowId,
         requesting_node: NodeId,
     },
+    /// 存活探测：仅确认对端仍在线，不产生任何副作用。
+    ///
+    /// 用途是故障转移的**在途转发**腿（见
+    /// [`crate::runtime::workflow::FailoverManager::record_outbound`]）：当本节点
+    /// 把任务转发给某 peer 后，若该 peer 从未被观测到心跳（节点在首个心跳间隔
+    /// 前即失联），心跳视图无法判定其死活，此时主动探测是唯一可用的存活信号。
+    /// 探测失败即可安全地把在途任务判定为失败——探测成功说明对端仍在服务，
+    /// 任务继续等待结果，避免误杀。
+    Ping,
 }
 
 /// 直接响应-请求协议类型，用于点对点通信。
@@ -447,6 +468,8 @@ pub enum DirectResponse {
         /// 人类可读的错误描述。
         message: String,
     },
+    /// [`DirectRequest::Ping`] 的应答：对端在线且直连协议栈可服务。
+    Pong,
 }
 
 /// Actant 直连请求-响应协议的 ALPN。
@@ -580,7 +603,7 @@ impl NetworkManager {
             max_message_size,
         });
 
-        // blob 原语（0.3.2 R1）：存储由调用方随 data_dir 打开；未传入的
+        // blob 原语：存储由调用方随 data_dir 打开；未传入的
         // 装配路径（直连 `new`，如纯嵌入/测试）不启用，blob_store 返回明确错误。
         tracing::info!("network.new: spawning router");
         let mut router_builder = Router::builder(endpoint.clone())
@@ -1056,6 +1079,29 @@ impl Transport for NetworkManager {
         self.recv_event().await
     }
 
+    /// 自投递：把事件推回本节点自己的事件通道。
+    ///
+    /// gossip 广播不回环，故"本节点也要处理"的广播（超时取消）必须走这里。
+    /// 通道满时事件被丢弃——这与 gossip 路径的降级语义一致（尽力投递），
+    /// 但必须留告警：丢弃一条取消 = 本地在途任务不会被强还原。
+    fn inject_local_event(&self, event: NetworkEvent) -> bool {
+        match self.event_tx.try_send(event) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!(
+                    "network event channel full, dropping self-injected event; \
+                     the corresponding local cancel will not be applied"
+                );
+                crate::metrics::inc_gossip_updates_dropped();
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::warn!("network event channel closed, self-injected event dropped");
+                false
+            }
+        }
+    }
+
     async fn dial(&self, addr: &str) -> crate::common::Result<()> {
         self.dial(addr).await
     }
@@ -1092,7 +1138,7 @@ impl Transport for NetworkManager {
         self.shutdown().await
     }
 
-    // blob 原语（0.3.2 R2）：委托给同名固有方法（固有方法优先，显式转发消歧）。
+    // blob 原语：委托给同名固有方法（固有方法优先，显式转发消歧）。
 
     fn blobs(&self) -> Option<&Arc<BlobStore>> {
         NetworkManager::blobs(self)

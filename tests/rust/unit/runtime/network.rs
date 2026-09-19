@@ -548,6 +548,18 @@ async fn network_manager_broadcast_without_subscribe_returns_error() {
 
 // ───────────────────────── DirectRequest serialization (remaining variants) ─────────────────────────
 
+/// 存活探测往返：`Ping` 无载荷，`Pong` 无载荷，二者都必须能独立编解码。
+#[test]
+fn direct_ping_pong_serialization_roundtrip() {
+    let bytes = postcard::to_allocvec(&DirectRequest::Ping).expect("serialize");
+    let decoded: DirectRequest = postcard::from_bytes(&bytes).expect("deserialize");
+    assert!(matches!(decoded, DirectRequest::Ping));
+
+    let bytes = postcard::to_allocvec(&DirectResponse::Pong).expect("serialize");
+    let decoded: DirectResponse = postcard::from_bytes(&bytes).expect("deserialize");
+    assert!(matches!(decoded, DirectResponse::Pong));
+}
+
 #[test]
 fn direct_request_query_workflow_state_serialization_roundtrip() {
     let req = DirectRequest::QueryWorkflowState {

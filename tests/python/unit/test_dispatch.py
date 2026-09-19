@@ -22,8 +22,8 @@ def _deserialize_outcome(payload: bytes) -> tuple[bool, object]:
 
 
 def test_execute_with_retries_success() -> None:
-    # P2-9 优化后 _execute_with_retries 直接返回 (success, payload_obj) 元组，
-    # 不再序列化。payload_obj 是 result 对象本身。
+    # _execute_with_retries 直接返回 (success, payload_obj) 元组，不序列化。
+    # payload_obj 是 result 对象本身。
     ok, result_obj = _execute_with_retries(
         lambda: 42,
         (),
@@ -40,7 +40,7 @@ def test_execute_with_retries_success() -> None:
 
 
 def test_execute_with_retries_exhausted() -> None:
-    """重试次数耗尽后返回异常对象（P2-9：不再序列化为 bytes）。"""
+    """重试次数耗尽后返回异常对象（不序列化为 bytes）。"""
     ok, exc_obj = _execute_with_retries(
         lambda: (_ for _ in ()).throw(ValueError("boom")),
         (),

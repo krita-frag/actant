@@ -35,12 +35,15 @@ Actant 采用 **Rust + iroh** 构建核心运行时，通过 **PyO3** 暴露给 
 
 ## 高层 API（@task / @flow）
 
-`@task` 和 `@flow` 是面向用户的便捷 API，底层基于 ERH 的 `Execute` capability 实现：
+`@task` 和 `@flow` 是面向用户的便捷 API。**任务提交不经过 `Execute` capability**：
+`submit()` → Rust `submit_task` → 后台 channel → `SchedulerActor.enqueue()` →
+`ProcessTaskDispatcher`（进程池）。`Execute` capability 的 `ExecuteHandler` 默认
+**不注册**（`register_execute_handler` 是给 Rust 嵌入场景按需调用的公开 API）。
 
 - **`@task`**：将函数包装为 `Task` 对象，支持同步调用（直接执行）和异步提交（`submit()`/`delay()` 返回 `AsyncResult`）。支持 `retries`/`retry_delay_ms`/`timeout_ms` 参数。
 - **`AsyncResult`**：任务句柄，提供 `result()`/`exception()`/`state`/`done()`/`ref()`。作为下游 `submit()` 参数时自动阻塞等待（依赖解析递归处理 `list`/`tuple`/`dict`）。大结果（超 `REF_INLINE_THRESHOLD`，1MB）经 `ValueStore` capability 落本节点内容寻址 blob store，句柄内部以 `Ref` 表示，`result()` 透明拉取反序列化。
 - **`Ref`**（`actant.task._ref`）：内容寻址值引用句柄（blake3 hash + 来源节点），`result()` 按需拉取；可直接作为 `submit()` 参数，提交方父进程解析为帧内联字节（worker 不感知网络）。
-- **`@flow`**：工作流编排装饰器，校验活跃 Runtime 并广播 `WorkflowLifecycle` 事件（`submitted` → `started` → `completed`/`failed`）。
+- **`@flow`**：工作流编排装饰器，校验活跃 Runtime 并广播 `WorkflowLifecycle` 事件（`submitted` → `started` → `completed`/`failed`）。`submitted`/`started` 在工作流**真正建槽之后**才广播（惰性创建：函数体首次 `Task.submit` 或进入等待点），故事件里的 `workflow_id` 立即可用；从未创建工作流的 flow 只有终态事件。
 - **`Runtime`**：任务经 Rust `ProcessTaskDispatcher` 进程池执行（worker 子进程、每进程单任务），维护任务注册表（`list_tasks`/`get_task`/`cancel_task`）。
 
 ## 目录结构
@@ -163,7 +166,10 @@ actant/
 
 Actant 是 P2P 对等混合架构：每个节点同时是编排器与执行器，启动一个 `Runtime` 即在该节点上自动启动一个 `Worker`（含 `SchedulerActor`，负责并发槽位、任务超时、优雅 drain）。与 ray/prefect/celery 等中心化系统不同，**无需连接中心服务器**——节点通过 iroh P2P 自动发现对端。
 
-`Runtime.with_defaults()` 注册内置 handler（本地路由 / FIFO 调度 / 无重试）并以默认配置构造 `_RuntimeCore`，Worker 随之启动。`rt.serve()` 在 tokio 后台 spawn worker 守护循环（订阅 P2P topic + 任务执行循环），非阻塞——调用方线程可继续执行编排逻辑。开发期 P2P 发现默认走 `local` preset（本地网络自动发现对端节点），无需手动配置 bootstrap。
+`Runtime.with_defaults()` 注册内置 handler（本地路由 / FIFO 调度 / 无重试）并以默认配置构造 `_RuntimeCore`，Worker 随之启动。`rt.serve()` 在 tokio 后台 spawn worker 守护循环（订阅 P2P topic + 任务执行循环），非阻塞——调用方线程可继续执行编排逻辑。开发期 P2P 发现的默认 preset 取决于
+`data_dir`：**未显式传 `data_dir` 时为 `none`**（完全离线，仅 loopback，须显式
+`bootstrap_nodes` 拨号）；**显式给了 `data_dir` 时为 `local`**（本地网络自动发现）。
+可用 `ACTANT_DISCOVERY=<preset>` 环境变量覆盖。
 
 ### 进程级任务隔离
 
@@ -185,14 +191,18 @@ Worker 行为由 `actant.actant._ActantConfig` 控制。高层 `Runtime`/`Runtim
 | `remote_fallback_delay_ms` | 500 | 本地无法执行的任务重新入队前的延迟 |
 | `scheduler` | `"priority"` | 调度器类型（`"priority"` / `"fifo"`） |
 
-任务超时、重试、崩溃故障转移、远程回退由 Worker 与 `FailoverActor`、`SchedulerActor` 协同处理；Python 层通过 `Execute` capability 覆盖执行行为，通过 `RetryPolicy` 覆盖重试决策。`WorkerError` 异常镜像 Rust 侧 Worker 运行时错误。
+任务超时、重试、崩溃故障转移、远程回退由 Worker 与 `FailoverActor`、`SchedulerActor` 协同处理；重试决策可通过 `RetryPolicy` capability 覆盖。
+**执行行为不能**通过 Python 层的 `Execute` capability 覆盖——`Runtime.layer(...).chain(handler)`
+只登记在 Python 侧，不参与 Rust 内部 dispatch（桥接函数 `chain_python_handler` 存在
+但默认未接线）；要改执行行为须走 Rust 侧 `RuntimeBuilder`。`WorkerError` 异常镜像
+Rust 侧 Worker 运行时错误。
 
 ## Rust 嵌入
 
 核心扩展缝全部是公开 trait：`Capability`/`Handler`（ERH）、`Scheduler`、`TaskDispatcher`、
 `Transport`、`Discovery`、`ConditionEvaluator`；Rust 侧可用 `RuntimeBuilder` 直接组装
 Runtime（见 `tests/rust/unit/runtime/builder.rs`）。这是嵌入实现细节，**无稳定性承诺**、
-不做 dylib/WASM 插件（裁决 J4，见 plans/ROADMAP.md）；任务执行默认绑定 Python 进程池，
+不做 dylib/WASM 插件；任务执行默认绑定 Python 进程池，
 Rust 原生执行器需自行实现 `TaskDispatcher`。
 
 ## 技术栈

@@ -26,7 +26,9 @@ use crate::runtime::actor::Actor;
 use crate::runtime::event_bus::{BusEvent, EventBus};
 use crate::runtime::network::Transport;
 use crate::runtime::workflow::messaging::{decode, encode, ok_result, payload_result};
-use crate::runtime::workflow::{Dag, DagGossip, FailoverManager, FailureScope, Orchestrator};
+use crate::runtime::workflow::{
+    Dag, DagGossip, DagNode, FailoverManager, FailureScope, Orchestrator, WaitCondition,
+};
 
 /// 可序列化的任务完成响应。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +39,19 @@ pub struct TaskCompletionResponse {
 }
 
 pub const WORKFLOW_ACTOR_TYPE: &str = "WorkflowActor";
+
+/// 任务结果回灌的裁决结果（[`WorkflowActor::on_task_result`] 的返回）。
+///
+/// 调用方据此决定后续动作：本地完成通道取完成响应；结果回灌路径取重试
+/// 任务（入队调度器）或终局标志（发布结果事件）。
+enum TaskResultIngest {
+    /// 任务完成且未被 fencing 拒绝：legacy `COMPLETE_TASK` 消息的响应载荷。
+    Completed(TaskCompletionResponse),
+    /// orchestrator 驱动重试：调用方须把任务入队调度器（延迟 `1` 毫秒）。
+    Retry(Box<TaskDefinition>, u64),
+    /// 失败终局 / 取消 / fencing 拒绝：无派发动作。
+    Settled,
+}
 
 /// 任务终态结果载荷：[`WorkflowActor::on_task_result`] 唯一入口的 `outcome` 参数。
 ///
@@ -73,12 +88,22 @@ pub mod workflow_methods {
     pub const SKIP_CONDITIONAL_BRANCH: &str = "skip_conditional_branch";
     pub const FAIL_TASK: &str = "fail_task";
     pub const CANCEL_TASK: &str = "cancel_task";
+    /// 增量加入单个节点（flow 提交路径）。
+    pub const ADD_NODE: &str = "add_node";
+    /// 取消整个工作流（flow 失败兜底 / 控制面出口）。
+    pub const CANCEL_WORKFLOW: &str = "cancel_workflow";
+    /// 封口工作流节点集（flow 函数体返回信号）。
+    pub const SEAL_WORKFLOW: &str = "seal_workflow";
     /// 任务结果回灌唯一入口（远端直连与 gossip 路径统一走此方法）。
     pub const ON_TASK_RESULT: &str = "on_task_result";
     pub const MARK_TASK_RUNNING: &str = "mark_task_running";
-    /// 任务被本地 Worker 接受执行（S0 派发事件，Worker fire-and-forget 上报）。
+    /// 任务被本地 Worker 接受执行（派发事件，Worker fire-and-forget 上报）。
     pub const TASK_DISPATCHED: &str = "task_dispatched";
     pub const GET_STATE: &str = "get_state";
+    /// DAG 结构快照（暴露面）：不含 payload，见 [`DagSnapshot`]。
+    pub const GET_DAG: &str = "get_dag";
+    /// 事件历史读取（审计出口）。
+    pub const GET_HISTORY: &str = "get_history";
     pub const ACTIVE_WORKFLOW_IDS: &str = "active_workflow_ids";
     pub const ADOPT_WORKFLOW: &str = "adopt_workflow";
     pub const DELETE_WORKFLOW: &str = "delete_workflow";
@@ -86,6 +111,12 @@ pub mod workflow_methods {
     pub const GET_WORKFLOW_STATE_BYTES: &str = "get_workflow_state_bytes";
     pub const APPLY_FULL_STATE: &str = "apply_full_state";
     pub const RESCHEDULE_RUNNING_TASKS: &str = "reschedule_running_tasks";
+    /// 注册持久化等待点（signal / timer 条件）。
+    pub const REGISTER_WAIT_POINT: &str = "register_wait_point";
+    /// 递交信号唤醒等待点（Signals 的 orchestrator 单入口）。
+    pub const SIGNAL_WAIT_POINT: &str = "signal_wait_point";
+    /// 恢复挂起：唤醒该工作流所有 `Suspend` 等待点（单入口）。
+    pub const RESUME_SUSPENDED: &str = "resume_suspended";
 }
 
 /// 封装 `Orchestrator` 的 Actor，负责 DAG 提交、执行推进与状态查询。
@@ -109,7 +140,7 @@ impl WorkflowActor {
         }
     }
 
-    /// 任务结果回灌唯一入口（S8 单路化）。
+    /// 任务结果回灌唯一入口。
     ///
     /// 三条路径（本地完成通道 / 远端 TaskResult 直连 / gossip 状态同步）全部
     /// 收敛于此：attempt fencing、失败语义（FailureScope）决策、终态推进均在
@@ -117,26 +148,28 @@ impl WorkflowActor {
     ///
     /// - **attempt fencing**：`attempt` 为结果所属派发代数。入口先经
     ///   `Orchestrator::result_attempt_accepted` 做唯一接受决策，过期代数的
-    ///   结果直接丢弃（返回 `Ok(None)`，不推进状态、不发事件）。wire 协议
+    ///   结果直接丢弃（返回 `Settled`，不推进状态、不发事件）。wire 协议
     ///   尚未携带派发代数，三条路径当前均传 `None`（fencing 放行），协议
     ///   扩展后无需改动入口签名。DAG 写入方法内部的 fencing 校验保留为防
     ///   绕过的最终防线（recover / 重派发等不经本入口的写入路径）。
     ///
-    /// - **失败语义统一裁决**：任务失败一律按工作流级失败语义处理（内部固定
+    /// - **失败语义统一裁决**：失败先经 `Orchestrator::handle_task_failure`
+    ///   做重试裁决（节点 RetryPolicy 有余量 → 重置任务并返回重派发
+    ///   定义）；余量耗尽才按工作流级失败语义处理（内部固定
     ///   `FailureScope::WorkflowLevel`），最终效果由 `failure_strategy` 决定：
     ///   FailFast → 首个任务失败即工作流 Failed；Continue → 任务标 Failed，
     ///   待全部任务终态且有失败时工作流 Failed。理由：到达 orchestrator 的
-    ///   失败已是重试耗尽后的最终结果（重试发生在 worker / 派发侧，核心不
-    ///   存在消费 TaskOnly 状态的重试路径）；FailFast 下 TaskOnly 会让工作流
-    ///   悬挂在非终态（只能等工作流 deadline 兜底），与 failure_strategy 的
-    ///   文档语义（"任何任务失败都立即标记工作流为失败"）矛盾。
-    ///   `FailureScope::TaskOnly` 保留在 DAG 层 API，供后续 orchestrator 驱动
-    ///   重试时在入口内部决策使用。
+    ///   失败已是重试耗尽后的最终结果（flow 任务的 worker 层重试已在派发侧
+    ///   剥离，核心不存在其他消费 TaskOnly 状态的重试路径）。
+    ///   因此本入口一律传 `FailureScope::WorkflowLevel`；`TaskOnly`
+    ///   （仅标记任务失败、工作流保持非终态）只由直接调用 `fail_task` 的调用方
+    ///   选择，编排内部不构造它。
     ///
     /// - `source` 仅用于日志与指标，不影响状态语义。
     ///
-    /// 返回 `Some(response)` 仅当 outcome 为 `Completed` 且未被 fencing 拒绝
-    /// （legacy `COMPLETE_TASK` 消息的响应载荷）；其余返回 `None`。
+    /// 返回 `TaskResultIngest::Completed` 仅当 outcome 为 `Completed` 且未被
+    /// fencing 拒绝（legacy `COMPLETE_TASK` 消息的响应载荷）；重试裁决返回
+    /// `Retry`；其余返回 `Settled`。
     async fn on_task_result(
         &mut self,
         workflow_id: &WorkflowId,
@@ -144,7 +177,7 @@ impl WorkflowActor {
         outcome: TaskResultOutcome,
         attempt: Option<u32>,
         source: ResultSource,
-    ) -> Result<Option<TaskCompletionResponse>> {
+    ) -> Result<TaskResultIngest> {
         tracing::debug!(
             workflow = %workflow_id.as_str(),
             task = %task_id.as_str(),
@@ -157,7 +190,7 @@ impl WorkflowActor {
             .orchestrator
             .result_attempt_accepted(workflow_id, task_id, attempt)
         {
-            return Ok(None);
+            return Ok(TaskResultIngest::Settled);
         }
         match outcome {
             TaskResultOutcome::Completed(result) => {
@@ -165,22 +198,25 @@ impl WorkflowActor {
                     .orchestrator
                     .on_task_completed(workflow_id, task_id, result)
                     .await?;
-                Ok(Some(TaskCompletionResponse {
+                Ok(TaskResultIngest::Completed(TaskCompletionResponse {
                     workflow_terminal,
                     ready_successors: ready,
                     conditional_edges: conditional,
                 }))
             }
             TaskResultOutcome::Failed(error) => {
-                // 失败语义在此统一（见方法文档）：所有来源一律 WorkflowLevel。
-                self.orchestrator
-                    .fail_task(workflow_id, task_id, error, FailureScope::WorkflowLevel)
-                    .await?;
-                Ok(None)
+                match self
+                    .orchestrator
+                    .handle_task_failure(workflow_id, task_id, error)
+                    .await?
+                {
+                    Some((task, delay_ms)) => Ok(TaskResultIngest::Retry(Box::new(task), delay_ms)),
+                    None => Ok(TaskResultIngest::Settled),
+                }
             }
             TaskResultOutcome::Cancelled => {
-                self.orchestrator.cancel_task(workflow_id, task_id)?;
-                Ok(None)
+                self.orchestrator.cancel_task(workflow_id, task_id).await?;
+                Ok(TaskResultIngest::Settled)
             }
         }
     }
@@ -209,6 +245,9 @@ impl Actor for WorkflowActor {
             // 同上：子任务已退出时 send 返回 Err，丢弃合理。
             let _ = tx.send(true);
         }
+        // 释放 park 中的等待点等待者：`wait_wait_point` 的无限等待语义使等待者
+        // 可能永不返回，关停时不唤醒会挂住进程退出（park 方可能是主线程）。
+        self.orchestrator.release_all_wait_point_waiters();
         // 停止前同步落盘所有脏状态，确保 graceful shutdown 不丢数据。
         if let Err(e) = self.orchestrator.flush_dirty().await {
             let node = self
@@ -263,7 +302,7 @@ impl Actor for WorkflowActor {
                     decode(&msg.payload)?;
                 // 本地完成通道：经唯一入口回灌。fencing 拒绝或非完成结果时
                 // 返回空响应（与拒绝路径的响应形状一致）。
-                let response = self
+                let response = match self
                     .on_task_result(
                         &workflow_id,
                         &task_id,
@@ -272,12 +311,31 @@ impl Actor for WorkflowActor {
                         ResultSource::Local,
                     )
                     .await?
-                    .unwrap_or(TaskCompletionResponse {
+                {
+                    TaskResultIngest::Completed(response) => response,
+                    _ => TaskCompletionResponse {
                         workflow_terminal: false,
                         ready_successors: vec![],
                         conditional_edges: vec![],
-                    });
+                    },
+                };
                 Ok(payload_result(msg_id, encode(&response)?))
+            }
+            workflow_methods::ADD_NODE => {
+                let (workflow_id, node, deps): (WorkflowId, DagNode, Vec<TaskId>) =
+                    decode(&msg.payload)?;
+                let outcome = self.orchestrator.add_node(&workflow_id, node, deps).await?;
+                Ok(payload_result(msg_id, encode(&outcome)?))
+            }
+            workflow_methods::CANCEL_WORKFLOW => {
+                let workflow_id: WorkflowId = decode(&msg.payload)?;
+                self.orchestrator.cancel(&workflow_id).await?;
+                Ok(ok_result(msg_id))
+            }
+            workflow_methods::SEAL_WORKFLOW => {
+                let workflow_id: WorkflowId = decode(&msg.payload)?;
+                self.orchestrator.seal_workflow(&workflow_id).await?;
+                Ok(ok_result(msg_id))
             }
             workflow_methods::ACTIVATE_CONDITIONAL => {
                 let (workflow_id, task_id): (WorkflowId, TaskId) = decode(&msg.payload)?;
@@ -321,16 +379,25 @@ impl Actor for WorkflowActor {
                     Option<u32>,
                     ResultSource,
                 ) = decode(&msg.payload)?;
-                self.on_task_result(&workflow_id, &task_id, outcome, attempt, source)
-                    .await?;
-                Ok(ok_result(msg_id))
+                // 重试裁决：Some((task, delay)) 随响应返回，由调用方入队调度器
+                // （gossip 路径忽略——重复失败已在直连/本地路径裁决）。
+                let retry = match self
+                    .on_task_result(&workflow_id, &task_id, outcome, attempt, source)
+                    .await?
+                {
+                    TaskResultIngest::Retry(task, delay_ms) => Some((*task, delay_ms)),
+                    _ => None,
+                };
+                Ok(payload_result(msg_id, encode(&retry)?))
             }
             workflow_methods::CANCEL_TASK => {
                 // 取消指令路径（用户 / 控制面发起）与结果回灌分离；gossip /
                 // 远端的 Cancelled 结果走 ON_TASK_RESULT 单入口，二者最终都
                 // 落到 `Orchestrator::cancel_task` 同一写入路径。
                 let (workflow_id, task_id): (WorkflowId, TaskId) = decode(&msg.payload)?;
-                self.orchestrator.cancel_task(&workflow_id, &task_id)?;
+                self.orchestrator
+                    .cancel_task(&workflow_id, &task_id)
+                    .await?;
                 Ok(ok_result(msg_id))
             }
             workflow_methods::MARK_TASK_RUNNING => {
@@ -349,6 +416,23 @@ impl Actor for WorkflowActor {
                 let workflow_id: WorkflowId = decode(&msg.payload)?;
                 let state = self.orchestrator.get_state(&workflow_id);
                 Ok(payload_result(msg_id, encode(&state)?))
+            }
+            workflow_methods::GET_DAG => {
+                let workflow_id: WorkflowId = decode(&msg.payload)?;
+                let snapshot = self.orchestrator.dag_snapshot(&workflow_id);
+                Ok(payload_result(msg_id, encode(&snapshot)?))
+            }
+            workflow_methods::GET_HISTORY => {
+                let (workflow_id, after): (
+                    WorkflowId,
+                    Option<crate::runtime::state::event_log::EventId>,
+                ) = decode(&msg.payload)?;
+                let entries = self.orchestrator.workflow_history(&workflow_id, after);
+                // 只回传不透明载荷与 ID；kind/task_id/error 由 PyO3 边界解码，
+                // 避免把 LogEntry 布局变成跨语言契约。
+                let slim: Vec<(crate::runtime::state::event_log::EventId, Vec<u8>)> =
+                    entries.into_iter().map(|e| (e.id, e.payload)).collect();
+                Ok(payload_result(msg_id, encode(&slim)?))
             }
             workflow_methods::ACTIVE_WORKFLOW_IDS => {
                 let ids = self.orchestrator.active_workflow_ids();
@@ -393,6 +477,31 @@ impl Actor for WorkflowActor {
                 let workflow_id: WorkflowId = decode(&msg.payload)?;
                 let tasks = self.orchestrator.reschedule_running_tasks(&workflow_id)?;
                 Ok(payload_result(msg_id, encode(&tasks)?))
+            }
+            workflow_methods::REGISTER_WAIT_POINT => {
+                // 等待点注册经 orchestrator 落事件 + 标记脏，
+                // 与"结果回灌唯一入口"同构（双主/分区下无第二写路径）。
+                let (workflow_id, wait_key, condition): (WorkflowId, String, WaitCondition) =
+                    decode(&msg.payload)?;
+                self.orchestrator
+                    .register_wait_point(&workflow_id, &wait_key, condition)?;
+                Ok(ok_result(msg_id))
+            }
+            workflow_methods::SIGNAL_WAIT_POINT => {
+                // 返回 `Option<Vec<u8>>`：`None` = 无该等待点；`Some(payload)` =
+                // 已唤醒（含"重放体已收到 → 直接返回"的幂等路径）。
+                let (workflow_id, wait_key): (WorkflowId, String) = decode(&msg.payload)?;
+                let delivered = self
+                    .orchestrator
+                    .signal_wait_point(&workflow_id, &wait_key)?;
+                Ok(payload_result(msg_id, encode(&delivered)?))
+            }
+            workflow_methods::RESUME_SUSPENDED => {
+                // 返回**实际唤醒的挂起点数量**（0 = 当前无挂起中的挂起
+                // 点，重复调用幂等）。只匹配 `Suspend` 条件，不冒充业务信号。
+                let workflow_id: WorkflowId = decode(&msg.payload)?;
+                let resumed = self.orchestrator.resume_suspended(&workflow_id)?;
+                Ok(payload_result(msg_id, encode(&resumed)?))
             }
             other => Err(ActantError::Actor(format!(
                 "WorkflowActor: unknown method {}",

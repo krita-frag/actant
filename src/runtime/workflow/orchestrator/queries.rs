@@ -4,10 +4,48 @@
 
 use crate::common::payload::unpack_payload;
 use crate::common::serialization::serialize_rkyv;
-use crate::common::{TaskId, WorkflowId};
+use crate::common::{RetryPolicy, TaskId, WorkflowId};
 use crate::runtime::workflow::{Dag, Phase, WorkflowExecution};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use super::{keys::*, Orchestrator};
+
+/// DAG 结构快照（Python 暴露面，`get_dag` 的序列化形态）。
+///
+/// **刻意不含 `payload`**：它是签名的 cloudpickle 字节，对 Rust 完全不透明
+///（架构不变量「载荷不透明」），且可能很大——经 actor 通道搬运整份 DAG 不划算。
+/// 需要任务结果用 `get_workflow_state()` 的 `tasks[*].result`
+///（任务结果经 `get_workflow_state()` 的 `tasks[*].result` 暴露，不随本快照搬运）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DagSnapshot {
+    pub workflow_id: String,
+    pub failure_strategy: String,
+    /// DAG 级默认重试策略。**必须暴露**：节点 `retry_policy=None` 时生效的是它，
+    /// 缺了这一项就无法在 Python 侧复现 `Dag::effective_retry_policy` 的语义。
+    pub default_retry_policy: Option<RetryPolicy>,
+    pub nodes: Vec<DagNodeSnapshot>,
+    pub edges: Vec<DagEdgeSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DagNodeSnapshot {
+    pub task_id: String,
+    pub name: String,
+    /// 前驱 task_id 列表（依赖边）。
+    pub deps: Vec<String>,
+    pub timeout_ms: Option<u64>,
+    pub priority: i32,
+    pub metadata: HashMap<String, String>,
+    pub retry_policy: Option<RetryPolicy>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DagEdgeSnapshot {
+    pub from: String,
+    pub to: String,
+    pub condition: Option<String>,
+}
 
 impl Orchestrator {
     pub fn get_state(&self, workflow_id: &WorkflowId) -> Option<WorkflowExecution> {
@@ -19,6 +57,75 @@ impl Orchestrator {
 
     pub fn get_dag(&self, workflow_id: &WorkflowId) -> Option<Dag> {
         self.state.slots.get(workflow_id).map(|s| s.dag.clone())
+    }
+
+    /// DAG 结构快照：不含 payload 的可序列化形态，供 Python 暴露面使用。
+    ///
+    /// 与 [`Self::get_dag`] 的区别是**用途**：后者返回完整 `Dag`（含 payload），
+    /// 供 Rust 内部与 gossip 状态同步；本方法只做"结构可见"，刻意不搬 payload。
+    pub fn dag_snapshot(&self, workflow_id: &WorkflowId) -> Option<DagSnapshot> {
+        let slot = self.state.slots.get(workflow_id)?;
+        let dag = &slot.dag;
+        Some(DagSnapshot {
+            workflow_id: workflow_id.as_str().to_string(),
+            failure_strategy: dag.failure_strategy.as_str().to_string(),
+            default_retry_policy: dag.default_retry_policy.clone(),
+            nodes: dag
+                .nodes()
+                .map(|n| DagNodeSnapshot {
+                    task_id: n.task_id.as_str().to_string(),
+                    name: n.name.clone(),
+                    deps: dag
+                        .predecessors_of(&n.task_id)
+                        .iter()
+                        .map(|p| p.task_id.as_str().to_string())
+                        .collect(),
+                    timeout_ms: n.timeout_ms,
+                    priority: n.priority,
+                    metadata: n.metadata.clone(),
+                    retry_policy: n.retry_policy.clone(),
+                })
+                .collect(),
+            edges: dag
+                .edges()
+                .map(|e| DagEdgeSnapshot {
+                    from: e.from.as_str().to_string(),
+                    to: e.to.as_str().to_string(),
+                    condition: e.condition.clone(),
+                })
+                .collect(),
+        })
+    }
+
+    /// 读取工作流的事件历史（审计出口）。
+    ///
+    /// `after = None` 表示从头读取。事件载荷是 postcard 编码的
+    /// `WorkflowEventPayload`；调用方（PyO3 边界）负责解码出"过滤用字段"
+    /// （kind / task_id / error），`payload` 本身对 Python 保持不透明
+    ///（`payload` 对 Python 保持不透明，Rust 枚举字段增减不致破坏跨语言契约）。
+    ///
+    /// 无 event_log 或无该工作流时返回空（历史是**可选**的观测面，缺它不应
+    /// 让查询失败）。
+    pub fn workflow_history(
+        &self,
+        workflow_id: &WorkflowId,
+        after: Option<crate::runtime::state::event_log::EventId>,
+    ) -> Vec<crate::runtime::state::event_log::LogEntry> {
+        let Some(log) = self.event_log.clone() else {
+            return Vec::new();
+        };
+        if !self.state.contains_workflow(workflow_id) {
+            return Vec::new();
+        }
+        let topic = format!("workflow:{}", workflow_id.as_str());
+        log.read_after(&topic, after.as_ref()).unwrap_or_else(|e| {
+            tracing::warn!(
+                workflow = %workflow_id.as_str(),
+                error = %e,
+                "workflow_history: failed to read event log"
+            );
+            Vec::new()
+        })
     }
 
     pub fn active_workflow_ids(&self) -> Vec<WorkflowId> {
@@ -203,9 +310,5 @@ impl Orchestrator {
         let base = policy.delay_ms as f64;
         let multiplier = policy.backoff_multiplier.powi(retry_count as i32);
         (base * multiplier).min(policy.max_delay_ms as f64) as u64
-    }
-
-    pub fn get_expired_workflow_ids(&self) -> Vec<WorkflowId> {
-        self.state.expired_workflow_ids()
     }
 }

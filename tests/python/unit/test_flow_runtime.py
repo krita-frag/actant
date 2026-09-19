@@ -70,28 +70,58 @@ def test_flow_failure() -> None:
     assert "failed" in events
 
 
-def test_flow_retry_then_success() -> None:
+def test_flow_body_error_does_not_retry() -> None:
+    """flow 不重试：函数体抛错直接传播，不重跑。
+
+    重试语义由任务级 ``@task(retries=...)`` 承载（orchestrator 驱动）；
+    flow 体本身的失败恢复走续跑/重放。
+    """
     _flow_retry_count["count"] = 0
 
     @flow(retries=2, retry_delay_ms=0)  # type: ignore[untyped-decorator]
     def my_flow() -> str:
         _bump_flow_retry()
-        if _flow_retry_count["count"] < 3:
-            raise RuntimeError("not yet")
-        return "ok"
+        raise RuntimeError("not yet")
 
-    with Runtime.with_defaults():
-        assert my_flow() == "ok"
-        assert _flow_retry_count["count"] == 3
+    with Runtime.with_defaults(), pytest.raises(RuntimeError, match="not yet"):
+        my_flow()
+    assert _flow_retry_count["count"] == 1
 
 
 def test_flow_timeout() -> None:
+    """强还原：函数体阻塞在任务等待上 → deadline 到期后取消本地在途任务，
+    函数体被唤醒并以 ``ActantTimeoutError`` 呈现给调用方。
+
+    注意必须走 ``submit()``：``@task`` 直接调用是**同步执行**，不产生编排
+    节点，工作流不存在，deadline 也就没有宿主。
+    """
+
     @flow(timeout_ms=100)  # type: ignore[untyped-decorator]
     def my_flow() -> str:
-        return _slow_task().result()  # type: ignore[no-any-return]
+        return _slow_task.submit().result()  # type: ignore[no-any-return]
 
-    with Runtime.with_defaults(), pytest.raises(ActantTimeoutError):
+    with Runtime.with_defaults(), pytest.raises(ActantTimeoutError) as excinfo:
         my_flow()
+
+    # 抛错源必须是工作流 deadline 归一，而不是别的路径恰好抛了同类异常。
+    assert "deadline" in str(excinfo.value), str(excinfo.value)
+
+
+def test_task_free_flow_deadline_has_no_host() -> None:
+    """无 ``Task.submit`` 的函数体不产生编排外壳 → deadline 无宿主、不生效。
+
+    这是**文档化约束**：超时的判定与
+    强还原都挂在工作流上，而空 flow 沿用既有的"惰性创建"语义、不创建工作流。
+    函数体因此自己跑完并正常返回——纯 CPU 段本就不可中断，报超时也没有意义。
+    """
+
+    @flow(timeout_ms=50)  # type: ignore[untyped-decorator]
+    def my_flow() -> str:
+        time.sleep(0.2)
+        return "done"
+
+    with Runtime.with_defaults():
+        assert my_flow() == "done"
 
 
 def test_flow_with_name() -> None:
@@ -132,48 +162,44 @@ def test_flow_workflow_id_in_context() -> None:
         assert "my_flow" in wid
 
 
-def _spy_submit_dag(
+def _spy_submit_workflow(
     rt: Runtime,
     captured: dict[str, object],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """用 spy 替换 ``rt.submit_dag``，记录 kwargs 后委托原实现。"""
-    orig = rt.submit_dag
+    """spy 工作流外壳创建（提交路径第一步），记录随外壳传递的参数。"""
+    orig = rt.submit_workflow
 
-    def spy(workflow_id: str, nodes: object, edges: object, **kw: object) -> None:
+    def spy(workflow_id: str, **kw: object) -> None:
         captured.update(kw)
-        orig(workflow_id, nodes, edges, **kw)  # type: ignore[arg-type]
+        orig(workflow_id, **kw)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(rt, "submit_dag", spy)
+    monkeypatch.setattr(rt, "submit_workflow", spy)
 
 
 def test_flow_failure_strategy_default_unchanged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """默认（未传 failure_strategy）不向 Rust 传递该参数。
-
-    Rust 侧 ``submit_dag`` 对 ``None`` 应用 ``FailureStrategy::FailFast``
-    默认值，因此默认行为与旧版硬编码 ``"fail_fast"`` 一致。
-    """
+    """默认（未传 failure_strategy）外壳不携带策略——Rust 应用 FailFast 默认。"""
     captured: dict[str, object] = {}
     with Runtime.with_defaults() as rt:
-        _spy_submit_dag(rt, captured, monkeypatch)
+        _spy_submit_workflow(rt, captured, monkeypatch)
 
         @flow  # type: ignore[untyped-decorator]
         def my_flow() -> int:
             return _add_one.submit(1).result()  # type: ignore[no-any-return]
 
         assert my_flow() == 2
-    assert "failure_strategy" not in captured
+    assert captured.get("failure_strategy") is None, "default must pass None (Rust applies FailFast)"
 
 
 def test_flow_failure_strategy_continue_passthrough(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """显式 ``failure_strategy="continue"`` 原样透传给 ``submit_dag``。"""
+    """显式 ``failure_strategy="continue"`` 原样透传给 ``submit_workflow``。"""
     captured: dict[str, object] = {}
     with Runtime.with_defaults() as rt:
-        _spy_submit_dag(rt, captured, monkeypatch)
+        _spy_submit_workflow(rt, captured, monkeypatch)
 
         @flow(failure_strategy="continue")  # type: ignore[untyped-decorator]
         def my_flow() -> int:
@@ -183,41 +209,37 @@ def test_flow_failure_strategy_continue_passthrough(
     assert captured["failure_strategy"] == "continue"
 
 
-def test_flow_timeout_body_not_reexecuted_while_orphan_alive(
+def test_flow_timeout_fails_without_reexecution(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """超时后孤儿线程未结束时不得重试——流程体不并发重复执行。
+    """超时即失败终态：函数体不重试、不并发重复执行。
 
-    孤儿线程睡眠 1s 远超缩短后的 join 上限（0.2s）：join 超时的正确行为是
-    放弃等待并直接抛出（不重试）——若实现错误地在孤儿存活时重试，计数会
-    达到 2。断言函数体只执行一次。
+    函数体阻塞在任务等待上被 deadline 强还原唤醒。本用例断言"强还原
+    不引发重放/重跑"——函数体调用计数保持 1。
     """
-    monkeypatch.setattr(_flow_module, "_FLOW_ORPHAN_JOIN_TIMEOUT_S", 0.2)
     calls = {"count": 0}
 
-    @flow(retries=3, timeout_ms=100)  # type: ignore[untyped-decorator]
+    @flow(timeout_ms=100)  # type: ignore[untyped-decorator]
     def my_flow() -> str:
         calls["count"] += 1
-        time.sleep(1.0)
-        return "done"
+        return _slow_task.submit().result()  # type: ignore[no-any-return]
 
     with Runtime.with_defaults(), pytest.raises(ActantTimeoutError):
         my_flow()
     assert calls["count"] == 1
 
 
-def test_flow_timeout_retry_after_orphan_joined() -> None:
-    """孤儿线程在 join 上限内正常结束后允许重试（非超时路径语义不变）。"""
+def test_flow_body_error_propagates_without_retry() -> None:
+    """函数体抛错：直接传播（无 flow 级重试），工作流转失败终态。"""
     calls = {"count": 0}
 
-    @flow(retries=1, timeout_ms=100)  # type: ignore[untyped-decorator]
+    @flow  # type: ignore[untyped-decorator]
     def my_flow() -> str:
         calls["count"] += 1
-        time.sleep(0.3)
-        return "done"
+        raise RuntimeError("not yet")
 
-    with Runtime.with_defaults(), pytest.raises(ActantTimeoutError):
+    with Runtime.with_defaults(), pytest.raises(RuntimeError, match="not yet"):
         my_flow()
-    # 第一次超时后孤儿线程已结束（0.3s < 5s 上限）→ 重试一次；
-    # 第二次超时后重试耗尽，抛 ActantTimeoutError。
-    assert calls["count"] == 2
+    assert calls["count"] == 1
+
+

@@ -20,7 +20,7 @@
 的完成信号汇聚到单个 ``threading.Event``，``gather`` 仅等待该 event
 一次，避免 N 次 ``wait_for`` 累加延迟。
 
-## 结果内部形态（0.3.2 R4 统一）
+## 结果内部形态
 
 ``_result`` 单字段两态：小结果为对象缓存（``result()`` 直接返回）；大结果
 （结果帧 > ``REF_INLINE_THRESHOLD``）为 ``Ref``（``result()`` 经 ValueStore
@@ -169,7 +169,7 @@ class AsyncResult:
         self._context = context
         self._workflow_id = workflow_id
         self._future = _CompletionFuture()
-        # _result 单字段两态（0.3.2 R4 统一，见模块 docstring）：
+        # _result 单字段两态（见模块 docstring）：
         # - 小结果：结果对象本身（worker 结果帧反序列化产物，含 bytes 返回值）。
         # - 大结果：Ref（结果帧字节已落本节点 blob store）。
         self._result: Any = None
@@ -418,7 +418,7 @@ class AsyncResult:
         )
 
     def _set_result_ref(self, ref_bytes: bytes) -> None:
-        """设置任务成功结果为 ``Ref``（大结果态，0.3.2 R4）并触发回调。
+        """设置任务成功结果为 ``Ref``（大结果态）并触发回调。
 
         Args:
             ref_bytes: 结果帧字节落 blob 后的 BlobRef wire 编码。
@@ -444,7 +444,7 @@ class AsyncResult:
             error_payload_or_msg: 失败信息。可为：
                 - ``bytes``：已序列化的异常字节（跨节点传播路径）。
                 - ``str``：错误消息字符串，包装为 ``ActantError`` 再序列化。
-                - ``BaseException``：异常对象（P2-9 优化路径，本地 dispatch），
+                - ``BaseException``：异常对象（本地 dispatch 的优化路径），
                   序列化后存入 ``_error_payload`` 供 ``result()`` 重新抛出。
         """
         with self._lock:
@@ -481,53 +481,11 @@ class AsyncResult:
             label=f"AsyncResult {self.task_id}: done callback",
         )
 
-    def _export_outcome(self) -> tuple[bool, bytes]:
-        """导出任务终态结果字节，供 Orchestrator 状态回灌（``complete_workflow``）。
-
-        Returns:
-            ``(success, result_bytes)``：
-            - 成功（对象缓存态）：``(True, cloudpickle.dumps(返回值))``。
-            - 成功（Ref 态，大结果）：``(True, BlobRef wire 编码)``——回灌引用
-              而非值字节，避免大值在 Orchestrator 持久化与查询面二次膨胀；
-              消费方经 ``Ref.result()`` 解析。
-            - 失败：``(False, 错误消息 UTF-8 字节)``——Orchestrator ``FAIL_TASK``
-              期望错误字符串，而非序列化异常。
-            - 取消/其他非成功终态：``(False, b"task cancelled")``。
-
-        由 ``FlowDAG.record_outcome`` 的完成回调调用；调用方保证任务已终态。
-        """
-        with self._lock:
-            state = self._state
-            if state == "completed":
-                result = self._result
-            elif state == "failed":
-                error_payload = self._error_payload
-            else:
-                # cancelled / 其它非成功终态：以失败回灌（Phase 1 近似，任务级
-                # Cancelled 状态回灌由后续阶段细化）。
-                return False, b"task cancelled"
-        if state == "completed":
-            if isinstance(result, Ref):
-                return True, result._ref_bytes
-            return True, cloudpickle.dumps(result)
-        # failed：错误负载是序列化异常，提取消息字符串（解码失败时给通用错误）。
-        try:
-            exc = cloudpickle.loads(error_payload)
-            msg = str(exc)
-        except Exception:
-            _logger.warning(
-                "task %s: failed to decode error payload for outcome export",
-                self.task_id,
-                exc_info=True,
-            )
-            msg = "unknown task failure"
-        return False, msg.encode("utf-8")
-
     def __repr__(self) -> str:
         return f"AsyncResult(task_id={self.task_id!r}, state={self.state!r})"
 
     def _bridge_to_loop(self, loop: asyncio.AbstractEventLoop) -> asyncio.Future[Any]:
-        """把任务完成信号桥接为 ``loop`` 上的 ``asyncio.Future``（0.3.2 R5）。
+        """把任务完成信号桥接为 ``loop`` 上的 ``asyncio.Future``。
 
         经 ``add_done_callback`` 注册回调：回调在完成触发线程（Rust 事件回调
         线程）中取值并 ``call_soon_threadsafe`` 直通 event loop——无每次等待
@@ -596,12 +554,13 @@ def _collect_dep_ids(value: Any, seen: set[str], ids: list[str]) -> Any:
 
     大结果（内部为 ``Ref``）**不在此处取值**：``result()`` 会把大值反序列化到
     提交方内存再随 envelope 重新序列化；保留 ``Ref`` 由 ``_submit`` 解析为
-    ``_RefArg`` 帧内联字节（0.3.2 R3b/R6，见 plans/REF_DESIGN.md）。
+    ``_RefArg`` 帧内联字节。
 
     两态判定必须先等终态：``Ref`` 只在结果抵达回调（``_set_result_ref``）中
-    才存在。eager flow 里下游 ``submit`` 通常早于上游完成，此时 ``ref()``
-    恒为 ``None``，若直接落 ``result()`` 会把大值整体反序列化进提交方并触发
-    ``_degrade_large_values`` 二次落 blob——正是 R6 要消除的"钉内存"残余。
+    才存在。flow 内是**增量提交**的——下游 ``submit`` 通常早于上游完成，此时
+    ``ref()`` 恒为 ``None``，若直接落 ``result()`` 会把大值整体反序列化进
+    提交方并触发 ``_degrade_large_values`` 二次落 blob，等于把大值钉在提交方
+    内存里。
     """
     if isinstance(value, AsyncResult):
         if value.task_id not in seen:
@@ -627,7 +586,7 @@ def _resolve_args_with_deps(
 ) -> tuple[tuple[Any, ...], dict[str, Any], list[str]]:
     """单遍解析 ``submit`` 参数：解析上游 ``AsyncResult`` 并收集依赖 id。
 
-    供 ``Task.submit`` / ``submit_batch`` 在构建 ``FlowDAG`` 依赖边时使用。
+    供 ``Task.submit`` / ``submit_batch`` 在构建编排依赖边时使用。
     相比"先 ``_collect_async_result_ids`` 再 ``_resolve_value``"两遍遍历，
     这里合并为一遍，同一规则不外泄、不漂移。
 

@@ -2,8 +2,8 @@
 //! 为每个内置 capability 提供实现 `PyAskCodec` / `PyPerformCodec` / `PyEmitCodec`
 //! 的 marker 类型。`capability_registry!` 通过声明式映射完成分发。
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{atomic, Arc, OnceLock};
+use std::sync::atomic::Ordering;
+use std::sync::{atomic, OnceLock};
 
 use pyo3::exceptions::PyStopIteration;
 use pyo3::prelude::*;
@@ -554,29 +554,6 @@ pub fn dict_response<'py>(py: Python<'py>) -> Bound<'py, PyDict> {
     PyDict::new(py)
 }
 
-pub fn ok_response<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-    use pyo3::conversion::IntoPyObject;
-    let b = true.into_pyobject(py)?;
-    Ok(b.to_owned().into_any())
-}
-
-pub fn opt_string_response<'py>(
-    py: Python<'py>,
-    value: Option<String>,
-) -> PyResult<Bound<'py, PyAny>> {
-    use pyo3::conversion::IntoPyObject;
-    match value {
-        Some(s) => {
-            let b = s.into_pyobject(py)?;
-            Ok(b.to_owned().into_any())
-        }
-        None => {
-            let b = py.None().into_pyobject(py)?;
-            Ok(b.to_owned().into_any())
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Capability 类型 PyO3 自动转换（#[pyclass] 自动派生等效方案）
 // ---------------------------------------------------------------------------
@@ -954,10 +931,6 @@ pub struct PyCancelToken {
 impl PyCancelToken {
     pub fn new(flag: CancelFlag) -> Self {
         Self { flag }
-    }
-
-    pub fn flag(&self) -> &Arc<AtomicBool> {
-        &self.flag
     }
 }
 

@@ -217,11 +217,11 @@ def test_repr() -> None:
     assert "pending" in repr(h)
 
 
-# ───────────────────────── P0-6 并发回归 ─────────────────────────
+# ───────────────────────── 并发回归 ─────────────────────────
 
 
 def test_add_done_callback_not_lost_when_racing_completion() -> None:
-    """P0-6 回归：``add_done_callback`` 与 ``_set_result`` 并发时回调不得丢失。
+    """并发回归：``add_done_callback`` 与 ``_set_result`` 并发时回调不得丢失。
 
     完成协议在锁内置终态、锁外 set future；若 ``add_done_callback`` 以
     ``is_set()`` 判定完成，窗口内新回调会 append 进已清空的列表而永久丢失。

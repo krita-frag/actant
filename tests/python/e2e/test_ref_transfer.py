@@ -1,6 +1,6 @@
-"""值引用（Ref）跨节点传输 e2e（0.3.2 R6 验收）：双节点 100MB 单次序列化。
+"""值引用（Ref）跨节点传输 e2e：双节点 100MB 单次序列化。
 
-验收口径（plans/REF_DESIGN.md 方案① / ROADMAP §0.3.2）：
+验收口径（方案①）：
 
 1. ``test_dual_node_100mb_single_serialization``：节点 A 任务返回 ~100MB
    bytes（结果帧超阈值 → 原样落 A 本地 blob，handle 持 Ref），节点 B 提交
@@ -17,8 +17,8 @@
    消费侧以 ``Ref`` 作参数提交（解析路径只搬运 blob 字节）。期望 hash 由
    测试端按确定性模式分块流式计算，不在测试进程物化 100MB 期望值。
 
-2. ``test_ref_small_result_inline_regression``：小结果（<1MB）行为与 0.3.1
-   一致——对象缓存态直传，``ref()`` 为 ``None``，无 blob 参与。
+2. ``test_ref_small_result_inline_regression``：小结果（<1MB）行为——对象缓存态直传，
+   ``ref()`` 为 ``None``，无 blob 参与。
 
 3. ``test_ref_survives_blob_missing``：Ref 指向的 blob 缺失（blob hash 被篡
    改为不存在的值，等价于"消费前 blob 被清除"——本节点 blob 存储为 redb
@@ -140,7 +140,7 @@ class TestRefTransfer:
         def _boom(_self: Ref, timeout: float | None = None) -> Any:
             raise AssertionError(
                 "Ref.result() was called in the submitter process: the 100MB "
-                "value was deserialized as an object (R6 regression)"
+                "value was deserialized as an object (large-value regression)"
             )
 
         monkeypatch.setattr(Ref, "result", _boom)
@@ -176,7 +176,7 @@ class TestRefTransfer:
         )
 
     def test_ref_small_result_inline_regression(self, two_nodes) -> None:
-        """小结果（<1MB）与 0.3.1 行为一致：对象态直传，ref() 为 None。
+        """小结果（<1MB）对象态直传，ref() 为 None。
 
         结果与参数两条路径都验证：无 blob 参与（对象缓存态），值语义与
         直传对象完全相同。

@@ -26,6 +26,7 @@ static EXC_TIMEOUT: OnceLock<Py<PyAny>> = OnceLock::new();
 static EXC_CANCELLED: OnceLock<Py<PyAny>> = OnceLock::new();
 static EXC_INVALID_STATE: OnceLock<Py<PyAny>> = OnceLock::new();
 static EXC_INTERNAL: OnceLock<Py<PyAny>> = OnceLock::new();
+static EXC_REPLAY: OnceLock<Py<PyAny>> = OnceLock::new();
 
 /// 用缓存的 Python 异常类构造 `PyErr`。
 ///
@@ -76,6 +77,7 @@ impl From<ActantError> for PyErr {
             ActantError::Timeout(_) => make_pyerr(&EXC_TIMEOUT, &message),
             ActantError::Cancelled(_) => make_pyerr(&EXC_CANCELLED, &message),
             ActantError::InvalidState(_) => make_pyerr(&EXC_INVALID_STATE, &message),
+            ActantError::Replay(_) => make_pyerr(&EXC_REPLAY, &message),
             ActantError::Internal(_) => make_pyerr(&EXC_INTERNAL, &message),
         }
     }
@@ -115,6 +117,7 @@ pub fn register_exceptions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     reg!(EXC_TIMEOUT, "ActantTimeoutError");
     reg!(EXC_CANCELLED, "TaskCancelledError");
     reg!(EXC_INVALID_STATE, "InvalidStateError");
+    reg!(EXC_REPLAY, "FlowReplayError");
     reg!(EXC_INTERNAL, "InternalError");
 
     // 额外注册 Python 端独有的异常类（无对应 Rust ActantError 变体）。

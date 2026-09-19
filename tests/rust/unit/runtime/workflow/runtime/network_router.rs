@@ -964,3 +964,41 @@ async fn handle_task_result_skipped_returns_false() {
         DirectResponse::TaskResultAck { accepted: false }
     ));
 }
+
+// ───────────────────── 直连存活探测（在途转发腿） ─────────────────────
+
+/// `DirectRequest::Ping` 必须被应答为 `Pong`：这是心跳视图不可用时
+/// 判定"在途转发目标是否仍在线"的唯一信号，缺了它该腿会静默失效。
+#[tokio::test]
+async fn handle_direct_request_ping_responds_pong() {
+    let transport = Arc::new(MockTransport::new("node-A", "peer-A"));
+    let scheduler: Arc<dyn Scheduler> = Arc::new(MockScheduler::new());
+    let router = NetworkEventRouter::new(NetworkEventRouterConfig {
+        network: transport.clone(),
+        event_bus: EventBus::new(),
+        scheduler,
+        actor_system: None,
+        workflow_actor_id: None,
+        dag_gossip_actor_id: None,
+        capability_gossip: None,
+        failover: None,
+        cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+        cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+    });
+
+    router
+        .handle(NetworkEvent::DirectRequest {
+            peer_id: "peer-prober".to_string(),
+            request: Box::new(DirectRequest::Ping),
+            channel: DirectResponseChannel::test_stub(),
+        })
+        .await;
+
+    let responses = transport.take_responses();
+    assert_eq!(responses.len(), 1, "Ping must produce exactly one response");
+    assert!(
+        matches!(responses[0].1, DirectResponse::Pong),
+        "Ping must be answered with Pong, got {:?}",
+        responses[0].1
+    );
+}

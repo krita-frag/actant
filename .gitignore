@@ -44,6 +44,10 @@ benches/python/results/
 # Agent skills (embedded git repos)
 .agents/skills/
 
+# Agent-side project data (memory / skills)：代理本地数据，不入库。
+# 注意与 `.agents/skills/` 区分：那是嵌入式 git 仓库，这是纯本地工作数据。
+.workbuddy/
+
 # IDE local files
 .trae/
 

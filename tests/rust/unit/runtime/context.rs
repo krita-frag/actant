@@ -6,6 +6,7 @@ use crate::common::wire::TOPIC_CANCEL;
 use crate::common::{ActantConfig, ActorId, NodeId};
 use crate::runtime::actor::ActorSystem;
 use crate::runtime::capability::CapabilityRuntime;
+use crate::runtime::dispatcher::WorkerLaunchSpec;
 use crate::runtime::dispatcher::{ProcessTaskDispatcher, TaskDispatcher};
 use crate::runtime::event_bus::EventBus;
 use crate::runtime::state::{LmdbStore, Store};
@@ -16,7 +17,7 @@ use tempfile::tempdir;
 /// （运行时存储调度器，测试中不真正派发任务）。
 fn hermetic_dispatcher() -> Arc<dyn TaskDispatcher> {
     Arc::new(
-        ProcessTaskDispatcher::new(0, "python3".to_string(), 1, Vec::new(), Vec::new())
+        ProcessTaskDispatcher::new(0, WorkerLaunchSpec::default(), 1, Vec::new())
             .expect("process task dispatcher init"),
     )
 }

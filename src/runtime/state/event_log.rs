@@ -59,6 +59,19 @@ pub trait EventLog: Send + Sync {
 
     /// 返回指定 topic 的事件总数（仅用于测试/调试）。
     fn count(&self, topic: &str) -> Result<usize>;
+
+    /// 裁剪**已被快照吸收**的历史：`up_to` 通常取持久化水位。
+    ///
+    /// 删除 `id <= up_to` 的条目中最旧的若干条，使该区间至多保留 `keep` 条；
+    /// **`up_to` 之后的条目永不裁剪**——它们是重放所需的增量
+    /// （`replay_events_after_watermarks` 读的就是这一段）。
+    ///
+    /// 返回实际删除条数。`keep == 0` 表示不裁剪（保守默认）。
+    ///
+    /// 这是事件历史唯一的留存机制：
+    /// 只增不删会让长跑工作流的历史无限增长，但按"保留最近 N 条"裁剪会破坏
+    /// 重放，故裁剪上界必须是水位。
+    fn trim_absorbed(&self, topic: &str, up_to: &EventId, keep: usize) -> Result<usize>;
 }
 
 /// 基于 LMDB `LmdbStore` 的 EventLog 实现。
@@ -186,6 +199,33 @@ impl EventLog for LmdbEventLog {
         let entries = self.store.scan_prefix(&prefix)?;
         Ok(entries.len())
     }
+
+    fn trim_absorbed(&self, topic: &str, up_to: &EventId, keep: usize) -> Result<usize> {
+        if keep == 0 {
+            return Ok(0);
+        }
+        let prefix = Self::prefix(topic);
+        let mut absorbed: Vec<EventId> = Vec::new();
+        for (_, value) in self.store.scan_prefix(&prefix)? {
+            let entry: LogEntry = postcard::from_bytes(&value)
+                .map_err(|e| ActantError::Serialization(e.to_string()))?;
+            if entry.id <= *up_to {
+                absorbed.push(entry.id);
+            }
+        }
+        // scan_prefix 按 key（= id）升序：前面的就是最旧的。
+        absorbed.sort();
+        let excess = absorbed.len().saturating_sub(keep);
+        if excess == 0 {
+            return Ok(0);
+        }
+        let mut removed = 0usize;
+        for id in absorbed.into_iter().take(excess) {
+            self.store.delete(&Self::key(topic, &id))?;
+            removed += 1;
+        }
+        Ok(removed)
+    }
 }
 
 /// 内存实现的 EventLog，仅用于测试。
@@ -239,6 +279,24 @@ impl EventLog for MemoryEventLog {
     fn count(&self, topic: &str) -> Result<usize> {
         let inner = self.inner.lock();
         Ok(inner.get(topic).map(|v| v.len()).unwrap_or(0))
+    }
+
+    fn trim_absorbed(&self, topic: &str, up_to: &EventId, keep: usize) -> Result<usize> {
+        if keep == 0 {
+            return Ok(0);
+        }
+        let mut inner = self.inner.lock();
+        let Some(entries) = inner.get_mut(topic) else {
+            return Ok(0);
+        };
+        // 追加顺序即升序，前面的最旧。
+        let absorbed = entries.iter().filter(|e| e.id <= *up_to).count();
+        let excess = absorbed.saturating_sub(keep);
+        if excess == 0 {
+            return Ok(0);
+        }
+        entries.drain(..excess);
+        Ok(excess)
     }
 }
 

@@ -1,4 +1,4 @@
-"""P2-1: async gather + AsyncResult.__await__ 测试。"""
+"""async gather + AsyncResult.__await__ 测试。"""
 
 from __future__ import annotations
 

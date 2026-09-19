@@ -4,38 +4,6 @@
 use super::*;
 
 #[test]
-fn pack_upstream_prefix_empty_returns_default() {
-    let default = b"hello".to_vec();
-    let result = pack_upstream_prefix(&[], &default).unwrap();
-    assert_eq!(result, default);
-}
-
-#[test]
-fn pack_upstream_prefix_format() {
-    let upstream = vec![b"a".to_vec(), b"bb".to_vec()];
-    let default = b"inner".to_vec();
-    let result = pack_upstream_prefix(&upstream, &default).unwrap();
-
-    // [TAG_UPSTREAM_PREFIX, count=2, len1=1, "a", len2=2, "bb", "inner"]
-    assert_eq!(result[0], TAG_UPSTREAM_PREFIX);
-    assert_eq!(
-        u32::from_le_bytes([result[1], result[2], result[3], result[4]]),
-        2
-    );
-    assert_eq!(
-        u32::from_le_bytes([result[5], result[6], result[7], result[8]]),
-        1
-    );
-    assert_eq!(&result[9..10], b"a");
-    assert_eq!(
-        u32::from_le_bytes([result[10], result[11], result[12], result[13]]),
-        2
-    );
-    assert_eq!(&result[14..16], b"bb");
-    assert_eq!(&result[16..], b"inner");
-}
-
-#[test]
 fn sign_and_verify_roundtrip() {
     let key = b"test-secret-key";
     let payload = b"hello world";
@@ -183,7 +151,7 @@ fn empty_data_rejected_with_key() {
     assert!(verify(b"key", b"").is_err());
 }
 
-// ───────────────────────── BlobRef（0.3.2 R1 值引用 wire 编码）─────────────────────────
+// ───────────────────────── BlobRef（值引用 wire 编码）─────────────────────────
 
 #[test]
 fn blob_ref_roundtrip() {
@@ -262,7 +230,7 @@ fn blob_hash_hex_display_and_parse_roundtrip() {
     assert!(crate::common::model::BlobHash::from_str(&"aa".repeat(31)).is_err());
 }
 
-// ───────────────────────── wire_mac / verify_wire_mac 属性测试（H1）─────────────────────────
+// ───────────────────────── wire_mac / verify_wire_mac 属性测试 ─────────────────────────
 //
 // `wire_mac` / `verify_wire_mac` 是 `payload.rs` 内的 pub 函数，但未在
 // `common.rs` 中 re-export，因此 `tests/rust/property/` 无法访问。这里通过

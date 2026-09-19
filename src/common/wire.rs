@@ -37,10 +37,14 @@ pub mod constants {
         pub const EXEC: &str = "orch:exec:";
         pub const PENDING: &str = "orch:pending:";
         pub const RESULT: &str = "orch:result:";
-        /// 等待点快照（S1）：与 exec/pending 同批落盘的重放加速缓存，
+        /// 等待点快照：与 exec/pending 同批落盘的重放加速缓存，
         /// 事实源仍是 `workflow:{id}` topic 的等待点事件。
         pub const WAIT: &str = "orch:wait:";
-        /// 事件水位（S0）：快照已包含的最后一个事件的 `EventId`，
+        /// 信号缓冲快照：等待点**注册前**抵达的信号。
+        /// 与 [`WAIT`] 同批落盘、同批删除——等待点跨重启存活而其信号不存活的
+        /// 不对称会让缓冲在重启路径上失效。
+        pub const SIGNAL_BUF: &str = "orch:sigbuf:";
+        /// 事件水位：快照已包含的最后一个事件的 `EventId`，
         /// recover 时据此只重放其后的事件（快照 + 事件重放，序号对齐）。
         pub const EVENT_SEQ: &str = "orch:eventseq:";
         pub const LEASE: &str = "lease:";
@@ -366,7 +370,7 @@ pub use constants::{
     store_keys::{
         DAG as STORE_KEY_DAG, EVENT_SEQ as STORE_KEY_EVENT_SEQ, EXEC as STORE_KEY_EXEC,
         LEASE as STORE_KEY_LEASE, PENDING as STORE_KEY_PENDING, RESULT as STORE_KEY_RESULT,
-        WAIT as STORE_KEY_WAIT,
+        SIGNAL_BUF as STORE_KEY_SIGNAL_BUF, WAIT as STORE_KEY_WAIT,
     },
     TOPIC_CANCEL, TOPIC_DAG_STATE, TOPIC_FAILOVER, TOPIC_HEADS, TOPIC_HEARTBEAT,
     TOPIC_WORKFLOW_STATE_REQ, TOPIC_WORKFLOW_STATE_RESP_PREFIX, WIRE_PROTOCOL_VERSION,

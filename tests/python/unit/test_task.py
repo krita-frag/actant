@@ -543,16 +543,23 @@ class TestTaskRegistry:
             handle = _echo.submit(42)        # 排队，尚未开始
             cancelled = rt.cancel_task(handle.task_id)
             assert cancelled is True
-            assert rt.is_cancelled(handle.task_id) is True
+            # 只断言**可观测契约**（句柄终态 + result() 抛错），不断言
+            # is_cancelled 的瞬时值：它是"取消在途标记"，任务一进入终态就随注册表
+            # 回收被清除，而终态可能在 cancel_task() 返回后的任意时刻抵达——断言它
+            # 等于把竞态写进用例（本用例曾因此单跑 6 次挂 2 次）。
             with pytest.raises(TaskCancelledError):
                 handle.result(timeout=30)
+            assert handle.state == "cancelled"
             # 等待 blocker 完成，避免 stop() 长时间等待
             blocker.result(timeout=30)
+            # 终态后注册表与预取消标记都必须清理干净（无泄漏）。
+            # 以 get_task() 为等待条件：unregister_task 先清标记、后删句柄，
+            # 故句柄消失 ⇒ 标记必已清除，断言无竞态。
             deadline = time.monotonic() + 5.0
-            while rt.is_cancelled(handle.task_id) and time.monotonic() < deadline:
+            while rt.get_task(handle.task_id) is not None and time.monotonic() < deadline:
                 time.sleep(0.01)
-            assert rt.is_cancelled(handle.task_id) is False
             assert rt.get_task(handle.task_id) is None
+            assert rt.is_cancelled(handle.task_id) is False
 
     def test_cancel_unknown_task_returns_false(self):
         with Runtime.with_defaults() as rt:

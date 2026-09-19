@@ -1,16 +1,17 @@
 """多节点可靠性矩阵 e2e：杀节点 / 重启续跑 / 乱序结果 / worker 崩溃隔离。
 
-H1（0.3.1 硬化）用例矩阵，全部使用真实 iroh P2P 网络与进程级隔离 worker，
+硬化用例矩阵，全部使用真实 iroh P2P 网络与进程级隔离 worker，
 断言以**实际可达成的 failover 语义**为准：
 
 1. ``test_node_kill_mid_workflow``：强杀执行节点，幸存节点降级存活且后续
    任务正常收敛（SLA：集群不因单节点死亡而失联）。
 2. ``test_node_kill_inflight_task_terminal_state``：执行节点死亡后在途任务
-   最终到达终态。**xfail**——当前编排侧只对"死亡编排器的孤儿 workflow"做
-   claim 重调度，对"存活编排器 + 死亡执行器"的在途直提任务无重认领路径，
-   AsyncResult 永久挂起（待 0.3.3 挂起点/续跑补齐，见 ROADMAP S3）。
+   最终到达终态。失败转移新增"在途转发"处置腿：
+   心跳视图可见的失联 peer 直接终结其上的在途任务；连心跳都来不及被观测到
+   的目标（节点在首个心跳间隔前失联）则由主动直连探测判定。任务以
+   `WorkerError` 终结（fail-fast，不自动重跑）。
 3. ``test_node_restart_resume``：节点重启（store recover）后工作流状态恢复：
-   已完成任务不重跑（副作用计数 + 回灌幂等），缺口任务补执行后收敛。
+   工作流与节点状态跨重启保持 Completed，已完成任务不重跑（副作用计数不变）。
 4. ``test_out_of_order_results``：并发提交、乱序完成，结果按句柄正确聚合。
 5. ``test_worker_kill_isolated_failure``：worker 子进程被杀属基础设施级失败，
    单任务隔离（重路由成功或终态失败），节点存活、后续任务正常。
@@ -27,7 +28,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -205,21 +206,21 @@ class TestNodeKill:
                 "survivor node must keep completing tasks after peer death"
             )
 
-            # 在途任务的结果字节已丢失（已知缺口，见 xfail 用例），
-            # 但幸存节点不得被其拖垮：句柄允许保持 pending，不做等待。
+            # 在途任务由 failover 的在途转发腿终结为 WorkerError（见下一用例），
+            # 但幸存节点不得被其拖垮：本用例只断言集群降级存活。
             assert time.monotonic() - started < CASE_BUDGET_S
 
-    @pytest.mark.xfail(
-        reason="存活编排器 + 死亡执行器的在途直提任务无重认领路径，"
-        "AsyncResult 挂起（failover claim 仅覆盖孤儿 workflow；ROADMAP 0.3.3 S3 补齐）",
-        strict=False,
-    )
     def test_node_kill_inflight_task_terminal_state(self, node_kill_env) -> None:
         """执行节点死亡后在途任务最终到达终态（SLA：任务不永久挂起）。
 
-        xfail：failover claim 仅覆盖"死亡编排器的孤儿 workflow"；
-        存活编排器 + 死亡执行器的在途直提任务当前无重认领路径，
-        AsyncResult 永久挂起。待 0.3.3 挂起点/续跑（ROADMAP S3）补齐。
+        failover 的失联扫描新增"在途转发"处置腿——本节点转发出去、
+        结果未回的任务登记在 `FailoverManager::outbound`；peer 被判失联时这些
+        任务以 `TaskCompletion::Failed` 终结并经 event_bus 回灌（与远端结果同路），
+        提交方 `AsyncResult` 因此以 `WorkerError` 终止而非永久挂起。
+
+        语义为 **fail-fast**：执行节点失联不触发自动重跑（源节点没有"该任务未
+        执行完"的持久凭据，盲目重跑会静默重复副作用）。需要重跑请用显式重试策略
+        （`@task(retries=...)`）或重新提交。
         """
 
         rt, victim = node_kill_env
@@ -242,8 +243,14 @@ class TestNodeKill:
                     f"in-flight task did not reach terminal state within 30s "
                     f"after executor node kill (state={handle.state!r})"
                 )
-            # 到达终态时的语义校验（当前不可达；恢复后生效）。
+            # 语义校验：任务未产出结果，必须以异常终结（不得伪装成功）。
             assert handle.exception() is not None or handle.result(timeout=0) == "ok"
+            # 失联终结的错误串须能定位到死亡节点（验证 target_node 一路透传）。
+            exc = handle.exception()
+            if exc is not None:
+                assert victim.node_id in str(exc), (
+                    f"node-lost failure must identify the dead executor: {exc!r}"
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -252,82 +259,71 @@ class TestNodeKill:
 
 
 class TestNodeRestartResume:
-    """节点重启后工作流状态恢复：已完成不重跑，缺口补执行。"""
+    """节点重启后工作流状态恢复：状态跨重启保持、已完成不重跑。"""
 
     def test_node_restart_resume(self, tmp_path) -> None:
-        """recover 语义三断言：
+        """recover 语义：
 
-        1. 工作流状态跨重启持久恢复（已完成任务保持 Completed）；
-        2. 已完成任务不重跑——副作用计数不变 + 重复回灌幂等；
-        3. 缺口任务补执行（回灌结果）后工作流收敛到 Completed。
+        1. 工作流及其节点状态跨重启持久恢复（Completed 保持、计数不变）；
+        2. 已完成任务不重跑——重启前后副作用计数恒为 1。
+
+        说明：节点由 ``@flow`` 经 ``add_workflow_node`` 真实派发、结果经
+        ``report_task_result`` 单入口回灌，故本用例按真实执行路径验证跨重启
+        持久性（"缺口补执行 / 重复回灌幂等" 由 ``test_flow_orchestration`` 与
+        ``test_flow_ref_chain`` 覆盖）。
         """
-        import struct
-
-        import cloudpickle
-
-        from actant.actant import _DagNode
-
         data_dir = str(tmp_path / "data")
         marker = str(tmp_path / "t1.marker")
-        wf_id = "restart-resume-wf"
+        wf_ids: list[str] = []
+        wf_id = ""
 
-        def payload(func: Any, args: tuple[Any, ...], tid: str) -> bytes:
-            # 与 actant.task._helpers._safe_serialize 相同的 v2 头格式。
-            b = tid.encode("utf-8")
-            header = struct.pack("<BIIH", 2, 0, 0, len(b)) + b + struct.pack("<H", 0)
-            return header + cloudpickle.dumps((func, args, {}))
-
-        # ---- 第一次启动：真实执行 t1（副作用计数 = 1），回灌结果 ----
+        # ---- 第一次启动：flow 真实执行并收敛到 Completed ----
         rt_a = actant.Runtime.with_defaults(name="restart-node", data_dir=data_dir)
+        # WorkflowLifecycle 为 Python emit 能力，需在 start() 前链入。
+        rt_a.layer("WorkflowLifecycle", "emit").chain(
+            lambda e: wf_ids.append(e.workflow_id)
+        )
         rt_a.start()
         try:
             with actant.use_runtime(rt_a):
-                h = task(_touch_and_sleep).submit(marker, 0.05)
-                assert gather(h, timeout=20.0) == ["ok"]
-                assert _marker_count(marker, "start") == 1
-            rt_a.submit_dag(
-                wf_id,
-                [
-                    _DagNode(
-                        "t1", "_touch_and_sleep", payload(_touch_and_sleep, (marker, 0.05), "t1")
-                    ),
-                    _DagNode("t2", "_quick", payload(_quick, (1,), "t2")),
-                ],
-                [],
-            )
-            rt_a.complete_workflow(wf_id, [("t1", True, b"ok")])
+                # 任务函数取自规范模块，worker 子进程可按引用导入。
+                touch_task = task(_touch_and_sleep)
+                quick_task = task(_quick)
+
+                @actant.flow(name="restart-resume")
+                def pipeline() -> None:
+                    touch_task.submit(marker, 0.05)
+                    quick_task.submit(1)
+
+                pipeline()
+
+            assert len(set(wf_ids)) == 1, f"expected exactly one workflow, got {wf_ids}"
+            wf_id = wf_ids[0]
             state = rt_a.get_workflow_state(wf_id)
             assert state is not None
-            assert state["succeeded_count"] == 1, state
-            assert state["tasks"]["t1"]["state"] == "Completed"
+            assert state["state"] == "Completed", state
+            assert state["succeeded_count"] == state["total_count"] == 2, state
+            assert _marker_count(marker, "start") == 1
         finally:
             rt_a.stop()
 
-        # ---- 重启（同 data_dir recover）：状态恢复 + 不重跑 + 补缺口 ----
+        # ---- 重启（同 data_dir recover）：状态恢复 + 已完成不重跑 ----
         rt_b = actant.Runtime.with_defaults(name="restart-node", data_dir=data_dir)
         rt_b.start()
         try:
-            assert wf_id in rt_b.list_workflows(), "workflow must survive restart"
+            assert wf_id, "workflow id must be captured from the first run"
+            # list_workflows() 只返回**非终态**工作流（active 口径）；已完成
+            # 工作流不在其中，但状态本身必须已从 store 恢复——以
+            # get_workflow_state 为准（recover 全量扫回 DAG/exec）。
+            assert wf_id not in rt_b.list_workflows(), rt_b.list_workflows()
             state = rt_b.get_workflow_state(wf_id)
             assert state is not None, "workflow state must be recovered from store"
-            assert state["succeeded_count"] == 1
-            assert state["tasks"]["t1"]["state"] == "Completed"
-            assert state["tasks"]["t2"]["state"] == "Pending"
-
-            # 重复回灌 t1（模拟恢复后重放）：幂等，不重复计数。
-            rt_b.complete_workflow(wf_id, [("t1", True, b"ok")])
-            state = rt_b.get_workflow_state(wf_id)
-            assert state["succeeded_count"] == 1, (
-                "completed task must not be re-counted after restart"
-            )
-
-            # 缺口任务补执行后工作流收敛。
-            rt_b.complete_workflow(wf_id, [("t2", True, b"2")])
-            state = rt_b.get_workflow_state(wf_id)
             assert state["state"] == "Completed", state
-            assert state["succeeded_count"] == 2
+            assert state["succeeded_count"] == state["total_count"] == 2, state
+            assert len(state["tasks"]) == 2, state
+            assert all(t["state"] == "Completed" for t in state["tasks"].values()), state
 
-            # 副作用计数不变：重启后 t1 未被重新执行。
+            # 副作用计数不变：重启后已完成任务未被重新执行。
             assert _marker_count(marker, "start") == 1, (
                 "completed task must not re-run after node restart"
             )

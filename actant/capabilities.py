@@ -132,7 +132,7 @@ class ExecuteOutcome:
 
 @dataclass
 class ValueStoreReq:
-    """`ValueStore` capability 的请求（0.3.2 R2 值引用原语）。
+    """`ValueStore` capability 的请求（值引用原语）。
 
     内容寻址存储：同一次 ``store`` 的数据字节决定 ``ref``（BlobRef wire 编码，
     内含 blake3 hash 与来源节点）；``fetch`` 按 ``ref`` 取回原始字节，跨节点时
@@ -226,7 +226,7 @@ class ExecuteHandler(Protocol):
 
 @runtime_checkable
 class ValueStoreHandler(Protocol):
-    """副作用型：值引用存取（0.3.2 R2）。
+    """副作用型：值引用存取。
 
     ``op="store"`` 返回 BlobRef wire 编码字节（``ref``）；``op="fetch"`` 返回
     取回的原始字节。默认 handler 走本节点 Rust blob 桥（`_RuntimeCore.

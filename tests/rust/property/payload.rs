@@ -4,10 +4,7 @@
 //! 这些测试使用 `proptest` 验证 payload 编解码的不变量，
 //! 覆盖手写单元测试难以穷举的边界情况。
 
-use actant::common::{
-    pack_group, pack_single, pack_upstream_prefix, sign, unpack_payload, verify,
-    TAG_UPSTREAM_PREFIX,
-};
+use actant::common::{pack_group, pack_single, sign, unpack_payload, verify};
 use proptest::prelude::*;
 
 proptest! {
@@ -27,38 +24,6 @@ proptest! {
         let packed = pack_group(&items).unwrap();
         let unpacked = unpack_payload(&packed).unwrap();
         prop_assert_eq!(unpacked, items);
-    }
-
-    /// `pack_upstream_prefix` 空列表返回原 payload。
-    #[test]
-    fn pack_upstream_prefix_empty_returns_default(
-        payload in prop::collection::vec(any::<u8>(), 0..256)
-    ) {
-        let result = pack_upstream_prefix(&[], &payload).unwrap();
-        prop_assert_eq!(result, payload);
-    }
-
-    /// `pack_upstream_prefix` 非空时以 TAG_UPSTREAM_PREFIX 开头，且 default_payload 在尾部。
-    #[test]
-    fn pack_upstream_prefix_nonempty_preserves_default_payload(
-        upstream in prop::collection::vec(prop::collection::vec(any::<u8>(), 0..32), 1..8),
-        default in prop::collection::vec(any::<u8>(), 0..128)
-    ) {
-        let result = pack_upstream_prefix(&upstream, &default).unwrap();
-        prop_assert_eq!(result[0], TAG_UPSTREAM_PREFIX);
-        // default_payload 应完整出现在 result 尾部
-        let tail_start = result.len() - default.len();
-        prop_assert_eq!(&result[tail_start..], &default[..]);
-    }
-
-    /// `pack_upstream_prefix` 的 upstream_count 字段应等于输入长度。
-    #[test]
-    fn pack_upstream_prefix_count_matches(
-        upstream in prop::collection::vec(prop::collection::vec(any::<u8>(), 0..32), 1..16)
-    ) {
-        let result = pack_upstream_prefix(&upstream, b"").unwrap();
-        let count = u32::from_le_bytes([result[1], result[2], result[3], result[4]]);
-        prop_assert_eq!(count as usize, upstream.len());
     }
 
     /// sign + verify 往返：非空 key 下应恢复原始 payload。

@@ -371,8 +371,8 @@ def _run_dispatch(payload: bytes, cancel_event: threading.Event) -> bytes:
             payload
         )
         func, args, kwargs = _reuse_unpack(func_payload)
-        # 解值引用参数哨兵（0.3.2 R3b）：提交方父进程已把大值字节内联进帧，
-        # worker 只做 loads 还原（结果帧约定取 [1]，见 plans/REF_DESIGN.md）。
+        # 解值引用参数哨兵：提交方父进程已把大值字节内联进帧，
+        # worker 只做 loads 还原（结果帧约定取 [1]）。
         args = _resolve_ref_arg(args)
         kwargs = _resolve_ref_arg(kwargs)
     except Exception as exc:  # 头解析 / 反序列化失败：返回可序列化的错误

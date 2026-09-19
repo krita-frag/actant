@@ -5,7 +5,7 @@
 
 use crate::common::{
     Result, TaskId, WorkflowId, STORE_KEY_DAG, STORE_KEY_EVENT_SEQ, STORE_KEY_EXEC,
-    STORE_KEY_PENDING, STORE_KEY_RESULT, STORE_KEY_WAIT,
+    STORE_KEY_PENDING, STORE_KEY_RESULT, STORE_KEY_SIGNAL_BUF, STORE_KEY_WAIT,
 };
 use crate::runtime::workflow::{Dag, WorkflowExecution};
 
@@ -29,49 +29,27 @@ pub(super) fn wait_key(wf_id: &WorkflowId) -> String {
     format!("{}{}", STORE_KEY_WAIT, wf_id.as_str())
 }
 
+/// 信号缓冲快照键：与 [`wait_key`] 同批落盘 / 同批删除。
+pub(super) fn signal_buf_key(wf_id: &WorkflowId) -> String {
+    format!("{}{}", STORE_KEY_SIGNAL_BUF, wf_id.as_str())
+}
+
 pub(super) fn event_seq_key(wf_id: &WorkflowId) -> String {
     format!("{}{}", STORE_KEY_EVENT_SEQ, wf_id.as_str())
 }
 
-/// 构造带 MAC 签名的 task payload：有前驱依赖时，把所有已产出结果的前驱
-/// 结果统一前置到原始 payload 前并重新签名。
+/// 构造带 MAC 签名的 task payload。
 ///
-/// ## 约定：无结果的前驱被跳过
-///
-/// 收集 `upstream_results` 时，`filter_map` 会跳过没有 `result` 的前驱
-/// （典型为条件分支中未被激活、已被标记 `Skipped` 的条件前驱——它们按
-/// 设计不产生结果）。因此下游任务收到的上游结果数量可能少于其前驱数量，
-/// 该行为是有意的：参数合并逻辑（Python dispatcher 侧）按顺序消费存在的
-/// 结果，不依赖与前驱数量一一对应。
+/// 节点 payload 即 Python 提交侧构建的 v2 envelope（函数 + 已解析参数 +
+/// 控制头部，自足完整——flow 语义下上游结果在提交方父进程解析后内联进
+/// 参数）。当前仅对 payload 做 MAC 签名包装。
 pub(super) fn build_task_payload(
-    dag: &Dag,
-    execution: &WorkflowExecution,
-    task_id: &TaskId,
+    _dag: &Dag,
+    _execution: &WorkflowExecution,
+    _task_id: &TaskId,
     default_payload: &[u8],
     signing_key: &[u8],
 ) -> Result<Vec<u8>> {
-    let predecessors = dag.predecessors_of(task_id);
-    if predecessors.is_empty() {
-        return Ok(default_payload.to_vec());
-    }
-    // 先验证并解包原始任务 payload，再重新包装上游结果并签名。
-    // 这保证了带依赖的任务 payload 仍具有端到端 MAC 保护。
-    let raw_payload =
-        crate::common::payload::verify(signing_key, default_payload).map_err(|e| {
-            crate::common::ActantError::Internal(format!("payload verification: {}", e))
-        })?;
-    // 收集前驱任务结果（按 DAG 边顺序），统一前置到 default_payload。
-    // Rust 核心不感知 default_payload 的 tag 类型 — 参数合并逻辑由 Python dispatcher 处理。
-    let upstream_results: Vec<Vec<u8>> = predecessors
-        .iter()
-        .filter_map(|pred| {
-            execution
-                .tasks
-                .get(&pred.task_id)
-                .and_then(|t| t.result.clone())
-        })
-        .collect();
-    let inner = crate::common::payload::pack_upstream_prefix(&upstream_results, &raw_payload)?;
-    crate::common::payload::sign(signing_key, &inner)
+    crate::common::payload::sign(signing_key, default_payload)
         .map_err(|e| crate::common::ActantError::Internal(format!("payload sign: {}", e)))
 }

@@ -1,4 +1,4 @@
-"""混沌与压力基线 e2e（H2）：打满队列 / 大 fan-out / 慢消费者。
+"""混沌与压力基线 e2e：打满队列 / 大 fan-out / 慢消费者。
 
 单节点、真实 worker 子进程池，验证并记录压力场景下的**行为契约**：
 1. ``test_queue_saturation_backpressure_zero_loss``：提交量远超

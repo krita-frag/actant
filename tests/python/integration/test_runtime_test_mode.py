@@ -1,4 +1,4 @@
-"""P2-3: Runtime.test() 内存模式测试。
+"""Runtime.test() 内存模式测试。
 
 验证：
 - ``Runtime.test()`` 创建的 Runtime 无 P2P 网络开销。

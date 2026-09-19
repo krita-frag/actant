@@ -183,7 +183,9 @@ impl ActorStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Serialize, Deserialize, Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 #[rkyv(bytecheck())]
 pub struct RetryPolicy {
     pub max_retries: u32,
@@ -441,6 +443,7 @@ impl ActorErrorKind {
             Self::Timeout => "timeout",
             Self::Cancelled => "cancelled",
             Self::InvalidState => "invalid_state",
+            Self::Replay => "replay",
             Self::Internal => "internal",
         }
     }
@@ -470,6 +473,7 @@ pub enum ActorErrorKind {
     Timeout,
     Cancelled,
     InvalidState,
+    Replay,
     Internal,
 }
 
@@ -494,6 +498,7 @@ impl From<&crate::common::ActantError> for ActorErrorEnvelope {
             ActantError::Timeout(m) => (ActorErrorKind::Timeout, m.clone()),
             ActantError::Cancelled(m) => (ActorErrorKind::Cancelled, m.clone()),
             ActantError::InvalidState(m) => (ActorErrorKind::InvalidState, m.clone()),
+            ActantError::Replay(m) => (ActorErrorKind::Replay, m.clone()),
             ActantError::Internal(m) => (ActorErrorKind::Internal, m.clone()),
         };
         Self { kind, message }
@@ -526,6 +531,7 @@ impl From<ActorErrorEnvelope> for crate::common::ActantError {
             ActorErrorKind::Timeout => Self::Timeout(envelope.message),
             ActorErrorKind::Cancelled => Self::Cancelled(envelope.message),
             ActorErrorKind::InvalidState => Self::InvalidState(envelope.message),
+            ActorErrorKind::Replay => Self::Replay(envelope.message),
             ActorErrorKind::Internal => Self::Internal(envelope.message),
         }
     }

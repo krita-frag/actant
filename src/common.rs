@@ -54,13 +54,13 @@ pub use model::{
 // 协议类型 — crate 内部
 pub(crate) use wire::{
     OrchestratorClaim, Topic, WireTaskResult, STORE_KEY_DAG, STORE_KEY_EVENT_SEQ, STORE_KEY_EXEC,
-    STORE_KEY_LEASE, STORE_KEY_PENDING, STORE_KEY_RESULT, STORE_KEY_WAIT, TOPIC_FAILOVER,
-    TOPIC_HEADS, TOPIC_HEARTBEAT, TOPIC_WORKFLOW_STATE_REQ,
+    STORE_KEY_LEASE, STORE_KEY_PENDING, STORE_KEY_RESULT, STORE_KEY_SIGNAL_BUF, STORE_KEY_WAIT,
+    TOPIC_FAILOVER, TOPIC_HEADS, TOPIC_HEARTBEAT, TOPIC_WORKFLOW_STATE_REQ,
 };
 // 请求-响应协议所需类型（公共 API）
 pub use payload::{
-    decode_blob_ref, encode_blob_ref, pack_group, pack_single, pack_upstream_prefix, sign,
-    unpack_payload, verify, BlobRef, TAG_UPSTREAM_PREFIX,
+    decode_blob_ref, encode_blob_ref, pack_group, pack_single, sign, unpack_payload, verify,
+    BlobRef,
 };
 pub use serialization::MAX_DECODE_SIZE;
 pub use serialization::{decode_postcard, deserialize_rkyv_value, encode_postcard, serialize_rkyv};

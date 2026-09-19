@@ -102,6 +102,8 @@ with Runtime.with_defaults():
 
 `@flow` 广播生命周期事件（`submitted` → `started` → `completed`/`failed`），可通过 `rt.layer("WorkflowLifecycle").chain(handler)` 订阅。
 
+`submitted` / `started` 在工作流**真正建槽之后**才广播（工作流是惰性创建的：函数体第一次 `Task.submit` 或进入等待点时创建），因此事件里的 `workflow_id` 拿到即可用于递交信号。函数体若从未创建工作流（无 `Task.submit`、无等待点），则只有终态事件。
+
 ---
 
 ## 核心概念
@@ -122,18 +124,26 @@ with Runtime.with_defaults():
 from actant import Runtime
 from actant.actant import _ActantConfig, _NetworkConfig
 
+# `Runtime.__init__` 是纯关键字参数，配置经 `config=` 传入；
+# `_ActantConfig` 的 `payload_signing_key` 必填。
+def _cfg(preset: str, **kw):
+    return _ActantConfig(
+        payload_signing_key=b"shared-secret",
+        network=_NetworkConfig(preset=preset, **kw),
+    )
+
 # 局域网部署：禁用 relay，仅 mDNS
-rt = Runtime(_ActantConfig(network=_NetworkConfig(preset="mdns")))
+rt = Runtime(config=_cfg("mdns"))
 
 # 测试 / CI：完全离线
-rt = Runtime(_ActantConfig(network=_NetworkConfig(preset="none")))
+rt = Runtime(config=_cfg("none"))
 
 # 自定义 DNS 发现域
-rt = Runtime(_ActantConfig(network=_NetworkConfig(
-    preset="dns",
-    dns_origin_domain="actant.example.com",
-)))
+rt = Runtime(config=_cfg("dns", dns_origin_domain="actant.example.com"))
 ```
+
+> 更简单的做法是用 `Runtime.with_defaults(name=..., data_dir=...)`；不显式给
+> `data_dir` 时 developer preset 为 `none`，给了则为 `local`。
 
 **环境变量覆盖**：`ACTANT_DISCOVERY=<preset>` 优先于配置中的 `preset`，用于在不动代码的前提下切换发现策略（例如 CI 中强制 `ACTANT_DISCOVERY=none` 避免联网）。
 
@@ -169,9 +179,35 @@ def long_pipeline(items: list) -> list:
 
 **Flow 级超时（`@flow(timeout_ms=...)`）**
 
-- 在主线程上用 `threading.Event` 等待子线程，超时后设置 `cancel_event`。
-- 子线程中后续的 `Task.submit` 调用会检查该事件并立即抛出 `ActantTimeoutError`，**阻止 orphan 任务继续创建**。
-- Flow 级超时是软超时：flow 函数体在子线程中执行，超时后使已提交任务经进程池终态化，但函数体线程可能继续运行——Python 无法强制中断线程。长时间运行的 flow 应拆分为多个 `Task.submit`，由任务级硬超时兜底。
+- `timeout_ms` 是**工作流级 deadline**（S5 起）。唯一决策者是 orchestrator 的超时 watcher，它按 `state_poll_interval_ms`（默认 500ms）轮询，到期把工作流标为 `Failed`（error = `workflow timeout exceeded`）**并真正取消全部运行中任务**，worker 在协作检查点退出。
+- 取消同时覆盖**本节点与远端**：watcher 除 gossip 广播 `CancelBroadcast` 外，还把同一份载荷自投递回本节点事件通道。gossip 广播只投递给邻居、**不回环给发送者**，只靠广播会漏掉本节点自己执行的在途任务（工作流已 `Failed`，而阻塞在任务等待上的函数体会永久挂起）。
+- 调用方语义：任务级终态是 `Cancelled`（这是事实），对外归一为 `ActantTimeoutError`。
+- 返回时刻为 `deadline + 轮询周期`（默认 500ms 量级），**不再是"超时瞬间立即返回"**。
+- **函数体本身不可中断**：Python 无法抢占正在执行的字节码。若函数体已正常返回而 deadline 已到期，调用方**仍抛 `ActantTimeoutError`**——返回值不会被当作成功。
+- **不含任何 `Task.submit` 的 flow 不创建编排外壳**（沿用惰性创建工作流的既有语义），deadline 因此无宿主、不生效。长耗时段落应拆成 `Task.submit`，既能被工作流 deadline 取消，也自动获得任务级硬超时兜底：
+
+```python
+import time
+
+from actant import ActantTimeoutError, Runtime, flow, task
+
+@task(timeout_ms=10_000)
+def heavy(chunk: int) -> int:
+    time.sleep(2)          # 模拟长计算
+    return chunk * 2
+
+@flow(timeout_ms=3_000)
+def pipeline(chunks: list[int]) -> int:
+    # 用 submit 提交（直接调用 heavy(c) 是同步执行，不产生编排节点，
+    # 超时也就无从取消）。这样工作流 deadline 到期才能真正取消在途计算。
+    return sum(heavy.submit(c).result() for c in chunks)
+
+with Runtime.with_defaults():
+    try:
+        pipeline([1, 2, 3])          # 3 段共 6s，超出 3s deadline
+    except ActantTimeoutError as exc:
+        print(f"exceeded deadline: {exc}")
+```
 
 **何时不用 `timeout_ms`**
 

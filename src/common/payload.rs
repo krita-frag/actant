@@ -3,27 +3,13 @@
 //! ## 设计原则
 //!
 //! Rust 核心层**不感知** Python 的参数语义（args/kwargs/TaskRef 位置等）。
-//! 本模块只提供两个职责：
-//!
-//! 1. **基础打包**：`pack_single` / `pack_group` — 由 Python 侧调用构建 default_payload，
-//!    Rust 视为不透明字节。
-//! 2. **上游结果前置**：`pack_upstream_prefix` — 由 Rust orchestrator 调用，
-//!    把前驱任务结果机械地前置到 default_payload，**不检查 default_payload 的 tag 类型**。
+//! 本模块提供基础打包：`pack_single` / `pack_group` — 由 Python 侧调用构建
+//! 任务 payload，Rust 视为不透明字节。
 //!
 //! ## Payload 格式
 //!
-//! ### default_payload（由 Python 构建，Rust 视为不透明）
-//!
 //! Python 侧定义自己的 tag 系统（TAG_SINGLE/TAG_GROUP/TAG_GENERIC/TAG_POSITIONAL 等），
 //! Rust 不需要知道这些 tag 的含义。
-//!
-//! ### 最终 payload（Rust 构建后）
-//!
-//! 若任务有前驱，Rust 用 `pack_upstream_prefix` 包装：
-//! `[TAG_UPSTREAM_PREFIX, upstream_count(u32), up_len1(u32), up_bytes1, ..., default_payload]`
-//!
-//! Python dispatcher 收到后先解包 upstream prefix，再把剩余的 default_payload
-//! 交给对应的 tag dispatcher 处理。
 //!
 //! ## Payload 完整性保护
 //!
@@ -38,15 +24,12 @@ const TAG_SINGLE: u8 = 0x00;
 const TAG_GROUP: u8 = 0x01;
 /// 位置+关键字参数调用标签（仅用于 `unpack_payload` 内部校验）。
 const TAG_SINGLE_KW: u8 = 0x02;
-/// 上游结果前置标签：Rust orchestrator 用此标签包装 default_payload。
-///
-/// 格式：`[TAG_UPSTREAM_PREFIX, upstream_count(u32 LE), up_len1(u32 LE), up_bytes1, ..., default_payload]`
-/// Python dispatcher 先解包此前缀，再把 default_payload 交给对应 tag 的 dispatcher。
-pub const TAG_UPSTREAM_PREFIX: u8 = 0x08;
-
 /// 将单个结果打包为 `[TAG_SINGLE, pickle_bytes...]`。
 ///
-/// 由 Python 侧调用构建 default_payload，Rust 不直接调用。
+/// **当前无生产调用者**：原注释称"由 Python 侧调用构建 default_payload"，
+/// 该调用方已随 `actant/_serialization.py` 移除（仓库里只剩过期的 .pyc）。
+/// 保留是因为它是 [`pack_group`] 的对称原语、且属 `pub mod common` 的公开
+/// API（Rust 嵌入场景可用）；若确认不再需要，按守则 3 删除。
 pub fn pack_single(pickle_bytes: Vec<u8>) -> Vec<u8> {
     let mut buf = Vec::with_capacity(1 + pickle_bytes.len());
     buf.push(TAG_SINGLE);
@@ -81,51 +64,6 @@ pub fn pack_group(results: &[Vec<u8>]) -> crate::common::Result<Vec<u8>> {
         buf.extend_from_slice(&len.to_le_bytes());
         buf.extend_from_slice(data);
     }
-    Ok(buf)
-}
-
-/// 将上游结果前置到 default_payload，生成最终 payload。
-///
-/// **这是 Rust orchestrator 构建 task payload 的唯一函数**。
-/// 它不检查 default_payload 的 tag 类型，只做机械的前置操作。
-///
-/// 格式：`[TAG_UPSTREAM_PREFIX, upstream_count(u32 LE), up_len1(u32 LE), up_bytes1, ..., default_payload]`
-///
-/// - `upstream_results`: 前驱任务的结果字节列表（按 DAG 边顺序）
-/// - `default_payload`: Python 构建的原始 payload（含 callable + concrete args）
-///
-/// 若 `upstream_results` 为空，直接返回 `default_payload`（无前驱的叶子任务）。
-///
-/// 返回 `Err` 当 `upstream_results.len()` 或任一 `r.len()` 超过 `u32::MAX`——
-/// 格式用 u32 LE 编码长度，超过会静默截断。
-pub fn pack_upstream_prefix(
-    upstream_results: &[Vec<u8>],
-    default_payload: &[u8],
-) -> crate::common::Result<Vec<u8>> {
-    if upstream_results.is_empty() {
-        return Ok(default_payload.to_vec());
-    }
-    let count = u32::try_from(upstream_results.len()).map_err(|_| {
-        crate::common::ActantError::Serialization(format!(
-            "pack_upstream_prefix: upstream count {} exceeds u32::MAX",
-            upstream_results.len()
-        ))
-    })?;
-    let upstream_len: usize = upstream_results.iter().map(|r| 4 + r.len()).sum::<usize>();
-    let mut buf = Vec::with_capacity(1 + 4 + upstream_len + default_payload.len());
-    buf.push(TAG_UPSTREAM_PREFIX);
-    buf.extend_from_slice(&count.to_le_bytes());
-    for r in upstream_results {
-        let len = u32::try_from(r.len()).map_err(|_| {
-            crate::common::ActantError::Serialization(format!(
-                "pack_upstream_prefix: upstream item len {} exceeds u32::MAX",
-                r.len()
-            ))
-        })?;
-        buf.extend_from_slice(&len.to_le_bytes());
-        buf.extend_from_slice(r);
-    }
-    buf.extend_from_slice(default_payload);
     Ok(buf)
 }
 
@@ -181,7 +119,7 @@ pub fn unpack_payload(data: &[u8]) -> crate::common::Result<Vec<Vec<u8>>> {
 
 /// 值引用（Ref）wire 类型：指向某节点 blob 存储中的内容寻址数据。
 ///
-/// 作为"值引用"出现在 DAG 边载荷/任务参数中时的编码形态（R3/R6 接入消费）。
+/// 作为"值引用"出现在 DAG 边载荷/任务参数中时的编码形态。
 /// 完整性由两层保证：内容侧 blake3/bao 逐块校验（`runtime::blobs`），传输侧
 /// wire MAC；本类型自身只携带 `hash + node` 两个事实，不引入额外签名。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

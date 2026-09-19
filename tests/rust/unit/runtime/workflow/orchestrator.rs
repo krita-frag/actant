@@ -7,7 +7,8 @@ use crate::runtime::network::{
 use crate::runtime::state::Store;
 use crate::runtime::workflow::dag::Terminal;
 use crate::runtime::workflow::orchestrator::types::ConditionEvaluator;
-use crate::runtime::workflow::{Dag, DagNode, FailureScope, Phase};
+// `WaitCondition` 由下方「统一工作流历史」段落的 import 引入（同一文件作用域），此处不重复导入。
+use crate::runtime::workflow::{Dag, DagNode, FailureScope, Phase, WaitPointState};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -379,49 +380,6 @@ async fn cancel_unknown_workflow_returns_not_found() {
     assert!(matches!(err, crate::common::ActantError::NotFound(_)));
 }
 
-#[tokio::test]
-async fn terminal_waiter_resolves_after_completion() {
-    let orch = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
-    let wf = WorkflowId::from("wf-1");
-    orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
-    orch.start(&wf).unwrap();
-
-    let rx = orch.state.register_terminal_waiter(wf.clone());
-
-    // Complete all tasks
-    orch.on_task_completed(&wf, &TaskId::from("t1"), b"r1".to_vec())
-        .await
-        .unwrap();
-    orch.on_task_completed(&wf, &TaskId::from("t2"), b"r2".to_vec())
-        .await
-        .unwrap();
-    orch.on_task_completed(&wf, &TaskId::from("t3"), b"r3".to_vec())
-        .await
-        .unwrap();
-
-    // Waiter should resolve
-    tokio::time::timeout(std::time::Duration::from_secs(1), rx)
-        .await
-        .expect("waiter did not resolve within 1s")
-        .expect("waiter was dropped without signaling");
-}
-
-#[tokio::test]
-async fn terminal_waiter_resolves_immediately_if_already_terminal() {
-    let orch = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
-    let wf = WorkflowId::from("wf-1");
-    orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
-    orch.start(&wf).unwrap();
-    orch.cancel(&wf).await.unwrap();
-
-    let rx = orch.state.register_terminal_waiter(wf.clone());
-    // Should resolve immediately
-    tokio::time::timeout(std::time::Duration::from_millis(100), rx)
-        .await
-        .expect("waiter did not resolve immediately")
-        .expect("waiter was dropped without signaling");
-}
-
 #[test]
 fn builder_with_node_id_sets_node_id() {
     let orch = Orchestrator::new()
@@ -454,6 +412,9 @@ async fn submit_with_timeout_sets_deadline() {
 struct BroadcastCaptureTransport {
     node_id: NodeId,
     broadcasts: StdMutex<Vec<(String, Vec<u8>)>>,
+    /// 自投递到本节点的事件（`inject_local_event`）。gossip 广播不回环，
+    /// 所以"本地也要处理"的广播必须从这里进来——记录它才能验证本地腿存在。
+    injected: StdMutex<Vec<NetworkEvent>>,
 }
 
 impl BroadcastCaptureTransport {
@@ -461,11 +422,16 @@ impl BroadcastCaptureTransport {
         Self {
             node_id: NodeId::from(node_id.to_string()),
             broadcasts: StdMutex::new(Vec::new()),
+            injected: StdMutex::new(Vec::new()),
         }
     }
 
     fn take_broadcasts(&self) -> Vec<(String, Vec<u8>)> {
         self.broadcasts.lock().unwrap().drain(..).collect()
+    }
+
+    fn take_injected(&self) -> Vec<NetworkEvent> {
+        self.injected.lock().unwrap().drain(..).collect()
     }
 }
 
@@ -486,6 +452,10 @@ impl Transport for BroadcastCaptureTransport {
     }
     async fn subscribe(&self, _topic: &str) -> Result<()> {
         Ok(())
+    }
+    fn inject_local_event(&self, event: NetworkEvent) -> bool {
+        self.injected.lock().unwrap().push(event);
+        true
     }
     async fn recv_event(&self) -> Option<NetworkEvent> {
         None
@@ -581,6 +551,66 @@ async fn workflow_timeout_broadcasts_cancel_when_network_set() {
     // 工作流应已进入 Failed 终态。
     let state = orch.get_state(&wf).unwrap();
     assert_eq!(state.state, Phase::Failed);
+}
+
+/// 关键回归：工作流超时不仅 gossip 广播（只到邻居），还必须**自投递**到
+/// 本节点事件通道。
+///
+/// 没有这一腿时，本节点自己执行的在途任务不会被取消：工作流已 `Failed`，而
+/// 阻塞在任务等待上的 flow 体永久挂起（实测本地句柄在 10s 观察窗内始终
+/// running）。故本测试断言的正是"广播 + 自投递"必须成对出现，且字节一致。
+#[tokio::test]
+async fn workflow_timeout_self_delivers_cancel_locally() {
+    use crate::common::wire::{CancelBroadcast, TOPIC_CANCEL};
+    use crate::runtime::network::{NetworkEvent, NetworkMessage};
+
+    let mut config = ActantConfig::default();
+    config.workflow.state_poll_interval_ms = 20;
+    let transport = Arc::new(BroadcastCaptureTransport::new("n1"));
+    let orch = Orchestrator::new()
+        .with_signing_key(TEST_SIGNING_KEY.to_vec())
+        .with_config(config)
+        .with_network(transport.clone());
+
+    let wf = WorkflowId::from("wf-self-deliver");
+    orch.submit_with_timeout(wf.clone(), make_linear_dag(), 10)
+        .await
+        .unwrap();
+    let roots = orch.start(&wf).unwrap();
+    orch.mark_task_running(&wf, &roots[0].id).unwrap();
+
+    let cancel_tx = orch.start_timeout_watcher();
+
+    let mut injected = Vec::new();
+    for _ in 0..200 {
+        injected = transport.take_injected();
+        if !injected.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let _ = cancel_tx.send(true);
+
+    assert_eq!(
+        injected.len(),
+        1,
+        "timeout watcher must self-deliver exactly one cancel event; \
+         gossip broadcast does NOT loop back to the sender"
+    );
+    let NetworkEvent::Message(NetworkMessage { topic, data }) = &injected[0] else {
+        panic!(
+            "expected a self-delivered Message event, got {:?}",
+            injected[0]
+        );
+    };
+    assert_eq!(
+        topic, TOPIC_CANCEL,
+        "self-delivered event must ride the cancel topic so the router's \
+         existing TopicRoute::Cancel branch handles it"
+    );
+    let decoded: CancelBroadcast = postcard::from_bytes(data).unwrap();
+    assert_eq!(decoded.workflow_id, wf);
+    assert_eq!(decoded.task_id, roots[0].id);
 }
 
 /// B2 回归测试：未注入网络时，超时监控仍标记工作流失败但不广播取消。
@@ -960,7 +990,7 @@ async fn recover_resumes_workflow_submitted_before_progress_flush() {
     assert_eq!(recovered.get_state(&wf).unwrap().state, Phase::Completed);
 }
 
-// ---- P0-2：终态守卫（迟到完成不得复活终态工作流）----
+// ---- 终态守卫（迟到完成不得复活终态工作流）----
 
 /// 取消后 worker 迟到回传完成：`on_task_completed` 应被守卫拒绝——
 /// 工作流保持 Cancelled，任务状态与结果不被改写，不返回任何 ready 后继。
@@ -1167,41 +1197,134 @@ async fn workflow_timeout_writes_failed_event_to_event_log() {
 
 // ───────────────────────── 派发代数（attempt）递增测试 ─────────────────────────
 
-/// 首次派发 attempt = 0，任务完成后重试路径递增 attempt 并随新派发携带。
+/// orchestrator 驱动重试：任务失败且节点 RetryPolicy 有余量时，裁决为重试
+/// ——任务从 Running 重置回 Pending，attempt 递增并随新派发携带。
 #[tokio::test]
-async fn prepare_task_retry_increments_attempt_and_carries_it_on_dispatch() {
+async fn handle_task_failure_retries_with_incremented_attempt_and_carries_it_on_dispatch() {
     let orch = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
     let wf = WorkflowId::from("wf-attempt-retry");
-    orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
+
+    let mut dag = Dag::new();
+    let mut node = make_node("t1", "retryable");
+    node.retry_policy = Some(RetryPolicy {
+        max_retries: 2,
+        delay_ms: 0,
+        backoff_multiplier: 2.0,
+        max_delay_ms: 60000,
+    });
+    dag.add_node(node).unwrap();
+    orch.submit(wf.clone(), dag).await.unwrap();
 
     let roots = orch.start(&wf).unwrap();
     assert_eq!(roots[0].attempt, 0, "first dispatch must carry attempt 0");
 
-    // t1 失败（TaskOnly，workflow 保持非终态）后重试。
-    orch.fail_task(
-        &wf,
-        &TaskId::from("t1"),
-        "boom".into(),
-        FailureScope::TaskOnly,
-    )
-    .await
-    .unwrap();
-
-    let task_def = orch
-        .prepare_task_retry(&wf, &TaskId::from("t1"))
+    // 真实失败结果只能来自已派发的任务：先标记 Running 再回灌失败。
+    orch.mark_task_running(&wf, &TaskId::from("t1")).unwrap();
+    let (task_def, _delay_ms) = orch
+        .handle_task_failure(&wf, &TaskId::from("t1"), "boom".into())
+        .await
         .unwrap()
-        .expect("failed task should be retryable");
+        .expect("task with retry budget must be scheduled for orchestrator retry");
     assert_eq!(
         task_def.attempt, 1,
         "retry dispatch must carry the incremented attempt"
     );
 
     let state = orch.get_state(&wf).unwrap();
+    let t1 = &state.tasks[&TaskId::from("t1")];
     assert_eq!(
-        state.tasks[&TaskId::from("t1")].attempt(),
+        t1.attempt(),
         1,
         "TaskState.attempt must record the new dispatch generation"
     );
+    assert_eq!(
+        t1.state,
+        Phase::Pending,
+        "orchestrator retry resets the task to Pending (awaiting redispatch)"
+    );
+}
+
+/// 重试余量耗尽后失败为终局（返回 None，fail-fast 下工作流进入 Failed）。
+#[tokio::test]
+async fn handle_task_failure_exhausts_budget_then_fails_workflow() {
+    let orch = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
+    let wf = WorkflowId::from("wf-retry-exhausted");
+
+    let mut dag = Dag::new();
+    let mut node = make_node("t1", "retryable");
+    node.retry_policy = Some(RetryPolicy {
+        max_retries: 1,
+        delay_ms: 0,
+        backoff_multiplier: 2.0,
+        max_delay_ms: 60000,
+    });
+    dag.add_node(node).unwrap();
+    orch.submit(wf.clone(), dag).await.unwrap();
+    orch.start(&wf).unwrap();
+    orch.mark_task_running(&wf, &TaskId::from("t1")).unwrap();
+
+    // 第一次失败：余量 1 → 重试。
+    let retry = orch
+        .handle_task_failure(&wf, &TaskId::from("t1"), "boom-1".into())
+        .await
+        .unwrap();
+    assert!(retry.is_some(), "first failure must be retried");
+
+    // 第二次失败前任务处于重试 Pending：先标记 Running 再失败（余量 0）。
+    orch.mark_task_running(&wf, &TaskId::from("t1")).unwrap();
+    let final_verdict = orch
+        .handle_task_failure(&wf, &TaskId::from("t1"), "boom-2".into())
+        .await
+        .unwrap();
+    assert!(
+        final_verdict.is_none(),
+        "exhausted retry budget must settle the failure terminally"
+    );
+
+    let state = orch.get_state(&wf).unwrap();
+    assert_eq!(state.state, Phase::Failed);
+}
+
+/// 迟到失败守卫：重试在途（Pending 且 retry_count > 0）时到达的重复失败
+/// 按过期结果忽略，不得把已排定重试的任务改写为 Failed。
+#[tokio::test]
+async fn handle_task_failure_ignores_late_duplicate_while_retry_pending() {
+    let orch = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
+    let wf = WorkflowId::from("wf-retry-late");
+
+    let mut dag = Dag::new();
+    let mut node = make_node("t1", "retryable");
+    node.retry_policy = Some(RetryPolicy {
+        max_retries: 3,
+        delay_ms: 0,
+        backoff_multiplier: 2.0,
+        max_delay_ms: 60000,
+    });
+    dag.add_node(node).unwrap();
+    orch.submit(wf.clone(), dag).await.unwrap();
+    orch.start(&wf).unwrap();
+    orch.mark_task_running(&wf, &TaskId::from("t1")).unwrap();
+
+    let retry = orch
+        .handle_task_failure(&wf, &TaskId::from("t1"), "boom".into())
+        .await
+        .unwrap();
+    assert!(retry.is_some(), "first failure schedules a retry");
+
+    // 重试已排定（任务回到 Pending 且 retry_count=1）：迟到重复失败被忽略。
+    let late = orch
+        .handle_task_failure(&wf, &TaskId::from("t1"), "boom-duplicate".into())
+        .await
+        .unwrap();
+    assert!(
+        late.is_none(),
+        "late duplicate failure while retry is pending must be ignored"
+    );
+
+    let state = orch.get_state(&wf).unwrap();
+    let t1 = &state.tasks[&TaskId::from("t1")];
+    assert_eq!(t1.state, Phase::Pending, "task stays Pending for retry");
+    assert_eq!(state.state, Phase::Running, "workflow must not fail");
 }
 
 /// 故障转移重派发：Running 任务重置 Pending 时 attempt 递增并随新派发携带。
@@ -1303,7 +1426,7 @@ async fn on_task_completed_without_attempt_info_still_accepts_results() {
     assert_eq!(ready[0].id, TaskId::from("t2"));
 }
 
-// ───────────────────────── S0：统一工作流历史（快照 + 事件重放）─────────────────────────
+// ───────────────────────── 统一工作流历史（快照 + 事件重放）─────────────────────────
 
 use crate::runtime::state::event_log::{EventLog, MemoryEventLog};
 use crate::runtime::workflow::orchestrator::types::WorkflowEventPayload;
@@ -1333,6 +1456,7 @@ fn event_names(events: &[WorkflowEventPayload]) -> Vec<&'static str> {
             WorkflowEventPayload::TaskFailed { .. } => "TaskFailed",
             WorkflowEventPayload::TaskCancelled { .. } => "TaskCancelled",
             WorkflowEventPayload::Completed { .. } => "Completed",
+            WorkflowEventPayload::Cancelled { .. } => "Cancelled",
             WorkflowEventPayload::Failed { .. } => "Failed",
             WorkflowEventPayload::WaitPointRegistered { .. } => "WaitPointRegistered",
             WorkflowEventPayload::SignalReceived { .. } => "SignalReceived",
@@ -1364,7 +1488,7 @@ async fn submit_appends_node_added_event_per_node() {
         3,
         "one NodeAdded event per DAG node, got {names:?}"
     );
-    // NodeAdded 携带完整节点定义（S7 增量提交的可重建前提）。
+    // NodeAdded 携带完整节点定义（增量提交的可重建前提）。
     let nodes: Vec<String> = read_history(&event_log, &wf)
         .into_iter()
         .filter_map(|p| match p {
@@ -1582,7 +1706,7 @@ async fn workflow_history_covers_all_state_transitions() {
     }
 }
 
-// ───────────────────────── S1：持久化等待点原语 ─────────────────────────
+// ───────────────────────── 持久化等待点原语 ─────────────────────────
 
 /// 注册幂等：同 wait_key 重复注册为 no-op，且只产生一条注册事件。
 #[tokio::test]
@@ -1609,8 +1733,8 @@ async fn register_wait_point_is_idempotent() {
     );
 }
 
-/// signal 语义：未知 key → None；等待中 → Some(payload) 并记事件；
-/// 重复 signal → 直接返回（幂等），不重复记事件。
+/// signal 语义（含信号缓冲）：未知 key → `None` 且**入缓冲并记为独立历史条目**；
+/// 等待中 → `Some(payload)` 并记事件；重复 signal → 直接返回（幂等），不重复记事件。
 #[tokio::test]
 async fn signal_wait_point_none_for_unknown_and_idempotent_on_repeat() {
     let event_log = Arc::new(MemoryEventLog::default());
@@ -1622,8 +1746,16 @@ async fn signal_wait_point_none_for_unknown_and_idempotent_on_repeat() {
     orch.register_wait_point(&wf, "go", WaitCondition::Signal { name: "go".into() })
         .unwrap();
 
-    // 无工作流级等待点表命中：未知 key → None。
+    // 未知 key → None，且信号**入缓冲**并记为独立历史条目（这是「查历史」
+    // 机制的前置条件，故此处明确断言它**入了缓冲**）。
     assert_eq!(orch.signal_wait_point(&wf, "nope").unwrap(), None);
+    assert!(
+        orch.state
+            .pending_signals
+            .get(&wf)
+            .is_some_and(|buf| buf.contains_key("nope")),
+        "未知 key 的信号应入缓冲，而不是被丢弃"
+    );
 
     let first = orch.signal_wait_point(&wf, "go").unwrap();
     assert_eq!(first, Some(Vec::<u8>::new()));
@@ -1631,9 +1763,10 @@ async fn signal_wait_point_none_for_unknown_and_idempotent_on_repeat() {
     assert_eq!(first, second, "repeat signal must return the same payload");
 
     let names = event_names(&read_history(&event_log, &wf));
+    // 2 = 缓冲的 "nope"（1）+ 唤醒 "go"（1）；重复递交 "go" 不追加第三条。
     assert_eq!(
         names.iter().filter(|n| **n == "SignalReceived").count(),
-        1,
+        2,
         "repeat signal must not append a second event"
     );
 }
@@ -1661,6 +1794,30 @@ async fn wait_point_waiter_wakes_on_signal() {
         .await
         .expect("already-signaled waitpoint must resolve waiter immediately")
         .unwrap();
+}
+
+/// 关停释放：`release_all_wait_point_waiters` 必须唤醒全部 park 中的等待者。
+///
+/// `wait_wait_point` 的无限 park 语义（`timeout_ms = 0`）使等待者可能永不返回；
+/// 若关停不释放，park 线程（可能是主线程）会挂住进程退出。丢弃 sender 后
+/// receiver 立即收到 `Err`，park 方据此返回"未唤醒"。
+#[tokio::test]
+async fn release_all_wait_point_waiters_unblocks_parked_waiters() {
+    let orch = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
+    let wf = WorkflowId::from("wf-wait-release");
+    orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
+    orch.register_wait_point(&wf, "go", WaitCondition::Signal { name: "go".into() })
+        .unwrap();
+
+    let rx = orch.register_wait_point_waiter(wf.clone(), "go");
+    orch.release_all_wait_point_waiters();
+    let outcome = tokio::time::timeout(std::time::Duration::from_millis(200), rx)
+        .await
+        .expect("release must not leave the waiter parked");
+    assert!(
+        outcome.is_err(),
+        "released waiter must observe channel close, not a payload"
+    );
 }
 
 /// Timer 等待点：仅到期者触发，重复 poll 幂等；未到期的保持 Waiting。
@@ -1796,5 +1953,467 @@ async fn waitpoint_snapshot_survives_recover_and_timer_fires_after_recover() {
     assert!(
         names.contains(&"TimerFired"),
         "post-recover timer firing must append TimerFired event, got {names:?}"
+    );
+}
+
+/// 接线回归：**超时 watcher 自身**扫描并触发到期的 Timer 等待点。
+///
+/// 本测试存在的唯一理由是守住"接线"而非"实现"：`poll_expired_timers` 曾长期
+/// 只有测试调用者（`grep` 全仓，生产路径零调用），导致 Timer 类等待点永不自动
+/// 到期、在等待点 park 的 flow 线程永久挂起。因此本测试**刻意不直接调用**
+/// `poll_expired_timers`——唯一驱动源是 `start_timeout_watcher` 的周期轮询。
+/// 它若失败，代表接线再次断裂（不是实现回归）。
+///
+/// 同时锁定唤醒延迟的机制来源：等待点扫描复用超时 watcher 的轮询周期
+/// （`state_poll_interval_ms`），故**唤醒延迟上界 = 该周期**。这里设为 20ms
+/// 以便测试快速收敛；生产默认 500ms。
+#[tokio::test]
+async fn timeout_watcher_fires_expired_timer_wait_point_without_explicit_poll() {
+    let mut config = ActantConfig::default();
+    config.workflow.state_poll_interval_ms = 20;
+
+    let event_log = Arc::new(MemoryEventLog::default());
+    let orch = Orchestrator::new()
+        .with_signing_key(TEST_SIGNING_KEY.to_vec())
+        .with_config(config)
+        .with_event_log(event_log.clone());
+
+    let wf = WorkflowId::from("wf-wait-watcher");
+    orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
+
+    // deadline 已过 → watcher 首次轮询即应触发。
+    orch.register_wait_point(
+        &wf,
+        "tick",
+        WaitCondition::Timer {
+            deadline_ms: crate::common::epoch_millis().saturating_sub(100),
+        },
+    )
+    .unwrap();
+
+    // "先注册后检查"：句柄须在 watcher 启动前注册，否则首次轮询会因无等待者而空转。
+    let rx = orch.register_wait_point_waiter(wf.clone(), "tick");
+
+    let cancel_tx = orch.start_timeout_watcher();
+
+    let awaited = tokio::time::timeout(std::time::Duration::from_secs(2), rx).await;
+    let _ = cancel_tx.send(true);
+
+    assert!(
+        awaited.is_ok(),
+        "timeout watcher must fire the expired timer wait point without an explicit \
+         poll_expired_timers() call (timer wiring regression)"
+    );
+    assert!(
+        awaited.unwrap().is_ok(),
+        "wait point waiter must receive the signal payload"
+    );
+
+    let names = event_names(&read_history(&event_log, &wf));
+    assert!(
+        names.contains(&"TimerFired"),
+        "watcher-driven timer firing must append TimerFired to the workflow history, \
+         got {names:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 终态释放 park 等待者 / suspend 恢复
+// ---------------------------------------------------------------------------
+
+/// 核心修复：工作流进入终态时必须释放**等待点 park** 的等待者。
+///
+/// 等待点 park 是独立于 `AsyncResult` 的第二条阻塞原语，此前唯一的释放点是
+/// 运行时关停（`release_all_wait_point_waiters`）。缺了这一步，cancel / fail /
+/// deadline 都到不了 park 中的 flow 体——工作流已终态而函数体永久挂起
+///（实测：8s 观察窗内纹丝不动）。
+#[tokio::test]
+async fn terminal_state_release_unparks_wait_point_waiter() {
+    let orch = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
+    let wf = WorkflowId::from("wf-park");
+    orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
+    orch.start(&wf).unwrap();
+
+    orch.register_wait_point(&wf, "suspend-1", WaitCondition::Suspend)
+        .unwrap();
+    let parked = orch.register_wait_point_waiter(wf.clone(), "suspend-1");
+
+    // 取消使工作流进入终态 → 必须解阻塞 park，而不是让它等到超时/关停。
+    orch.cancel(&wf).await.unwrap();
+
+    // 超时未触发即代表"不再挂起"；释放语义下 receiver 收到的是 Err（无 payload），
+    // 由调用方查工作流终态判定真实原因（cancel / failed / deadline）。
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), parked).await;
+    assert!(
+        outcome.is_ok(),
+        "park 中的等待点等待者在 cancel 后仍未被释放：flow 函数体会永久挂起"
+    );
+}
+
+/// `resume_suspended` 只唤醒 `Suspend` 条件的等待点：业务信号不得被冒充满足。
+#[tokio::test]
+async fn resume_suspended_wakes_only_suspend_condition() {
+    let orch = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
+    let wf = WorkflowId::from("wf-suspend");
+    orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
+    orch.start(&wf).unwrap();
+
+    orch.register_wait_point(
+        &wf,
+        "gate",
+        WaitCondition::Signal {
+            name: "gate".to_string(),
+        },
+    )
+    .unwrap();
+    orch.register_wait_point(&wf, "suspend-1", WaitCondition::Suspend)
+        .unwrap();
+    let parked = orch.register_wait_point_waiter(wf.clone(), "suspend-1");
+
+    assert_eq!(
+        orch.resume_suspended(&wf).unwrap(),
+        1,
+        "应恰好唤醒 1 个挂起点"
+    );
+
+    // 唤醒必须真的解阻塞 park 方（携带空 payload），而非只改状态字段。
+    let payload = tokio::time::timeout(std::time::Duration::from_secs(1), parked)
+        .await
+        .expect("resume 未唤醒 park 中的等待者")
+        .expect("park 等待者在 resume 后被丢弃而未投递 payload");
+    assert!(payload.is_empty(), "resume 不应伪造业务信号 payload");
+
+    let table = orch.state.waitpoints.get(&wf).expect("waitpoints 表应存在");
+    assert!(
+        matches!(
+            table.get("suspend-1").unwrap().state,
+            WaitPointState::Signaled { .. }
+        ),
+        "Suspend 等待点应已 Signaled"
+    );
+    assert!(
+        matches!(table.get("gate").unwrap().state, WaitPointState::Waiting),
+        "业务信号等待点不应被 resume 冒充满足"
+    );
+
+    // 幂等：已唤醒的等待点重复 resume 返回 0。
+    assert_eq!(
+        orch.resume_suspended(&wf).unwrap(),
+        0,
+        "重复 resume 应返回 0"
+    );
+}
+
+/// 未知工作流 / 无挂起点时 `resume_suspended` 返回 0（不是错误）。
+#[test]
+fn resume_suspended_unknown_workflow_returns_zero() {
+    let orch = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
+    assert_eq!(orch.resume_suspended(&WorkflowId::from("nope")).unwrap(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// 信号缓冲：等待点注册前抵达的信号
+// ---------------------------------------------------------------------------
+
+/// 缓冲核心：注册前递交 → 注册时立即命中，等待点生成为 `Signaled`。
+#[tokio::test]
+async fn signal_before_registration_is_buffered_and_consumed() {
+    let orch = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
+    let wf = WorkflowId::from("wf-buf");
+    orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
+    orch.start(&wf).unwrap();
+
+    // 等待点尚未注册 → 入缓冲，返回 None 表示"无等待点被唤醒"。
+    assert_eq!(orch.signal_wait_point(&wf, "go").unwrap(), None);
+    assert!(
+        orch.state
+            .pending_signals
+            .get(&wf)
+            .is_some_and(|buf| buf.contains_key("go")),
+        "信号应已入缓冲"
+    );
+
+    // 注册即命中：等待点直接生成为已唤醒态（park 方"先注册后检查"会立即返回）。
+    orch.register_wait_point(
+        &wf,
+        "go",
+        WaitCondition::Signal {
+            name: "go".to_string(),
+        },
+    )
+    .unwrap();
+    let table = orch.state.waitpoints.get(&wf).expect("waitpoints 表");
+    assert!(
+        matches!(
+            table.get("go").unwrap().state,
+            WaitPointState::Signaled { .. }
+        ),
+        "缓冲命中后等待点应直接为 Signaled"
+    );
+    drop(table);
+    // 消费后出缓冲。
+    assert!(
+        !orch
+            .state
+            .pending_signals
+            .get(&wf)
+            .is_some_and(|buf| buf.contains_key("go")),
+        "缓冲应已被消费"
+    );
+
+    // 重复递交（闩锁）：命中已 Signaled 的等待点 → 返回 payload。
+    assert_eq!(orch.signal_wait_point(&wf, "go").unwrap(), Some(Vec::new()));
+}
+
+/// 闩锁：同一 key 重复递交不重复入历史（重试安全）。
+#[tokio::test]
+async fn repeated_signal_while_buffered_is_a_no_op() {
+    let orch = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
+    let wf = WorkflowId::from("wf-latch");
+    orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
+    orch.start(&wf).unwrap();
+
+    assert_eq!(orch.signal_wait_point(&wf, "go").unwrap(), None);
+    let first_len = orch
+        .state
+        .pending_signals
+        .get(&wf)
+        .map(|buf| buf.len())
+        .unwrap_or(0);
+    // 重试：仍是 None（不报错、不新增条目）。
+    assert_eq!(orch.signal_wait_point(&wf, "go").unwrap(), None);
+    assert_eq!(
+        orch.state
+            .pending_signals
+            .get(&wf)
+            .map(|b| b.len())
+            .unwrap_or(0),
+        first_len,
+        "闩锁：重复递交不得新增缓冲条目"
+    );
+}
+
+/// 只有 `Signal` 条件的等待点消费缓冲：`Suspend` 不得被业务信号顶替。
+#[tokio::test]
+async fn buffered_signal_is_not_consumed_by_suspend_condition() {
+    let orch = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
+    let wf = WorkflowId::from("wf-cond");
+    orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
+    orch.start(&wf).unwrap();
+
+    assert_eq!(orch.signal_wait_point(&wf, "gate").unwrap(), None);
+    orch.register_wait_point(&wf, "gate", WaitCondition::Suspend)
+        .unwrap();
+
+    let table = orch.state.waitpoints.get(&wf).expect("waitpoints 表");
+    assert!(
+        matches!(table.get("gate").unwrap().state, WaitPointState::Waiting),
+        "Suspend 条件的等待点不得消费信号缓冲"
+    );
+    drop(table);
+    assert!(
+        orch.state
+            .pending_signals
+            .get(&wf)
+            .is_some_and(|buf| buf.contains_key("gate")),
+        "缓冲应仍在，等待后续 Signal 条件的等待点"
+    );
+}
+
+/// 递交错误：未知工作流 → `NotFound`。终态**不**报错（重试安全）。
+#[tokio::test]
+async fn signal_to_unknown_workflow_is_not_found() {
+    let orch = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
+    let err = orch
+        .signal_wait_point(&WorkflowId::from("nope"), "go")
+        .unwrap_err();
+    assert!(
+        matches!(err, ActantError::NotFound(_)),
+        "递给不存在的工作流应报 NotFound，而不是静默 None：{err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 暴露面：DAG 结构快照
+// ---------------------------------------------------------------------------
+
+/// `dag_snapshot` 暴露依赖边与两级重试策略；未知工作流返回 `None`。
+///
+/// 注意：本用例断言的是**暴露面**，不是 `get_dag`（后者另有测试）。两者的数据
+/// 相同但用途不同——快照刻意不含 payload，故不搬字节。
+#[tokio::test]
+async fn dag_snapshot_exposes_deps_and_retry_policies() {
+    use crate::common::RetryPolicy;
+
+    let orch = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
+    let wf = WorkflowId::from("wf-snap");
+    let mut dag = make_diamond_dag();
+    // DAG 级默认策略：节点自身没有策略时生效（Python 侧要能还原
+    // `effective_retry_policy`，故必须暴露）。
+    dag.default_retry_policy = Some(RetryPolicy::default());
+    let mut node = make_node("t5", "with-policy");
+    node.retry_policy = Some(RetryPolicy {
+        max_retries: 7,
+        ..RetryPolicy::default()
+    });
+    dag.add_node(node).unwrap();
+    orch.submit(wf.clone(), dag).await.unwrap();
+
+    let snap = orch.dag_snapshot(&wf).expect("dag snapshot should exist");
+    assert_eq!(snap.workflow_id, "wf-snap");
+    assert_eq!(snap.nodes.len(), 5);
+    assert!(
+        snap.default_retry_policy.is_some(),
+        "DAG 级默认重试策略必须暴露，否则无法还原 effective 策略"
+    );
+
+    let by_id: HashMap<String, _> = snap.nodes.iter().map(|n| (n.task_id.clone(), n)).collect();
+    // t4 的前驱是 t2 与 t3（菱形汇聚）。
+    let mut deps = by_id["t4"].deps.clone();
+    deps.sort();
+    assert_eq!(deps, vec!["t2".to_string(), "t3".to_string()], "依赖边错误");
+    assert!(by_id["t1"].deps.is_empty(), "根节点无前驱");
+    // 节点级策略覆盖默认策略。
+    assert_eq!(by_id["t5"].retry_policy.as_ref().unwrap().max_retries, 7);
+    assert!(by_id["t1"].retry_policy.is_none(), "未设策略的节点为 None");
+    // 边：菱形 4 条。
+    assert_eq!(snap.edges.len(), 4);
+
+    // 未知工作流 → None（与 get_workflow_state 同款契约）。
+    assert!(orch.dag_snapshot(&WorkflowId::from("nope")).is_none());
+}
+
+/// 重放路径上的"信号先于等待点抵达"（残留①）：信号事件早于注册事件时，
+/// 重放必须把它**入缓冲**而不是丢弃，否则信号缓冲跨重启失效。
+#[tokio::test]
+async fn replay_buffers_signal_that_precedes_registration() {
+    let dir = tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let event_log = Arc::new(MemoryEventLog::default());
+    let wf = WorkflowId::from("wf-replay-buf");
+
+    let orch = Orchestrator::new()
+        .with_signing_key(TEST_SIGNING_KEY.to_vec())
+        .with_store(store.clone())
+        .with_event_log(event_log.clone());
+    orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
+    orch.flush_dirty().await.unwrap();
+    // 信号先到（此时无等待点 → 入缓冲），随后才注册等待点。
+    // 两者都在水位之后，故 recover 必须靠重放重建这一顺序。
+    assert_eq!(orch.signal_wait_point(&wf, "late").unwrap(), None);
+    orch.register_wait_point(
+        &wf,
+        "late",
+        WaitCondition::Signal {
+            name: "late".into(),
+        },
+    )
+    .unwrap();
+    // 确认崩溃前内存态正确（对照）。
+    {
+        let table = orch.state.waitpoints.get(&wf).unwrap();
+        assert!(
+            matches!(
+                table.get("late").unwrap().state,
+                WaitPointState::Signaled { .. }
+            ),
+            "崩溃前：缓冲命中后应直接为 Signaled"
+        );
+    }
+    drop(orch);
+
+    let recovered = Orchestrator::recover(store, recover_config(), Some(event_log.clone()))
+        .await
+        .unwrap();
+    let table = recovered.state.waitpoints.get(&wf).expect("等待点应被重放");
+    assert!(
+        matches!(
+            table.get("late").unwrap().state,
+            WaitPointState::Signaled { .. }
+        ),
+        "重放后：先到的信号必须仍生效（等待点 Signaled），而不是被丢弃"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 读取出口 + 历史留存策略
+// ---------------------------------------------------------------------------
+
+/// `workflow_history` 读到完整历史；无 event_log 时返回空（可选观测面）。
+#[tokio::test]
+async fn workflow_history_returns_events_and_empty_without_log() {
+    let event_log = Arc::new(MemoryEventLog::default());
+    let orch = Orchestrator::new()
+        .with_signing_key(TEST_SIGNING_KEY.to_vec())
+        .with_event_log(event_log.clone());
+    let wf = WorkflowId::from("wf-hist");
+    orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
+    orch.start(&wf).unwrap();
+    orch.on_task_completed(&wf, &TaskId::from("t1"), b"r".to_vec())
+        .await
+        .unwrap();
+
+    let entries = orch.workflow_history(&wf, None);
+    assert!(!entries.is_empty(), "有 event_log 时应读到历史");
+    assert!(entries.len() >= 6, "应包含 submit/节点/started/完成等事件");
+
+    // 游标：从中间读取应更少。
+    let cursor = entries[entries.len() / 2].id;
+    let tail = orch.workflow_history(&wf, Some(cursor));
+    assert!(tail.len() < entries.len(), "游标之后的事件应更少");
+
+    // 无 event_log → 空（历史是可选观测面，不是错误）。
+    let bare = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
+    bare.submit(wf.clone(), make_linear_dag()).await.unwrap();
+    assert!(bare.workflow_history(&wf, None).is_empty());
+}
+
+/// 留存策略：裁剪**水位之前**的旧事件，但**绝不**动水位之后的增量——
+/// 否则 `replay_events_after_watermarks` 会丢掉恢复所需的事件。
+#[tokio::test]
+async fn history_trim_only_touches_events_absorbed_by_watermark() {
+    let dir = tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let event_log = Arc::new(MemoryEventLog::default());
+    let wf = WorkflowId::from("wf-trim");
+    let topic = format!("workflow:{}", wf.as_str());
+
+    let mut config = recover_config();
+    config.workflow.event_log_max_events_per_workflow = 2;
+
+    let orch = Orchestrator::new()
+        .with_signing_key(TEST_SIGNING_KEY.to_vec())
+        .with_store(store.clone())
+        .with_event_log(event_log.clone())
+        .with_config(config.clone());
+    orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
+    orch.start(&wf).unwrap();
+    // 第一条完成后落盘：水位落在"t1 完成"处。
+    orch.on_task_completed(&wf, &TaskId::from("t1"), b"r1".to_vec())
+        .await
+        .unwrap();
+    orch.flush_dirty().await.unwrap();
+    let watermark = orch.state.event_seq(&wf).expect("水位应已记录");
+    let total_before = event_log.count(&topic).unwrap();
+
+    // 水位之后再追加事件（模拟崩溃窗口内的增量）。
+    orch.on_task_completed(&wf, &TaskId::from("t2"), b"r2".to_vec())
+        .await
+        .unwrap();
+    let after_watermark_before = event_log.read_after(&topic, Some(&watermark)).unwrap();
+
+    // 触发裁剪（flush_dirty 在 put_batch 之后调 trim）。
+    orch.flush_dirty().await.unwrap();
+
+    let after_watermark_after = event_log.read_after(&topic, Some(&watermark)).unwrap();
+    assert_eq!(
+        after_watermark_after.len(),
+        after_watermark_before.len(),
+        "水位**之后**的事件必须一条不少——重放依赖它们"
+    );
+    let total_after = event_log.count(&topic).unwrap();
+    assert!(
+        total_after <= total_before,
+        "裁剪只应减少总量：before={total_before} after={total_after}"
     );
 }

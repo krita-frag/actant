@@ -53,6 +53,22 @@ jobs:
       - name: cargo test --no-default-features（CI 友好路径）
         run: cargo test --no-default-features
 
+      # 框架构建是一等公民：纯 Rust（无 PyO3）构建的告警必须为零。
+      # 与上面的默认特性 clippy 分开跑——后者开启 python feature，覆盖不到本路径
+      # （历史上正是此盲区让 AddNodeOutcome 的 cfg 泄漏以告警形式潜伏）。
+      - name: cargo clippy --no-default-features（框架构建零告警）
+        run: cargo clippy --no-default-features --all-targets -- -D warnings
+
+      # 框架一致性门禁：第 1 层（runtime/common）不得依赖绑定层（py）。
+      # 当前已满足；门禁用于防止边界随时间腐蚀。
+      - name: 框架边界门禁（runtime/common 零 crate::py 引用）
+        run: |
+          if grep -rn "crate::py" src/runtime src/common --include='*.rs'; then
+            echo "::error::框架边界腐蚀：src/runtime 或 src/common 出现 crate::py 引用（第 1 层不得依赖绑定层）"
+            exit 1
+          fi
+          echo "OK: runtime/common 无 crate::py 引用"
+
       - name: ruff
         run: uv run ruff check actant tests/python benches/
 

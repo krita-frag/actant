@@ -24,9 +24,19 @@ pub struct Orchestrator {
     pub(crate) node_id: Option<NodeId>,
     pub(crate) hlc: Arc<HybridLogicalClock>,
     /// 网络传输层。`None` 时（如单元测试或无网络场景）超时监控仅标记工作流
-    /// 失败，不广播取消消息；`Some` 时（生产运行时）超时监控通过 gossip
-    /// topic ``actant:cancel`` 广播 `CancelBroadcast`，触发所有相关节点
-    ///（包括本地与远端）取消运行中的任务。
+    /// 失败，不取消任何在途任务；`Some` 时（生产运行时）超时监控对每个运行中
+    /// 任务做**两件事**：
+    ///
+    /// 1. 经 gossip topic ``actant:cancel`` 广播 `CancelBroadcast`——覆盖
+    ///    **远端**节点上执行的任务；
+    /// 2. 经 [`Transport::inject_local_event`] 把同一份字节自投递回本节点事件
+    ///    通道——覆盖**本节点**执行的任务。
+    ///
+    /// 第 2 条曾经是想当然的：gossip 广播只投递给邻居、**不发回发送者**，所以
+    /// 只做广播时本节点自己的在途任务不会被取消（工作流已 `Failed`，而阻塞在
+    /// 任务等待上的 flow 体永久挂起）。自投递后本地与远端走同一段路由代码。
+    ///
+    /// [`Transport::inject_local_event`]: crate::runtime::network::Transport::inject_local_event
     pub(crate) network: Option<Arc<dyn Transport>>,
 }
 
@@ -117,10 +127,6 @@ impl Orchestrator {
 
     pub fn store(&self) -> &Option<Store> {
         &self.store
-    }
-
-    pub fn state_handle(&self) -> Arc<OrchestratorState> {
-        self.state.clone()
     }
 }
 

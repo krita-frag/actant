@@ -7,15 +7,53 @@ use std::sync::Arc;
 
 use crate::common::{
     serialization::serialize_rkyv, ActantConfig, Result, TaskId, WorkflowId, STORE_KEY_DAG,
-    STORE_KEY_EVENT_SEQ, STORE_KEY_EXEC, STORE_KEY_PENDING, STORE_KEY_WAIT,
+    STORE_KEY_EVENT_SEQ, STORE_KEY_EXEC, STORE_KEY_PENDING, STORE_KEY_SIGNAL_BUF, STORE_KEY_WAIT,
 };
 use crate::runtime::state::event_log::{EventId, EventLog};
 use crate::runtime::state::{HybridLogicalClock, Store};
 use crate::runtime::workflow::{
-    Dag, FailureScope, Phase, Terminal, WaitPoint, WaitPointState, WorkflowExecution,
+    Dag, FailureScope, Phase, Terminal, WaitCondition, WaitPoint, WaitPointState, WorkflowExecution,
 };
 
 use super::{keys::*, types::*, Orchestrator};
+
+/// 裁剪已被快照吸收的事件历史（留存策略）。
+///
+/// 必须在**水位成功落盘之后**调用：此时 `up_to` 之前的事件已进快照，删掉它们
+/// 只影响审计，不影响恢复。水位**之后**的事件永不裁剪——重放需要它们。
+/// `event_log_max_events_per_workflow == 0` 时不做任何事（保守默认）。
+///
+/// 两条 flush 路径（`start_persist_flush` / `flush_dirty`）共用本函数，
+/// 避免留存语义在两条路径上漂移。
+pub(crate) fn trim_absorbed_history(
+    event_log: Option<&Arc<dyn EventLog>>,
+    config: &ActantConfig,
+    workflow_id: &WorkflowId,
+    watermark: Option<&EventId>,
+) {
+    let keep = config.workflow.event_log_max_events_per_workflow;
+    if keep == 0 {
+        return;
+    }
+    let (Some(log), Some(up_to)) = (event_log, watermark) else {
+        return;
+    };
+    let topic = format!("workflow:{}", workflow_id.as_str());
+    match log.trim_absorbed(&topic, up_to, keep) {
+        Ok(0) => {}
+        Ok(n) => tracing::debug!(
+            workflow = %workflow_id.as_str(),
+            trimmed = n,
+            keep,
+            "trimmed event history absorbed by snapshot watermark"
+        ),
+        Err(e) => tracing::warn!(
+            workflow = %workflow_id.as_str(),
+            error = %e,
+            "failed to trim event history"
+        ),
+    }
+}
 
 /// 将工作流事件写入 event_log（若存在），返回事件 ID 供调用方记录事件水位。
 ///
@@ -55,7 +93,7 @@ impl Orchestrator {
         }
     }
 
-    /// 记录任务派发事件（S0）。由 Worker 在任务被本地接受执行时经
+    /// 记录任务派发事件。由 Worker 在任务被本地接受执行时经
     /// WorkflowActor 调用，进入工作流统一历史。
     pub(crate) fn log_task_dispatched(&self, workflow_id: &WorkflowId, task_id: &TaskId) {
         self.log_event(WorkflowEventPayload::TaskDispatched {
@@ -66,7 +104,7 @@ impl Orchestrator {
 
     /// 从持久化 [Store] 恢复 orchestrator 状态。
     ///
-    /// **恢复语义唯一化（S0）：recover = 快照 + 其后事件重放，别无第三路。**
+    /// **恢复语义唯一化：recover = 快照 + 其后事件重放，别无第三路。**
     ///
     /// 1. 快照加载：扫描 dag / exec / pending 前缀重建内存状态，Running 任务
     ///    重置为 Pending；同时加载等待点快照（`orch:wait:`）与事件水位
@@ -173,7 +211,7 @@ impl Orchestrator {
             }
         }
 
-        // 等待点快照与事件水位（S0/S1）：与 exec/pending 同批落盘的加速缓存。
+        // 等待点快照与事件水位：与 exec/pending 同批落盘的加速缓存。
         let wait_entries = store.scan_prefix(STORE_KEY_WAIT).await?;
         for (key, data) in wait_entries {
             let wf_id_str = key.strip_prefix(STORE_KEY_WAIT).unwrap_or(&key);
@@ -189,6 +227,30 @@ impl Orchestrator {
                         workflow = %wf_id_str,
                         error = ?e,
                         "recover: corrupt waitpoint snapshot, waitpoints will be rebuilt from events"
+                    );
+                }
+            }
+        }
+
+        // 信号缓冲快照：与等待点同批恢复，否则"等待点跨重启
+        // 存活、递给它的信号不存活"——缓冲在重启路径上等于失效。
+        let sigbuf_entries = store.scan_prefix(STORE_KEY_SIGNAL_BUF).await?;
+        for (key, data) in sigbuf_entries {
+            let wf_id_str = key.strip_prefix(STORE_KEY_SIGNAL_BUF).unwrap_or(&key);
+            let wf_id = WorkflowId::from(wf_id_str.to_string());
+            match postcard::from_bytes::<HashMap<String, Vec<u8>>>(&data) {
+                Ok(table) => {
+                    state
+                        .pending_signals
+                        .insert(wf_id, table.into_iter().collect());
+                }
+                Err(e) => {
+                    // 缓冲损坏只影响"先到的信号"，不阻塞任务状态恢复；与等待点
+                    // 快照同一处理口径：告警后继续。
+                    tracing::warn!(
+                        workflow = %wf_id_str,
+                        error = ?e,
+                        "recover: corrupt signal buffer snapshot, buffered signals dropped"
                     );
                 }
             }
@@ -222,6 +284,7 @@ impl Orchestrator {
                 exec_key(wf_id),
                 pending_key(wf_id),
                 wait_key(wf_id),
+                signal_buf_key(wf_id),
                 event_seq_key(wf_id),
             ] {
                 if let Err(e) = store.delete(&key).await {
@@ -262,7 +325,7 @@ impl Orchestrator {
             network: None,
         };
 
-        // S0：快照加载完成后重放其后的事件，恢复语义唯一化（快照 + 事件重放）。
+        // 快照加载完成后重放其后的事件，恢复语义唯一化（快照 + 事件重放）。
         orchestrator
             .replay_events_after_watermarks(event_log.as_deref(), &watermarks)
             .await;
@@ -270,7 +333,7 @@ impl Orchestrator {
         Ok(orchestrator)
     }
 
-    /// 重放各工作流水位之后的事件（S0：recover = 快照 + 事件重放）。
+    /// 重放各工作流水位之后的事件：recover = 快照 + 事件重放。
     ///
     /// 事件按追加顺序重放，逐条按语义幂等推进：
     /// - 任务事件复用 `WorkflowExecution::mark_task_completed` / `fail_task` /
@@ -278,7 +341,7 @@ impl Orchestrator {
     ///   事件被拒绝，不产生二次状态变更；
     /// - 等待点事件幂等：已注册的 wait_key 跳过、已 Signaled 的等待点跳过；
     /// - 节点事件：DAG 中已存在的节点跳过（快照加速），缺失节点从事件重建
-    ///   （S7 增量提交的前置能力）。
+    ///   （增量提交的前置能力）。
     ///
     /// 重放不追加新事件、不发网络消息、不触发等待者唤醒（恢复期尚无等待者）。
     /// 重放产生变更的工作流被标记脏，由后台 flush 把水位后的增量并入快照；
@@ -330,7 +393,7 @@ impl Orchestrator {
                         replayed += 1;
                     }
                     Err(e) => {
-                        // 解码失败的事件跳过：0.2/0.3.2 历史与新枚举布局不兼容
+                        // 解码失败的事件跳过：旧枚举布局与新枚举布局不兼容
                         // 时不阻断其余事件重放。
                         tracing::warn!(
                             workflow = %wf_id.as_str(),
@@ -418,8 +481,16 @@ impl Orchestrator {
                     Some(slot) if slot.state == SlotState::Ready => slot,
                     _ => return,
                 };
+                let was_terminal = slot.execution.is_terminal();
                 if slot.execution.cancel_task(&task_id) {
                     self.state.mark_dirty(&workflow_id);
+                }
+                // 取消可终结工作流（末节点被取消）：与 TaskFailed 回放对称，
+                // 需在恢复期落盘终态快照，否则重启后工作流状态回退为非终态。
+                let became_terminal = !was_terminal && slot.execution.is_terminal();
+                if became_terminal {
+                    drop(slot);
+                    self.persist_terminal_after_replay(&workflow_id).await;
                 }
             }
             WorkflowEventPayload::NodeAdded { workflow_id, node } => {
@@ -451,6 +522,25 @@ impl Orchestrator {
                 condition,
             } => {
                 // 幂等：同 wait_key 已存在（快照已含）则跳过。
+                if self
+                    .state
+                    .waitpoints
+                    .get(&workflow_id)
+                    .is_some_and(|t| t.contains_key(&wait_key))
+                {
+                    return;
+                }
+                // 与 `register_wait_point` 同款：注册时消费缓冲（若信号先到）。
+                // 重放顺序里 `SignalReceived` 可能早于 `WaitPointRegistered`
+                //（缓冲场景），不消费就会把已收到的信号丢掉。
+                let buffered = matches!(condition, WaitCondition::Signal { .. })
+                    .then(|| {
+                        self.state
+                            .pending_signals
+                            .get(&workflow_id)
+                            .and_then(|buf| buf.remove(&wait_key).map(|(_, p)| p))
+                    })
+                    .flatten();
                 self.state
                     .waitpoints
                     .entry(workflow_id)
@@ -458,7 +548,10 @@ impl Orchestrator {
                     .entry(wait_key)
                     .or_insert_with(|| WaitPoint {
                         condition,
-                        state: WaitPointState::Waiting,
+                        state: match buffered {
+                            Some(payload) => WaitPointState::Signaled { payload },
+                            None => WaitPointState::Waiting,
+                        },
                     });
             }
             WorkflowEventPayload::SignalReceived {
@@ -466,16 +559,31 @@ impl Orchestrator {
                 wait_key,
                 payload,
             } => {
-                if let Some(mut wp) = self
-                    .state
-                    .waitpoints
-                    .entry(workflow_id)
-                    .or_default()
-                    .get_mut(&wait_key)
-                {
-                    if wp.state == WaitPointState::Waiting {
-                        wp.state = WaitPointState::Signaled { payload };
-                    }
+                // 一次取表到底，不写成"先判存在、再 get_mut().expect()"——
+                // 那两步之间有窗口，并发移除会让 expect panic（审查发现的 TOCTOU）。
+                // 等待点不存在 ⇒ 信号先到：入缓冲，等后续 `WaitPointRegistered`
+                // 重放时消费。此前直接丢弃，等于"缓冲跨重启失效"
+                // （缓冲与等待点同批落盘，保证跨重启一致性的兜底路径）。
+                let Some(table) = self.state.waitpoints.get_mut(&workflow_id) else {
+                    self.state
+                        .pending_signals
+                        .entry(workflow_id)
+                        .or_default()
+                        .entry(wait_key)
+                        .or_insert(payload);
+                    return;
+                };
+                let Some(mut wp) = table.get_mut(&wait_key) else {
+                    self.state
+                        .pending_signals
+                        .entry(workflow_id)
+                        .or_default()
+                        .entry(wait_key)
+                        .or_insert(payload);
+                    return;
+                };
+                if wp.state == WaitPointState::Waiting {
+                    wp.state = WaitPointState::Signaled { payload };
                 }
             }
             WorkflowEventPayload::TimerFired {
@@ -497,12 +605,13 @@ impl Orchestrator {
                 }
             }
             // 派发/运行事件对状态机无增量语义（Running 会在快照加载时被重置
-            // 为 Pending 以便重派发）；Submitted/Completed/Failed/Recovered 的
-            // 状态已由快照吸收。
+            // 为 Pending 以便重派发）；Submitted/Completed/Cancelled/Failed/
+            // Recovered 的状态已由快照吸收。
             WorkflowEventPayload::TaskDispatched { .. }
             | WorkflowEventPayload::TaskRunning { .. }
             | WorkflowEventPayload::Submitted { .. }
             | WorkflowEventPayload::Completed { .. }
+            | WorkflowEventPayload::Cancelled { .. }
             | WorkflowEventPayload::Failed { .. }
             | WorkflowEventPayload::Recovered { .. } => {}
         }
@@ -592,6 +701,8 @@ impl Orchestrator {
         let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
         let state = self.state.clone();
         let store = self.store.clone();
+        let event_log = self.event_log.clone();
+        let config = self.config.clone();
         let flush_interval =
             std::time::Duration::from_millis(self.config.workflow.persist_flush_interval_ms);
 
@@ -614,11 +725,12 @@ impl Orchestrator {
                             let Some(slot) = state.slots.get(wf_id) else {
                                 continue;
                             };
-                            // 事件水位必须先于快照序列化捕获（S0）：保证任何已计入
+                            // 事件水位必须先于快照序列化捕获：保证任何已计入
                             // 水位的状态变更必然已包含在快照中；反向窗口由重放幂等
                             // 守卫兜底。同时收集等待点快照，与 exec/pending 同批落盘。
                             let watermark = state.event_seq(wf_id);
                             let waitpoints = state.clone_waitpoints(wf_id);
+                            let signal_buf = state.clone_pending_signals(wf_id);
                             // 序列化失败不得静默丢弃：记录 error 并重新标记脏，
                             // 让下一轮 flush 重试（drain 已把该 workflow 移出脏集合）。
                             match serialize_rkyv(&slot.execution) {
@@ -658,6 +770,21 @@ impl Orchestrator {
                                     }
                                 }
                             }
+                            if let Some(buf) = signal_buf {
+                                match postcard::to_allocvec(&buf) {
+                                    Ok(buf_bytes) => {
+                                        batch.push((signal_buf_key(wf_id), buf_bytes))
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            workflow = %wf_id.as_str(),
+                                            error = %e,
+                                            "persist flush: failed to serialize signal buffer"
+                                        );
+                                        state.mark_dirty(wf_id);
+                                    }
+                                }
+                            }
                             if let Some(id) = watermark {
                                 match postcard::to_allocvec(&id) {
                                     Ok(seq_bytes) => {
@@ -684,6 +811,16 @@ impl Orchestrator {
                                         state.mark_dirty(wf_id);
                                     }
                                 }
+                            } else {
+                                // 水位已落盘：此刻裁剪"已进快照"的历史才是安全的。
+                                for wf_id in &dirty_ids {
+                                    trim_absorbed_history(
+                                        event_log.as_ref(),
+                                        &config,
+                                        wf_id,
+                                        state.event_seq(wf_id).as_ref(),
+                                    );
+                                }
                             }
                         }
                     }
@@ -709,7 +846,7 @@ impl Orchestrator {
             let Some(slot) = self.state.slots.get(wf_id) else {
                 continue;
             };
-            // 事件水位先于快照序列化捕获（S0），语义同 start_persist_flush。
+            // 事件水位先于快照序列化捕获，语义同 start_persist_flush。
             let watermark = self.state.event_seq(wf_id);
             let waitpoints = self.state.clone_waitpoints(wf_id);
             // 序列化失败不得静默丢弃：记录 error 并重新标记脏，保持与后台
@@ -749,6 +886,20 @@ impl Orchestrator {
                     }
                 }
             }
+            // 信号缓冲与等待点同批落盘。
+            if let Some(buf) = self.state.clone_pending_signals(wf_id) {
+                match postcard::to_allocvec(&buf) {
+                    Ok(buf_bytes) => batch.push((signal_buf_key(wf_id), buf_bytes)),
+                    Err(e) => {
+                        tracing::error!(
+                            workflow = %wf_id.as_str(),
+                            error = %e,
+                            "flush_dirty: failed to serialize signal buffer"
+                        );
+                        self.state.mark_dirty(wf_id);
+                    }
+                }
+            }
             if let Some(id) = watermark {
                 match postcard::to_allocvec(&id) {
                     Ok(seq_bytes) => batch.push((event_seq_key(wf_id), seq_bytes)),
@@ -765,6 +916,15 @@ impl Orchestrator {
         }
         if !batch.is_empty() {
             store.put_batch(&batch).await?;
+        }
+        // 与 start_persist_flush 共用：水位落盘后裁剪已被快照吸收的历史。
+        for wf_id in &dirty_ids {
+            trim_absorbed_history(
+                self.event_log.as_ref(),
+                &self.config,
+                wf_id,
+                self.state.event_seq(wf_id).as_ref(),
+            );
         }
         Ok(())
     }
@@ -926,6 +1086,7 @@ impl Orchestrator {
                 pending_key(old_id),
                 result_key(old_id),
                 wait_key(old_id),
+                signal_buf_key(old_id),
                 event_seq_key(old_id),
             ] {
                 if let Err(e) = s.delete(&key).await {

@@ -34,6 +34,9 @@ pub struct MockTransport {
     pub broadcasts: BroadcastLog,
     pub subscribed: Arc<Mutex<Vec<String>>>,
     pub direct_responses: DirectResponseLog,
+    /// `send_direct_request` 的应答。`None`（默认）表示对端不响应（返回错误），
+    /// 用于模拟不可达对端；设为 `Some(Pong)` 即模拟存活对端。
+    pub direct_request_response: Arc<Mutex<Option<DirectResponse>>>,
 }
 
 #[allow(dead_code)]
@@ -45,7 +48,13 @@ impl MockTransport {
             broadcasts: Arc::new(Mutex::new(Vec::new())),
             subscribed: Arc::new(Mutex::new(Vec::new())),
             direct_responses: Arc::new(Mutex::new(Vec::new())),
+            direct_request_response: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// 设置所有 `send_direct_request` 的应答（用于存活探测等请求-响应测试）。
+    pub fn with_direct_request_response(&self, response: DirectResponse) {
+        *self.direct_request_response.lock() = Some(response);
     }
 
     /// 返回至今记录到的广播次数。
@@ -115,9 +124,12 @@ impl Transport for MockTransport {
         _peer_id_str: &str,
         _request: DirectRequest,
     ) -> Result<DirectResponse> {
-        Err(ActantError::Internal(
-            "MockTransport: send_direct_request not implemented".into(),
-        ))
+        match self.direct_request_response.lock().clone() {
+            Some(response) => Ok(response),
+            None => Err(ActantError::Internal(
+                "MockTransport: send_direct_request not implemented".into(),
+            )),
+        }
     }
 
     async fn send_direct_response(

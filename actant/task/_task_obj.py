@@ -26,6 +26,23 @@ from actant.task._helpers import (
 _logger = logging.getLogger("actant.task")
 
 
+def _unpack_item(
+    item: Any,
+    unpack: bool,
+) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    """按 ``unpack`` 语义解包 ``submit_batch`` 的单个元素。
+
+    支持 ``(args,)`` / ``(args, kwargs)`` 两种形式（与 ``starmap`` 一致）；
+    ``unpack=False`` 时元素整体作为唯一位置参数。
+    """
+    if not unpack:
+        return (item,), {}
+    if isinstance(item, tuple) and len(item) == 2 and isinstance(item[1], dict):
+        raw_args, raw_kwargs = item
+        return raw_args, raw_kwargs
+    return tuple(item), {}
+
+
 class Task:
     """由 ``@task`` 装饰器产生的可执行任务对象。
 
@@ -133,6 +150,13 @@ class Task:
             target_node: 目标 Actant ``node_id``。
             endpoint_addr: 目标 ``listen_addresses()["endpoint_addr"]``。
                 若省略，使用 ``target_node`` 作为直连地址。
+
+        Note:
+            **执行节点失联时为 fail-fast，不自动重跑**：被指定的节点
+            死亡后在途任务会以 ``WorkerError`` 终结，句柄不会永久挂起，但任务
+            也不会被重派发到别的节点——源节点没有"该任务尚未执行完"的持久凭据，
+            自动重跑会静默重复副作用。需要重跑请显式声明重试策略
+            （``@task(retries=...)``）或重新提交。
         """
         return self._submit(
             args,
@@ -157,10 +181,20 @@ class Task:
             )
 
         # 单遍解析参数：把上游 AsyncResult 解析为其结果值，同时收集其 task_id
-        # 作为 FlowDAG 依赖边（解析与收集合并一次遍历，避免两遍重复递归）。
+        # 作为编排依赖边（解析与收集合并一次遍历，避免两遍重复递归）。
         resolved_args, resolved_kwargs, deps = _resolve_args_with_deps(args, kwargs)
 
-        task_id, _workflow_id, payload, _task_ctx, handle, task_def = self._prepare_task_def(
+        # 判定：FlowContext 活跃 → orchestrator 驱动的持久化编排路径；
+        # 否则保持独立 @task 直调的任务队列语义不变。
+        from actant.flow import current_flow_state
+
+        flow_state = current_flow_state()
+        if flow_state is not None:
+            return self._flow_submit(
+                runtime, flow_state, resolved_args, resolved_kwargs, deps,
+            )
+
+        task_id, _workflow_id, _payload, _task_ctx, handle, task_def = self._prepare_task_def(
             resolved_args, resolved_kwargs,
             target_node=target_node, target_endpoint_addr=target_endpoint_addr,
             runtime=runtime,
@@ -174,44 +208,66 @@ class Task:
         except Exception:
             runtime.unregister_task(task_id)
             raise
-        # 提交成功后记录节点（含上游依赖边）到当前 flow 的 FlowDAG。
-        self._record_dag_node(task_id=task_id, payload=payload, deps=deps, handle=handle)
         return handle
 
-    def _record_dag_node(
+    def _flow_submit(
         self,
-        *,
-        task_id: str,
-        payload: bytes,
+        runtime: Any,
+        state: Any,
+        resolved_args: tuple[Any, ...],
+        resolved_kwargs: dict[str, Any],
         deps: list[str],
-        handle: AsyncResult,
-    ) -> None:
-        """把已提交任务作为节点记录到当前 flow 的 ``FlowDAG``（若在 flow 上下文中）。
+    ) -> AsyncResult:
+        """flow 上下文内的提交路径：生成节点 → 持久化 → orchestrator 派发。
 
-        由 ``_submit`` / ``submit_batch`` 在任务提交成功后调用，同时为任务句柄
-        注册完成回调：任务终态时把结果写入 ``FlowDAG``，供 ``complete_workflow``
-        回灌 Orchestrator。不在 flow 上下文（``current_flow_dag()`` 返回
-        ``None``）时为空操作，保持普通 ``task.submit`` 语义不变。
+        节点标识 ``{任务名}-{序号}-{workflow_id}`` 确定性生成（跨重放稳定）；依赖边来自参数树引用的上游节点（``_resolve_args_with_deps``，
+        上游结果已阻塞解析并内联进 payload）；经 ``add_workflow_node`` 先持久化
+        再派发。重放命中历史时（节点已存在且指纹一致）不重新提交：已完成 →
+        返回记录结果的句柄；进行中 → 返回绑定句柄。
         """
-        from actant.flow import current_flow_dag
+        seq = state.next_seq()
+        task_id = f"{self._name}-{seq}-{state.workflow_id}"
 
-        dag = current_flow_dag()
-        if dag is None:
-            return
-        dag.add_task(
+        _tid, _wf, _payload, _ctx, handle, _task_def = self._prepare_task_def(
+            resolved_args, resolved_kwargs,
+            target_node=None, target_endpoint_addr=None,
+            runtime=runtime,
+            task_id=task_id,
+            flow_mode=True,
+        )
+
+        # 工作流外壳惰性创建：首个节点提交前持久化空 workflow（含失败策略与
+        # 工作流级 deadline）；空 flow 不创建工作流。
+        # 经 flow 侧的唯一入口，顺带在真正建槽**之后**广播 submitted/started
+        # ——此处不再自己写一遍创建块，否则事件时序会再次漂移。
+        from actant.flow import _ensure_workflow_created
+
+        _ensure_workflow_created(runtime, state)
+
+        # @task(retries=...) 映射为节点 RetryPolicy（orchestrator 是唯一
+        # 重试执行者）；payload 头部 retries 已在 flow_mode 下剥离。
+        from actant.actant import _DagNode, _RetryPolicy
+
+        retry = (
+            _RetryPolicy(max_retries=self._retries, delay_ms=self._retry_delay_ms)
+            if self._retries > 0
+            else None
+        )
+        node = _DagNode(
             task_id=task_id,
             name=self._name,
-            payload=payload,
-            deps=deps,
+            payload=_payload,
+            retry=retry,
             timeout_ms=self._timeout_ms if self._timeout_ms > 0 else None,
             priority=self._priority,
-            retries=self._retries,
-            retry_delay_ms=self._retry_delay_ms,
         )
-        def _record_outcome(h: AsyncResult) -> None:
-            dag.record_outcome(task_id, h._export_outcome())
+        outcome = runtime.add_workflow_node(state.workflow_id, node, deps)
+        if not outcome.get("created"):
+            # 重放命中：按历史状态重建句柄，不重新提交、不重跑。
+            from actant.flow import _replay_node_outcome
 
-        handle.add_done_callback(_record_outcome)
+            _replay_node_outcome(runtime, handle, outcome)
+        return handle
 
     def _prepare_task_def(
         self,
@@ -221,25 +277,36 @@ class Task:
         target_node: str | None,
         target_endpoint_addr: str | None,
         runtime: Any,
+        task_id: str | None = None,
+        flow_mode: bool = False,
     ) -> tuple[str, str, bytes, TaskContext, AsyncResult, Any]:
         """构造单个任务的内部状态（task_id, payload, AsyncResult, _TaskDef）。
 
-        抽出此方法以支持 ``_submit`` 与 ``submit_batch`` 共享序列化、上下文创建、
-        Runtime 注册逻辑，避免两条路径行为漂移。
+        抽出此方法以支持 ``_submit`` / ``_flow_submit`` / ``submit_batch``
+        共享序列化、上下文创建、Runtime 注册逻辑，避免多条路径行为漂移。
+
+        Args:
+            task_id: 外部指定的任务标识（flow 路径传入确定性节点 id，重放
+                身份）；省略时按 uuid 生成。
+            flow_mode: flow 编排路径标记。置位时 payload 头部 ``retries`` 置 0
+                （重试单层化：flow 任务唯一重试执行者是 orchestrator 节点
+                RetryPolicy，worker 层不重试）。
 
         Returns:
             ``(task_id, workflow_id, payload, task_ctx, handle, task_def)``
-            元组。调用方负责调用 ``core.submit_task(task_def)`` 或批量提交。
+            元组。调用方负责调用 ``core.submit_task(task_def)`` / 批量提交，
+            或（flow 路径）以 payload 构造 DAG 节点经 orchestrator 派发。
         """
-        task_id = f"{self._name}-{uuid.uuid4().hex[:8]}"
+        if task_id is None:
+            task_id = f"{self._name}-{uuid.uuid4().hex[:8]}"
         # 从 flow 上下文继承 workflow_id，使 TaskEvent 归属正确。
-        from actant.flow import current_workflow_id, is_flow_cancelled
+        from actant.flow import current_workflow_id
 
         workflow_id = current_workflow_id() or ""
 
-        # 值引用降级（0.3.2 R3b，均发生在提交方父进程）：
+        # 值引用降级（均发生在提交方父进程）：
         # 1. 参数树中的 Ref（上游大结果 / 用户显式传入）→ _RefArg 帧内联字节
-        #    （blob 字节原样搬运，无对象级序列化，见 plans/REF_DESIGN.md）。
+        #    （blob 字节原样搬运，无对象级序列化）。
         # 2. 直传大值（> REF_INLINE_THRESHOLD）→ 落 blob + _RefArg。
         from actant.task._ref import _degrade_large_values, _materialize_refs
 
@@ -263,8 +330,8 @@ class Task:
         }
 
         options = {
-            "retries": self._retries,
-            "retry_delay_ms": self._retry_delay_ms,
+            "retries": 0 if flow_mode else self._retries,
+            "retry_delay_ms": 0 if flow_mode else self._retry_delay_ms,
             "timeout_ms": self._timeout_ms,
             "task_id": task_id,
             "workflow_id": workflow_id,
@@ -275,15 +342,6 @@ class Task:
         payload = _safe_serialize(
             self._func, resolved_args, resolved_kwargs, options, task_id=self._name,
         )
-
-        # Flow 超时治理：若当前 flow 已被取消（超时），
-        # 拒绝提交新任务，阻止 orphan 线程继续创建任务。
-        if is_flow_cancelled():
-            from actant.exceptions import ActantTimeoutError
-            raise ActantTimeoutError(
-                f"flow {workflow_id!r} has been cancelled (timeout); "
-                f"cannot submit new task {task_id!r}"
-            )
 
         # 创建任务上下文（取消系统）：关联到 AsyncResult。
         task_ctx = TaskContext(task_id, workflow_id=workflow_id)
@@ -350,8 +408,8 @@ class Task:
             ``AsyncResult`` 列表，顺序与输入 ``items`` 一致。
 
         Raises:
-            InvalidStateError: Runtime 未启动。
-            ActantTimeoutError: 当前 flow 已被取消。
+            InvalidStateError: Runtime 未启动，或 flow 的工作流已到达终态
+                （如 deadline 到期被强还原后继续提交节点）。
 
         用法::
 
@@ -373,6 +431,25 @@ class Task:
                 "task.submit_batch: no active Runtime; "
                 "wrap your code in `with actant.Runtime() as rt:`"
             )
+
+        # 判定：flow 上下文中逐项走 orchestrator 驱动的编排路径（节点
+        # 先持久化再派发），不做批量直调——编排节点的持久化与派发裁决必须
+        # 逐节点进行。批量快路径仅保留给独立 @task（任务队列语义）。
+        from actant.flow import current_flow_state
+
+        flow_state = current_flow_state()
+        if flow_state is not None:
+            handles: list[AsyncResult] = []
+            for item in items:
+                raw_args, raw_kwargs = _unpack_item(item, unpack)
+                resolved_args, resolved_kwargs, deps = _resolve_args_with_deps(
+                    raw_args, raw_kwargs
+                )
+                handles.append(
+                    self._flow_submit(runtime, flow_state, resolved_args, resolved_kwargs, deps)
+                )
+            return handles
+
         core = runtime._rust_core
         if core is None:
             raise InvalidStateError("Runtime not started: rust_core is None")
@@ -382,20 +459,7 @@ class Task:
         registered_ids: list[str] = []
         try:
             for item in items:
-                if unpack:
-                    # 支持 (args,) 或 (args, kwargs) 两种形式
-                    if (
-                        isinstance(item, tuple)
-                        and len(item) == 2
-                        and isinstance(item[1], dict)
-                    ):
-                        raw_args, raw_kwargs = item
-                    else:
-                        raw_args = tuple(item)
-                        raw_kwargs = {}
-                else:
-                    raw_args = (item,)
-                    raw_kwargs = {}
+                raw_args, raw_kwargs = _unpack_item(item, unpack)
                 # 单遍解析本项参数：解析上游 AsyncResult 并收集 task_id 作为依赖边。
                 resolved_args, resolved_kwargs, deps = _resolve_args_with_deps(
                     raw_args, raw_kwargs
@@ -409,7 +473,7 @@ class Task:
                 prepared.append((task_id, payload, deps, handle, task_def))
                 registered_ids.append(task_id)
         except Exception:
-            # 序列化或 flow 取消检查失败：清理已注册的 task_id。
+            # 序列化失败：清理已注册的 task_id。
             for tid in registered_ids:
                 runtime.unregister_task(tid)
             raise
@@ -422,10 +486,6 @@ class Task:
             for tid in registered_ids:
                 runtime.unregister_task(tid)
             raise
-
-        # 全部提交成功后记录节点到当前 flow 的 FlowDAG（含各自的上游依赖边）。
-        for task_id, payload, deps, handle, _td in prepared:
-            self._record_dag_node(task_id=task_id, payload=payload, deps=deps, handle=handle)
 
         return [handle for _, _, _, handle, _ in prepared]
 

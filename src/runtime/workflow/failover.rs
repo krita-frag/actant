@@ -18,9 +18,24 @@
 //! 新 claim 的租约同时记录墙钟时间和单调 deadline；从 store 恢复的租约没有
 //! 单调基线，只能回退到墙钟过期判断。
 //!
+//! ## 两条失联处置腿
+//!
+//! 判失效后按"谁的账谁认"分两腿，覆盖执行器与编排器两种死亡形态：
+//!
+//! 1. **孤儿编排**（既有）：peer 的 `active_workflows` 非空 ⇒ 它是那些 workflow
+//!    的编排者，按一致性哈希 `claim` 接管并 `reschedule_running_tasks`。
+//! 2. **在途转发**（新增）：peer 是**执行器**时 `active_workflows` 为空，
+//!    但它身上跑着**本节点转发过去**的任务。这些任务登记在
+//!    [`FailoverManager::outbound`]，失联时终结为 `TaskCompletion::Failed`
+//!    并经 event_bus 发布（与远端结果回灌同一条路），使提交方 `AsyncResult`
+//!    不再永久挂起。
+//!
+//! 第 2 腿刻意**不重派发**：源节点没有"该任务未执行完"的持久凭据，盲目重跑
+//! 会静默重复副作用；重跑交由显式重试策略（重试裁决）或提交方重提。
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use dashmap::DashMap;
 use rkyv::Archive;
@@ -28,13 +43,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::common::{
     should_claim_workflow, ActorId, FailoverConfig, NodeHeartbeat, NodeId, OrchestratorClaim,
-    Result, WireEnvelope, WireMessage, WorkflowId, STORE_KEY_LEASE, TOPIC_FAILOVER, TOPIC_HEADS,
-    TOPIC_HEARTBEAT,
+    Result, TaskCompletion, TaskId, WireEnvelope, WireMessage, WorkflowId, STORE_KEY_LEASE,
+    TOPIC_FAILOVER, TOPIC_HEADS, TOPIC_HEARTBEAT,
 };
 use crate::runtime::actor::ActorSystem;
+use crate::runtime::event_bus::{BusEvent, EventBus};
 use crate::runtime::state::{HybridLogicalClock, LmdbStore};
 use crate::runtime::workflow::actor::workflow_methods;
 use crate::runtime::workflow::messaging;
+
+/// 在途目标主动存活探测的单次超时上界。
+///
+/// 取值远小于 `failure_timeout_ms`（默认 8s）且远小于检测间隔（4s）量级：
+/// 对端已死时直连握手可能拖到 QUIC 超时（数十秒），必须由本上界截断，
+/// 否则探测会拖住整轮失联扫描。2s 对健康对端是极宽裕的往返预算。
+const OUTBOUND_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Debug, Clone, Serialize, Deserialize, Archive, rkyv::Serialize, rkyv::Deserialize)]
 #[rkyv(bytecheck())]
@@ -50,6 +73,25 @@ struct PeerState {
     available_slots: u32,
     max_slots: u32,
     endpoint_addr: Option<String>,
+}
+
+/// 已转发到远端 peer、结果尚未回来的在途任务条目。
+///
+/// 只保存**构造失败完成事件所需的最小字段**（不含 payload）——登记表是"路由
+/// 记账"，不是任务副本，避免为每个在途任务额外持有一份可能达 MiB 级的 payload。
+#[derive(Debug, Clone)]
+pub struct OutboundTask {
+    /// 任务所属 workflow（直提任务为空串 id）。
+    pub workflow_id: WorkflowId,
+    /// 任务名（失败完成事件的 `task_name` 字段）。
+    pub task_name: String,
+    /// 转发目标节点。
+    pub target_node: NodeId,
+    /// 转发目标的可达地址（iroh 公钥）。用于心跳视图不可用时的主动存活探测；
+    /// `None` 时退化为以 `target_node` 作为地址（与转发路径的取值一致）。
+    pub target_endpoint_addr: Option<String>,
+    /// 登记时刻，用于诊断"在途过久"。
+    pub forwarded_at: Instant,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,6 +199,14 @@ pub struct FailoverManager {
     local_available_capacity: Arc<AtomicU32>,
     /// Local node's maximum task capacity.
     local_max_capacity: Arc<AtomicU32>,
+    /// 已转发到远端 peer 的在途任务登记（`task_id` → 目标/来源信息）。
+    ///
+    /// 仅内存、不落盘：本表是恢复加速器而非正确性凭据——丢失只退化为"该任务
+    /// 不因节点失联而终止"（回到失联处置之前的行为），不会产生错误恢复。
+    outbound: Arc<DashMap<String, OutboundTask>>,
+    /// 本地事件总线：失联时把在途任务终结为 `TaskFailed` 发布出去，让提交方
+    /// `AsyncResult` 得以终止。`None` 时（极简测试桩）该腿只清理登记表并告警。
+    event_bus: Option<EventBus>,
 }
 
 impl Drop for FailoverManager {
@@ -208,6 +258,8 @@ impl FailoverManager {
             clock: Arc::new(HybridLogicalClock::new()),
             local_available_capacity: Arc::new(AtomicU32::new(0)),
             local_max_capacity: Arc::new(AtomicU32::new(0)),
+            outbound: Arc::new(DashMap::new()),
+            event_bus: None,
         };
         fm.recover_leases_from_store();
         fm
@@ -282,6 +334,180 @@ impl FailoverManager {
     /// 注入用于 failover 重调度的 scheduler。
     pub fn set_scheduler(&self, scheduler: Arc<dyn crate::runtime::workflow::Scheduler>) {
         *self.scheduler.lock() = Some(scheduler);
+    }
+
+    /// 注入本地事件总线，用于失联时终结在途任务（见 `fail_outbound_tasks_to`）。
+    ///
+    /// 采用 builder 方法而非构造参数，是为了让既有 11 处
+    /// `FailoverManager::new` 调用点（多为不需要该腿的单元测试桩）保持不变。
+    pub fn with_event_bus(mut self, event_bus: EventBus) -> Self {
+        self.event_bus = Some(event_bus);
+        self
+    }
+
+    /// 登记一条"已转发到远端、结果未回"的在途任务。
+    ///
+    /// 由 Worker 在 `forward_remote_task` 成功后调用；同一 `task_id` 重复登记
+    /// 覆盖旧值（重路由场景下目标是最后一次转发目标）。
+    pub fn record_outbound(
+        &self,
+        task_id: &TaskId,
+        target_node: &NodeId,
+        target_endpoint_addr: Option<&str>,
+        workflow_id: WorkflowId,
+        task_name: &str,
+    ) {
+        self.outbound.insert(
+            task_id.as_str().to_string(),
+            OutboundTask {
+                workflow_id,
+                task_name: task_name.to_string(),
+                target_node: target_node.clone(),
+                target_endpoint_addr: target_endpoint_addr.map(str::to_string),
+                forwarded_at: Instant::now(),
+            },
+        );
+    }
+
+    /// 清除一条在途登记（该任务的命运已在本地确定）。
+    ///
+    /// 由 Worker 网络事件路由在收到该任务的远端结果时调用。
+    pub fn clear_outbound(&self, task_id: &str) {
+        self.outbound.remove(task_id);
+    }
+
+    /// 当前在途登记条数（诊断 / 测试用）。
+    pub fn outbound_len(&self) -> usize {
+        self.outbound.len()
+    }
+
+    /// 取出并移除所有目标为 `dead` 的在途登记。
+    fn drain_outbound_to(&self, dead: &NodeId) -> Vec<(String, OutboundTask)> {
+        let keys: Vec<String> = self
+            .outbound
+            .iter()
+            .filter(|e| &e.value().target_node == dead)
+            .map(|e| e.key().clone())
+            .collect();
+        let mut drained = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some((_, entry)) = self.outbound.remove(&key) {
+                drained.push((key, entry));
+            }
+        }
+        drained
+    }
+
+    /// 该 peer 是否处于"新鲜"心跳窗口内（可用于跳过主动探测）。
+    fn is_peer_fresh(&self, node_id: &NodeId) -> bool {
+        let now_ms = crate::common::epoch_millis();
+        self.peers.get(node_id).is_some_and(|p| {
+            p.last_heartbeat_ms > 0
+                && now_ms.saturating_sub(p.last_heartbeat_ms) <= self.failure_timeout_ms
+        })
+    }
+
+    /// 失联处置第 2 腿之二：对**心跳视图不可判**的在途目标做主动存活探测。
+    ///
+    /// 心跳视图有一个天然盲区：节点在发出第一个可被观测的心跳之前就失联
+    /// （或从未与本节点建立心跳关系，例如仅按 `endpoint_addr` 直投）。此时
+    /// `peers` 里既没有它的条目、也没有可用于超时判定的时间基线，第 1 腿与
+    /// 第 2 腿的前半段都无从触发，在途任务会永久挂起。对一个**已经成功转发过
+    /// 任务**的目标，本节点持有直连通道，可以直接探测——这是该情形下唯一
+    /// 可靠的存活信号。
+    ///
+    /// 探测成功即认为对端仍在服务：**不**终结其任务（避免误杀健康任务）；
+    /// 探测失败/超时才终结。仅对"不在新鲜心跳窗口内"的目标探测，正常拓扑下
+    /// 每次扫描通常零探测。
+    async fn probe_outbound_targets(&self) {
+        // 去重：同一目标可能承载多个在途任务，只探测一次。
+        let mut targets: HashMap<NodeId, Option<String>> = HashMap::new();
+        for entry in self.outbound.iter() {
+            let target = entry.value().target_node.clone();
+            if self.is_peer_fresh(&target) {
+                continue;
+            }
+            targets
+                .entry(target)
+                .or_insert_with(|| entry.value().target_endpoint_addr.clone());
+        }
+        for (target, addr) in targets {
+            let addr = addr.unwrap_or_else(|| target.as_str().to_string());
+            let probe = self
+                .network
+                .send_direct_request(&addr, crate::runtime::network::DirectRequest::Ping);
+            let alive = matches!(
+                tokio::time::timeout(OUTBOUND_PROBE_TIMEOUT, probe).await,
+                Ok(Ok(crate::runtime::network::DirectResponse::Pong))
+            );
+            if alive {
+                tracing::debug!(
+                    node = %target.as_str(),
+                    "in-flight target answered liveness probe; keeping its tasks"
+                );
+                continue;
+            }
+            tracing::warn!(
+                node = %target.as_str(),
+                addr = %addr,
+                probe_timeout_ms = OUTBOUND_PROBE_TIMEOUT.as_millis() as u64,
+                "in-flight target did not answer liveness probe; settling its tasks"
+            );
+            self.fail_outbound_tasks_to(&target).await;
+        }
+    }
+
+    /// 失联处置第 2 腿：把目标为 `dead` 的在途任务终结为 `TaskFailed`。
+    ///
+    /// 发布走 event_bus（与 `network_router::publish_remote_completion` 同一条路）：
+    /// - 直提任务：Python 事件泵解析 `AsyncResult` 为异常，句柄不再永久挂起；
+    /// - 编排任务：事件泵照常回灌 orchestrator，由重试裁决决定是否重派发。
+    ///
+    /// 返回终结的任务数，供调用方决定是否需要打日志。
+    async fn fail_outbound_tasks_to(&self, dead: &NodeId) -> usize {
+        let drained = self.drain_outbound_to(dead);
+        if drained.is_empty() {
+            return 0;
+        }
+        let count = drained.len();
+        let Some(event_bus) = self.event_bus.as_ref() else {
+            tracing::warn!(
+                node = %dead.as_str(),
+                count,
+                "no event_bus on FailoverManager; in-flight tasks cannot be settled"
+            );
+            return count;
+        };
+        for (task_id, entry) in drained {
+            crate::metrics::inc_failover_node_lost_tasks();
+            tracing::warn!(
+                task_id = %task_id,
+                node = %dead.as_str(),
+                workflow_id = %entry.workflow_id.as_str(),
+                in_flight_ms = entry.forwarded_at.elapsed().as_millis() as u64,
+                "executor node lost; settling in-flight task as failed"
+            );
+            // 错误 kind 复用既有的 `worker`（执行侧基础设施失败），不新增 kind：
+            // 新增 kind 需同时改 `ActorErrorKind` 与 Python `_KIND_TO_EXCEPTION`
+            // 两处，而语义上"执行节点消失"本属执行侧失败。
+            // 前缀经 `format_error_kind` 生成，避免手写格式漂移。
+            let completion = TaskCompletion::Failed {
+                workflow_id: entry.workflow_id,
+                task_id: TaskId::from(task_id),
+                task_name: entry.task_name,
+                error: crate::common::format_error_kind(
+                    "worker",
+                    &format!(
+                        "executor node {} was lost before the task produced a result; \
+                         the task is settled as failed and is NOT re-run automatically",
+                        dead.as_str()
+                    ),
+                ),
+                target_node: Some(dead.clone()),
+            };
+            event_bus.publish(BusEvent::TaskFailed(completion));
+        }
+        count
     }
 
     /// 订阅 failover 相关 gossip topic。
@@ -667,7 +893,24 @@ impl FailoverManager {
         for (node_id, info) in &to_check {
             let is_failed = info.last_heartbeat_ms > 0
                 && now_ms.saturating_sub(info.last_heartbeat_ms) > timeout_ms;
-            if !is_failed || info.active_workflows.is_empty() {
+            if !is_failed {
+                continue;
+            }
+
+            // 第 2 腿：无论该 peer 是否编排 workflow，都要处置转发到它
+            // 身上的在途任务——死亡执行器的 active_workflows 为空，正是旧守卫
+            // 让在途任务永久挂起的地方。
+            let settled = self.fail_outbound_tasks_to(node_id).await;
+
+            if info.active_workflows.is_empty() {
+                // 纯执行器失联：没有孤儿 workflow，第 2 腿已处置完毕。
+                if settled > 0 {
+                    tracing::warn!(
+                        node = %node_id.0,
+                        settled,
+                        "failed peer was an executor only; settled its in-flight tasks"
+                    );
+                }
                 continue;
             }
             tracing::warn!(
@@ -698,6 +941,11 @@ impl FailoverManager {
                 }
             }
         }
+
+        // 第 2 腿之二：心跳视图不可判的在途目标走主动探测。
+        // 放在逐 peer 扫描之后——已被判失联的 peer 其条目已在上文被清空，
+        // 此处只处理"连心跳都没来得及被观测到"的残余目标。
+        self.probe_outbound_targets().await;
     }
 
     /// 处理远端心跳并更新 peer 视图。

@@ -7,7 +7,7 @@ use super::*;
 /// （`init_worker` 仅存储调度器，不在测试中真正派发任务）。
 fn hermetic_dispatcher() -> Arc<dyn TaskDispatcher> {
     Arc::new(
-        ProcessTaskDispatcher::new(0, "python3".to_string(), 1, Vec::new(), Vec::new())
+        ProcessTaskDispatcher::new(0, WorkerLaunchSpec::default(), 1, Vec::new())
             .expect("process task dispatcher init"),
     )
 }
@@ -125,6 +125,7 @@ fn similar_named_path_not_rejected_by_ancestor_check() {
 // ───────────────────────── init_actor_system 测试 ─────────────────────────
 
 use crate::common::WorkerConfig;
+use crate::runtime::dispatcher::WorkerLaunchSpec;
 use crate::runtime::workflow::FailoverManager;
 use crate::test_support::MockTransport;
 use tempfile::tempdir;
@@ -596,7 +597,7 @@ async fn build_can_be_called_multiple_times_with_different_dirs() {
     rt2.shutdown().await.expect("shutdown rt2 ok");
 }
 
-// ───────────────────────── P0-5 恢复重派发接线测试 ─────────────────────────
+// ───────────────────────── 恢复重派发接线测试 ─────────────────────────
 
 use crate::runtime::workflow::{Dag, DagNode, Orchestrator};
 

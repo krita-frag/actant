@@ -436,6 +436,13 @@ pub struct WorkflowConfig {
     /// 脏工作流执行状态按此间隔批量写入存储，而非每次状态变更都写，减少写放大。
     /// 终态总是立即持久化。
     pub persist_flush_interval_ms: u64,
+    /// 事件历史留存：每个工作流最多保留多少条**已被快照吸收**的事件
+    /// （即 `id <= 持久化水位` 的那一批）。
+    ///
+    /// `0` = **不裁剪**（默认，保守：不静默改变既有留存行为）。
+    /// 水位**之后**的事件永不裁剪——它们是重放所需的增量。见
+    /// 事件历史留存策略。
+    pub event_log_max_events_per_workflow: usize,
 }
 
 impl Default for WorkflowConfig {
@@ -445,6 +452,7 @@ impl Default for WorkflowConfig {
             completed_retention_count: 1000,
             default_timeout_ms: 3_600_000,
             persist_flush_interval_ms: 200,
+            event_log_max_events_per_workflow: 0,
         }
     }
 }

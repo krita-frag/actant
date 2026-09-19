@@ -212,7 +212,7 @@ async fn failover_actor_unknown_method_returns_error() {
     system.stop(&actor_id).await.unwrap();
 }
 
-// ───────────────────────── S8：结果回灌单路化 ─────────────────────────
+// ───────────────────────── 结果回灌单路化 ─────────────────────────
 
 use crate::runtime::state::event_log::{EventLog, MemoryEventLog};
 use crate::runtime::workflow::orchestrator::types::WorkflowEventPayload;
@@ -271,6 +271,7 @@ fn count_events(event_log: &MemoryEventLog, wf_id: &WorkflowId) -> HashMap<Strin
             WorkflowEventPayload::TaskFailed { .. } => "TaskFailed",
             WorkflowEventPayload::TaskCancelled { .. } => "TaskCancelled",
             WorkflowEventPayload::Completed { .. } => "Completed",
+            WorkflowEventPayload::Cancelled { .. } => "Cancelled",
             WorkflowEventPayload::Failed { .. } => "Failed",
             WorkflowEventPayload::WaitPointRegistered { .. } => "WaitPointRegistered",
             WorkflowEventPayload::SignalReceived { .. } => "SignalReceived",

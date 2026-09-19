@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::common::{TaskId, WorkflowId};
+use crate::runtime::dispatcher::WorkerLaunchSpec;
 use crate::runtime::state::LmdbStore as StateStore;
 use tempfile::tempdir;
 
@@ -510,7 +511,7 @@ fn register_execute_handler_adds_layer() {
     use crate::runtime::dispatcher::{ProcessTaskDispatcher, TaskDispatcher};
     let rt = CapabilityRuntime::new();
     let dispatcher: Arc<dyn TaskDispatcher> = Arc::new(
-        ProcessTaskDispatcher::new(0, "python3".to_string(), 1, Vec::new(), Vec::new()).unwrap(),
+        ProcessTaskDispatcher::new(0, WorkerLaunchSpec::default(), 1, Vec::new()).unwrap(),
     );
     register_execute_handler(&rt, dispatcher, Vec::new()).unwrap();
     assert_eq!(rt.capability_count(), 1);
@@ -1182,7 +1183,7 @@ fn layer_chain_multiple_handlers() {
 // ExecuteHandler 签名验证
 // =========================================================================
 
-/// H7.1：`timeout_ms = 0` 必须映射为"无超时"（远期硬超时），而非立即超时。
+/// `timeout_ms = 0` 必须映射为"无超时"（远期硬超时），而非立即超时。
 ///
 /// dispatcher 收到的 timeout 应为远期时长；同时用短任务冒烟验证 dispatch
 /// 不会被 0 值立即强杀。

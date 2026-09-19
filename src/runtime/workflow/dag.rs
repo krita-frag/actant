@@ -254,6 +254,11 @@ pub struct WorkflowExecution {
     /// 工作流进入 `Failed` 状态时捕获的错误消息。
     #[serde(default)]
     pub error: Option<String>,
+    /// 节点集是否封口：整图提交（`submit`）立即封口；flow 增量提交
+    /// 在函数体返回后经 `seal_workflow` 封口。未封口时全部已知节点终态
+    /// 不代表提交序列结束，`check_workflow_completion` 不做终态判定。
+    #[serde(default)]
+    nodes_sealed: bool,
 }
 
 impl WorkflowExecution {
@@ -321,7 +326,23 @@ impl WorkflowExecution {
             started_at_ms: None,
             failure_strategy: FailureStrategy::default(),
             error: None,
+            nodes_sealed: false,
         }
+    }
+
+    /// 封口节点集（flow 增量提交的"函数体返回"信号）。
+    ///
+    /// 封口即重跑终态判定：增量提交期间 `check_workflow_completion` 因未封口
+    /// 早退，fire-and-forget flow 的全部节点可能在封口前已终态，封口时点是
+    /// 它们唯一的终态判定时机。
+    pub(crate) fn seal_nodes(&mut self) {
+        self.nodes_sealed = true;
+        self.check_workflow_completion();
+    }
+
+    /// 节点集是否已封口（终态判定与失败防御的前置条件）。
+    pub(crate) fn nodes_sealed(&self) -> bool {
+        self.nodes_sealed
     }
 
     pub fn with_failure_strategy(mut self, strategy: FailureStrategy) -> Self {
@@ -334,6 +355,27 @@ impl WorkflowExecution {
         if self.started_at_ms.is_none() {
             self.started_at_ms = Some(crate::common::epoch_millis());
         }
+    }
+
+    /// 注册一个增量加入的任务（flow 增量提交）。
+    ///
+    /// 与 [`Self::new`] 的整批构造不同，此方法在节点写入点单独登记
+    /// Pending 状态并推进 `total_count`——工作流终态判定
+    /// （`check_workflow_completion`）以 `total_count` 为准，增量节点
+    /// 必须计入，否则全部任务终态后工作流永远无法到达终态。
+    pub(crate) fn register_task(&mut self, task_id: TaskId) {
+        self.tasks.insert(
+            task_id.clone(),
+            TaskState {
+                task_id,
+                state: Phase::Pending,
+                result: None,
+                error: None,
+                retry_count: 0,
+                attempt: 0,
+            },
+        );
+        self.total_count += 1;
     }
 
     pub fn is_expired(&self) -> bool {
@@ -453,27 +495,48 @@ impl WorkflowExecution {
     }
 
     /// 检查工作流是否已到达终态。
+    ///
+    /// 判定口径：封口后**全部节点终态**即工作流终态；终态类别按优先级
+    /// `Failed` > `Cancelled` > `Completed` 选取。
+    ///
+    /// - `Failed`：存在失败节点。fail-fast 的即时置败在 `fail_task` 内完成，
+    ///   此分支覆盖 continue 策略与 `TaskOnly` 重试耗尽后的收尾。
+    /// - `Cancelled`：无失败但存在被取消节点——工作流被取消，结果不全不得当
+    ///   作成功。
+    /// - `Completed`：全部节点为 Completed/Skipped。
+    ///
+    /// **回归修复**：此前判定为 `succeeded + skipped == total` 走 Completed、
+    /// 否则仅 `Continue` 策略才检查全终态。fail-fast（默认）下「全部节点被取消」
+    /// （succeeded=0）既不满足和式、又不进 continue 分支，工作流永久停在
+    /// `Running`——flow 的终态轮询（`_wait_terminal_and_emit`）因此永不返回。
     fn check_workflow_completion(&mut self) {
         // 终态工作流不可被改写：已终态（如 Cancelled / Failed）后到达的
         // 任务事件不得把状态翻转为 Completed。
         if self.state.is_terminal() {
             return;
         }
-        // 所有 task 已完成或被跳过 → workflow 完成
-        if self.succeeded_count + self.skipped_count == self.total_count {
-            self.state = Phase::Completed;
-        } else if self.failure_strategy != FailureStrategy::FailFast {
-            // 非 fail-fast：检查是否所有 task 都已到达终态
-            let all_terminal = self.tasks.values().all(|t| t.state.is_terminal());
-            if all_terminal {
-                let any_failed = self.tasks.values().any(|t| t.state == Phase::Failed);
-                if any_failed {
-                    let msg = self.collect_failed_summary();
-                    self.set_failed(msg);
-                } else {
-                    self.state = Phase::Completed;
-                }
+        // 节点集未封口（flow 增量提交进行中）：后续还会有新节点加入，
+        // 全部已知节点终态不代表提交序列结束，终态判定延迟到封口后。
+        if !self.nodes_sealed {
+            return;
+        }
+        // 尚有非终态节点（Pending / Running）→ 工作流未结束。
+        let mut any_failed = false;
+        let mut any_cancelled = false;
+        for task in self.tasks.values() {
+            if !task.state.is_terminal() {
+                return;
             }
+            any_failed |= task.state == Phase::Failed;
+            any_cancelled |= task.state == Phase::Cancelled;
+        }
+        if any_failed {
+            let msg = self.collect_failed_summary();
+            self.set_failed(msg);
+        } else if any_cancelled {
+            self.state = Phase::Cancelled;
+        } else {
+            self.state = Phase::Completed;
         }
     }
 
@@ -524,14 +587,9 @@ impl WorkflowExecution {
                 if self.failure_strategy == FailureStrategy::FailFast {
                     self.set_failed(error);
                 } else {
-                    let all_terminal = self.tasks.values().all(|t| t.state.is_terminal());
-                    if all_terminal {
-                        let any_failed = self.tasks.values().any(|t| t.state == Phase::Failed);
-                        if any_failed {
-                            let msg = self.collect_failed_summary();
-                            self.set_failed(msg);
-                        }
-                    }
+                    // Continue：终态判定与完成路径同一封口约束（增量提交
+                    // 进行中不得因已知节点终态而提前终态化）。
+                    self.check_workflow_completion();
                 }
             }
         }
@@ -611,8 +669,27 @@ impl WorkflowExecution {
         }
     }
 
-    pub fn is_workflow_failed(&self) -> bool {
-        matches!(self.state, Phase::Failed)
+    /// 启动一次 orchestrator 驱动的节点重试。
+    ///
+    /// 与 `reset_task(increment_retry=true)` 的差异：不要求任务先经过 Failed
+    /// 状态——重试裁决在失败结果到达入口时同步完成，直接从 Running 转回
+    /// Pending（attempt 同步递增，fencing 前提），避免 TaskOnly 失败与重置
+    /// 之间的状态往返。返回 `false` 表示任务不可重置（已终态或不存在）。
+    pub(crate) fn begin_orchestrated_retry(&mut self, task_id: &TaskId) -> bool {
+        if !self.can_transition_task(task_id) {
+            return false;
+        }
+        let Some(task) = self.tasks.get_mut(task_id) else {
+            return false;
+        };
+        if !matches!(task.state, Phase::Running | Phase::Pending | Phase::Failed) {
+            return false;
+        }
+        task.increment_retry_count();
+        task.increment_attempt();
+        task.state = Phase::Pending;
+        task.result = None;
+        true
     }
 
     pub fn mark_workflow_failed(&mut self, error: String) {
@@ -626,6 +703,12 @@ impl WorkflowExecution {
     }
 
     pub fn mark_cancelled(&mut self) {
+        // 终态守卫：已终态（Failed/Completed/Cancelled）的工作流不可被
+        // 兜底取消改写——flow 失败路径的 cancel_workflow 与 fail-fast 的
+        // Failed 终态竞态时，Failed 是更准确的事实源。
+        if self.state.is_terminal() {
+            return;
+        }
         for task in self.tasks.values_mut() {
             if task.state == Phase::Running {
                 task.state = Phase::Cancelled;
@@ -634,15 +717,28 @@ impl WorkflowExecution {
         self.state = Phase::Cancelled;
     }
 
-    /// 取消指定 ID 的任务。如果任务未运行，则返回 false。
+    /// 取消指定 ID 的任务。
+    ///
+    /// Running 与 Pending 任务均可取消（flow 增量提交后，排队的编排节点
+    /// 同样可被取消指令命中；Pending 不可取消会让取消后仍被派发执行）。
+    /// 如果任务已处于终态，返回 false。
+    ///
+    /// 取消后**重跑终态判定**：最后一个在途节点被取消即工作流终态，不能等到
+    /// 下一次封口或结果回灌——取消可能发生在封口之后（例如 flow 函数体返回后
+    /// 仍有在途任务被取消），那时再无别的判定时机。未封口时
+    /// `check_workflow_completion` 自行早退，语义不变。
     pub fn cancel_task(&mut self, task_id: &TaskId) -> bool {
-        if let Some(task) = self.tasks.get_mut(task_id) {
-            if matches!(task.state, Phase::Running) {
+        let cancelled = match self.tasks.get_mut(task_id) {
+            Some(task) if matches!(task.state, Phase::Running | Phase::Pending) => {
                 task.state = Phase::Cancelled;
-                return true;
+                true
             }
+            _ => false,
+        };
+        if cancelled {
+            self.check_workflow_completion();
         }
-        false
+        cancelled
     }
 }
 
@@ -652,14 +748,14 @@ impl Terminal for WorkflowExecution {
     }
 }
 
-/// 等待点条件（S1 持久化等待点原语）。
+/// 等待点条件（持久化等待点原语）。
 ///
 /// 纯数据结构，与 [`Dag`]/[`Phase`] 同层：不解释条件语义、不触发唤醒，
 /// 唤醒由 `Orchestrator` 的等待点 API 追加事件后推进状态机。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum WaitCondition {
-    /// 外部信号触发（S2 经 Signals capability 递交）。
+    /// 外部信号触发（经 Signals capability 递交）。
     Signal {
         /// 信号名。与 wait_key 相互独立：wait_key 是注册表键，name 是信号语义名。
         name: String,
@@ -667,6 +763,16 @@ pub enum WaitCondition {
     /// 定时到期唤醒。`deadline_ms` 为绝对 epoch 毫秒，与工作流级超时
     /// watcher（`is_expired` / `epoch_millis`）使用同一时钟基准。
     Timer { deadline_ms: u64 },
+    /// 挂起等待显式恢复：由 `Orchestrator::resume_suspended` 唤醒。
+    ///
+    /// 与 [`WaitCondition::Signal`] 的区别是**语义来源**——`Signal` 等待一个具名
+    /// 业务事件，`Suspend` 等待操作员的恢复指令。二者共用
+    /// `WorkflowEventPayload::SignalReceived` 作为唤醒事件（其载荷语义本就是
+    /// "等待点被外部满足"），由本字段区分是 signal 还是 resume，故新语义不新增
+    /// 事件变体（resume 复用 `SignalReceived` 唤醒事件，不新增变体）。
+    ///
+    /// 新变体追加在末尾：postcard 的变体判别按声明顺序，追加不改变既有值的编码。
+    Suspend,
 }
 
 /// 等待点当前状态。
@@ -710,7 +816,8 @@ pub struct DagNode {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Archive, rkyv::Serialize, rkyv::Deserialize)]
 #[rkyv(bytecheck())]
-pub(crate) struct DagEdge {
+/// 与 [`DagNode`] 同为 DAG 的结构元素，故同等可见：`Dag::edges()` 需要它。
+pub struct DagEdge {
     pub from: TaskId,
     pub to: TaskId,
     /// 条件标签，用于条件分支。
@@ -965,6 +1072,12 @@ impl Dag {
 
     pub fn nodes(&self) -> impl Iterator<Item = &DagNode> {
         self.nodes.values()
+    }
+
+    /// 全部有向边（含条件标签）。与 [`Self::nodes`] 对称，供结构暴露面使用
+    /// ——`successor_ids` 只能给出邻接关系，拿不到边的 `condition`。
+    pub fn edges(&self) -> impl Iterator<Item = &DagEdge> {
+        self.edges.iter()
     }
 
     /// 返回节点的有效重试策略：

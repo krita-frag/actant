@@ -26,14 +26,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::common::{
-    format_error_kind, ActantError, NodeId, Result, TaskCompletion, TaskDefinition, Topic,
+    format_error_kind, ActantError, NodeId, Result, TaskCompletion, TaskDefinition, TaskId, Topic,
     WorkerConfig, WorkflowId,
 };
 use crate::runtime::actor::ActorSystem;
 use crate::runtime::dispatcher::{new_cancel_flag, CancelFlag, TaskDispatcher};
 use crate::runtime::event_bus::{BusEvent, EventBus};
 use crate::runtime::network::Transport;
-use crate::runtime::workflow::actor::InnerScheduler;
+use crate::runtime::workflow::actor::{InnerScheduler, ResultSource, TaskResultOutcome};
+use crate::runtime::workflow::messaging::{decode, encode};
+use crate::runtime::workflow::workflow_methods;
 use crate::runtime::workflow::Scheduler;
 
 mod cancel;
@@ -43,8 +45,6 @@ mod result_delivery;
 pub(crate) use network_router::{NetworkEventRouter, NetworkEventRouterConfig};
 use result_delivery::{start_pending_result_loop, try_enqueue_pending_result, PendingResult};
 
-#[cfg(test)]
-use crate::common::TaskId;
 #[cfg(test)]
 use crate::runtime::network::DirectResponseChannel;
 
@@ -251,6 +251,16 @@ pub struct Worker {
     ready: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
+/// [`Worker::report_task_result`] 的返回值（回传 Python 事件泵的重试裁决）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TaskReportResponse {
+    /// orchestrator 是否裁决为「重试」。为 `true` 时本节点已按 `delay_ms`
+    /// 延迟把重试任务重新入队调度器，提交方句柄应保持等待。
+    pub retry: bool,
+    /// 重试前的延迟（毫秒）。`retry == false` 时为 0。
+    pub delay_ms: u64,
+}
+
 impl Worker {
     /// Clear the capacity callback, releasing any captured references.
     pub fn clear_capacity_callback(&mut self) {
@@ -450,23 +460,43 @@ impl Worker {
         &self.task_dispatcher
     }
 
-    /// 取消运行中的任务：将对应的 `cancel_flag` 置为 true。
+    /// 取消任务：运行中则置位其 `cancel_flag`；尚未进入执行则登记「派发前取消」。
     ///
-    /// 这是低层运行时取消入口，仅作用于已进入执行中的任务。
-    /// 排队中的任务由 Python 侧预取消状态拦截，避免让 Rust Worker 维护
-    /// 两套并行的“待执行取消”语义。
+    /// 这是低层运行时取消入口。任务尚在调度器队列中（主循环尚未预注册
+    /// `cancel_flag`）时，把请求登记到「派发前取消」注册表（`cancelled_tasks`）：
+    /// 主循环取出该任务时据此短路为 `TaskCompletion::Cancelled`，不执行任务体。
     ///
-    /// 返回 `true` 表示找到了运行中的任务并成功提交取消请求；
-    /// 返回 `false` 表示任务不存在或尚未进入运行态。
+    /// **为什么必须双写**：远端的 `CancelBroadcast` 路径一直是「置 flag +
+    /// 登记注册表」双写（见 `runtime/network_router.rs` 的 `TopicRoute::Cancel`），
+    /// 而本地路径此前只置 flag。未进执行的任务没有 flag 可置，本地取消请求因此
+    /// 被静默丢弃——任务照常执行到完成，`propagate=True` 的级联取消形同虚设。
+    ///
+    /// 返回 `true` 表示存在运行中的任务且已置位取消标志；返回 `false` 表示没有
+    /// 运行中的任务（请求可能已登记待派发前拦截，也可能该 task_id 不存在——
+    /// worker 侧不持有队列所有权，无法区分；登记条目由 TTL 清理循环兜底）。
     pub fn cancel_task(&self, task_id: &str) -> bool {
-        let flags = self.cancel_flags.lock();
-        if let Some(flag) = flags.get(task_id) {
-            flag.store(true, std::sync::atomic::Ordering::Release);
-            crate::metrics::inc_tasks_cancelled();
-            true
-        } else {
-            false
+        let running = {
+            let flags = self.cancel_flags.lock();
+            match flags.get(task_id) {
+                Some(flag) => {
+                    flag.store(true, std::sync::atomic::Ordering::Release);
+                    true
+                }
+                None => false,
+            }
+        };
+        if !running {
+            let mut pending = self.cancelled_tasks.lock();
+            // 仅新插入时增加 pending 计数；重复取消不重复计数（与远端路径一致）。
+            if pending
+                .insert(task_id.to_string(), Instant::now())
+                .is_none()
+            {
+                crate::metrics::inc_cancelled_tasks_pending();
+            }
         }
+        crate::metrics::inc_tasks_cancelled();
+        running
     }
 
     /// 记录一次重入队弹跳；超过 [`MAX_REROUTE_BOUNCES`] 时清除计数并返回 `true`。
@@ -505,6 +535,101 @@ impl Worker {
         task.target_node = Some(target_node);
         self.scheduler.enqueue(task).await?;
         Ok(())
+    }
+
+    /// 上报本地 flow 任务的终态结果（Rust 侧桥）。
+    ///
+    /// # 为什么需要这条桥
+    ///
+    /// 本地 worker 的结果帧正文**对 Rust 不透明**：业务失败由 worker 编码进
+    /// 正文（`dumps((False, exc))`），`ProcessTaskDispatcher` 对成功与失败都返回
+    /// `Ok(Ok(body))`。因此只有 Python 侧能区分二者，编排推进与重试裁决必须由
+    /// Python 事件泵解析后经本方法发起（见 `settle_local_completion` 的说明）。
+    ///
+    /// # 行为
+    ///
+    /// 结果经 `ON_TASK_RESULT` 回灌本地 `WorkflowActor`，随后落实
+    /// orchestrator 的裁决：
+    /// - 裁决为「重试」→ 按 `delay_ms` 延迟把重试任务入队本节点调度器，返回
+    ///   `retry = true`（Python 侧据此保持提交方句柄等待，不发布失败事件）；
+    /// - 终局（完成 / 重试耗尽 / 取消 / fencing 拒绝）→ 返回 `retry = false`。
+    ///
+    /// `workflow_id` 为空（独立 `@task` 直调，非编排任务）时不做任何事。
+    ///
+    /// # 降级
+    ///
+    /// 未绑定 `ActorSystem` / `WorkflowActor`（不启动 Actor 系统的 Worker 测试
+    /// 路径）时返回无裁决（`retry = false`）：编排是可选能力，缺失不应让任务
+    /// 本身失败——与本地事件发布路径的降级语义一致。
+    ///
+    /// # Errors
+    ///
+    /// 结果编码失败、Actor 调用失败或 workflow 拒绝结果时返回错误，由调用方
+    /// （Python 事件泵）记录并继续——句柄侧仍有事件路径兜底。
+    pub async fn report_task_result(
+        &self,
+        workflow_id: &WorkflowId,
+        task_id: &TaskId,
+        outcome: TaskResultOutcome,
+    ) -> Result<TaskReportResponse> {
+        if workflow_id.as_str().is_empty() {
+            return Ok(TaskReportResponse::default());
+        }
+        let (Some(actor_system), Some(workflow_actor_id)) =
+            (self.actor_system.as_ref(), self.workflow_actor_id.as_ref())
+        else {
+            tracing::debug!(
+                task_id = %task_id.as_str(),
+                "report_task_result: no workflow actor bound; skipping orchestration ingest"
+            );
+            return Ok(TaskReportResponse::default());
+        };
+        // wire 协议尚未携带派发代数，attempt 传 `None`（入口 fencing 放行）；
+        // DAG 写入方法内部的 fencing 校验仍是最终防线。
+        let payload = encode(&(
+            workflow_id.clone(),
+            task_id.clone(),
+            outcome,
+            None::<u32>,
+            ResultSource::Local,
+        ))?;
+        let result = actor_system
+            .call(workflow_actor_id, workflow_methods::ON_TASK_RESULT, payload)
+            .await?;
+        if let Some(error) = result.error {
+            return Err(ActantError::from(error));
+        }
+        // 响应载荷是编码后的 `Option<(TaskDefinition, u64)>`：`None`
+        // 表示终局（无重试任务），`Some` 才是 orchestrator 的重试裁决。注意
+        // postcard 下 `None` 仍占一个判别字节（`[0x00]`）而非空 payload，
+        // 因此必须按 `Option` 解码——直接解码成二元组会读到判别字节当结构体
+        // 头部而报 "Hit the end of buffer"。
+        let verdict: Option<(TaskDefinition, u64)> = if result.payload.is_empty() {
+            None
+        } else {
+            decode(&result.payload)?
+        };
+        let Some((task, delay_ms)) = verdict else {
+            return Ok(TaskReportResponse::default());
+        };
+        let scheduler = self.scheduler.clone();
+        // 延迟入队由独立 task 承担：调用方（Python 事件泵）不阻塞，句柄等待
+        // 语义与旧 worker 层重试一致——重试耗尽前提交方见不到失败。
+        self.tokio_handle.spawn(async move {
+            if delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+            if let Err(e) = scheduler.enqueue(task).await {
+                tracing::error!(
+                    error = %e,
+                    "failed to enqueue orchestrator-driven retry task (local result report)"
+                );
+            }
+        });
+        Ok(TaskReportResponse {
+            retry: true,
+            delay_ms,
+        })
     }
 
     /// 查询当前网络视图中的 peer 节点。
@@ -702,11 +827,13 @@ impl Worker {
                 while let Some(dropped) = self.try_dequeue_drain().await {
                     publish_drained_task_cancellation(
                         dropped,
-                        &node_id,
-                        network.as_ref(),
-                        &event_bus,
-                        pending_tx,
-                        self.pending_result_channel_capacity,
+                        &DrainNotifyCtx {
+                            node_id: &node_id,
+                            network: network.as_ref(),
+                            event_bus: &event_bus,
+                            pending_results: pending_tx,
+                            pending_capacity: self.pending_result_channel_capacity,
+                        },
                     )
                     .await;
                 }
@@ -714,11 +841,13 @@ impl Worker {
                 for dropped in inflight.drain(..) {
                     publish_drained_task_cancellation(
                         dropped,
-                        &node_id,
-                        network.as_ref(),
-                        &event_bus,
-                        pending_tx,
-                        self.pending_result_channel_capacity,
+                        &DrainNotifyCtx {
+                            node_id: &node_id,
+                            network: network.as_ref(),
+                            event_bus: &event_bus,
+                            pending_results: pending_tx,
+                            pending_capacity: self.pending_result_channel_capacity,
+                        },
                     )
                     .await;
                 }
@@ -779,22 +908,26 @@ impl Worker {
                         while let Some(dropped) = self.try_dequeue_drain().await {
                             publish_drained_task_cancellation(
                                 dropped,
-                                &node_id,
-                                network.as_ref(),
-                                &event_bus,
-                                pending_tx,
-                                self.pending_result_channel_capacity,
+                                &DrainNotifyCtx {
+                                    node_id: &node_id,
+                                    network: network.as_ref(),
+                                    event_bus: &event_bus,
+                                    pending_results: pending_tx,
+                                    pending_capacity: self.pending_result_channel_capacity,
+                                },
                             )
                             .await;
                         }
                         for dropped in inflight.drain(..) {
                             publish_drained_task_cancellation(
                                 dropped,
-                                &node_id,
-                                network.as_ref(),
-                                &event_bus,
-                                pending_tx,
-                                self.pending_result_channel_capacity,
+                                &DrainNotifyCtx {
+                                    node_id: &node_id,
+                                    network: network.as_ref(),
+                                    event_bus: &event_bus,
+                                    pending_results: pending_tx,
+                                    pending_capacity: self.pending_result_channel_capacity,
+                                },
                             )
                             .await;
                         }
@@ -868,6 +1001,19 @@ impl Worker {
                             crate::metrics::inc_task_forward_succeeded();
                             // 转发成功：清零弹跳计数，后续失败重新从 1 计。
                             self.reroute_counts.lock().remove(task.id.as_str());
+                            // 登记"已转发、结果未回"。若目标节点失联，
+                            // failover 据此终结该任务，避免提交方永久挂起。
+                            if let Some(failover) = self.failover.as_ref() {
+                                failover.record_outbound(
+                                    &task.id,
+                                    target,
+                                    task.target_endpoint_addr.as_deref(),
+                                    task.workflow_id
+                                        .clone()
+                                        .unwrap_or_else(|| WorkflowId::from(String::new())),
+                                    &task.name,
+                                );
+                            }
                             continue;
                         }
                         Err(e) => {
@@ -1035,7 +1181,65 @@ impl Worker {
                 });
             }
 
-            // S0：派发事件。任务被本地接受执行时经 WorkflowActor 追加
+            // 本地派发状态推进（Running）。
+            //
+            // 远端任务经 gossip 的 `MARK_TASK_RUNNING` 进入 Running；本地路径
+            // 此前只记录 `TaskDispatched` 历史而**无状态迁移**，任务在整个执行
+            // 期间仍是 `Pending`。这会让本地任务的真实失败与「编排合成的、从未
+            // 派发的失败」无法区分——`handle_task_failure` 的迟到守卫据此丢弃
+            // 前者，重试永不触发、任务永远停在 Pending。
+            //
+            // 必须是同步 `call`（而非 fire-and-forget `send`）：状态先于结果
+            // 回灌生效，否则极快任务的结果帧可能先于本次迁移到达，被守卫误判。
+            if let Some(running_wf) = task.workflow_id.clone() {
+                if let (Some(system), Some(actor_id)) =
+                    (self.actor_system.clone(), self.workflow_actor_id.clone())
+                {
+                    match crate::runtime::workflow::messaging::encode(&(
+                        running_wf,
+                        task.id.clone(),
+                    )) {
+                        Ok(running_payload) => {
+                            match system
+                                .call(
+                                    &actor_id,
+                                    crate::runtime::workflow::workflow_methods::MARK_TASK_RUNNING,
+                                    running_payload,
+                                )
+                                .await
+                            {
+                                Ok(result) => {
+                                    if let Some(err) = result.error {
+                                        // 工作流已终态 / 已被淘汰时拒绝推进属正常，
+                                        // 不影响任务本身的执行。
+                                        tracing::debug!(
+                                            task_id = ?task.id,
+                                            error = %err,
+                                            "workflow actor declined running transition"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        task_id = ?task.id,
+                                        error = %e,
+                                        "failed to mark task running in workflow actor"
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                task_id = ?task.id,
+                                error = %e,
+                                "failed to encode task running report"
+                            );
+                        }
+                    }
+                }
+            }
+
+            // 派发事件。任务被本地接受执行时经 WorkflowActor 追加
             // TaskDispatched 到工作流统一历史；fire-and-forget，失败仅告警。
             if let Some(dispatched_wf) = task.workflow_id.clone() {
                 if let (Some(system), Some(actor_id)) =
@@ -1089,6 +1293,20 @@ impl Worker {
                 .lock()
                 .insert(task.id.to_string(), cancel_flag.clone());
 
+            // 采纳窗口期到达的本地取消：主循环的「派发前取消」检查（见上方
+            // `cancelled_tasks` 短路块）发生在取出任务之初，而 cancel_flag 直到
+            // 此处才注册。落在两者之间的取消既碰不到检查、也找不到 flag——
+            // `Worker::cancel_task` 会把请求登记到 `cancelled_tasks`，此处补一次
+            // 采纳：置位刚注册的 flag，spawn 闭包起始处的检查随即走取消完成流程。
+            if cancelled_tasks.lock().remove(task.id.as_str()).is_some() {
+                cancel_flag.store(true, std::sync::atomic::Ordering::Release);
+                crate::metrics::dec_cancelled_tasks_pending();
+                tracing::info!(
+                    task_id = %task.id.as_str(),
+                    "adopted pre-dispatch cancellation registered during dispatch window"
+                );
+            }
+
             tokio::spawn(async move {
                 let _permit = permit;
                 let task_id_dbg = task.id.clone();
@@ -1127,7 +1345,7 @@ impl Worker {
                         task_name: task.name.clone(),
                         target_node: task.target_node.clone(),
                     };
-                    publish_task_completion(
+                    settle_local_completion(
                         completion,
                         &task,
                         &node_id_for_spawn,
@@ -1218,7 +1436,7 @@ impl Worker {
                     effective_timeout,
                 );
 
-                publish_task_completion(
+                settle_local_completion(
                     completion,
                     &task,
                     &node_id_for_spawn,
@@ -1247,8 +1465,12 @@ impl Worker {
 
     /// 请求 Worker 进入 drain 并停止主循环。
     ///
-    /// 此方法只广播取消信号，不等待任务完成。等待顺序由
-    /// [`crate::runtime::Runtime::shutdown`] 统一处理。
+    /// 除广播取消信号外，本方法**还会**关闭任务派发器
+    /// （`TaskDispatcher::shutdown` 强杀空闲 worker 进程并回收子进程）。
+    /// 它**不**等待在途任务完成——drain 与超时等待由
+    /// [`crate::runtime::Runtime::shutdown`] 编排。
+    ///
+    /// 幂等：`Runtime::shutdown` 之后再次调用是 no-op（`free_workers` 已被取空）。
     pub fn shutdown(&self) {
         // state_sender.send_replace 返回旧值无意义。
         let _ = self.state.send_replace(WorkerState::Draining);
@@ -1432,35 +1654,54 @@ fn build_completion_from_dispatch_result(
         }
         Ok(Err(e)) => {
             // 硬超时由 dispatcher 内部强杀 worker 并回收槽位后返回
-            // `ActantError::Timeout`，计入超时指标；其余错误按任务失败处理。
-            if let ActantError::Timeout(_) = e {
-                crate::metrics::inc_tasks_timeout();
-                crate::metrics::dec_running_tasks();
-                crate::metrics::observe_task_duration_ms(
-                    crate::common::epoch_millis().saturating_sub(dispatch_start_ms),
-                );
-                TaskCompletion::Failed {
-                    workflow_id,
-                    task_id: task.id.clone(),
-                    task_name: task.name.clone(),
-                    error: format_error_kind(
-                        "timeout",
-                        &format!("task timed out after {}ms", effective_timeout.as_millis()),
-                    ),
-                    target_node: task.target_node.clone(),
+            // `ActantError::Timeout`，计入超时指标；取消返回
+            // `ActantError::Cancelled`（dispatcher 在宽限期耗尽后强杀并回传），
+            // 必须映射为取消终态——**不得**按失败处理：失败会进入重试裁决，
+            // 把已取消的任务重新入队执行（取消被"复活"），且在 fail-fast 策略下
+            // 把工作流错误地判为 Failed。其余错误按任务失败处理。
+            match e {
+                ActantError::Timeout(_) => {
+                    crate::metrics::inc_tasks_timeout();
+                    crate::metrics::dec_running_tasks();
+                    crate::metrics::observe_task_duration_ms(
+                        crate::common::epoch_millis().saturating_sub(dispatch_start_ms),
+                    );
+                    TaskCompletion::Failed {
+                        workflow_id,
+                        task_id: task.id.clone(),
+                        task_name: task.name.clone(),
+                        error: format_error_kind(
+                            "timeout",
+                            &format!("task timed out after {}ms", effective_timeout.as_millis()),
+                        ),
+                        target_node: task.target_node.clone(),
+                    }
                 }
-            } else {
-                crate::metrics::inc_tasks_failed();
-                crate::metrics::dec_running_tasks();
-                crate::metrics::observe_task_duration_ms(
-                    crate::common::epoch_millis().saturating_sub(dispatch_start_ms),
-                );
-                TaskCompletion::Failed {
-                    workflow_id,
-                    task_id: task.id.clone(),
-                    task_name: task.name.clone(),
-                    error: format_error_kind("task", &e.to_string()),
-                    target_node: task.target_node.clone(),
+                ActantError::Cancelled(_) => {
+                    crate::metrics::dec_running_tasks();
+                    crate::metrics::observe_task_duration_ms(
+                        crate::common::epoch_millis().saturating_sub(dispatch_start_ms),
+                    );
+                    TaskCompletion::Cancelled {
+                        workflow_id,
+                        task_id: task.id.clone(),
+                        task_name: task.name.clone(),
+                        target_node: task.target_node.clone(),
+                    }
+                }
+                other => {
+                    crate::metrics::inc_tasks_failed();
+                    crate::metrics::dec_running_tasks();
+                    crate::metrics::observe_task_duration_ms(
+                        crate::common::epoch_millis().saturating_sub(dispatch_start_ms),
+                    );
+                    TaskCompletion::Failed {
+                        workflow_id,
+                        task_id: task.id.clone(),
+                        task_name: task.name.clone(),
+                        error: format_error_kind("task", &other.to_string()),
+                        target_node: task.target_node.clone(),
+                    }
                 }
             }
         }
@@ -1507,14 +1748,16 @@ fn build_completion_from_dispatch_result(
 /// drain 后这些任务不会被执行，复用 [`publish_task_completion`] 走既有投递
 /// 路径：远端任务（origin != 本节点）直连回传 Cancelled 结果给 origin 节点，
 /// 本地任务发布 `BusEvent::TaskCancelled` 给事件总线订阅者。
-async fn publish_drained_task_cancellation(
-    task: TaskDefinition,
-    node_id: &NodeId,
-    network: &dyn crate::runtime::network::Transport,
-    event_bus: &EventBus,
-    pending_results: &tokio::sync::mpsc::Sender<PendingResult>,
+/// drain 通知所需的共享依赖集合（`publish_drained_task_cancellation` 参数收敛）。
+struct DrainNotifyCtx<'a> {
+    node_id: &'a NodeId,
+    network: &'a dyn crate::runtime::network::Transport,
+    event_bus: &'a EventBus,
+    pending_results: &'a tokio::sync::mpsc::Sender<PendingResult>,
     pending_capacity: usize,
-) {
+}
+
+async fn publish_drained_task_cancellation(task: TaskDefinition, ctx: &DrainNotifyCtx<'_>) {
     tracing::info!(
         task_id = %task.id.as_str(),
         "dropping queued task during drain, publishing cancellation"
@@ -1528,9 +1771,48 @@ async fn publish_drained_task_cancellation(
         task_name: task.name.clone(),
         target_node: task.target_node.clone(),
     };
-    publish_task_completion(
+    settle_local_completion(
         completion,
         &task,
+        ctx.node_id,
+        ctx.network,
+        ctx.event_bus,
+        ctx.pending_results,
+        ctx.pending_capacity,
+    )
+    .await;
+}
+
+/// 本地任务终态结算。
+///
+/// 本地任务的结算**只做事件发布**：[`publish_task_completion`] 把终态投递给
+/// 事件总线（无 `workflow_id` 的独立 `@task` 直调由此解析提交方句柄）；
+/// 携带 `workflow_id` 的 flow 编排节点，事件同时由 Python 事件泵
+/// （`Runtime._on_task_result`）消费。
+///
+/// ## 编排状态推进不在本函数内
+///
+/// worker 结果帧正文是 `dumps((success, payload))`——**payload 对 Rust 不透明**，
+/// 且 `ProcessTaskDispatcher` 对「任务成功」与「任务业务失败」都返回
+/// `Ok(Ok(body))`（失败被 worker 编码进 body 而非协议层）。因此 Rust 无法区分
+/// 二者：若在此按 `Completed` 回灌 orchestrator，业务失败会被记成成功。
+///
+/// 故编排推进与重试裁决由**唯一能解析 payload 的一方**发起：Python 事件泵
+/// 解析结果后经 [`Worker::report_task_result`] 桥上报，再由
+/// `WorkflowActor::on_task_result` 统一裁决。
+#[allow(clippy::too_many_arguments)]
+async fn settle_local_completion(
+    completion: TaskCompletion,
+    task: &TaskDefinition,
+    node_id: &NodeId,
+    network: &dyn Transport,
+    event_bus: &EventBus,
+    pending_results: &tokio::sync::mpsc::Sender<PendingResult>,
+    pending_capacity: usize,
+) {
+    publish_task_completion(
+        completion,
+        task,
         node_id,
         network,
         event_bus,

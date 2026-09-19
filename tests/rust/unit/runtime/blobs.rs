@@ -1,9 +1,8 @@
-//! Unit tests for `src/runtime/blobs.rs`（0.3.2 R1，spike 用例改写为正式单测）。
+//! Unit tests for `src/runtime/blobs.rs`（三协议共存往返、10MB 流式读取、中途取消不悬挂）。
 //! Compiled via `#[path]` attribute — retains `super::` access to private items.
 //!
-//! 原 spike 验证（plans/archive/SPIKE_0.3.2_BLOBS.md）：三协议共存往返、10MB 流式
-//! 读取（峰值 ≤16KiB）、中途取消不悬挂。此处以生产装配路径
-//! `NetworkManager::with_blob_store`（gossip + 直连 + blobs 同一 Router）重写。
+//! 覆盖三协议共存往返、10MB 流式读取（峰值 ≤16KiB）、中途取消不悬挂，经生产装配路径
+//! `NetworkManager::with_blob_store`（gossip + 直连 + blobs 同一 Router）验证。
 
 use std::time::{Duration, Instant};
 
@@ -85,7 +84,7 @@ async fn drain(fetch: &mut BlobFetch) -> (blake3::Hash, usize, usize) {
     (hasher.finalize(), total, max_chunk)
 }
 
-/// spike `round_trip_10mb_multi_protocol` 改写：同一 Router 上直连协议与
+/// 同一 Router 上直连协议与
 /// blobs 协议共存——先走直连请求-响应（bob 侧经 recv_event 消费并回错，
 /// 模拟无业务订阅者时的快速失败路径），再经 blob_fetch 拉取并校验 hash。
 #[tokio::test(flavor = "multi_thread")]
@@ -140,7 +139,7 @@ async fn blob_roundtrip_with_direct_protocol_coexistence() {
     assert_eq!(computed, blake3::hash(&data));
 }
 
-/// spike `stream_read_10mb_chunked` 改写：10MB 流式拉取，单块 ≤16KiB
+/// 10MB 流式拉取，单块 ≤16KiB
 /// （blake3 chunk group），增量 hash 与整块一致——数据从未整块进内存。
 #[tokio::test(flavor = "multi_thread")]
 async fn blob_fetch_10mb_streams_in_chunks() {
@@ -164,7 +163,7 @@ async fn blob_fetch_10mb_streams_in_chunks() {
     );
 }
 
-/// spike `cancel_mid_transfer` 改写：拉取中途显式取消，取消即时生效
+/// 拉取中途显式取消，取消即时生效
 /// （不再产出数据），provider 随后仍可服务新请求，两端不悬挂。
 #[tokio::test(flavor = "multi_thread")]
 async fn blob_fetch_cancel_mid_transfer_does_not_hang() {

@@ -125,6 +125,7 @@ fn mark_task_completed_triggers_workflow_completion() {
         vec![TaskId::from("a".to_string())],
     );
     wf.mark_running();
+    wf.seal_nodes();
     wf.mark_task_completed(&TaskId::from("a"), b"ok".to_vec(), None);
     assert_eq!(wf.state, Phase::Completed);
 }
@@ -136,6 +137,7 @@ fn mark_task_skipped_triggers_workflow_completion() {
         vec![TaskId::from("a".to_string())],
     );
     wf.mark_running();
+    wf.seal_nodes();
     wf.mark_task_skipped(&TaskId::from("a"));
     assert_eq!(wf.state, Phase::Completed);
 }
@@ -148,6 +150,7 @@ fn fail_task_with_fail_fast_strategy() {
     )
     .with_failure_strategy(FailureStrategy::FailFast);
     wf.mark_running();
+    wf.seal_nodes();
     wf.fail_task(
         &TaskId::from("a"),
         "boom".into(),
@@ -166,6 +169,7 @@ fn fail_task_with_continue_strategy_keeps_running() {
     )
     .with_failure_strategy(FailureStrategy::Continue);
     wf.mark_running();
+    wf.seal_nodes();
     wf.fail_task(
         &TaskId::from("a"),
         "boom".into(),
@@ -301,6 +305,75 @@ fn cancel_task_cancels_running_task_only() {
     assert!(wf.cancel_task(&TaskId::from("a")));
     assert_eq!(wf.tasks[&TaskId::from("a")].state, Phase::Cancelled);
     assert!(!wf.cancel_task(&TaskId::from("a"))); // 幂等：不会再次取消
+}
+
+/// 回归：fail-fast（默认）策略下「全部节点被取消」必须使工作流进入
+/// `Cancelled` 终态。
+///
+/// 此前终态判定为 `succeeded + skipped == total` 走 Completed、且仅 continue
+/// 策略才检查「全部节点终态」。全取消（succeeded=0）既不满足和式、又不进
+/// continue 分支，工作流永久停在 `Running`——flow 的终态轮询
+/// （`_wait_terminal_and_emit`）因此永不返回，表现为测试挂起。
+#[test]
+fn all_cancelled_failfast_workflow_terminates_cancelled() {
+    let mut wf = WorkflowExecution::new(
+        WorkflowId::from("wf-1".to_string()),
+        vec![TaskId::from("a".to_string()), TaskId::from("b".to_string())],
+    );
+    wf.mark_running();
+    wf.seal_nodes();
+    assert!(!wf.is_terminal());
+
+    assert!(wf.cancel_task(&TaskId::from("a")));
+    assert!(
+        !wf.is_terminal(),
+        "仍有在途节点时不得提前终态化：{:?}",
+        wf.state
+    );
+
+    assert!(wf.cancel_task(&TaskId::from("b")));
+    assert_eq!(
+        wf.state,
+        Phase::Cancelled,
+        "全部节点被取消须以 Cancelled 收尾"
+    );
+    assert!(wf.is_terminal());
+}
+
+/// 混合终态（已完成 + 被取消，无失败）→ 工作流为 `Cancelled`。
+///
+/// 缺结果不等于成功：不得因「无失败节点」而把部分取消的工作流报告为
+/// `Completed`，否则调用方会拿到不完整的结果集。
+#[test]
+fn partially_cancelled_workflow_is_not_reported_completed() {
+    let mut wf = WorkflowExecution::new(
+        WorkflowId::from("wf-1".to_string()),
+        vec![TaskId::from("a".to_string()), TaskId::from("b".to_string())],
+    );
+    wf.mark_running();
+    wf.seal_nodes();
+    assert!(wf.mark_task_completed(&TaskId::from("a"), b"r".to_vec(), None));
+    assert!(!wf.is_terminal());
+
+    assert!(wf.cancel_task(&TaskId::from("b")));
+    assert_eq!(wf.state, Phase::Cancelled);
+    assert!(wf.is_terminal());
+}
+
+/// 未封口（flow 增量提交进行中）时取消不得提前终态化——后续还会有新节点
+/// 加入，「全部已知节点终态」不代表提交序列结束；封口时点才是判定时机。
+#[test]
+fn cancel_before_seal_does_not_terminate_workflow() {
+    let mut wf = WorkflowExecution::new(
+        WorkflowId::from("wf-1".to_string()),
+        vec![TaskId::from("a".to_string())],
+    );
+    wf.mark_running();
+    assert!(wf.cancel_task(&TaskId::from("a")));
+    assert!(!wf.is_terminal(), "未封口不得终态化：{:?}", wf.state);
+
+    wf.seal_nodes();
+    assert_eq!(wf.state, Phase::Cancelled, "封口即收尾");
 }
 
 #[test]
@@ -660,6 +733,7 @@ fn duplicate_completion_is_idempotent_and_returns_false() {
         vec![TaskId::from("a".to_string())],
     );
     wf.mark_running();
+    wf.seal_nodes();
     assert!(wf.mark_task_completed(&TaskId::from("a".to_string()), b"r1".to_vec(), None));
     assert!(wf.is_terminal());
 
@@ -742,6 +816,7 @@ fn newer_attempt_result_is_accepted() {
         vec![TaskId::from("a".to_string())],
     );
     wf.mark_running();
+    wf.seal_nodes();
     assert!(wf.mark_task_completed(&TaskId::from("a".to_string()), b"r".to_vec(), Some(7)));
     assert_eq!(wf.state, Phase::Completed);
 }
@@ -755,6 +830,7 @@ fn unknown_attempt_result_is_accepted_for_backward_compat() {
         vec![TaskId::from("a".to_string())],
     );
     wf.mark_running();
+    wf.seal_nodes();
     wf.reset_task(&TaskId::from("a".to_string()), false, true);
     assert!(wf.mark_task_completed(&TaskId::from("a".to_string()), b"r".to_vec(), None));
     assert_eq!(wf.state, Phase::Completed);

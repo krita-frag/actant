@@ -14,7 +14,7 @@ use crate::runtime::dispatcher::TaskDispatcher;
 use crate::runtime::event_bus::EventBus;
 use crate::runtime::network::Transport;
 use crate::runtime::state::Store;
-use crate::runtime::workflow::{FailoverManager, Worker};
+use crate::runtime::workflow::{FailoverManager, Orchestrator, Worker};
 
 // Re-export init_worker params so Runtime can construct them without exposing internals.
 use crate::runtime::builder::{init_worker, WorkerInitParams};
@@ -40,8 +40,11 @@ pub struct Runtime {
     capability: Arc<CapabilityRuntime>,
     event_bus: EventBus,
     task_dispatcher: Arc<dyn TaskDispatcher>,
-    /// blob 原语 facade（0.3.2 R1）；未启用 blob 存储时为 `None`。
+    /// blob 原语 facade；未启用 blob 存储时为 `None`。
     blobs: Option<Arc<BlobStore>>,
+    /// 编排器只读句柄（builder 装配后注入）。供绑定层在 actor 之外做
+    /// 阻塞式等待点 park，见 [`Runtime::orchestrator_handle`]。
+    orchestrator: Option<Orchestrator>,
     /// 非 Actor 化后台任务（如 capability gossip）的取消句柄集合。
     background_loop_cancels: Arc<BackgroundCancels>,
 }
@@ -73,6 +76,7 @@ impl Runtime {
             event_bus,
             task_dispatcher,
             blobs,
+            orchestrator: None,
             background_loop_cancels: Arc::new(BackgroundCancels::new(Vec::new())),
         }
     }
@@ -115,6 +119,22 @@ impl Runtime {
 
     pub fn set_worker(&mut self, worker: Arc<Worker>) {
         self.worker = Some(worker);
+    }
+
+    /// 编排器只读句柄克隆（`Orchestrator: Clone`，内部状态全为共享句柄）。
+    ///
+    /// 供绑定层在**不经过 actor 消息循环**的前提下做阻塞式 park：actor 消息
+    /// 处理是单线程顺序执行的，若把阻塞等待放进 `handle_message`，整个
+    /// WorkflowActor（全部工作流）都会停摆。因此等待点 park 必须由调用方
+    /// 持有编排器句柄、在 actor 之外阻塞。
+    ///
+    /// `None` 表示编排器尚未注入（`Runtime::new` 之后、builder 完成装配之前）。
+    pub fn orchestrator_handle(&self) -> Option<&Orchestrator> {
+        self.orchestrator.as_ref()
+    }
+
+    pub fn set_orchestrator(&mut self, orchestrator: Orchestrator) {
+        self.orchestrator = Some(orchestrator);
     }
 
     pub fn capability(&self) -> &Arc<CapabilityRuntime> {
@@ -167,12 +187,16 @@ impl Runtime {
         &self,
         tokio_handle: tokio::runtime::Handle,
     ) -> crate::common::Result<Arc<Worker>> {
-        let failover = Arc::new(FailoverManager::new(
-            self.node_id.clone(),
-            self.network.clone(),
-            self.actor_system.clone(),
-            self.workflow_actor_id.clone(),
-        ));
+        let failover = Arc::new(
+            FailoverManager::new(
+                self.node_id.clone(),
+                self.network.clone(),
+                self.actor_system.clone(),
+                self.workflow_actor_id.clone(),
+            )
+            // 失联时终结在途任务的发布出口（与本 Runtime 同一 event_bus）。
+            .with_event_bus(self.event_bus.clone()),
+        );
         let dag_gossip_actor_id = crate::common::ActorId::dag_gossip(&self.node_id);
         let worker = init_worker(WorkerInitParams {
             node_id: &self.node_id,

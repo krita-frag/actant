@@ -947,7 +947,7 @@ async fn make_fm_with_mutable_active(
     (fm, network)
 }
 
-/// 0.3.1 租约裁决：本节点活跃 workflow 的失效租约**无条件续租**——
+/// 租约裁决：本节点活跃 workflow 的失效租约**无条件续租**——
 /// 直接本地延长到期时间并持久化，不重走 claim→广播→重选路径。
 #[tokio::test]
 async fn expire_leases_renews_lapsed_lease_for_active_workflow_without_reclaim() {
@@ -1076,4 +1076,206 @@ async fn expire_leases_keeps_own_valid_lease() {
     let leases = fm.active_leases();
     assert_eq!(leases.len(), 1);
     assert_eq!(leases[0].0, "wf-renew");
+}
+
+// ─────────────── 在途转发登记与失联终结（第 2 腿） ───────────────
+
+/// 短租约 + 短失败窗口 + 真实 event_bus 的 manager（用于第 2 腿测试）。
+async fn make_fm_short_lease_with_bus(node_id: &str) -> (FailoverManager, EventBus) {
+    let (fm, bus, _) = make_fm_short_lease_with_bus_and_transport(node_id).await;
+    (fm, bus)
+}
+
+/// 同上，但把底层 transport 一并返回，供需要配置存活探测应答的用例使用。
+async fn make_fm_short_lease_with_bus_and_transport(
+    node_id: &str,
+) -> (FailoverManager, EventBus, Arc<MockTransport>) {
+    let transport = Arc::new(MockTransport::new(node_id));
+    let network: Arc<dyn crate::runtime::network::Transport> = transport.clone();
+    let actor_system = Arc::new(ActorSystem::new());
+    let wf_id = ActorId::workflow(&NodeId::from(node_id.to_string()));
+    actor_system
+        .spawn(wf_id.clone(), StubWorkflowActor)
+        .await
+        .unwrap();
+    let config = FailoverConfig {
+        heartbeat_interval_ms: 1,
+        failure_timeout_ms: 5,
+        lease_duration_ms: 10,
+        lease_expiry_check_interval_secs: 1,
+    };
+    let event_bus = EventBus::new();
+    let fm = FailoverManager::with_config(
+        NodeId::from(node_id.to_string()),
+        network,
+        actor_system,
+        wf_id,
+        config,
+        None,
+    )
+    .with_event_bus(event_bus.clone());
+    (fm, event_bus, transport)
+}
+
+/// 纯执行器失联（`active_workflows` 为空，旧守卫在此 `continue`）时，
+/// 转发到它身上的在途任务必须被终结为 `TaskFailed`；其他节点的任务不受牵连。
+#[tokio::test]
+async fn node_lost_settles_inflight_forwarded_tasks() {
+    let (fm, event_bus) = make_fm_short_lease_with_bus("node-A").await;
+    let mut rx = event_bus.subscribe(crate::runtime::event_bus::Topic::TaskFailed);
+
+    fm.record_outbound(
+        &TaskId::from("task-lost".to_string()),
+        &NodeId::from("node-B".to_string()),
+        None,
+        WorkflowId("wf-x".to_string()),
+        "slow_task",
+    );
+    fm.record_outbound(
+        &TaskId::from("task-other".to_string()),
+        &NodeId::from("node-C".to_string()),
+        None,
+        WorkflowId(String::new()),
+        "other_task",
+    );
+    assert_eq!(fm.outbound_len(), 2);
+
+    // node-B 是纯执行器：无 active workflow，旧守卫会直接跳过。
+    register_and_age_peer(&fm, "node-B", &[]).await;
+    // node-C 心跳新鲜：既不在失联集合内，也跳过主动探测（本轮不动它）。
+    fm.handle_heartbeat(&hb("node-C", crate::common::epoch_millis(), &[]));
+
+    fm.detect_and_claim_failed_nodes().await;
+
+    assert_eq!(
+        fm.outbound_len(),
+        1,
+        "only node-B's entry may be drained; node-C's task is still in flight"
+    );
+    match rx.try_recv().expect("TaskFailed must be published") {
+        BusEvent::TaskFailed(c) => {
+            assert_eq!(c.task_id().as_str(), "task-lost");
+            assert_eq!(c.task_name(), "slow_task");
+            assert_eq!(c.workflow_id().as_str(), "wf-x");
+            assert_eq!(c.target_node().map(NodeId::as_str), Some("node-B"));
+            assert_eq!(
+                c.as_str(),
+                "Failed",
+                "settled in-flight task must be a Failed completion"
+            );
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+}
+
+/// `error` 串必须带 `worker` kind 前缀——Python 侧据此还原异常子类。
+#[tokio::test]
+async fn node_lost_error_carries_kind_prefix() {
+    let (fm, event_bus) = make_fm_short_lease_with_bus("node-A").await;
+    let mut rx = event_bus.subscribe(crate::runtime::event_bus::Topic::TaskFailed);
+
+    fm.record_outbound(
+        &TaskId::from("task-k".to_string()),
+        &NodeId::from("node-B".to_string()),
+        None,
+        WorkflowId(String::new()),
+        "t",
+    );
+    register_and_age_peer(&fm, "node-B", &[]).await;
+    fm.detect_and_claim_failed_nodes().await;
+
+    let BusEvent::TaskFailed(c) = rx.try_recv().expect("TaskFailed must be published") else {
+        panic!("expected TaskFailed");
+    };
+    let TaskCompletion::Failed { error, .. } = &c else {
+        panic!("expected TaskCompletion::Failed, got {c:?}");
+    };
+    assert!(
+        error.starts_with("[actant:worker] "),
+        "error must carry the worker kind prefix so Python maps it to WorkerError; got {error:?}"
+    );
+}
+
+/// 结果已回的登记条目必须可被清除：清除后不得再因失联重复发布失败事件。
+#[tokio::test]
+async fn cleared_outbound_entry_is_not_settled() {
+    let (fm, event_bus) = make_fm_short_lease_with_bus("node-A").await;
+    let mut rx = event_bus.subscribe(crate::runtime::event_bus::Topic::TaskFailed);
+
+    fm.record_outbound(
+        &TaskId::from("task-done".to_string()),
+        &NodeId::from("node-B".to_string()),
+        None,
+        WorkflowId(String::new()),
+        "t",
+    );
+    fm.clear_outbound("task-done");
+    assert_eq!(fm.outbound_len(), 0);
+
+    register_and_age_peer(&fm, "node-B", &[]).await;
+    fm.detect_and_claim_failed_nodes().await;
+
+    assert!(
+        rx.try_recv().is_err(),
+        "a task whose result already arrived must not be failed again"
+    );
+}
+
+/// 心跳盲区：目标节点的第一个可观测心跳都没来得及发出就失联（`peers` 里
+/// 完全没有它），必须靠主动探测判定——探测无应答则终结在途任务。
+#[tokio::test]
+async fn probe_settles_tasks_of_ghost_target() {
+    let (fm, event_bus, transport) = make_fm_short_lease_with_bus_and_transport("node-A").await;
+    let mut rx = event_bus.subscribe(crate::runtime::event_bus::Topic::TaskFailed);
+    // 默认 mock 不响应直连请求 → 等价于目标不可达。
+    assert!(transport.direct_request_response.lock().is_none());
+
+    fm.record_outbound(
+        &TaskId::from("task-ghost".to_string()),
+        &NodeId::from("node-ghost".to_string()),
+        Some("peer-node-ghost"),
+        WorkflowId(String::new()),
+        "ghost_task",
+    );
+
+    fm.detect_and_claim_failed_nodes().await;
+
+    assert_eq!(
+        fm.outbound_len(),
+        0,
+        "ghost target's in-flight task must be settled"
+    );
+    let BusEvent::TaskFailed(c) = rx.try_recv().expect("TaskFailed must be published") else {
+        panic!("expected TaskFailed");
+    };
+    assert_eq!(c.task_id().as_str(), "task-ghost");
+    assert_eq!(c.target_node().map(NodeId::as_str), Some("node-ghost"));
+}
+
+/// 探测成功的对端**不得**被误判：健康但未进入心跳视图的目标，其任务继续等待。
+#[tokio::test]
+async fn probe_keeps_tasks_of_live_target() {
+    let (fm, event_bus, transport) = make_fm_short_lease_with_bus_and_transport("node-A").await;
+    let mut rx = event_bus.subscribe(crate::runtime::event_bus::Topic::TaskFailed);
+    transport.with_direct_request_response(crate::runtime::network::DirectResponse::Pong);
+
+    fm.record_outbound(
+        &TaskId::from("task-live".to_string()),
+        &NodeId::from("node-live".to_string()),
+        Some("peer-node-live"),
+        WorkflowId(String::new()),
+        "live_task",
+    );
+
+    fm.detect_and_claim_failed_nodes().await;
+
+    assert_eq!(
+        fm.outbound_len(),
+        1,
+        "a live target's in-flight task must NOT be settled by a successful probe"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "no TaskFailed may be published for a live target"
+    );
 }

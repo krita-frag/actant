@@ -7,6 +7,7 @@
 //! 取消标志。
 
 use super::*;
+use std::collections::BTreeMap;
 
 const TEST_KEY: &[u8] = b"test-key";
 
@@ -28,7 +29,16 @@ fn new_cancel_flag_starts_false() {
 
 #[test]
 fn new_requires_non_empty_worker_program() {
-    let err = ProcessTaskDispatcher::new(1, String::new(), 1000, TEST_KEY.to_vec(), Vec::new());
+    let err = ProcessTaskDispatcher::new(
+        1,
+        WorkerLaunchSpec {
+            program: String::new(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+        },
+        1000,
+        TEST_KEY.to_vec(),
+    );
     assert!(
         matches!(err, Err(ActantError::Config(_))),
         "empty worker_program should be rejected"

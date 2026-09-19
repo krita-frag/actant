@@ -13,7 +13,7 @@ import time
 
 import pytest
 
-from actant import Runtime, flow, task
+from actant import Runtime, current_workflow_id, flow, task
 
 
 class _Events:
@@ -98,10 +98,11 @@ class TestFlowOrchestration:
             wf_id = events.items[-1]["workflow_id"]
             state = rt.get_workflow_state(wf_id)
             assert state is not None
+            # partition 重试耗尽后失败：fail-fast 使工作流终态 Failed。
+            # 任务级语义由 DAG 状态机维护（partition=Failed，其余 Completed）。
             assert state["state"] == "Failed", state["state"]
             assert state["succeeded_count"] == 3, state
             assert state["total_count"] == 4, state
-            # partition 任务应标记 Failed，其余已完成。
             by_state = {t["state"] for t in state["tasks"].values()}
             assert "Failed" in by_state and "Completed" in by_state, by_state
 
@@ -132,13 +133,13 @@ class TestFlowOrchestration:
                 assert not ts["error"]
 
     def test_flow_retry_re_runs_until_success(self) -> None:
-        """flow 级重试：函数体中途异常，重试后成功返回。"""
+        """flow 级重试已移除：函数体中途异常直接传播、不重跑；任务级重试由
+        ``@task(retries=...)`` 承载（与 flow 级重试无关）。"""
 
         attempts = {"n": 0}
 
-        # 异常直接在 flow 函数体中抛出（而非经 Task.submit 派发）：flow 函数体
-        # 在进程内直接执行，其闭包计数器在 flow 级重试之间是共享的；而经 submit
-        # 派发的任务载荷会被序列化，闭包计数器在每次派发间不共享，无法观测重试。
+        # flow 级不重试：函数体抛错直接传播，不重跑。
+        # 任务级重试由 @task(retries=...) 承载（orchestrator 驱动）。
         @flow(name="wf-retry", retries=1, retry_delay_ms=10)
         def pipeline(src: int) -> int:
             attempts["n"] += 1
@@ -146,23 +147,172 @@ class TestFlowOrchestration:
                 raise RuntimeError("first attempt fails")
             return src * 2
 
-        with Runtime.with_defaults():
-            result = pipeline(4)
+        with Runtime.with_defaults(), pytest.raises(RuntimeError, match="first attempt"):
+            pipeline(4)
 
-        assert result == 8
-        assert attempts["n"] == 2
+        assert attempts["n"] == 1
 
-    def test_flow_soft_timeout_raises(self) -> None:
-        """flow 软超时：超过 timeout_ms 抛 ActantTimeoutError。"""
+    def test_flow_deadline_restores_strongly(self) -> None:
+        """强还原：deadline 到期由 orchestrator 取消在途任务 → 工作流 Failed。
+
+        与旧软超时实现的差异（破坏性变更）：
+        - **不再"立即返回"**：抛错时刻在 ``deadline + 轮询周期``量级；
+        - **事实源是工作流终态**（``Failed`` + ``workflow timeout exceeded``），
+          不是 Python 侧计时器——后者已整体删除；
+        - 被唤醒的原因是**本地在途任务被取消**（gossip 广播不回环，故必须
+          自投递；否则本用例的函数体会永久挂起）。
+        """
         from actant.exceptions import ActantTimeoutError
+        from actant.flow import current_workflow_id
 
         @task(name="it_slow")
         def slow() -> None:
-            time.sleep(10)
+            time.sleep(30)
 
-        @flow(name="wf-timeout", timeout_ms=200)
+        seen: dict[str, str] = {}
+
+        @flow(name="wf-timeout", timeout_ms=300)
         def pipeline() -> None:
+            seen["wf"] = current_workflow_id() or ""
             slow.submit().result()
 
-        with Runtime.with_defaults(), pytest.raises(ActantTimeoutError):
-            pipeline()
+        with Runtime.with_defaults() as rt:
+            started = time.monotonic()
+            with pytest.raises(ActantTimeoutError):
+                pipeline()
+            elapsed = time.monotonic() - started
+            state = rt.get_workflow_state(seen["wf"])
+
+        assert state is not None, "workflow should still be queryable"
+        assert state["state"] == "Failed", state
+        assert state["error"] == "workflow timeout exceeded", state
+        # 强还原要等到下一次轮询：deadline(0.3s) + 轮询周期(0.5s) + 取消结算，
+        # 远不到任务自身的 30s。这个上界是"没有永久挂起"的判据。
+        assert elapsed < 3.0, f"强还原耗时过长（{elapsed:.2f}s）"
+
+    def test_flow_without_workflow_emits_only_terminal_event(self) -> None:
+        """未创建工作流的 flow **不**广播 ``submitted`` / ``started``。
+
+        函数体既无 ``Task.submit`` 也无等待点 ⇒ 工作流从不建槽，故不广播
+        ``submitted`` / ``started``；"看到 ``submitted`` ⇒ 工作流确实已被提交"，
+        只保留终态事件。
+
+        这是**调用方可见的观测面变更**，已记入 CHANGELOG。
+        """
+        events = _Events()
+
+        @flow(name="wf-noworkflow")
+        def pipeline() -> int:
+            return 1 + 1
+
+        with Runtime.with_defaults() as rt:
+            rt.layer("WorkflowLifecycle", "emit").chain(events)
+            assert pipeline() == 2
+
+        kinds = [i["kind"] for i in events.items]
+        assert kinds == ["completed"], kinds
+
+    def test_get_dag_exposes_structure_and_retry_policy(self) -> None:
+        """``get_dag`` 暴露 DAG **结构**：节点 / 依赖边 / 重试策略。
+
+        与 ``get_workflow_state`` 的分工：后者是**执行**状态（含 ``retry_count`` /
+        ``attempt`` / ``result``），本方法是**结构**。按查重口径，
+        ``get_retry_info`` 的 ``retry_count`` 那一半与 ``get_workflow_state`` 重复，
+        故**不暴露**；其"重试策略"那一半由本方法覆盖（节点策略 + DAG 默认策略）。
+        """
+        seen: list[str] = []
+
+        @flow(name="wf-getdag")
+        def pipeline(src: int) -> str:
+            raw = _fetch.submit(src)
+            seen.append(current_workflow_id() or "")
+            return _store.submit(_partition.submit(raw, raw)).result()
+
+        with Runtime.with_defaults() as rt:
+            assert pipeline(5) == "stored[ok:5:5]"
+            dag = rt.get_dag(seen[0])
+            # 执行状态（含 retry_count）仍在 get_workflow_state —— 二者不重复。
+            state = rt.get_workflow_state(seen[0])
+
+        assert dag is not None, "get_dag 应返回结构"
+        assert dag["workflow_id"] == seen[0]
+        assert dag["failure_strategy"] == "fail_fast"
+
+        nodes = {n["task_id"]: n for n in dag["nodes"]}
+        assert len(nodes) == 3, nodes
+        # 依赖边：partition 与 store 都依赖 fetch。
+        fetch_id = next(t for t, n in nodes.items() if n["name"] == "it_fetch")
+        part_id = next(t for t, n in nodes.items() if n["name"] == "it_partition")
+        store_id = next(t for t, n in nodes.items() if n["name"] == "it_store")
+        assert nodes[fetch_id]["deps"] == []
+        assert nodes[part_id]["deps"] == [fetch_id]
+        assert nodes[store_id]["deps"] == [part_id]
+
+        # 重试策略：@task(retries=1, retry_delay_ms=10) 落在节点上；
+        # 未声明的节点为 None（此时生效的是 default_retry_policy）。
+        assert nodes[part_id]["retry_policy"]["max_retries"] == 1
+        assert nodes[part_id]["retry_policy"]["delay_ms"] == 10
+        assert nodes[fetch_id]["retry_policy"] is None
+        assert "default_retry_policy" in dag, "默认策略必须暴露，否则无法还原生效策略"
+
+        # 刻意不含 payload（不透明且可能很大）。
+        assert "payload" not in nodes[fetch_id], "get_dag 不得搬运 payload"
+
+        assert state is not None
+        assert "retry_count" in state["tasks"][fetch_id]
+
+    def test_get_dag_returns_none_for_unknown_workflow(self) -> None:
+        """未知工作流 → ``None``（与 ``get_workflow_state`` 同款契约）。"""
+        with Runtime.with_defaults() as rt:
+            assert rt.get_dag("no-such-workflow") is None
+
+    def test_get_workflow_history_exposes_event_stream(self) -> None:
+        """``get_workflow_history`` 暴露事件流（审计出口）。
+
+        历史是**事实源**：``recover`` = 快照 + 其后事件重放，等待点与信号也进同一
+        历史。本方法是它的对外读取出口。
+
+        ``kind`` / ``task_id`` / ``error`` 供筛选；``payload`` 是**不透明**字节
+        ——Python 不解释其布局，故 Rust 枚举字段增减不会变成跨语言契约。
+        """
+        seen: list[str] = []
+
+        @flow(name="wf-history")
+        def pipeline(src: int) -> str:
+            raw = _fetch.submit(src)
+            seen.append(current_workflow_id() or "")
+            return _store.submit(raw).result()
+
+        with Runtime.with_defaults() as rt:
+            assert pipeline(5) == "stored[5]"
+            history = rt.get_workflow_history(seen[0])
+
+        kinds = [e["kind"] for e in history]
+        # 提交 → 节点 → 启动 → 完成 → 工作流终态。
+        assert "Submitted" in kinds, kinds
+        assert kinds.count("NodeAdded") == 2, kinds
+        assert "Started" in kinds, kinds
+        assert "Completed" in kinds, kinds
+        assert kinds.count("TaskCompleted") == 2, kinds
+
+        # 筛选字段：任务事件带 task_id；payload 是不透明字节。
+        completed = [e for e in history if e["kind"] == "TaskCompleted"]
+        assert all(e["task_id"] for e in completed), completed
+        assert all(isinstance(e["payload"], bytes) for e in history)
+        # 序列递增，可作为游标。
+        seqs = [e["sequence"] for e in history]
+        assert seqs == sorted(seqs), seqs
+
+        # 游标：从中间读取应更短，且不与头部重叠。
+        cursor = (history[2]["sequence"], history[2]["timestamp_ms"])
+        with Runtime.with_defaults():
+            pass
+        tail_history: list[dict] = []
+        with Runtime.with_defaults() as rt2:
+            tail_history = rt2.get_workflow_history(seen[0], after=cursor)
+        assert len(tail_history) < len(history)
+
+    def test_get_workflow_history_returns_empty_for_unknown_workflow(self) -> None:
+        """未知工作流 → 空列表（历史是**可选**观测面，缺失不构成错误）。"""
+        with Runtime.with_defaults() as rt:
+            assert rt.get_workflow_history("no-such-workflow") == []

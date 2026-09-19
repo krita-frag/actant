@@ -256,10 +256,10 @@ class _TaskCompletion:
 
 @final
 class _DagNode:
-    """DAG 节点定义，由 Python 层构造后通过 `submit_dag` 提交。
+    """DAG 节点定义，由 Python 层构造后通过 `add_workflow_node` 提交。
 
     `task_id` 是节点在 DAG 中的唯一标识（对应 Orchestrator 侧 TaskId），
-    由 FlowDAG 记录器设为被提交任务的 task_id；`name` 为人类可读名称。
+    flow 路径下由提交序号确定性生成（S3 重放身份）；`name` 为人类可读名称。
     `priority` 为有符号整数；语义由 Python 层定义。
     `metadata` 为不透明 key-value 映射，Rust 透传不解释。
     """
@@ -300,7 +300,9 @@ class _TaskDef:
     target_node: str | None
     target_endpoint_addr: str | None
     timeout_ms: int | None
-    retry_policy: _RetryPolicy | None
+    # 注意：Rust 侧 `_TaskDef.retry_policy` 没有 `#[pyo3(get)]`（与 `timeout_ms`
+    # 不同），故此处**不声明**该属性——按存根访问会 AttributeError。
+    # 需要读节点重试策略请用 `Runtime.get_dag()` 的 `nodes[*].retry_policy`。
 
     def __new__(
         cls,
@@ -385,16 +387,91 @@ class _RuntimeCore:
 
         仅在批量场景使用（如 ``gather``）；要求已调用 ``serve()``。
         """
-    def submit_dag(
+    def submit_workflow(
         self,
         workflow_id: str,
-        nodes: list[_DagNode],
-        edges: list[tuple[str, str]],
         failure_strategy: str | None = None,
-        default_retry_policy: _RetryPolicy | None = None,
-    ) -> None: ...
-    def complete_workflow(self, workflow_id: str, outcomes: list[tuple[str, bool, bytes]]) -> None: ...
+        timeout_ms: int = 0,
+    ) -> None:
+        """创建空持久化工作流外壳（S7 flow 提交路径第一步）。"""
+    def add_workflow_node(
+        self,
+        workflow_id: str,
+        node: _DagNode,
+        deps: list[str],
+    ) -> dict[str, Any]:
+        """增量加入单个 DAG 节点（S7，先持久化再派发；重放命中时返回历史状态）。
+
+        返回 ``{"created": bool, "state": str | None, "result": bytes | None,
+        "error": str | None}``。
+        """
+    def cancel_workflow(self, workflow_id: str) -> None: ...
+    def seal_workflow(self, workflow_id: str) -> None:
+        """封口工作流节点集（S7：flow 函数体返回信号）。"""
+    def register_wait_point(
+        self,
+        workflow_id: str,
+        wait_key: str,
+        kind: str,
+        name: str | None = None,
+        deadline_ms: int = 0,
+    ) -> None:
+        """注册持久化等待点（S1/S2/S4）。
+
+        `kind` 为 ``"signal"`` / ``"timer"`` / ``"suspend"``；timer 须给绝对
+        epoch 毫秒 `deadline_ms`（> 0）。同 `wait_key` 重复注册幂等。
+        """
+    def signal_wait_point(self, workflow_id: str, wait_key: str) -> bytes | None:
+        """递交信号唤醒等待点（信号缓冲：注册前抵达不再被丢弃）。
+
+        返回唤醒的 payload；``None`` 表示**此刻没有等待点可被唤醒**，信号已入
+        缓冲，将来注册同一 `wait_key` 时立即命中。**未知工作流**抛
+        ``NotFoundError``；**工作流已终态不报错**（递交方重试时会撞上刚跑完的
+        终态，报错就等于"明明送到了却报错"）。
+        """
+    def resume_suspended(self, workflow_id: str) -> int:
+        """恢复挂起（S4）：唤醒该工作流所有等待中的 `suspend` 等待点。
+
+        返回唤醒数量；``0`` 表示当前没有挂起中的挂起点（幂等）。只唤醒
+        `suspend` 条件，不触碰 `signal` / `timer` 等待点。
+        """
+    def wait_wait_point(
+        self, workflow_id: str, wait_key: str, timeout_ms: int = 0
+    ) -> bytes | None:
+        """阻塞等待等待点条件满足；``timeout_ms=0`` 表示无限等待。"""
+    def report_task_result(
+        self,
+        workflow_id: str,
+        task_id: str,
+        state: str,
+        result: bytes | None = None,
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        """上报本地 flow 任务终态结果（S6/S7 桥）。
+
+        `state` 为 ``"Completed"`` / ``"Failed"`` / ``"Cancelled"``；
+        返回 ``{"retry": bool, "delay_ms": int}``。
+        """
     def get_workflow_state(self, workflow_id: str) -> dict[str, Any] | None: ...
+    def get_dag(self, workflow_id: str) -> dict[str, Any] | None:
+        """查询工作流 DAG **结构**（E3）：节点 / 依赖边 / 重试策略。
+
+        与 `get_workflow_state`（**执行**状态）分工：本方法是**结构**。
+        返回 ``None``（工作流不存在）或含 ``nodes`` / ``edges`` /
+        ``default_retry_policy`` / ``failure_strategy`` 的 dict。**不含任务
+        payload**（对 Rust 不透明且可能很大）——需要结果查 `get_workflow_state`。
+        """
+
+    def get_workflow_history(
+        self, workflow_id: str, *, after: tuple[int, int] | None = None
+    ) -> list[dict[str, Any]]:
+        """读取工作流事件历史（E2 审计出口）。
+
+        每项 ``{sequence, timestamp_ms, kind, task_id, error, payload}``；``kind``
+        / ``task_id`` / ``error`` 供筛选，``payload`` 为不透明字节。`after` 是
+        ``(sequence, timestamp_ms)`` 游标，``None`` 从头读取。
+        """
+
     def list_workflows(self) -> list[str]: ...
     def register_task_result_callback(self, callback: Callable[[_TaskCompletion], None]) -> None: ...
     def value_store(self, data: bytes) -> bytes:

@@ -82,6 +82,7 @@ from actant.exceptions import (
     ActorError,
     AlreadyExistsError,
     ConfigError,
+    FlowReplayError,
     InternalError,
     InvalidStateError,
     MetricsError,
@@ -97,7 +98,15 @@ from actant.exceptions import (
     WorkflowError,
     WorkflowFailedError,
 )
-from actant.flow import current_workflow_id, flow
+from actant.flow import (
+    current_workflow_id,
+    flow,
+    register_flow_recovery,
+    resume_flows,
+    sleep_until,
+    suspend,
+    wait_signal,
+)
 from actant.task import (
     REF_INLINE_THRESHOLD,
     AsyncResult,
@@ -140,6 +149,7 @@ __all__ = [
     "ExecuteCtx",
     "ExecuteHandler",
     "ExecuteOutcome",
+    "FlowReplayError",
     "InternalError",
     "InvalidStateError",
     "Layer",
@@ -197,7 +207,12 @@ __all__ = [
     "perform",
     "perform_async",
     "perform_batch_async",
+    "register_flow_recovery",
     "require_runtime",
+    "resume_flows",
+    "sleep_until",
+    "suspend",
     "task",
     "use_runtime",
+    "wait_signal",
 ]

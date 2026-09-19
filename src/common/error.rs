@@ -68,6 +68,11 @@ pub enum ActantError {
     #[error("invalid state: {0}")]
     InvalidState(String),
 
+    /// flow 重放冲突：重放体的第 n 次提交与工作流历史中同序位的节点
+    /// 指纹不一致——提交序列确定性契约被破坏，显式失败而非静默错位。
+    #[error("flow replay conflict: {0}")]
+    Replay(String),
+
     #[error("internal error: {0}")]
     Internal(String),
 }

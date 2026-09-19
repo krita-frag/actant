@@ -112,7 +112,7 @@ async def gather_async(
     """异步并行等待多个 ``AsyncResult`` 完成。
 
     与 ``gather`` 语义一致，但返回 coroutine，可在 ``async def`` 函数中
-    ``await``。等待经 ``AsyncResult`` 完成回调直通 event loop（0.3.2 R5）：
+    ``await``。等待经 ``AsyncResult`` 完成回调直通 event loop：
     每个 handle 桥接为一个 ``asyncio.Future``，``asyncio.wait`` 一次性等待——
     无守护线程、不阻塞循环。
 

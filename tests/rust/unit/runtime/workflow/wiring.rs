@@ -1,4 +1,4 @@
-//! P0-3 / P0-4 装配接线测试：验证 `NetworkEventRouter` 将入站 wire 消息
+//! 装配接线测试：验证 `NetworkEventRouter` 将入站 wire 消息
 //! （Heartbeat / DagUpdate / Claim）**直连分发**到 FailoverManager /
 //! DagGossipActor——peer 出现、gossip seen 登记、claim 生效。
 //!
