@@ -1528,6 +1528,123 @@ impl PyRuntimeCore {
         Ok(())
     }
 
+    /// 注册任务日志回调（N3 档 1）。
+    ///
+    /// 订阅 event_bus 的 ``TaskLog`` 话题（worker 子进程经 stderr 边带上报的
+    /// 任务日志，tap 语义 best-effort 可丢），收到事件时调用
+    /// ``callback(dict)``，dict 为 ``{task_id, level, message}``。
+    /// 回调在 tokio 后台线程执行，通过 ``Python::attach`` 获取 GIL。
+    #[tracing::instrument(
+        name = "py.register_task_log_callback",
+        level = "info",
+        skip(self, callback)
+    )]
+    fn register_task_log_callback(&self, callback: Py<PyAny>) -> PyResult<()> {
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))?;
+        let tokio = self.tokio.lock().clone().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("tokio runtime unavailable")
+        })?;
+        let event_bus = runtime.event_bus().clone();
+        let callback = Arc::new(callback);
+        let mut rx_log = event_bus.subscribe(BusTopic::TaskLog);
+
+        let handle = tokio.spawn(async move {
+            loop {
+                let Some(event) = rx_log.recv().await else {
+                    break;
+                };
+                let BusEvent::TaskLog {
+                    task_id,
+                    level,
+                    message,
+                } = event
+                else {
+                    continue;
+                };
+                let cb = callback.clone();
+                tokio::task::spawn_blocking(move || {
+                    Python::attach(|py| {
+                        let t0 = std::time::Instant::now();
+                        let dict = pyo3::types::PyDict::new(py);
+                        if dict.set_item("task_id", task_id.as_str()).is_err()
+                            || dict.set_item("level", level).is_err()
+                            || dict.set_item("message", message).is_err()
+                        {
+                            return;
+                        }
+                        let cb_ref = cb.clone_ref(py);
+                        if let Err(e) = cb_ref.call1(py, (dict,)) {
+                            tracing::warn!("task log callback error: {}", e);
+                        }
+                        crate::metrics::observe_event_bridge_ms(t0.elapsed().as_millis() as u64);
+                    });
+                });
+            }
+        });
+        self.task_result_callback_handles.lock().push(handle);
+        Ok(())
+    }
+
+    /// 注册 Worker 状态回调（X4）。
+    ///
+    /// 订阅 event_bus 的 ``WorkerLifecycle`` 话题（draining/drained/stopped），
+    /// 收到事件时调用 ``callback(dict)``，dict 为 ``{state, node_id}``。
+    #[tracing::instrument(
+        name = "py.register_worker_state_callback",
+        level = "info",
+        skip(self, callback)
+    )]
+    fn register_worker_state_callback(&self, callback: Py<PyAny>) -> PyResult<()> {
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))?;
+        let tokio = self.tokio.lock().clone().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("tokio runtime unavailable")
+        })?;
+        let event_bus = runtime.event_bus().clone();
+        let callback = Arc::new(callback);
+        let mut rx = event_bus.subscribe(BusTopic::WorkerLifecycle);
+
+        let handle = tokio.spawn(async move {
+            loop {
+                let Some(event) = rx.recv().await else {
+                    break;
+                };
+                let (state, node_id) = match &event {
+                    BusEvent::WorkerDraining { node_id } => ("draining", node_id),
+                    BusEvent::WorkerDrained { node_id } => ("drained", node_id),
+                    BusEvent::WorkerStopped { node_id } => ("stopped", node_id),
+                    _ => continue,
+                };
+                let state = state.to_string();
+                let node_id = node_id.clone();
+                let cb = callback.clone();
+                tokio::task::spawn_blocking(move || {
+                    Python::attach(|py| {
+                        let t0 = std::time::Instant::now();
+                        let dict = pyo3::types::PyDict::new(py);
+                        if dict.set_item("state", state).is_err()
+                            || dict.set_item("node_id", node_id.as_str()).is_err()
+                        {
+                            return;
+                        }
+                        let cb_ref = cb.clone_ref(py);
+                        if let Err(e) = cb_ref.call1(py, (dict,)) {
+                            tracing::warn!("worker state callback error: {}", e);
+                        }
+                        crate::metrics::observe_event_bridge_ms(t0.elapsed().as_millis() as u64);
+                    });
+                });
+            }
+        });
+        self.task_result_callback_handles.lock().push(handle);
+        Ok(())
+    }
+
     /// 启动 Worker 守护循环（订阅 P2P topic + 任务执行循环）。
     ///
     /// 非阻塞：`worker.run()` 在 tokio runtime 后台 spawn，直到 `shutdown()` 取消。

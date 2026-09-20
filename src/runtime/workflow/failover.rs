@@ -1069,6 +1069,19 @@ impl FailoverManager {
         if !self.require_signed_records {
             return true;
         }
+        // 重放防御：签名覆盖 timestamp_ms，但接收方新鲜度用本地时钟——不校验
+        // 发送方时间戳时，捕获的旧签名心跳可被无限重放，让死亡节点永久占据
+        // peer 视图。容差 = failure_timeout_ms（与失联判定同窗；跨节点时钟
+        // 偏差侵蚀该窗口的既有语义不变）。
+        let now_ms = crate::common::epoch_millis();
+        if now_ms.saturating_sub(hb.timestamp_ms) > self.failure_timeout_ms {
+            tracing::warn!(
+                node = %hb.node_id.0,
+                ts = hb.timestamp_ms,
+                "heartbeat rejected: sender timestamp older than failure_timeout (replay?)"
+            );
+            return false;
+        }
         let (Some(sig_bytes), Some(ref addr)) = (&hb.signature, &hb.endpoint_addr) else {
             tracing::warn!(node = %hb.node_id.0, "heartbeat rejected: unsigned while require_signed_records is on");
             return false;
@@ -1123,7 +1136,18 @@ impl FailoverManager {
             peer.available_slots = hb.available_slots;
             peer.max_slots = hb.max_slots;
             peer.endpoint_addr = hb.endpoint_addr.clone();
-            peer.labels = hb.labels.clone();
+            // 入站标签与发送侧同限：超限整体置空，防止恶意 peer 用超大标签集
+            // 经 PeerState 常驻与 peers() 输出放大带宽。
+            peer.labels = if crate::common::model::node_labels_within_limit(&hb.labels) {
+                hb.labels.clone()
+            } else {
+                tracing::warn!(
+                    node = %hb.node_id.0,
+                    "heartbeat labels exceed {} bytes; ignoring them",
+                    crate::common::model::NODE_LABELS_MAX_BYTES
+                );
+                BTreeMap::new()
+            };
             peer.platform = hb.platform.clone();
             if is_new {
                 crate::metrics::inc_connected_peers();

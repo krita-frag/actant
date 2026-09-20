@@ -28,6 +28,13 @@ cloudpickle ``Pickler`` 绑定的 ``BytesIO`` 与读取用 ``BytesIO``，避免�
 汇入对应 OTel histogram；其余 stderr 行原样转发为日志。任务得/失败由 Rust
 在父进程依据 Result 帧与超时判定计入 counters，无需子进程上报。
 
+任务日志边带（N3 档 1）：任务执行期间，``logging`` 输出与 ``print``（stdout
+文本层）被捕获为 ``actant_log: <ts_ms> <level> <task_id> <message>`` 单行写入
+stderr，父进程 ``drain_stderr`` 发布为 ``TaskLog`` 事件（tap 语义，可丢）。
+**stdout 帧通道不可触碰**：捕获仅替换 ``sys.stdout`` 文本包装层——帧写入用的是
+main() 启动时捕获的 raw buffer（``sys.stdout.buffer``），不受代理影响；这同时
+修复了任务内 ``print`` 直写 fd 1 会损坏帧流的隐患。
+
 取消模型：线程读取 stdin 期间持续处理 ``Cancel`` 帧；``Cancel`` 到达时设置
 当前任务（或待分配的下一个任务）的取消事件。执行线程在 ``_execute_with_retries``
 的尝试间检查点 / ``_interruptible_sleep`` 段内协作退出。Rust 侧负责硬超时后的
@@ -36,7 +43,9 @@ cloudpickle ``Pickler`` 绑定的 ``BytesIO`` 与读取用 ``BytesIO``，避免�
 
 from __future__ import annotations
 
+import contextlib
 import io
+import logging
 import os
 import queue
 import struct
@@ -359,6 +368,100 @@ class _WorkerCancelToken:
         return self._event.is_set()
 
 
+# 任务日志边带行前缀：父进程 drain_stderr 据此识别行内容是任务日志。
+# 行格式：actant_log: <ts_ms> <level> <task_id> <message>（message 单行）。
+# 与帧类型常量同级，是跨语言契约，改名须两侧同步。
+_LOG_LINE_PREFIX = "actant_log: "
+
+
+def _emit_task_log(task_id: str, level: str, message: str) -> None:
+    """把一条任务日志以 stderr 边带单行发出（多行文本拆行）。
+
+    与 ``_emit_metric`` 同锁串行化，避免与读取线程的协议错误行交错。
+    """
+    ts_ms = int(time.time() * 1000)
+    with _metric_lock:
+        for line in message.splitlines() or [""]:
+            sys.stderr.write(f"{_LOG_LINE_PREFIX}{ts_ms} {level} {task_id} {line}\n")
+
+
+class _StdoutLogProxy:
+    """``sys.stdout`` 文本层代理：write 输出转任务日志边带，其余属性透传。
+
+    帧通道安全性的关键：帧写入使用 main() 捕获的 raw ``sys.stdout.buffer``，
+    本代理只覆盖任务执行期间暴露给用户代码的文本层（print / f.write）。
+    """
+
+    def __init__(self, real: Any, task_id: str) -> None:
+        self._real = real
+        self._task_id = task_id
+        self._buf: list[str] = []
+
+    def write(self, text: str) -> int:
+        self._buf.append(text)
+        while "\n" in "".join(self._buf):
+            joined = "".join(self._buf)
+            self._buf = []
+            *lines, rest = joined.split("\n")
+            for line in lines:
+                _emit_task_log(self._task_id, "STDOUT", line)
+            if rest:
+                self._buf.append(rest)
+        return len(text)
+
+    def flush(self) -> None:
+        if self._buf:
+            message = "".join(self._buf)
+            self._buf = []
+            if message:
+                _emit_task_log(self._task_id, "STDOUT", message)
+        with contextlib.suppress(Exception):
+            self._real.flush()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real, name)
+
+
+class _TaskLogScope:
+    """任务执行期的日志捕获作用域：root logger handler + stdout 文本层代理。
+
+    进入时安装、退出时恢复。worker 单任务单线程，swap/restore 无并发风险；
+    handler 级别取 WARNING——INFO 级框架内部日志量在任务粒度不可控，
+    用户任务自己的 logger 可显式调级（N3 是 tap 通道，不是全量日志导出）。
+    """
+
+    def __init__(self, task_id: str) -> None:
+        self._task_id = task_id
+        self._handler: logging.Handler | None = None
+        self._real_stdout: Any = None
+
+    def __enter__(self) -> _TaskLogScope:
+        task_id = self._task_id
+
+        class _EdgeHandler(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                try:
+                    message = self.format(record)
+                except Exception:
+                    message = record.getMessage()
+                _emit_task_log(task_id, record.levelname, message)
+
+        handler = _EdgeHandler()
+        handler.setLevel(logging.WARNING)
+        handler.setFormatter(logging.Formatter("%(name)s: %(message)s"))
+        root = logging.getLogger()
+        root.addHandler(handler)
+        self._handler = handler
+        self._real_stdout = sys.stdout
+        sys.stdout = _StdoutLogProxy(sys.stdout, task_id)
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        sys.stdout = self._real_stdout
+        if self._handler is not None:
+            logging.getLogger().removeHandler(self._handler)
+
+
 def _run_dispatch(payload: bytes, cancel_event: threading.Event) -> bytes:
     """解析 v2 任务载荷并执行，返回与 generic handler 兼容的结果字节。
 
@@ -388,7 +491,7 @@ def _run_dispatch(payload: bytes, cancel_event: threading.Event) -> bytes:
     ctx = _DispatchTaskContext(task_id, workflow_id, token)
     # 无 Runtime：事件（started/completed/failed...）由 Rust Worker 在父进程侧
     # 发布；子进程内 silent=True 抑制 TaskLifecycle emit，避免依赖 parent runtime。
-    with _task_context_scope(ctx):
+    with _task_context_scope(ctx), _TaskLogScope(task_id):
         t0 = time.monotonic()
         success, payload_obj = _execute_with_retries(
             func, args, kwargs, 0, retries, retry_delay_ms,

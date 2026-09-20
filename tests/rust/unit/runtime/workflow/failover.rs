@@ -197,6 +197,40 @@ fn forged_signature_rejected() {
 }
 
 #[test]
+fn stale_signed_heartbeat_rejected_replay_defense() {
+    // 合法签名但发送方时间戳早于 failure_timeout：重放的旧心跳必须被拒，
+    // 否则死亡节点可被无限重放维持在 peer 视图中。
+    let key = iroh::SecretKey::generate();
+    let fm = make_fm_with_identity("node-A", None, true, Vec::new());
+    let stale_ts = crate::common::epoch_millis().saturating_sub(10_000_000);
+    fm.handle_heartbeat(&signed_hb(&key, "node-B", stale_ts));
+    assert!(
+        fm.get_peer_infos().is_empty(),
+        "replayed stale signed heartbeat must be rejected"
+    );
+
+    // 新鲜时间戳的同一密钥签名照常接受。
+    fm.handle_heartbeat(&signed_hb(&key, "node-B", crate::common::epoch_millis()));
+    assert_eq!(fm.get_peer_infos().len(), 1);
+}
+
+#[test]
+fn oversized_inbound_labels_dropped() {
+    let mut hb = hb("node-B", crate::common::epoch_millis(), &[]);
+    let mut labels = BTreeMap::new();
+    labels.insert("big".to_string(), "x".repeat(8192));
+    hb.labels = labels;
+    let fm = make_fm("node-A");
+    fm.handle_heartbeat(&hb);
+
+    let peer = &fm.get_peer_infos()[&NodeId::from("node-B".to_string())];
+    assert!(
+        peer.labels.is_empty(),
+        "oversized inbound labels must be dropped"
+    );
+}
+
+#[test]
 fn unsigned_heartbeat_accepted_when_not_required() {
     // 向后兼容：require_signed_records=false（默认）时缺签心跳照常入表。
     let fm = make_fm_with_identity("node-A", None, false, Vec::new());

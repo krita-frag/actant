@@ -17,7 +17,7 @@ use tempfile::tempdir;
 /// （运行时存储调度器，测试中不真正派发任务）。
 fn hermetic_dispatcher() -> Arc<dyn TaskDispatcher> {
     Arc::new(
-        ProcessTaskDispatcher::new(0, WorkerLaunchSpec::default(), 1, Vec::new())
+        ProcessTaskDispatcher::new(0, WorkerLaunchSpec::default(), 1, Vec::new(), None)
             .expect("process task dispatcher init"),
     )
 }

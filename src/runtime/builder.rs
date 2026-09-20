@@ -390,19 +390,21 @@ impl RuntimeBuilder {
             .map_err(|e| ActantError::Storage(format!("failed to open store: {}", e)))?;
         let store = Store::new(lmdb_store.clone());
 
-        let task_dispatcher: Arc<dyn TaskDispatcher> = Arc::new(
-            ProcessTaskDispatcher::new(
-                self.config.worker.num_worker_processes.max(1),
-                WorkerLaunchSpec::new(
-                    self.config.worker.worker_program.clone(),
-                    self.config.worker.worker_args.clone(),
-                    self.config.worker.worker_env.clone(),
-                ),
-                self.config.worker.worker_cancel_grace_ms,
-                self.config.payload_signing_key.clone(),
-            )
-            .map_err(|e| ActantError::Config(format!("failed to create task dispatcher: {}", e)))?,
-        );
+        // N3：任务日志边带出口必须在构造时提供——进程池在此刻拉起，
+        // 后置注入会错过首批 worker 的 stderr 事件流。
+        let dispatcher = ProcessTaskDispatcher::new(
+            self.config.worker.num_worker_processes.max(1),
+            WorkerLaunchSpec::new(
+                self.config.worker.worker_program.clone(),
+                self.config.worker.worker_args.clone(),
+                self.config.worker.worker_env.clone(),
+            ),
+            self.config.worker.worker_cancel_grace_ms,
+            self.config.payload_signing_key.clone(),
+            Some(event_bus.clone()),
+        )
+        .map_err(|e| ActantError::Config(format!("failed to create task dispatcher: {}", e)))?;
+        let task_dispatcher: Arc<dyn TaskDispatcher> = Arc::new(dispatcher);
 
         // ── Capability 注册 ────────────────────────────────────────────
         // 关键顺序：先 register_defaults + register_store_handler（chain 追加），

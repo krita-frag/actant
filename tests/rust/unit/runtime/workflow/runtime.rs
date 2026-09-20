@@ -67,6 +67,7 @@ fn make_worker(node_id: &str) -> Worker {
             WorkerLaunchSpec::default(),
             1,
             Vec::new(),
+            None,
         )
         .expect("ProcessTaskDispatcher init"),
     );
@@ -496,6 +497,7 @@ async fn worker_schedule_task_with_real_scheduler() {
             WorkerLaunchSpec::default(),
             1,
             Vec::new(),
+            None,
         )
         .expect("ProcessTaskDispatcher init"),
     );
@@ -1379,6 +1381,7 @@ fn make_worker_with_transport(node_id: &str, transport: Arc<dyn Transport>) -> W
             WorkerLaunchSpec::default(),
             1,
             Vec::new(),
+            None,
         )
         .expect("ProcessTaskDispatcher init"),
     );

@@ -511,7 +511,7 @@ fn register_execute_handler_adds_layer() {
     use crate::runtime::dispatcher::{ProcessTaskDispatcher, TaskDispatcher};
     let rt = CapabilityRuntime::new();
     let dispatcher: Arc<dyn TaskDispatcher> = Arc::new(
-        ProcessTaskDispatcher::new(0, WorkerLaunchSpec::default(), 1, Vec::new()).unwrap(),
+        ProcessTaskDispatcher::new(0, WorkerLaunchSpec::default(), 1, Vec::new(), None).unwrap(),
     );
     register_execute_handler(&rt, dispatcher, Vec::new()).unwrap();
     assert_eq!(rt.capability_count(), 1);

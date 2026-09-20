@@ -44,7 +44,8 @@ use tokio::sync::Semaphore;
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd};
 
-use crate::common::ActantError;
+use crate::common::{ActantError, TaskId};
+use crate::runtime::event_bus::{BusEvent, EventBus};
 
 /// 取消标志，用于协调任务分发器和跨进程取消操作。
 ///
@@ -267,6 +268,8 @@ pub struct ProcessTaskDispatcher {
     cancel_grace: Duration,
     /// 关闭时终止空闲 worker。
     shutting_down: AtomicBool,
+    /// 任务日志边带出口（N3）。`None` 时 actant_log 行仅经 tracing 转发。
+    log_bus: Option<EventBus>,
 }
 
 impl ProcessTaskDispatcher {
@@ -275,11 +278,17 @@ impl ProcessTaskDispatcher {
     /// `launch` 完整描述如何拉起 worker 子进程（可执行文件 + 参数 + 环境变量），
     /// 核心不解释其中任何语言语义；解释器路径、模块入口与环境变量的拼装由
     /// 绑定层或嵌入方负责（见 [`WorkerLaunchSpec`]）。
+    ///
+    /// `log_bus` 是任务日志边带出口（N3）：`Some` 时池内 worker 的
+    /// `actant_log:` 行发布为 `BusEvent::TaskLog`（tap 语义）；`None` 时仅经
+    /// tracing 转发。进程池在构造时即拉起，出口必须在此提供——后置注入会
+    /// 错过首批 worker。
     pub fn new(
         num_workers: usize,
         launch: WorkerLaunchSpec,
         worker_cancel_grace_ms: u64,
         signing_key: Vec<u8>,
+        log_bus: Option<EventBus>,
     ) -> crate::common::Result<Self> {
         if launch.program.trim().is_empty() {
             return Err(ActantError::Config(
@@ -294,9 +303,11 @@ impl ProcessTaskDispatcher {
             signing_key,
             cancel_grace,
             shutting_down: AtomicBool::new(false),
+            log_bus,
         };
         for _ in 0..num_workers {
-            let worker = ProcessTaskDispatcher::spawn_one(&dispatcher.launch)?;
+            let worker =
+                ProcessTaskDispatcher::spawn_one(&dispatcher.launch, dispatcher.log_bus.clone())?;
             dispatcher.free_workers.lock().push_back(worker);
         }
         Ok(dispatcher)
@@ -315,6 +326,7 @@ impl ProcessTaskDispatcher {
             signing_key,
             cancel_grace: Duration::from_millis(10),
             shutting_down: AtomicBool::new(false),
+            log_bus: None,
         }
     }
     /// 在 Unix 下从 `ChildStdin` dup 原始 fd 封装回 tokio `File`，作为取消帧独立写端。
@@ -355,7 +367,10 @@ impl ProcessTaskDispatcher {
     }
 
     /// 拉起单个 worker 子进程并把 stderr 转发到 tracing。
-    fn spawn_one(launch: &WorkerLaunchSpec) -> Result<WorkerProc, ActantError> {
+    fn spawn_one(
+        launch: &WorkerLaunchSpec,
+        log_bus: Option<EventBus>,
+    ) -> Result<WorkerProc, ActantError> {
         let mut cmd = Command::new(&launch.program);
         cmd.args(&launch.args);
         for (k, v) in &launch.env {
@@ -377,7 +392,7 @@ impl ProcessTaskDispatcher {
             .take()
             .ok_or_else(|| ActantError::Worker("worker stdout not available".into()))?;
         if let Some(stderr) = child.stderr.take() {
-            tokio::spawn(drain_stderr(stderr));
+            tokio::spawn(drain_stderr(stderr, log_bus));
         }
         Ok(WorkerProc {
             child,
@@ -484,7 +499,7 @@ impl ProcessTaskDispatcher {
         if self.shutting_down.load(Ordering::Acquire) {
             return;
         }
-        match ProcessTaskDispatcher::spawn_one(&self.launch) {
+        match ProcessTaskDispatcher::spawn_one(&self.launch, self.log_bus.clone()) {
             Ok(worker) => self.release_worker(worker),
             Err(e) => tracing::warn!(error = %e, "failed to respawn worker; pool shrunk"),
         }
@@ -580,6 +595,11 @@ impl ProcessTaskDispatcher {
 /// 指标边带行前缀：worker 经 stderr 单行上报从属计时指标。
 const METRIC_LINE_PREFIX: &str = "actant_metric: ";
 
+/// 任务日志边带行前缀：worker 经 stderr 单行上报任务执行期间日志（N3 档 1）。
+/// 行格式：``actant_log: <ts_ms> <level> <task_id> <message>``（message 单行，
+/// 多行文本由 worker 侧拆行）。**跨语言契约**：与帧类型常量同级，改名须两侧同步。
+const LOG_LINE_PREFIX: &str = "actant_log: ";
+
 /// worker 以 stderr 边带上报的「任务处理耗时」指标名。
 ///
 /// **跨语言契约**：worker 侧实现必须发射同名指标（与帧类型字节一样，是两侧
@@ -592,7 +612,7 @@ const METRIC_TASK_HANDLER_MS: &str = "task.handler_ms";
 /// 同时识别从属指标边带：以 ``actant_metric:`` 开头、形如
 /// ``<name>=<value_ms>`` 的行，汇入对应 OTel histogram（当前仅
 /// [`METRIC_TASK_HANDLER_MS`]）；其余行原样作为日志透传，不改变可观测性契约。
-async fn drain_stderr(mut stderr: ChildStderr) {
+async fn drain_stderr(mut stderr: ChildStderr, log_bus: Option<EventBus>) {
     let mut lines = tokio::io::BufReader::new(&mut stderr).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         if let Some(value) = line.strip_prefix(METRIC_LINE_PREFIX) {
@@ -602,6 +622,36 @@ async fn drain_stderr(mut stderr: ChildStderr) {
                         crate::metrics::observe_task_handler_ms(ms);
                     }
                 }
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix(LOG_LINE_PREFIX) {
+            // 行格式：<ts_ms> <level> <task_id> <message…>。畸形行不吞——
+            // 落回通用日志转发，保留排查线索。
+            let mut parts = rest.splitn(4, ' ');
+            let (ts, level, task_id, message) =
+                match (parts.next(), parts.next(), parts.next(), parts.next()) {
+                    (Some(ts), Some(level), Some(task_id), Some(message)) => {
+                        (ts, level, task_id, message)
+                    }
+                    _ => {
+                        tracing::warn!(target: "actant.worker", "malformed task log line: {line}");
+                        continue;
+                    }
+                };
+            tracing::debug!(
+                target: "actant.worker.task_log",
+                ts = ts,
+                level = level,
+                task_id = task_id,
+                "{message}"
+            );
+            if let Some(ref bus) = log_bus {
+                bus.publish(BusEvent::TaskLog {
+                    task_id: TaskId::from(task_id.to_string()),
+                    level: level.to_string(),
+                    message: message.to_string(),
+                });
             }
             continue;
         }

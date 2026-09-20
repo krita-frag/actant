@@ -7,7 +7,7 @@ use super::*;
 /// （`init_worker` 仅存储调度器，不在测试中真正派发任务）。
 fn hermetic_dispatcher() -> Arc<dyn TaskDispatcher> {
     Arc::new(
-        ProcessTaskDispatcher::new(0, WorkerLaunchSpec::default(), 1, Vec::new())
+        ProcessTaskDispatcher::new(0, WorkerLaunchSpec::default(), 1, Vec::new(), None)
             .expect("process task dispatcher init"),
     )
 }

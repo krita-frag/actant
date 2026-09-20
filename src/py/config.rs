@@ -208,7 +208,7 @@ pub struct PyNetworkConfig {
     #[pyo3(get)]
     pub relay_endpoints: Vec<String>,
     /// 强制校验心跳节点记录签名。`Runtime.production()` 默认开启。
-    #[pyo3(get)]
+    #[pyo3(get, set)]
     pub require_signed_records: bool,
 }
 

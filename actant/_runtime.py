@@ -499,26 +499,8 @@ class Runtime:
                 "require_signed_records=True) to restrict membership to known "
                 "peers; query each node's endpoint id via its peer_id."
             )
-        if not effective_network.require_signed_records:
-            # 用户显式传入 network 时补齐心跳签名强制；已在白名单校验之后，
-            # 构造新 _NetworkConfig 保留其余字段。
-            effective_network = _NetworkConfig(
-                preset=effective_network.preset,
-                bootstrap_nodes=effective_network.bootstrap_nodes,
-                hlc_max_drift_ms=effective_network.hlc_max_drift_ms,
-                max_pending_direct_requests=effective_network.max_pending_direct_requests,
-                gossip_bootstrap_peers=effective_network.gossip_bootstrap_peers,
-                max_message_size=effective_network.max_message_size,
-                allowed_peer_ids=effective_network.allowed_peer_ids,
-                direct_request_timeout_ms=effective_network.direct_request_timeout_ms,
-                listen_port=effective_network.listen_port,
-                listen_ip=effective_network.listen_ip,
-                capability_gossip_interval_ms=effective_network.capability_gossip_interval_ms,
-                event_channel_capacity=effective_network.event_channel_capacity,
-                dns_origin_domain=effective_network.dns_origin_domain,
-                relay_endpoints=effective_network.relay_endpoints,
-                require_signed_records=True,
-            )
+        # 补齐心跳签名强制：直接置位，不逐字段重建（避免字段漂移陷阱）。
+        effective_network.require_signed_records = True
 
         config = _ActantConfig(
             payload_signing_key=payload_signing_key,
@@ -1772,6 +1754,44 @@ class Runtime:
         if core is None:
             raise InvalidStateError("Runtime not started: rust_core is None")
         return list(core.list_workflows())
+
+    def on_task_log(self, callback: Callable[[dict[str, Any]], None]) -> None:
+        """订阅任务日志流（N3 档 1）。
+
+        任务在 worker 子进程执行期间，``logging``（WARNING 及以上）与
+        ``print`` 输出经 stderr 边带回传，每个事件调用
+        ``callback({task_id, level, message})``。
+
+        通道为 tap 语义（best-effort 可丢），不承载正确性语义。
+
+        Args:
+            callback: 收到 ``dict(task_id=..., level=..., message=...)`` 时调用，
+                在后台线程执行（勿在其中阻塞）。
+
+        Raises:
+            InvalidStateError: Runtime 未启动。
+        """
+        core = self._rust_core
+        if core is None:
+            raise InvalidStateError("Runtime not started: rust_core is None")
+        core.register_task_log_callback(callback)
+
+    def on_worker_state(self, callback: Callable[[dict[str, Any]], None]) -> None:
+        """订阅 Worker 生命周期事件（X4）。
+
+        节点进入排空/完成排空/停止时调用
+        ``callback({state, node_id})``（state ∈ ``draining``/``drained``/``stopped``）。
+
+        Args:
+            callback: 在后台线程执行（勿在其中阻塞）。
+
+        Raises:
+            InvalidStateError: Runtime 未启动。
+        """
+        core = self._rust_core
+        if core is None:
+            raise InvalidStateError("Runtime not started: rust_core is None")
+        core.register_worker_state_callback(callback)
 
     def delete_workflow(self, workflow_id: str) -> None:
         """删除工作流（运维清理）。

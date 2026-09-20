@@ -47,6 +47,9 @@ pub enum Topic {
     TaskSkipped,
     /// 对端连接 / 断开。
     NetworkPeer,
+    /// 任务级日志流（N3 档 1）：worker 子进程经 stderr 边带上报的任务日志。
+    /// tap 语义（best-effort 可丢），不承载正确性语义。
+    TaskLog,
     /// Actor 生命周期中的不可恢复错误（panic / 状态机非法转换等
     /// 需要外部介入的错误）。
     ActorLifecycleError,
@@ -65,6 +68,7 @@ impl Topic {
             Topic::TaskCancelled => "TaskCancelled",
             Topic::TaskSkipped => "TaskSkipped",
             Topic::NetworkPeer => "NetworkPeer",
+            Topic::TaskLog => "TaskLog",
             Topic::ActorLifecycleError => "ActorLifecycleError",
             Topic::WorkerLifecycle => "WorkerLifecycle",
         }
@@ -101,6 +105,15 @@ pub enum BusEvent {
     // -- 网络 --
     PeerConnected(NodeId),
     PeerDisconnected(NodeId),
+
+    // -- 任务日志（可克隆，tap 语义）--
+    /// worker 子进程内任务执行期间的一条日志（logging/print 经 stderr 边带）。
+    /// `task_id` 为任务标识；`level` 为日志级别名（print 行为 "STDOUT"）。
+    TaskLog {
+        task_id: crate::common::TaskId,
+        level: String,
+        message: String,
+    },
 
     // -- Actor 生命周期（可克隆）--
     /// Actor 生命周期中的不可恢复错误。
@@ -139,6 +152,7 @@ impl BusEvent {
             BusEvent::TaskCancelled(_) => Topic::TaskCancelled,
             BusEvent::TaskSkipped(_) => Topic::TaskSkipped,
             BusEvent::PeerConnected(_) | BusEvent::PeerDisconnected(_) => Topic::NetworkPeer,
+            BusEvent::TaskLog { .. } => Topic::TaskLog,
             BusEvent::ActorLifecycleError { .. } => Topic::ActorLifecycleError,
             BusEvent::WorkerDraining { .. }
             | BusEvent::WorkerDrained { .. }

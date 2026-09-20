@@ -38,6 +38,7 @@ fn new_requires_non_empty_worker_program() {
         },
         1000,
         TEST_KEY.to_vec(),
+        None,
     );
     assert!(
         matches!(err, Err(ActantError::Config(_))),
