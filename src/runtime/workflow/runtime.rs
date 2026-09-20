@@ -33,7 +33,9 @@ use crate::runtime::actor::ActorSystem;
 use crate::runtime::dispatcher::{new_cancel_flag, CancelFlag, TaskDispatcher};
 use crate::runtime::event_bus::{BusEvent, EventBus};
 use crate::runtime::network::Transport;
-use crate::runtime::workflow::actor::{InnerScheduler, ResultSource, TaskResultOutcome};
+use crate::runtime::workflow::actor::{
+    InnerScheduler, ResultSource, TaskCompletionResponse, TaskResultOutcome,
+};
 use crate::runtime::workflow::messaging::{decode, encode};
 use crate::runtime::workflow::workflow_methods;
 use crate::runtime::workflow::Scheduler;
@@ -1184,6 +1186,17 @@ impl Worker {
 
             // 崩溃故障转移用捕获：scheduler（重入队）、崩溃重路由上限与延迟。
             let scheduler_for_failover = self.scheduler.clone();
+            // X2 本地编排回灌桥：绑定 workflow actor 时才启用；未绑定降级为
+            // 纯事件结算（可选编排语义不变）。
+            let orchestrator_bridge =
+                match (self.actor_system.clone(), self.workflow_actor_id.clone()) {
+                    (Some(actor_system), Some(workflow_actor_id)) => Some(OrchestratorBridge {
+                        actor_system,
+                        workflow_actor_id,
+                        scheduler: self.scheduler.clone(),
+                    }),
+                    _ => None,
+                };
             let crash_failover_max = self.crash_failover_max_attempts;
             let failover_delay = self.remote_fallback_delay;
 
@@ -1213,10 +1226,7 @@ impl Worker {
                 if let (Some(system), Some(actor_id)) =
                     (self.actor_system.clone(), self.workflow_actor_id.clone())
                 {
-                    match crate::runtime::workflow::messaging::encode(&(
-                        running_wf,
-                        task.id.clone(),
-                    )) {
+                    match encode(&(running_wf, task.id.clone())) {
                         Ok(running_payload) => {
                             match system
                                 .call(
@@ -1263,10 +1273,7 @@ impl Worker {
                 if let (Some(system), Some(actor_id)) =
                     (self.actor_system.clone(), self.workflow_actor_id.clone())
                 {
-                    match crate::runtime::workflow::messaging::encode(&(
-                        dispatched_wf,
-                        task.id.clone(),
-                    )) {
+                    match encode(&(dispatched_wf, task.id.clone())) {
                         Ok(payload) => {
                             let msg = crate::common::ActorMessage::new(
                                 actor_id.clone(),
@@ -1371,6 +1378,7 @@ impl Worker {
                         &event_bus,
                         &pending_results,
                         pending_capacity,
+                        orchestrator_bridge.as_ref(),
                     )
                     .await;
                     drop(_permit);
@@ -1462,6 +1470,7 @@ impl Worker {
                     &event_bus,
                     &pending_results,
                     pending_capacity,
+                    orchestrator_bridge.as_ref(),
                 )
                 .await;
 
@@ -1766,6 +1775,8 @@ async fn publish_drained_task_cancellation(task: TaskDefinition, ctx: &DrainNoti
         task_name: task.name.clone(),
         target_node: task.target_node.clone(),
     };
+    // drain 丢弃不回灌 orchestrator：任务未执行，Cancelled 经事件路径让
+    // 提交方终止（与既有语义一致）；workflow 视图由失联接管路径兜底。
     settle_local_completion(
         completion,
         &task,
@@ -1774,6 +1785,7 @@ async fn publish_drained_task_cancellation(task: TaskDefinition, ctx: &DrainNoti
         ctx.event_bus,
         ctx.pending_results,
         ctx.pending_capacity,
+        None,
     )
     .await;
 }
@@ -1804,7 +1816,38 @@ async fn settle_local_completion(
     event_bus: &EventBus,
     pending_results: &tokio::sync::mpsc::Sender<PendingResult>,
     pending_capacity: usize,
+    orchestrator_bridge: Option<&OrchestratorBridge>,
 ) {
+    // 本地编排回灌（X2 验收实验发现的缺口）：workflow 任务的完成事件此前只
+    // 发布到 EventBus——Python 路径的后继派发由「提交方阻塞解析依赖 + 事件泵
+    // 回灌」驱动，而 Rust 原生 DAG 提交（submit + start）没有事件泵，依赖
+    // 推进产出的后继任务无人入队，DAG 永不推进。core 内补齐：Completed 经
+    // COMPLETE_TASK 通道取 ready_successors 入队；Failed 经 ON_TASK_RESULT
+    // 做重试裁决（bridge.ingest 内部处理）。
+    if let Some(bridge) = orchestrator_bridge {
+        match bridge.ingest(&completion, task).await {
+            Ok(ready_successors) if !ready_successors.is_empty() => {
+                let scheduler = bridge.scheduler.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = scheduler.enqueue_batch(ready_successors).await {
+                        tracing::error!(
+                            error = %e,
+                            "failed to enqueue ready successor tasks (local result report)"
+                        );
+                    }
+                });
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    task_id = %task.id.as_str(),
+                    error = %e,
+                    "local orchestration ingest failed; falling back to event-only settlement"
+                );
+            }
+        }
+    }
+
     publish_task_completion(
         completion,
         task,
@@ -1815,6 +1858,122 @@ async fn settle_local_completion(
         pending_capacity,
     )
     .await;
+}
+
+/// 本地结果 → orchestrator 的回灌桥（X2）。
+///
+/// 持有 ON_TASK_RESULT 通道两端（actor_system + workflow_actor_id）与调度器
+/// 引用；`ingest` 返回 `Some(OrchestratorRetry)` 表示 orchestrator 裁决重试。
+/// `None` 变体由 `settle_local_completion` 的调用方在 spawn 时按 Worker 内部
+/// 状态构造（未绑定 workflow actor 时为 `None`，降级为纯事件结算）。
+struct OrchestratorBridge {
+    actor_system: Arc<crate::runtime::actor::ActorSystem>,
+    workflow_actor_id: crate::common::ActorId,
+    scheduler: Arc<dyn crate::runtime::workflow::Scheduler>,
+}
+
+impl OrchestratorBridge {
+    /// 结果单入口回灌。成功返回就绪后继任务（可为空）；`Err` = 回灌失败
+    /// （调用方降级为事件结算并告警）。重试裁决在 Failed 分支内部处理。
+    async fn ingest(
+        &self,
+        completion: &TaskCompletion,
+        task: &TaskDefinition,
+    ) -> Result<Vec<TaskDefinition>> {
+        // 返回「就绪后继任务」（依赖推进产出），由调用方入队调度器。
+        // 重试裁决走同通道：Failed 时 ON_TASK_RESULT 响应携带 retry verdict，
+        // 由 Worker::report_task_result 的既有路径延迟入队（此处不重复）。
+        let Some(ref workflow_id) = task.workflow_id else {
+            return Ok(Vec::new());
+        };
+        if workflow_id.as_str().is_empty() {
+            return Ok(Vec::new());
+        }
+        match completion {
+            TaskCompletion::Completed { result, .. } => {
+                // Completed 走 COMPLETE_TASK 通道：响应是 TaskCompletionResponse
+                //（含 ready_successors——Rust 原生 DAG 提交路径的后继派发腿，
+                // Python 路径由提交方阻塞解析依赖而无需此腿）。
+                let payload = encode(&(workflow_id.clone(), task.id.clone(), result.clone()))?;
+                let response = self
+                    .actor_system
+                    .call(
+                        &self.workflow_actor_id,
+                        crate::runtime::workflow::actor::workflow_methods::COMPLETE_TASK,
+                        payload,
+                    )
+                    .await?;
+                if let Some(error) = response.error {
+                    return Err(ActantError::from(error));
+                }
+                let parsed: TaskCompletionResponse = if response.payload.is_empty() {
+                    return Ok(Vec::new());
+                } else {
+                    decode(&response.payload)?
+                };
+                Ok(parsed.ready_successors)
+            }
+            TaskCompletion::Failed { error, .. } => {
+                let outcome = TaskResultOutcome::Failed(error.clone());
+                let retry = self
+                    .ingest_for_retry(workflow_id, &task.id, outcome)
+                    .await?;
+                if let Some((retry_task, delay_ms)) = retry {
+                    let scheduler = self.scheduler.clone();
+                    tokio::spawn(async move {
+                        if delay_ms > 0 {
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        }
+                        if let Err(e) = scheduler.enqueue(retry_task).await {
+                            tracing::error!(
+                                error = %e,
+                                "failed to enqueue orchestrator-driven retry task (local result report)"
+                            );
+                        }
+                    });
+                }
+                Ok(Vec::new())
+            }
+            // Cancelled / Skipped：编排侧由 cancel 路径与条件边处理收敛，
+            // 事件结算即可。
+            TaskCompletion::Cancelled { .. } | TaskCompletion::Skipped { .. } => Ok(Vec::new()),
+        }
+    }
+
+    /// Failed 结果的重试裁决通道（ON_TASK_RESULT 单入口）。
+    async fn ingest_for_retry(
+        &self,
+        workflow_id: &crate::common::WorkflowId,
+        task_id: &crate::common::TaskId,
+        outcome: TaskResultOutcome,
+    ) -> Result<Option<(TaskDefinition, u64)>> {
+        let payload = encode(&(
+            workflow_id.clone(),
+            task_id.clone(),
+            outcome,
+            None::<u32>,
+            ResultSource::Local,
+        ))?;
+        let result = self
+            .actor_system
+            .call(
+                &self.workflow_actor_id,
+                crate::runtime::workflow::actor::workflow_methods::ON_TASK_RESULT,
+                payload,
+            )
+            .await?;
+        if let Some(error) = result.error {
+            return Err(ActantError::from(error));
+        }
+        // 响应载荷是 `Option<(TaskDefinition, u64)>`：`None` = 终局。
+        // postcard 的 `None` 占一个判别字节，必须按 `Option` 解码。
+        let verdict: Option<(TaskDefinition, u64)> = if result.payload.is_empty() {
+            None
+        } else {
+            decode(&result.payload)?
+        };
+        Ok(verdict)
+    }
 }
 
 /// 将任务完成结果发布到事件总线或回传给远端 orchestrator。
