@@ -4,7 +4,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use super::model::{NodeId, PlatformInfo, TaskDefinition, TaskId, WorkflowId};
-use crate::runtime::state::HlcTimestamp;
+use crate::common::model::HlcTimestamp;
 
 /// 网络协议常量 — 所有魔法字符串与数值限制的唯一真相来源。
 ///

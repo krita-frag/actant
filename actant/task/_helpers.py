@@ -19,7 +19,6 @@ from typing import Any, Literal, cast
 
 import cloudpickle
 
-from actant.capabilities import ExecuteCtx, ExecuteOutcome
 from actant.exceptions import ActantError, SerializationError, TaskCancelledError
 from actant.task._context import get_task_context
 
@@ -841,8 +840,6 @@ def _emit_task_event(
 
 __all__ = [
     "CallbackErrorPolicy",
-    "ExecuteCtx",
-    "ExecuteOutcome",
     "_EventBatcher",
     "_EventBatcherScope",
     "_emit_task_event",

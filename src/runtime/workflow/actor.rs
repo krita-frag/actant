@@ -546,6 +546,9 @@ pub(crate) enum InnerScheduler {
         notify: Arc<tokio::sync::Notify>,
         closed: std::sync::atomic::AtomicBool,
     },
+    /// F4 注入缝：使用者提供的调度策略实现。所有操作转发给该实现——
+    /// fast-path enqueue（SharedInner 直调）与 Actor 消息路径行为一致。
+    External(Arc<dyn crate::runtime::workflow::Scheduler>),
 }
 
 impl InnerScheduler {
@@ -583,13 +586,16 @@ impl InnerScheduler {
     /// 避免丢失与 `EventBus::task_enqueued_notify` 共享的唤醒信号，
     /// 也避免重置 `closed` 导致 drain 状态被静默撤销。
     fn switch_to_priority(&mut self) {
-        // 仅在当前为 Fifo 时切换；已是 Priority 则 no-op。
-        if matches!(self, Self::Priority { .. }) {
+        // 仅在当前为 Fifo 时切换；已是 Priority 或 External 则 no-op。
+        if !matches!(self, Self::Fifo { .. }) {
             return;
         }
         let (notify, closed) = match self {
             Self::Fifo { notify, closed, .. } => (Arc::clone(notify), closed),
             Self::Priority { notify, closed, .. } => (Arc::clone(notify), closed),
+            Self::External(_) => {
+                return; // 外部实现的策略由实现方持有，切换 no-op
+            }
         };
         let closed =
             std::sync::atomic::AtomicBool::new(closed.load(std::sync::atomic::Ordering::Acquire));
@@ -606,6 +612,7 @@ impl InnerScheduler {
             Self::Fifo { closed, .. } | Self::Priority { closed, .. } => {
                 closed.load(Ordering::Acquire)
             }
+            Self::External(scheduler) => scheduler.is_closed(),
         }
     }
 
@@ -616,6 +623,7 @@ impl InnerScheduler {
                 closed.store(true, Ordering::Release);
                 notify.notify_waiters();
             }
+            Self::External(scheduler) => scheduler.close(),
         }
     }
 
@@ -640,6 +648,12 @@ impl InnerScheduler {
                 let key = std::cmp::Reverse(task.priority);
                 queues.lock().entry(key).or_default().push_back(task);
                 notify.notify_one();
+            }
+            // 外部调度器的 enqueue 是 async：在同步 fast-path 内以
+            // block_on 驱动。单任务入队是即时的（内存队列），
+            // 阻塞 Actor 线程的窗口可忽略；实现方若做重 IO 应自行 spawn。
+            Self::External(scheduler) => {
+                futures::executor::block_on(scheduler.enqueue(task))?;
             }
         }
         Ok(())
@@ -671,6 +685,9 @@ impl InnerScheduler {
                 drop(qs);
                 notify.notify_one();
             }
+            Self::External(scheduler) => {
+                futures::executor::block_on(scheduler.enqueue_batch(tasks))?;
+            }
         }
         Ok(())
     }
@@ -694,23 +711,22 @@ impl InnerScheduler {
                     qs.retain(|_, q| !q.is_empty());
                     task
                 }
+                Self::External(scheduler) => scheduler.dequeue().await,
             };
             if task.is_some() {
                 return task;
             }
             if self.is_closed() {
-                match self {
-                    Self::Fifo { notify, .. } | Self::Priority { notify, .. } => {
-                        notify.notify_waiters();
-                    }
+                // External 的 close 语义由实现方持有，无本地 notify 唤醒。
+                if let Self::Fifo { notify, .. } | Self::Priority { notify, .. } = self {
+                    notify.notify_waiters();
                 }
                 return None;
             }
-            match self {
-                Self::Fifo { notify, .. } | Self::Priority { notify, .. } => {
-                    notify.notified().await;
-                }
+            if let Self::Fifo { notify, .. } | Self::Priority { notify, .. } = self {
+                notify.notified().await;
             }
+            // External：dequeue().await 由本循环顶部完成等待，无需 Notify。
         }
     }
 
@@ -723,11 +739,15 @@ impl InnerScheduler {
                 qs.retain(|_, q| !q.is_empty());
                 task
             }
+            Self::External(scheduler) => futures::executor::block_on(scheduler.try_dequeue()),
         }
     }
 
     pub(crate) fn dequeue_batch(&self, limit: usize) -> Vec<TaskDefinition> {
         match self {
+            Self::External(scheduler) => {
+                futures::executor::block_on(scheduler.dequeue_batch(limit))
+            }
             Self::Fifo { queue, .. } => {
                 let mut q = queue.lock();
                 let count = limit.min(q.len());
@@ -759,6 +779,7 @@ impl InnerScheduler {
 
     fn drain_unrouted(&self) -> Vec<TaskDefinition> {
         match self {
+            Self::External(scheduler) => futures::executor::block_on(scheduler.drain_unrouted()),
             Self::Fifo { queue, .. } => {
                 let mut q = queue.lock();
                 let old = std::mem::take(&mut *q);
@@ -790,6 +811,7 @@ impl InnerScheduler {
         match self {
             Self::Fifo { queue, .. } => queue.lock().len(),
             Self::Priority { queues, .. } => queues.lock().values().map(|q| q.len()).sum(),
+            Self::External(scheduler) => futures::executor::block_on(scheduler.len()),
         }
     }
 
@@ -797,6 +819,7 @@ impl InnerScheduler {
         match self {
             Self::Fifo { queue, .. } => queue.lock().is_empty(),
             Self::Priority { queues, .. } => queues.lock().values().all(|q| q.is_empty()),
+            Self::External(scheduler) => futures::executor::block_on(scheduler.is_empty()),
         }
     }
 }
@@ -846,6 +869,26 @@ impl SchedulerActor {
             inner: Arc::new(InnerScheduler::fifo_with_notify(notify)),
             event_bus: Some(event_bus),
         }
+    }
+
+    /// 用注入的调度策略实现构造（F4 注入缝）。
+    ///
+    /// 内部队列状态被 [`InnerScheduler::External`] 包装——Actor 协议方法与
+    /// fast-path enqueue 全部转发给该实现。策略（优先级/公平性/外部系统）
+    /// 由实现方持有。
+    pub fn with_scheduler(
+        mut self,
+        scheduler: Arc<dyn crate::runtime::workflow::Scheduler>,
+    ) -> Result<Self> {
+        let inner = Arc::get_mut(&mut self.inner).ok_or_else(|| {
+            ActantError::Internal(
+                "with_scheduler must be called before shared_inner/spawn \
+                 (inner Arc already shared)"
+                    .into(),
+            )
+        })?;
+        *inner = InnerScheduler::External(scheduler);
+        Ok(self)
     }
 
     /// 设置优先级调度策略并返回 self（builder 风格）。

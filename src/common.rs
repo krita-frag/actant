@@ -40,17 +40,18 @@ pub fn should_claim_workflow(
 
 pub use backoff::{ExponentialBackoff, REMOTE_CALL_MAX_RETRY_DELAY};
 pub use config::{
-    discovery_mode, scheduler_kind, ActantConfig, ActorConfig, DiscoveryMode, FailoverConfig,
-    GossipConfig, NetworkConfig, SchedulerKind, StoreConfig, SyncMode, WorkerConfig,
-    WorkflowConfig,
+    discovery_mode, scheduler_kind, ActantConfig, ActorConfig, DiscoveryMode, EventBusConfig,
+    FailoverConfig, GossipConfig, NetworkConfig, SchedulerKind, StoreConfig, SyncMode,
+    WorkerConfig, WorkflowConfig,
 };
 pub use error::{format_error_kind, ActantError, Result};
 pub use wire::TopicRoute;
 // 领域类型 — 公共 API
 pub use model::{
     node_labels_within_limit, ActorErrorEnvelope, ActorErrorKind, ActorId, ActorMessage,
-    ActorMessageResult, ActorStatus, BlobHash, MessageId, NodeId, PlatformInfo, RetryPolicy,
-    TaskCompletion, TaskDefinition, TaskId, WorkflowId, NODE_LABELS_MAX_BYTES,
+    ActorMessageResult, ActorStatus, BlobHash, HlcTimestamp, HybridLogicalClock, MessageId, NodeId,
+    PlatformInfo, RetryPolicy, TaskCompletion, TaskDefinition, TaskId, WorkflowId,
+    NODE_LABELS_MAX_BYTES,
 };
 // 协议类型 — crate 内部
 pub(crate) use wire::{

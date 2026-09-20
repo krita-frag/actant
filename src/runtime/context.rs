@@ -199,6 +199,7 @@ impl Runtime {
         );
         let dag_gossip_actor_id = crate::common::ActorId::dag_gossip(&self.node_id);
         let worker = init_worker(WorkerInitParams {
+            scheduler: None,
             node_id: &self.node_id,
             network: &self.network,
             event_bus: self.event_bus.clone(),

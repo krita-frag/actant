@@ -12,7 +12,6 @@ def test_runtime_registers_builtin_capabilities() -> None:
     rt = Runtime()
     names = rt.capabilities
     assert "Routing" in names
-    assert "Execute" in names
 
 
 def test_layer_chain_and_handlers() -> None:

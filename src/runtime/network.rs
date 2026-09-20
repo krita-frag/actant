@@ -281,20 +281,6 @@ impl Discovery for LocalDiscovery {
 }
 
 /// 基于 mDNS 的本地网络发现。
-#[derive(Debug, Clone, Copy, Default)]
-pub struct MdnsDiscovery;
-
-impl Discovery for MdnsDiscovery {
-    #[tracing::instrument(name = "discovery.mdns", level = "debug", skip_all)]
-    fn apply(&self, builder: Builder) -> Builder {
-        iroh::endpoint::presets::N0DisableRelay.apply(builder)
-    }
-
-    fn name(&self) -> &'static str {
-        discovery_mode::MDNS
-    }
-}
-
 /// DNS endpoint 发现策略。
 ///
 /// 启用 iroh 的 `DnsAddressLookup` + `PkarrPublisher`，禁用 relay。
@@ -329,25 +315,6 @@ impl Discovery for DnsDiscovery {
     }
 }
 
-/// 强制启用 iroh relay 中继的发现策略。
-///
-/// 等价于 n0 预设但显式启用 `RelayMode::Default`，确保 NAT 穿透场景下
-/// 节点可通过 n0 公共 relay 中继。自定义 relay 集群经
-/// `NetworkConfig.relay_endpoints` 配置（覆盖 preset relay）。
-#[derive(Debug, Clone, Copy, Default)]
-pub struct RelayDiscovery;
-
-impl Discovery for RelayDiscovery {
-    #[tracing::instrument(name = "discovery.relay", level = "debug", skip_all)]
-    fn apply(&self, builder: Builder) -> Builder {
-        iroh::endpoint::presets::N0.apply(builder)
-    }
-
-    fn name(&self) -> &'static str {
-        discovery_mode::RELAY
-    }
-}
-
 /// 装箱的类型擦除发现策略。
 #[derive(Debug, Clone)]
 pub struct BoxedDiscovery(Arc<dyn Discovery>);
@@ -368,29 +335,6 @@ impl Discovery for BoxedDiscovery {
     }
 }
 
-/// 若 `name` 是内置发现策略则返回 `true`。
-pub fn is_registered(name: &str) -> bool {
-    matches!(
-        name,
-        discovery_mode::NONE
-            | discovery_mode::LOCAL
-            | discovery_mode::MDNS
-            | discovery_mode::DNS
-            | discovery_mode::RELAY
-    )
-}
-
-/// 返回内置发现策略名称的排序列表。
-pub fn registered_names() -> Vec<String> {
-    vec![
-        discovery_mode::NONE.to_string(),
-        discovery_mode::LOCAL.to_string(),
-        discovery_mode::MDNS.to_string(),
-        discovery_mode::DNS.to_string(),
-        discovery_mode::RELAY.to_string(),
-    ]
-}
-
 /// 从字符串名创建发现策略。
 ///
 /// `dns` 模式下 `config.dns_origin_domain` 非空时使用自定义 DNS 起源域，
@@ -403,15 +347,15 @@ pub fn discovery_from_name(
     match name {
         discovery_mode::NONE => Ok(BoxedDiscovery::new(NoDiscovery)),
         discovery_mode::LOCAL => Ok(BoxedDiscovery::new(LocalDiscovery)),
-        discovery_mode::MDNS => Ok(BoxedDiscovery::new(MdnsDiscovery)),
         discovery_mode::DNS => Ok(BoxedDiscovery::new(DnsDiscovery {
             origin_domain: config.dns_origin_domain.clone(),
         })),
-        discovery_mode::RELAY => Ok(BoxedDiscovery::new(RelayDiscovery)),
         other => Err(ActantError::Config(format!(
-            "unknown discovery mode '{}': expected one of {}",
+            "unknown discovery mode '{}': expected one of {}, {}, {}",
             other,
-            registered_names().join(", ")
+            discovery_mode::NONE,
+            discovery_mode::LOCAL,
+            discovery_mode::DNS
         ))),
     }
 }
@@ -512,7 +456,7 @@ impl NetworkManager {
     /// 如果配置校验失败、发现策略未知、endpoint bind 失败、router 启动失败，
     /// 或 bootstrap peer 解析失败，返回错误。
     pub async fn new(node_id: NodeId, config: NetworkConfig) -> crate::common::Result<Self> {
-        Self::build(node_id, config, None, None).await
+        Self::build(node_id, config, None, None, None).await
     }
 
     /// 创建启用了 blob 原语的 [`NetworkManager`]。
@@ -528,20 +472,23 @@ impl NetworkManager {
         config: NetworkConfig,
         blobs: Arc<BlobStore>,
     ) -> crate::common::Result<Self> {
-        Self::build(node_id, config, Some(blobs), None).await
+        Self::build(node_id, config, Some(blobs), None, None).await
     }
 
     /// 同 [`Self::with_blob_store`]，另注入节点身份密钥（identity）。
     ///
     /// `Some(key)` 时 endpoint 以该 keypair 构造——endpoint id 由密钥决定，
     /// 跨重启稳定；`None`（默认）时由 iroh 生成临时密钥。
+    /// `discovery_override`（F4）非 `None` 时替换 `discovery_mode` 字符串
+    /// 选择的内置策略。
     pub async fn with_identity(
         node_id: NodeId,
         config: NetworkConfig,
         blobs: Arc<BlobStore>,
         secret_key: Option<iroh::SecretKey>,
+        discovery_override: Option<Arc<dyn Discovery>>,
     ) -> crate::common::Result<Self> {
-        Self::build(node_id, config, Some(blobs), secret_key).await
+        Self::build(node_id, config, Some(blobs), secret_key, discovery_override).await
     }
 
     async fn build(
@@ -549,6 +496,7 @@ impl NetworkManager {
         config: NetworkConfig,
         blobs: Option<Arc<BlobStore>>,
         secret_key: Option<iroh::SecretKey>,
+        discovery_override: Option<Arc<dyn Discovery>>,
     ) -> crate::common::Result<Self> {
         let _span = tracing::info_span!("network.new", node = %node_id).entered();
         tracing::info!(
@@ -556,7 +504,13 @@ impl NetworkManager {
             listen_port = config.listen_port,
             "network.new: enter"
         );
-        let discovery = discovery_from_name(config.discovery_mode.as_str(), &config)?;
+        let discovery: Arc<dyn Discovery> = match discovery_override {
+            Some(d) => d,
+            None => Arc::new(discovery_from_name(
+                config.discovery_mode.as_str(),
+                &config,
+            )?),
+        };
         tracing::info!("network.new: discovery resolved");
 
         let builder = Endpoint::builder(iroh::endpoint::presets::Minimal);

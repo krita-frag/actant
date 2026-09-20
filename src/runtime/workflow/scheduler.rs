@@ -20,7 +20,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::common::scheduler_kind;
 use crate::common::{ActantError, ActorId, TaskDefinition};
 use crate::runtime::actor::ActorSystem;
 use crate::runtime::workflow::actor::{scheduler_methods, InnerScheduler};
@@ -93,20 +92,6 @@ pub trait Scheduler: Send + Sync {
 ///
 /// 供 [`crate::common::SchedulerKind::validate`] 在启动时拒绝未知调度器名，
 /// 而非静默回退到默认策略。
-pub fn is_registered(name: &str) -> bool {
-    matches!(name, scheduler_kind::FIFO | scheduler_kind::PRIORITY)
-}
-
-/// 返回内置调度器种类名称的排序列表。
-///
-/// 供配置错误信息枚举合法选项使用。
-pub fn registered_names() -> Vec<String> {
-    vec![
-        scheduler_kind::FIFO.to_string(),
-        scheduler_kind::PRIORITY.to_string(),
-    ]
-}
-
 /// 构造启用 enqueue fast-path 的 [`ActorScheduler`]（供 bench/test 使用）。
 ///
 /// 生产代码用 [`crate::runtime::builder::init_worker`] 装配；此函数仅供

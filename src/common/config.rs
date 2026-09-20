@@ -23,16 +23,21 @@ impl DiscoveryMode {
 
     /// 校验构造器。
     ///
-    /// 仅当名称已在发现注册表中注册时返回 `Ok`，否则返回
+    /// 仅当名称是内置发现模式时返回 `Ok`，否则返回
     /// [`crate::common::ActantError::Config`] — 不做静默回退。
     pub fn parse(s: &str) -> Result<Self, crate::common::ActantError> {
-        if crate::runtime::network::is_registered(s) {
+        if matches!(
+            s,
+            discovery_mode::NONE | discovery_mode::LOCAL | discovery_mode::DNS
+        ) {
             Ok(Self(s.to_string()))
         } else {
             Err(crate::common::ActantError::Config(format!(
-                "unknown discovery mode '{}': expected one of {}",
+                "unknown discovery mode '{}': expected one of {}, {}, {}",
                 s,
-                crate::runtime::network::registered_names().join(", ")
+                discovery_mode::NONE,
+                discovery_mode::LOCAL,
+                discovery_mode::DNS
             )))
         }
     }
@@ -63,7 +68,6 @@ impl std::fmt::Display for DiscoveryMode {
 ///
 /// - `none`：无自动发现，仅靠 `bootstrap_nodes` 显式拨号。
 /// - `local`：n0 预设（DNS + Pkarr 发布 + relay 兜底），适合互联网节点。
-/// - `mdns`：局域网（n0 预设但禁用 relay）。
 /// - `dns`：仅 DNS endpoint 发现（`DnsAddressLookup` + `PkarrPublisher`），无 relay。
 ///   适合 K8s Headless Service / 自建 DNS 场景：通过 `dns_origin_domain` 指定起源域。
 /// - `relay`：强制启用 iroh relay（`RelayMode::Default` + DNS），适合 NAT 穿透场景。
@@ -76,8 +80,6 @@ pub mod discovery_mode {
     pub const MDNS: &str = "mdns";
     /// 仅 DNS endpoint 发现（无 relay）。配合 `dns_origin_domain` 使用。
     pub const DNS: &str = "dns";
-    /// 强制启用 iroh relay 中继，适合 NAT 穿透场景。
-    pub const RELAY: &str = "relay";
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -89,7 +91,7 @@ pub struct ActantConfig {
     pub store: StoreConfig,
     pub failover: FailoverConfig,
     pub gossip: GossipConfig,
-    pub event_bus: crate::runtime::event_bus::EventBusConfig,
+    pub event_bus: EventBusConfig,
     /// 任务 payload 签名密钥。
     ///
     /// - 非空时：所有任务 payload 使用 BLAKE3 keyed hash 签名，反序列化前验证签名，
@@ -180,15 +182,16 @@ impl SchedulerKind {
         Self(s.into())
     }
 
-    /// 校验构造器 — 检查调度器注册表。
+    /// 校验构造器 — 检查内置调度器种类。
     pub fn parse(s: &str) -> Result<Self, crate::common::ActantError> {
-        if crate::runtime::workflow::scheduler::is_registered(s) {
+        if matches!(s, scheduler_kind::FIFO | scheduler_kind::PRIORITY) {
             Ok(Self(s.to_string()))
         } else {
             Err(crate::common::ActantError::Config(format!(
-                "unknown scheduler kind '{}': expected one of {}",
+                "unknown scheduler kind '{}': expected one of {}, {}",
                 s,
-                crate::runtime::workflow::scheduler::registered_names().join(", ")
+                scheduler_kind::FIFO,
+                scheduler_kind::PRIORITY
             )))
         }
     }
@@ -226,14 +229,12 @@ pub struct WorkerConfig {
     /// 调度器类型，内置项见 [`scheduler_kind`]。
     #[serde(default = "default_scheduler_kind")]
     pub scheduler_kind: SchedulerKind,
-    pub timeout_check_interval_ms: u64,
     pub default_task_timeout_ms: u64,
     /// 本地最大并发任务数（信号量背压 + 远端转发判断）。
     ///
     /// 进程池后端的有效本地并发由 worker 子进程数决定；此值应等于
     /// `num_worker_processes`，保持信号量与进程池容量一致。
     pub max_concurrent_tasks: usize,
-    pub completion_channel_capacity: usize,
     pub broadcast_retry_attempts: usize,
     pub broadcast_retry_base_delay_ms: u64,
     pub drain_timeout_secs: u64,
@@ -301,10 +302,8 @@ impl Default for WorkerConfig {
         let proc_count = num_cpus::get().max(1);
         Self {
             scheduler_kind: default_scheduler_kind(),
-            timeout_check_interval_ms: 10,
             default_task_timeout_ms: 30000,
             max_concurrent_tasks: proc_count,
-            completion_channel_capacity: 256,
             broadcast_retry_attempts: 3,
             broadcast_retry_base_delay_ms: 100,
             drain_timeout_secs: 30,
@@ -548,6 +547,31 @@ impl Default for StoreConfig {
             map_size: 2 * 1024 * 1024 * 1024,
             max_dbs: 16,
             sync_mode: SyncMode::default(),
+        }
+    }
+}
+
+/// EventBus 配置（F5 下移：纯配置结构，与 runtime 无依赖）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventBusConfig {
+    /// 每个订阅者的默认通道容量。
+    #[serde(default = "default_subscriber_capacity")]
+    pub subscriber_capacity: usize,
+}
+
+impl EventBusConfig {
+    /// 默认订阅者通道容量。
+    pub const DEFAULT_SUBSCRIBER_CAPACITY: usize = 256;
+}
+
+fn default_subscriber_capacity() -> usize {
+    EventBusConfig::DEFAULT_SUBSCRIBER_CAPACITY
+}
+
+impl Default for EventBusConfig {
+    fn default() -> Self {
+        Self {
+            subscriber_capacity: EventBusConfig::DEFAULT_SUBSCRIBER_CAPACITY,
         }
     }
 }

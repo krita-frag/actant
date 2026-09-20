@@ -7,16 +7,12 @@
 //! Rust 核心只保留：
 //! - `Capability` / `Handler` / `Layer` / `CapabilityRuntime` trait 与运行时
 //! - 内置 capability 的序列化 codec 注册（`register_defaults`）
-//! - 基于真实子系统的 handler（`StoreHandler` / `ExecuteHandler`）
-
-use std::sync::Arc;
-use std::time::Duration;
+//! - 基于真实子系统的 handler（`StoreHandler`）
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::common::{ActantError, NodeId, TaskId, WorkflowId};
-use crate::runtime::dispatcher::TaskDispatcher;
 use crate::runtime::state::LmdbStore as StateStore;
 
 use super::{
@@ -73,36 +69,6 @@ pub enum StoreReq {
     Put { key: Vec<u8>, value: Vec<u8> },
     Get { key: Vec<u8> },
     Delete { key: Vec<u8> },
-}
-
-pub struct Execute;
-impl Capability for Execute {
-    type Request = ExecuteCtx;
-    type Response = Result<ExecuteOutcome, String>;
-}
-impl Execute {
-    pub fn meta() -> CapabilityMeta {
-        CapabilityMeta::new::<Self>("Execute", EffectKind::Perform)
-    }
-}
-
-/// `Execute` capability 请求上下文。
-///
-/// `timeout_ms` 语义与 Python `@task(timeout_ms=...)` 文档对齐：`0` = 无超时
-/// （由 [`ExecuteHandler`] 映射为远期硬超时，见 [`EXECUTE_NO_TIMEOUT`]），
-/// 非 `0` 值为毫秒级硬超时——超时后 dispatcher 立即强杀 worker 进程。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecuteCtx {
-    pub task_id: TaskId,
-    pub workflow_id: WorkflowId,
-    pub payload: Vec<u8>,
-    pub timeout_ms: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecuteOutcome {
-    pub task_id: TaskId,
-    pub result_payload: Vec<u8>,
 }
 
 pub struct TaskLifecycle;
@@ -197,7 +163,6 @@ pub fn builtin_capabilities() -> Vec<CapabilityMeta> {
         Serialization::meta(),
         Transport::meta(),
         Store::meta(),
-        Execute::meta(),
         TaskLifecycle::meta(),
         WorkflowLifecycle::meta(),
         NodeLifecycle::meta(),
@@ -214,7 +179,6 @@ pub fn register_defaults(runtime: &CapabilityRuntime) {
     runtime.register_codec::<Serialization>();
     runtime.register_codec::<Transport>();
     runtime.register_codec::<Store>();
-    runtime.register_codec::<Execute>();
     runtime.register_codec::<TaskLifecycle>();
     runtime.register_codec::<WorkflowLifecycle>();
     runtime.register_codec::<NodeLifecycle>();
@@ -222,7 +186,6 @@ pub fn register_defaults(runtime: &CapabilityRuntime) {
     runtime.ensure_layer::<Serialization>(Serialization::meta());
     runtime.ensure_layer::<Transport>(Transport::meta());
     runtime.ensure_layer::<Store>(Store::meta());
-    runtime.ensure_layer::<Execute>(Execute::meta());
     runtime.ensure_layer::<TaskLifecycle>(TaskLifecycle::meta());
     runtime.ensure_layer::<WorkflowLifecycle>(WorkflowLifecycle::meta());
     runtime.ensure_layer::<NodeLifecycle>(NodeLifecycle::meta());
@@ -279,59 +242,6 @@ impl Handler<Store> for StoreHandler {
     }
 }
 
-/// 基于真实 `TaskDispatcher` 的 `Execute` capability handler。
-#[derive(Clone)]
-pub struct ExecuteHandler {
-    dispatcher: Arc<dyn TaskDispatcher>,
-    signing_key: Vec<u8>,
-}
-
-impl ExecuteHandler {
-    pub fn new(dispatcher: Arc<dyn TaskDispatcher>, signing_key: Vec<u8>) -> Self {
-        Self {
-            dispatcher,
-            signing_key,
-        }
-    }
-}
-
-/// `timeout_ms = 0`（无超时语义）映射到的硬超时时长。
-///
-/// 取 tokio `time::sleep` 支持的最大毫秒数（约 2.2 年，更长的输入会被 tokio
-/// 截断到同一上限），使任务在实践中等效于不受超时约束。直接传
-/// `Duration::from_millis(0)` 会让 dispatcher 的超时分支立即命中并强杀
-/// worker——历史陷阱，`0` 必须先行映射。
-const EXECUTE_NO_TIMEOUT: Duration = Duration::from_millis(68_719_476_734);
-
-#[async_trait]
-impl Handler<Execute> for ExecuteHandler {
-    async fn handle(&self, req: ExecuteCtx) -> Option<Result<ExecuteOutcome, String>> {
-        let cancel_flag = crate::runtime::dispatcher::new_cancel_flag();
-        let payload = crate::common::payload::sign(&self.signing_key, &req.payload)
-            .map_err(|e| format!("payload sign: {}", e));
-        let payload = match payload {
-            Ok(p) => p,
-            Err(e) => return Some(Err(e)),
-        };
-        let timeout = if req.timeout_ms == 0 {
-            EXECUTE_NO_TIMEOUT
-        } else {
-            Duration::from_millis(req.timeout_ms)
-        };
-        let result = self
-            .dispatcher
-            .dispatch(req.task_id.as_ref(), payload, cancel_flag, timeout)
-            .await;
-        Some(match result {
-            Ok(result_payload) => Ok(ExecuteOutcome {
-                task_id: req.task_id,
-                result_payload,
-            }),
-            Err(e) => Err(e.to_string()),
-        })
-    }
-}
-
 /// 注册真实 `Store` handler。
 ///
 /// Rust 核心不在 `register_defaults` 中注册任何 `Store` handler；
@@ -350,21 +260,5 @@ pub fn register_serialization_handler(runtime: &CapabilityRuntime) -> Result<(),
     runtime.register(
         Layer::<Serialization>::new(Serialization::meta())
             .chain_erased(erase_handler(SerializationHandler)),
-    )
-}
-
-/// 注册真实 `Execute` handler。
-///
-/// Rust 核心不在 `register_defaults` 中注册任何 `Execute` handler；
-/// `dispatcher` 必须注入实现了 [`TaskDispatcher`] 的执行后端（生产为
-/// 进程池 `ProcessTaskDispatcher`），否则 `Execute` capability 调用会失败。
-pub fn register_execute_handler(
-    runtime: &CapabilityRuntime,
-    dispatcher: Arc<dyn TaskDispatcher>,
-    signing_key: Vec<u8>,
-) -> Result<(), ActantError> {
-    runtime.register(
-        Layer::<Execute>::new(Execute::meta())
-            .chain_erased(erase_handler(ExecuteHandler::new(dispatcher, signing_key))),
     )
 }

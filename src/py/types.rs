@@ -12,9 +12,8 @@ use pyo3::types::PyDict;
 use crate::common::{NodeId, TaskId, WorkflowId};
 use crate::py::gil_thread::GilThread;
 use crate::runtime::capability::{
-    Execute, ExecuteCtx, ExecuteOutcome, NodeEvent, NodeLifecycle, Serialization, SerializationReq,
-    Store, StoreReq, TaskEvent, TaskLifecycle, Transport, TransportReq, WorkflowEvent,
-    WorkflowLifecycle,
+    NodeEvent, NodeLifecycle, Serialization, SerializationReq, Store, StoreReq, TaskEvent,
+    TaskLifecycle, Transport, TransportReq, WorkflowEvent, WorkflowLifecycle,
 };
 use crate::runtime::dispatcher::CancelFlag;
 
@@ -292,52 +291,6 @@ impl PyHandlerPerformCodec<Store> for StoreCodec {
             Ok(data) => Ok(Ok(Some(data))),
             Err(e) => Ok(Err(e.to_string())),
         }
-    }
-}
-
-pub struct ExecuteCodec;
-
-impl PyPerformCodec<Execute> for ExecuteCodec {
-    fn decode_request(ob: &Bound<'_, PyAny>) -> PyResult<ExecuteCtx> {
-        ob.extract()
-    }
-
-    fn encode_response(
-        py: Python<'_>,
-        resp: Result<ExecuteOutcome, String>,
-    ) -> PyResult<Bound<'_, PyAny>> {
-        use pyo3::types::PyBytes;
-        match resp {
-            Ok(outcome) => {
-                let dict = dict_response(py);
-                dict.set_item("task_id", outcome.task_id.to_string())?;
-                dict.set_item("result_payload", PyBytes::new(py, &outcome.result_payload))?;
-                Ok(dict.into_any())
-            }
-            Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e)),
-        }
-    }
-}
-
-impl PyHandlerPerformCodec<Execute> for ExecuteCodec {
-    fn encode_request<'py>(py: Python<'py>, req: &ExecuteCtx) -> PyResult<Bound<'py, PyAny>> {
-        let dict = dict_response(py);
-        dict.set_item("task_id", req.task_id.to_string())?;
-        dict.set_item("workflow_id", req.workflow_id.to_string())?;
-        dict.set_item("payload", bytes_response(py, &req.payload)?)?;
-        dict.set_item("timeout_ms", req.timeout_ms)?;
-        Ok(dict.into_any())
-    }
-
-    fn decode_response<'py>(
-        _py: Python<'py>,
-        obj: &Bound<'py, PyAny>,
-    ) -> PyResult<Result<ExecuteOutcome, String>> {
-        let outcome = ExecuteOutcome {
-            task_id: TaskId::from(get_string(obj, "task_id")?),
-            result_payload: get_bytes(obj, "result_payload").unwrap_or_default(),
-        };
-        Ok(Ok(outcome))
     }
 }
 
@@ -628,19 +581,6 @@ impl<'a, 'py> FromPyObject<'a, 'py> for StoreReq {
                 op
             ))),
         }
-    }
-}
-
-impl<'a, 'py> FromPyObject<'a, 'py> for ExecuteCtx {
-    type Error = PyErr;
-    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> Result<Self, Self::Error> {
-        let ob = ob.to_owned();
-        Ok(ExecuteCtx {
-            task_id: task_id(&ob, "task_id")?,
-            workflow_id: workflow_id(&ob, "workflow_id")?,
-            payload: get_bytes(&ob, "payload")?,
-            timeout_ms: get_u64(&ob, "timeout_ms")?,
-        })
     }
 }
 

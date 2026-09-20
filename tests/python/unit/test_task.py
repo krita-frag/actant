@@ -5,7 +5,7 @@
 - ``submit`` 异步执行与结果获取
 - 任务依赖自动解析
 - 重试与超时
-- 失败传播（异常编码进 ``ExecuteOutcome.error_payload``）
+- 失败传播（异常编码进结果帧 payload）
 - 任务注册表查询/取消
 - ``@flow`` 生命周期事件
 - ``TaskState`` 字面量类型

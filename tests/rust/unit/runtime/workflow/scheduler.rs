@@ -24,20 +24,6 @@ fn make_task(name: &str, priority: i32) -> TaskDefinition {
     }
 }
 
-#[test]
-fn is_registered_recognizes_builtin_kinds() {
-    assert!(is_registered(scheduler_kind::PRIORITY));
-    assert!(is_registered(scheduler_kind::FIFO));
-    assert!(!is_registered("nonexistent"));
-}
-
-#[test]
-fn registered_names_includes_builtins() {
-    let names = registered_names();
-    assert!(names.contains(&scheduler_kind::PRIORITY.to_string()));
-    assert!(names.contains(&scheduler_kind::FIFO.to_string()));
-}
-
 #[tokio::test]
 async fn actor_scheduler_forwards_through_scheduler_actor() {
     let actor_system = Arc::new(ActorSystem::new());

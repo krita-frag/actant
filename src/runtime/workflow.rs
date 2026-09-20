@@ -56,4 +56,4 @@ pub use route::{DefaultRoutePolicy, RouteCandidate, RouteContext, RoutePolicy};
 pub use runtime::{Worker, WorkerState};
 #[doc(hidden)]
 pub use scheduler::spawn_fast_path_scheduler;
-pub use scheduler::{is_registered, registered_names, ActorScheduler, Scheduler};
+pub use scheduler::{ActorScheduler, Scheduler};

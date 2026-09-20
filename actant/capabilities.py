@@ -29,7 +29,6 @@ RETRY_POLICY = "RetryPolicy"
 SERIALIZATION = "Serialization"
 TRANSPORT = "Transport"
 STORE = "Store"
-EXECUTE = "Execute"
 
 #: 副作用型（默认 handler 为 Python→Rust blob 桥，Python 可覆盖，如 S3 后端）
 VALUE_STORE = "ValueStore"
@@ -100,34 +99,6 @@ class StoreReq:
     key: bytes
     value: bytes = b""
 
-
-@dataclass
-class ExecuteCtx:
-    """`Execute` capability 的请求上下文。
-
-    ``timeout_ms`` 与 ``@task(timeout_ms=...)`` 语义对齐：``0`` = 无超时
-    （Rust 侧 ``ExecuteHandler`` 映射为远期硬超时），非 ``0`` 为毫秒级硬超时。
-    """
-
-    task_id: str
-    workflow_id: str
-    payload: bytes
-    timeout_ms: int = 0
-
-
-@dataclass
-class ExecuteOutcome:
-    """`Execute` capability 的执行结果。
-
-    成功时 ``result_payload`` 携带 cloudpickle 序列化的返回值，``error_payload`` 为空。
-    失败时 ``error_payload`` 携带 cloudpickle 序列化的异常实例，``result_payload`` 为空；
-    调用方（如 ``AsyncResult.result``）据此重新抛出异常。此设计使任务失败可跨节点传播，
-    而非依赖 ``perform`` 抛出异常（后者在跨节点时无法保证异常类型可序列化）。
-    """
-
-    task_id: str
-    result_payload: bytes
-    error_payload: bytes = b""
 
 
 @dataclass
@@ -218,13 +189,6 @@ class StoreHandler(Protocol):
 
 
 @runtime_checkable
-class ExecuteHandler(Protocol):
-    """副作用型：执行任务。"""
-
-    def __call__(self, ctx: ExecuteCtx) -> ExecuteOutcome: ...
-
-
-@runtime_checkable
 class ValueStoreHandler(Protocol):
     """副作用型：值引用存取。
 
@@ -278,7 +242,6 @@ BUILTIN_CAPABILITIES: dict[str, CapabilityMeta] = {
     "Serialization": CapabilityMeta("Serialization", "perform"),
     "Transport": CapabilityMeta("Transport", "perform"),
     "Store": CapabilityMeta("Store", "perform"),
-    "Execute": CapabilityMeta("Execute", "perform"),
     # ── 副作用型（默认 handler 为 Python→Rust blob 桥，Python 可覆盖）──
     "ValueStore": CapabilityMeta("ValueStore", "perform"),
     # ── 反应型（Rust 事件总线广播，Python 可订阅）──
@@ -334,7 +297,6 @@ def get_builtin_capability_meta(name: str) -> CapabilityMeta:
 
 __all__ = [
     "BUILTIN_CAPABILITIES",
-    "EXECUTE",
     "NODE_LIFECYCLE",
     "PYTHON_ONLY_CAPABILITIES",
     "RETRY_POLICY",
@@ -349,9 +311,6 @@ __all__ = [
     "WORKFLOW_LIFECYCLE",
     "CapabilityMeta",
     "EffectKind",
-    "ExecuteCtx",
-    "ExecuteHandler",
-    "ExecuteOutcome",
     "NodeEvent",
     "NodeLifecycleHandler",
     "RetryCtx",

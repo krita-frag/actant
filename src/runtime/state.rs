@@ -9,18 +9,17 @@
 
 pub mod event_log;
 
-use std::cmp::Ordering;
+pub use crate::common::{HlcTimestamp, HybridLogicalClock};
+
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use heed::types::{Bytes, Str};
 use heed::{Database, Env, EnvOpenOptions};
 use parking_lot::{Condvar, Mutex};
-use rkyv::Archive;
-use serde::{Deserialize, Serialize};
 
 use crate::common::{ActantError, Result, StoreConfig};
 
@@ -748,172 +747,6 @@ impl Store {
     }
 }
 
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Serialize,
-    Deserialize,
-    Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-)]
-#[rkyv(bytecheck())]
-pub struct HlcTimestamp {
-    wall_time: u64,
-    logical: u32,
-}
-
-impl HlcTimestamp {
-    pub fn zero() -> Self {
-        Self {
-            wall_time: 0,
-            logical: 0,
-        }
-    }
-
-    pub fn wall_time(&self) -> u64 {
-        self.wall_time
-    }
-
-    pub fn logical(&self) -> u32 {
-        self.logical
-    }
-
-    pub fn from_parts(wall_time: u64, logical: u32) -> Self {
-        Self { wall_time, logical }
-    }
-}
-
-impl PartialOrd for HlcTimestamp {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for HlcTimestamp {
-    fn cmp(&self, other: &Self) -> Ordering {
-        match self.wall_time().cmp(&other.wall_time()) {
-            Ordering::Equal => self.logical().cmp(&other.logical()),
-            other => other,
-        }
-    }
-}
-
-pub struct HybridLogicalClock {
-    inner: Mutex<Inner>,
-    max_drift_nanos: u64,
-}
-
-struct Inner {
-    last_time: u64,
-    logical: u32,
-}
-
-impl HybridLogicalClock {
-    pub fn new() -> Self {
-        Self::with_max_drift_ms(500)
-    }
-
-    pub fn with_max_drift_ms(max_drift_ms: u64) -> Self {
-        Self {
-            inner: Mutex::new(Inner {
-                last_time: 0,
-                logical: 0,
-            }),
-            max_drift_nanos: max_drift_ms.saturating_mul(1_000_000),
-        }
-    }
-
-    fn physical_now() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0)
-    }
-
-    pub fn tick(&self) -> HlcTimestamp {
-        let mut inner = self.inner.lock();
-        let physical = Self::physical_now();
-
-        if physical > inner.last_time {
-            inner.last_time = physical;
-            inner.logical = 0;
-        } else {
-            inner.logical += 1;
-        }
-
-        HlcTimestamp {
-            wall_time: inner.last_time,
-            logical: inner.logical,
-        }
-    }
-
-    /// 按 Kulkarni 标准 HLC merge 算法推进时钟（`max(pt_j, l.pt, m.pt)`）。
-    ///
-    /// 记 `pt` 为本地物理时钟、`l` 为本地上次状态、`m` 为（可能被 drift 上限
-    /// 截断的）远端时间戳，新的逻辑计数按三方最大值归属决定：
-    /// - 物理时钟严格主导：`c = 0`；
-    /// - 仅本地历史并列主导：`c = l.c + 1`；
-    /// - 仅远端并列主导：`c = m.c + 1`；
-    /// - 本地与远端同时并列主导：`c = max(l.c, m.c) + 1`。
-    ///
-    /// 每个分支都保证输出严格大于本地此前发出的任何时间戳（单调性）：
-    /// wall_time 不小于旧值；wall_time 相等时逻辑计数严格递增。
-    /// 远端超出 drift 上限时按 `(cap, m.c)` 参与比较，单调性不受影响。
-    pub fn merge(&self, remote: &HlcTimestamp) -> HlcTimestamp {
-        let mut inner = self.inner.lock();
-        let physical = Self::physical_now();
-        let max_drift = self.max_drift_nanos;
-
-        let capped_wall_time = if remote.wall_time() > physical.saturating_add(max_drift) {
-            tracing::warn!(
-                "HLC drift detected: remote wall_time {}ns exceeds local physical {}ns by >{}ms, capping",
-                remote.wall_time(),
-                physical,
-                max_drift / 1_000_000,
-            );
-            physical.saturating_add(max_drift)
-        } else {
-            remote.wall_time()
-        };
-
-        let local_wall = inner.last_time;
-        let local_logical = inner.logical;
-        let max_wall = physical.max(local_wall).max(capped_wall_time);
-        inner.last_time = max_wall;
-
-        let eq_local = max_wall == local_wall;
-        let eq_remote = max_wall == capped_wall_time;
-        inner.logical = if eq_local && eq_remote {
-            // 本地与远端并列主导：取双方逻辑计数的最大值再加一。
-            local_logical.max(remote.logical()).saturating_add(1)
-        } else if eq_local {
-            // 仅本地历史主导：本地物理时钟未前进（tick 语义的 c+1）。
-            local_logical.saturating_add(1)
-        } else if eq_remote {
-            // 仅远端并列主导。
-            remote.logical().saturating_add(1)
-        } else {
-            // 物理时钟严格大于双方：逻辑计数清零。
-            0
-        };
-
-        HlcTimestamp {
-            wall_time: inner.last_time,
-            logical: inner.logical,
-        }
-    }
-}
-
-impl Default for HybridLogicalClock {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 const FILE_MODE: u32 = 0o600;
 #[cfg(unix)]
 const DIR_MODE: u32 = 0o700;
@@ -979,112 +812,6 @@ fn restrict_file_permissions(path: &Path) -> Result<()> {
 #[cfg(test)]
 #[path = "../../tests/rust/unit/runtime/state.rs"]
 mod tests;
-
-/// HLC merge 单调性测试。
-///
-/// 与外置 `mod tests`（镜像单测文件）分离，专测 merge 在各分支下的
-/// 全序递增不变量：任一节点发出的 HLC 时间戳必须严格大于其此前发出
-/// 的所有时间戳，无论远端时间戳新旧、是否触发 drift cap。
-#[cfg(test)]
-mod hlc_merge_tests {
-    use super::{HlcTimestamp, HybridLogicalClock};
-
-    /// 断言 `next` 严格大于该节点此前输出的最大时间戳。
-    fn assert_advances(last: &mut Option<HlcTimestamp>, next: HlcTimestamp) {
-        if let Some(prev) = *last {
-            assert!(
-                next > prev,
-                "HLC regressed: ({}, {}) <= ({}, {})",
-                next.wall_time(),
-                next.logical(),
-                prev.wall_time(),
-                prev.logical()
-            );
-        }
-        *last = Some(next);
-    }
-
-    #[test]
-    fn physical_dominant_resets_logical() {
-        let clock = HybridLogicalClock::new();
-        // 远端为过去时间戳：物理时钟严格主导，logical 清零（Kulkarni c=0）。
-        let stale = HlcTimestamp::from_parts(1, 999);
-        let t = clock.merge(&stale);
-        assert_eq!(t.logical(), 0);
-        assert!(t.wall_time() > 1);
-    }
-
-    #[test]
-    fn tie_with_remote_takes_max_plus_one() {
-        // 远端时间戳取在 1000s 后的未来且 drift 上限极大，保证测试期间
-        // 本地物理时钟不可能越过它——排除真实时钟前进带来的不确定性。
-        let now = HybridLogicalClock::physical_now();
-        let clock = HybridLogicalClock::with_max_drift_ms(u64::MAX / 4_000_000);
-        let future_wall = now + 1_000_000_000_000;
-        // 本地先吸收远端时间戳，使本地历史与该远端并列。
-        let remote = HlcTimestamp::from_parts(future_wall, 7);
-        let t1 = clock.merge(&remote);
-        assert_eq!(t1.wall_time(), future_wall);
-        assert_eq!(t1.logical(), 8);
-
-        // 与远端时间戳并列的再次 merge：max(local, remote) + 1，而非远端 +1。
-        let t2 = clock.merge(&HlcTimestamp::from_parts(future_wall, 3));
-        assert_eq!(t2.wall_time(), future_wall);
-        assert_eq!(t2.logical(), 9);
-    }
-
-    #[test]
-    fn merge_after_drift_cap_is_monotonic() {
-        // 复现报告 P0 场景：远端超出 drift 上限被 cap 后，
-        // 后续携带较旧时间戳的常态 merge 不得造成 (T, 0) 回退。
-        let now = HybridLogicalClock::physical_now();
-        let clock = HybridLogicalClock::with_max_drift_ms(500);
-        let future = HlcTimestamp::from_parts(now + 10_000_000_000, 0);
-        let mut last = Some(clock.merge(&future)); // cap 到 now + 500ms
-
-        // 窗口内旧远端（gossip 常态）：全部落入本地主导分支 c+1。
-        for i in 0..100u32 {
-            let stale = HlcTimestamp::from_parts(now + i as u64, 0);
-            let t = clock.merge(&stale);
-            assert_advances(&mut last, t);
-        }
-    }
-
-    #[test]
-    fn merge_stale_remotes_never_regress() {
-        let now = HybridLogicalClock::physical_now();
-        let clock = HybridLogicalClock::with_max_drift_ms(500);
-        let mut last = None;
-        // 交替吸收"未来远端"与"陈旧远端"，覆盖全部四个分支。
-        let inputs = [
-            HlcTimestamp::from_parts(now + 100, 5),
-            HlcTimestamp::from_parts(now, 0),
-            HlcTimestamp::from_parts(now + 100, 50),
-            HlcTimestamp::from_parts(now.saturating_sub(1_000_000), 3),
-            HlcTimestamp::from_parts(now + 10_000_000_000, 1),
-            HlcTimestamp::from_parts(now + 100, 1),
-            HlcTimestamp::from_parts(now + 100, 200),
-            HlcTimestamp::from_parts(now, 1),
-        ];
-        for remote in inputs {
-            let t = clock.merge(&remote);
-            assert_advances(&mut last, t);
-        }
-    }
-
-    #[test]
-    fn tick_after_merge_is_monotonic() {
-        let clock = HybridLogicalClock::new();
-        let mut last = None;
-        for i in 0..50u32 {
-            let remote_wall = HybridLogicalClock::physical_now() + (i % 3) as u64 * 1_000;
-            let t = clock.merge(&HlcTimestamp::from_parts(remote_wall, i));
-            assert_advances(&mut last, t);
-            let t = clock.tick();
-            assert_advances(&mut last, t);
-        }
-    }
-}
 
 /// GroupCommit 合并提交路径的功能测试：flush 的严格提交保证与 Drop
 /// 最终 flush 不丢已接受写入。

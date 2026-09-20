@@ -21,13 +21,13 @@ use pyo3::prelude::*;
 
 use crate::common::ActantError;
 use crate::runtime::capability::{
-    Capability, CapabilityRuntime, ErasedHandler, Execute, NodeLifecycle, Serialization, Store,
+    Capability, CapabilityRuntime, ErasedHandler, NodeLifecycle, Serialization, Store,
     TaskLifecycle, Transport, WorkflowLifecycle,
 };
 
 use super::types::{
-    ExecuteCodec, NodeLifecycleCodec, PyHandlerEmitCodec, PyHandlerPerformCodec,
-    SerializationCodec, StoreCodec, TaskLifecycleCodec, TransportCodec, WorkflowLifecycleCodec,
+    NodeLifecycleCodec, PyHandlerEmitCodec, PyHandlerPerformCodec, SerializationCodec, StoreCodec,
+    TaskLifecycleCodec, TransportCodec, WorkflowLifecycleCodec,
 };
 
 /// Perform effect 的 Python handler 包装。
@@ -225,10 +225,6 @@ impl PythonHandlerRegistry {
             Box::new(PerformFactory::<Store, StoreCodec>::new()),
         );
         factories.insert(
-            "Execute".to_string(),
-            Box::new(PerformFactory::<Execute, ExecuteCodec>::new()),
-        );
-        factories.insert(
             "TaskLifecycle".to_string(),
             Box::new(EmitFactory::<TaskLifecycle, TaskLifecycleCodec>::new()),
         );
@@ -283,7 +279,6 @@ fn chain_by_name(
         "Serialization" => runtime.chain::<Serialization>(handler),
         "Transport" => runtime.chain::<Transport>(handler),
         "Store" => runtime.chain::<Store>(handler),
-        "Execute" => runtime.chain::<Execute>(handler),
         "TaskLifecycle" => runtime.chain::<TaskLifecycle>(handler),
         "WorkflowLifecycle" => runtime.chain::<WorkflowLifecycle>(handler),
         "NodeLifecycle" => runtime.chain::<NodeLifecycle>(handler),

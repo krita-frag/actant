@@ -42,12 +42,12 @@ ref_module = importlib.import_module("actant.task._ref")
 
 
 def test_value_store_capability_declared() -> None:
-    """第 11 个内置 capability：perform 语义、Python-only（无 Rust fallback）。"""
+    """内置 capability：perform 语义、Python-only（无 Rust fallback）。"""
     assert VALUE_STORE in BUILTIN_CAPABILITIES
     assert BUILTIN_CAPABILITIES[VALUE_STORE].kind == "perform"
     assert VALUE_STORE in PYTHON_ONLY_CAPABILITIES
     assert VALUE_STORE not in RUST_BACKED_CAPABILITIES
-    assert len(BUILTIN_CAPABILITIES) == 11
+    assert len(BUILTIN_CAPABILITIES) == 10
 
 
 def test_value_store_roundtrip_via_rust_bridge() -> None:

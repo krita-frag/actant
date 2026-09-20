@@ -196,7 +196,9 @@ fn identity_key_corrupt_file_rejected() {
 async fn init_orchestrator_without_data_dir_returns_new_orchestrator() {
     let node_id = make_node("node-D");
     let config = ActantConfig::default();
-    let orchestrator = init_orchestrator(None, &node_id, &config).await.unwrap();
+    let orchestrator = init_orchestrator(None, &node_id, &config, None)
+        .await
+        .unwrap();
     assert!(Arc::strong_count(&orchestrator) >= 1);
 }
 
@@ -205,9 +207,10 @@ async fn init_orchestrator_with_data_dir_recovers_from_store() {
     let dir = tempdir().unwrap();
     let node_id = make_node("node-E");
     let config = ActantConfig::default();
-    let orchestrator = init_orchestrator(Some(dir.path().to_str().unwrap()), &node_id, &config)
-        .await
-        .unwrap();
+    let orchestrator =
+        init_orchestrator(Some(dir.path().to_str().unwrap()), &node_id, &config, None)
+            .await
+            .unwrap();
     // 验证 orchestrator 子目录已创建。
     assert!(dir.path().join("orchestrator").exists());
     drop(orchestrator);
@@ -259,6 +262,7 @@ async fn init_worker_with_fifo_scheduler_spawns_actor_and_returns_worker() {
     let handle = tokio::runtime::Handle::current();
 
     let worker = init_worker(WorkerInitParams {
+        scheduler: None,
         node_id: &node_id,
         network: &network,
         event_bus,
@@ -290,6 +294,7 @@ async fn init_worker_with_priority_scheduler_spawns_actor() {
     let handle = tokio::runtime::Handle::current();
 
     let worker = init_worker(WorkerInitParams {
+        scheduler: None,
         node_id: &node_id,
         network: &network,
         event_bus,
@@ -320,6 +325,7 @@ async fn init_worker_with_unknown_scheduler_kind_returns_config_error() {
     let handle = tokio::runtime::Handle::current();
 
     let result = init_worker(WorkerInitParams {
+        scheduler: None,
         node_id: &node_id,
         network: &network,
         event_bus,
@@ -354,6 +360,7 @@ async fn init_worker_attaches_optional_actor_ids_when_provided() {
     let dag_gossip_actor_id = ActorId::dag_gossip(&node_id);
 
     let worker = init_worker(WorkerInitParams {
+        scheduler: None,
         node_id: &node_id,
         network: &network,
         event_bus,
@@ -711,7 +718,9 @@ async fn build_without_store_redispatches_nothing() {
     // 不产出恢复任务：内存 Orchestrator 没有任何 workflow。
     let node_id = make_node("node-D");
     let config = ActantConfig::default();
-    let orchestrator = init_orchestrator(None, &node_id, &config).await.unwrap();
+    let orchestrator = init_orchestrator(None, &node_id, &config, None)
+        .await
+        .unwrap();
     assert!(Arc::strong_count(&orchestrator) >= 1);
     let recovered = orchestrator.recover_ready_tasks();
     assert!(

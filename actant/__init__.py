@@ -36,7 +36,6 @@ from actant.actant import get_version
 from actant.actant import prometheus_text as metrics_text
 from actant.capabilities import (
     BUILTIN_CAPABILITIES,
-    EXECUTE,
     NODE_LIFECYCLE,
     PYTHON_ONLY_CAPABILITIES,
     RETRY_POLICY,
@@ -51,9 +50,6 @@ from actant.capabilities import (
     WORKFLOW_LIFECYCLE,
     CapabilityMeta,
     EffectKind,
-    ExecuteCtx,
-    ExecuteHandler,
-    ExecuteOutcome,
     NodeEvent,
     NodeLifecycleHandler,
     RetryCtx,
@@ -124,7 +120,6 @@ __version__ = get_version()
 
 __all__ = [
     "BUILTIN_CAPABILITIES",
-    "EXECUTE",
     "NODE_LIFECYCLE",
     "PYTHON_ONLY_CAPABILITIES",
     "REF_INLINE_THRESHOLD",
@@ -146,9 +141,6 @@ __all__ = [
     "CapabilityMeta",
     "ConfigError",
     "EffectKind",
-    "ExecuteCtx",
-    "ExecuteHandler",
-    "ExecuteOutcome",
     "FlowReplayError",
     "InternalError",
     "InvalidStateError",

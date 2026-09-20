@@ -365,7 +365,7 @@ impl CapabilityRuntime {
     ///
     /// 关键不变量：Actor 在 spawn 时**从当前 `layers` snapshot handlers**，
     /// 而非 register 时拿到的副本。因此所有 `register` / `chain` /
-    /// `register_store_handler` / `register_execute_handler` 必须在
+    /// `register_store_handler` 必须在
     /// `bind_actor_system` **之前**完成；绑定后再调用会返回错误。
     /// 取消运行期热更新后，CapabilityRuntime 不再持有后台任务和更新通道，
     /// 结构更简洁，也不存在 Actor 重启窗口。

@@ -18,10 +18,11 @@
 //!
 //! `publish` 无 await 点，可在同步或异步上下文直接调用。
 
+use crate::common::EventBusConfig;
+
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::common::{NodeId, TaskCompletion, TaskId, WorkflowId};
@@ -186,31 +187,6 @@ impl Clone for SubscriberSlot {
         Self {
             sender: self.sender.clone(),
             capacity: self.capacity,
-        }
-    }
-}
-
-/// EventBus 配置。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EventBusConfig {
-    /// 每个订阅者的默认通道容量。
-    #[serde(default = "default_subscriber_capacity")]
-    pub subscriber_capacity: usize,
-}
-
-impl EventBusConfig {
-    /// 默认订阅者通道容量。
-    pub const DEFAULT_SUBSCRIBER_CAPACITY: usize = 256;
-}
-
-fn default_subscriber_capacity() -> usize {
-    EventBusConfig::DEFAULT_SUBSCRIBER_CAPACITY
-}
-
-impl Default for EventBusConfig {
-    fn default() -> Self {
-        Self {
-            subscriber_capacity: EventBusConfig::DEFAULT_SUBSCRIBER_CAPACITY,
         }
     }
 }

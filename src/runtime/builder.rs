@@ -158,10 +158,14 @@ fn load_or_create_identity(data_dir: &Path) -> Result<iroh::SecretKey, ActantErr
 }
 
 /// 初始化 orchestrator，可选持久化。
+///
+/// `event_log_override`（F4）非 `None` 时以注入实现替换默认 LMDB 事件日志
+///（无 store 的纯内存场景注入值同样生效）。
 pub async fn init_orchestrator(
     data_dir: Option<&str>,
     node_id: &NodeId,
     config: &ActantConfig,
+    event_log_override: Option<Arc<dyn crate::runtime::state::event_log::EventLog>>,
 ) -> Result<Arc<Orchestrator>, ActantError> {
     if let Some(dir) = data_dir {
         let db_path = Path::new(dir).join("orchestrator");
@@ -170,9 +174,11 @@ pub async fn init_orchestrator(
         let store = LmdbStore::open_with_config(&db_path, &config.store)
             .map_err(|e| ActantError::Storage(format!("failed to open store: {}", e)))?;
         let async_store = Store::new(store.clone());
-        let event_log = Arc::new(crate::runtime::state::event_log::LmdbEventLog::new(
-            store.clone(),
-        ));
+        let event_log = event_log_override.unwrap_or_else(|| {
+            Arc::new(crate::runtime::state::event_log::LmdbEventLog::new(
+                store.clone(),
+            ))
+        });
         Ok(Arc::new(
             Orchestrator::recover(async_store, config.clone(), Some(event_log.clone()))
                 .await
@@ -181,11 +187,13 @@ pub async fn init_orchestrator(
                 .with_event_log(event_log),
         ))
     } else {
-        Ok(Arc::new(
-            Orchestrator::new()
-                .with_node_id(node_id.clone())
-                .with_config(config.clone()),
-        ))
+        let mut orchestrator = Orchestrator::new()
+            .with_node_id(node_id.clone())
+            .with_config(config.clone());
+        if let Some(event_log) = event_log_override {
+            orchestrator = orchestrator.with_event_log(event_log);
+        }
+        Ok(Arc::new(orchestrator))
     }
 }
 
@@ -194,6 +202,9 @@ pub struct WorkerInitParams<'a> {
     pub node_id: &'a NodeId,
     pub network: &'a Arc<dyn Transport>,
     pub event_bus: EventBus,
+    /// 预构造调度器（F4 注入）。`Some` 时忽略 `scheduler_kind` 字符串——
+    /// 直接以该实现 spawn（包为 SchedulerActor）。
+    pub scheduler: Option<Arc<dyn crate::runtime::workflow::Scheduler>>,
     pub scheduler_kind: &'a str,
     pub worker_config: &'a crate::common::WorkerConfig,
     pub actor_system: Arc<ActorSystem>,
@@ -217,18 +228,23 @@ pub async fn init_worker(params: WorkerInitParams<'_>) -> Result<Worker, ActantE
     let scheduler_actor_id = ActorId::scheduler(params.node_id);
     // 注入 EventBus 到 SchedulerActor：Actor 在 enqueue 后触发
     // notify_task_enqueued()，Worker 通过 Notify 信号实现事件驱动唤醒。
-    let scheduler_actor = match params.scheduler_kind {
-        scheduler_kind::FIFO => SchedulerActor::with_event_bus(params.event_bus.clone()),
-        scheduler_kind::PRIORITY => {
-            SchedulerActor::with_event_bus(params.event_bus.clone()).with_priority()?
-        }
-        other => {
-            return Err(ActantError::Config(format!(
-                "unknown scheduler kind '{}': expected one of: {}, {}",
-                other,
-                scheduler_kind::FIFO,
-                scheduler_kind::PRIORITY
-            )))
+    // F4：注入的现成调度器优先；字符串 kind 仅选择内置实现。
+    let scheduler_actor = if let Some(scheduler) = params.scheduler.clone() {
+        SchedulerActor::with_event_bus(params.event_bus.clone()).with_scheduler(scheduler)?
+    } else {
+        match params.scheduler_kind {
+            scheduler_kind::FIFO => SchedulerActor::with_event_bus(params.event_bus.clone()),
+            scheduler_kind::PRIORITY => {
+                SchedulerActor::with_event_bus(params.event_bus.clone()).with_priority()?
+            }
+            other => {
+                return Err(ActantError::Config(format!(
+                    "unknown scheduler kind '{}': expected one of: {}, {}",
+                    other,
+                    scheduler_kind::FIFO,
+                    scheduler_kind::PRIORITY
+                )))
+            }
         }
     };
     // 在 spawn 前提取共享内部状态引用，用于 ActorScheduler 的 enqueue 快路径。
@@ -286,6 +302,12 @@ pub struct RuntimeBuilder {
     node_id: NodeId,
     config: ActantConfig,
     data_dir: Option<String>,
+    // ── F4 注入缝：缺省走内置实现，行为不变 ──
+    scheduler: Option<Arc<dyn crate::runtime::workflow::Scheduler>>,
+    task_dispatcher: Option<Arc<dyn TaskDispatcher>>,
+    transport: Option<Arc<dyn Transport>>,
+    discovery: Option<Arc<dyn crate::runtime::network::Discovery>>,
+    event_log: Option<Arc<dyn crate::runtime::state::event_log::EventLog>>,
 }
 
 impl RuntimeBuilder {
@@ -294,7 +316,58 @@ impl RuntimeBuilder {
             node_id,
             config,
             data_dir: None,
+            scheduler: None,
+            task_dispatcher: None,
+            transport: None,
+            discovery: None,
+            event_log: None,
         }
+    }
+
+    /// 注入自定义任务调度器（F4）。
+    ///
+    /// 替换内置的 priority/fifo [`SchedulerActor`] 装配。注入时
+    /// `config.worker.scheduler_kind` 字符串不再生效。
+    pub fn with_scheduler(
+        mut self,
+        scheduler: Arc<dyn crate::runtime::workflow::Scheduler>,
+    ) -> Self {
+        self.scheduler = Some(scheduler);
+        self
+    }
+
+    /// 注入自定义任务分发器（F4）。
+    ///
+    /// 替换内置进程池 `ProcessTaskDispatcher`——Rust 引擎实现
+    /// [`TaskDispatcher`]（进程内/shell/任意语言 worker）即在此接入。
+    pub fn with_task_dispatcher(mut self, dispatcher: Arc<dyn TaskDispatcher>) -> Self {
+        self.task_dispatcher = Some(dispatcher);
+        self
+    }
+
+    /// 注入自定义传输层（F4）。替换内置 `NetworkManager` 构造。
+    pub fn with_transport(mut self, transport: Arc<dyn Transport>) -> Self {
+        self.transport = Some(transport);
+        self
+    }
+
+    /// 注入自定义节点发现策略（F4）。替换 `config.network.discovery_mode`
+    /// 字符串选择的内置实现。
+    pub fn with_discovery(
+        mut self,
+        discovery: Arc<dyn crate::runtime::network::Discovery>,
+    ) -> Self {
+        self.discovery = Some(discovery);
+        self
+    }
+
+    /// 注入自定义事件日志（F4）。替换按 store 有无选择的 LMDB/Memory 实现。
+    pub fn with_event_log(
+        mut self,
+        event_log: Arc<dyn crate::runtime::state::event_log::EventLog>,
+    ) -> Self {
+        self.event_log = Some(event_log);
+        self
     }
 
     pub fn with_data_dir(mut self, data_dir: String) -> Self {
@@ -359,18 +432,29 @@ impl RuntimeBuilder {
         // 节点身份：endpoint keypair 随 data_dir 持久化，endpoint id 跨重启稳定。
         let identity = load_or_create_identity(Path::new(&data_dir))?;
 
-        tracing::info!("build: NetworkManager::new enter");
-        let network: Arc<dyn Transport> = Arc::new(
-            NetworkManager::with_identity(
-                self.node_id.clone(),
-                self.config.network.clone(),
-                blob_store.clone(),
-                Some(identity.clone()),
-            )
-            .await
-            .map_err(|e| ActantError::Network(format!("network init failed: {}", e)))?,
-        );
-        tracing::info!("build: NetworkManager::new done");
+        let network: Arc<dyn Transport> = match self.transport.clone() {
+            // F4：使用方自带传输层（不再经 discovery preset 构造）。
+            Some(t) => {
+                tracing::info!("build: using injected transport");
+                t
+            }
+            None => {
+                tracing::info!("build: NetworkManager::new enter");
+                let net: Arc<dyn Transport> = Arc::new(
+                    NetworkManager::with_identity(
+                        self.node_id.clone(),
+                        self.config.network.clone(),
+                        blob_store.clone(),
+                        Some(identity.clone()),
+                        self.discovery.clone(),
+                    )
+                    .await
+                    .map_err(|e| ActantError::Network(format!("network init failed: {}", e)))?,
+                );
+                tracing::info!("build: NetworkManager::new done");
+                net
+            }
+        };
 
         let event_bus = EventBus::new();
 
@@ -390,21 +474,28 @@ impl RuntimeBuilder {
             .map_err(|e| ActantError::Storage(format!("failed to open store: {}", e)))?;
         let store = Store::new(lmdb_store.clone());
 
-        // N3：任务日志边带出口必须在构造时提供——进程池在此刻拉起，
-        // 后置注入会错过首批 worker 的 stderr 事件流。
-        let dispatcher = ProcessTaskDispatcher::new(
-            self.config.worker.num_worker_processes.max(1),
-            WorkerLaunchSpec::new(
-                self.config.worker.worker_program.clone(),
-                self.config.worker.worker_args.clone(),
-                self.config.worker.worker_env.clone(),
+        // F4：使用方自带分发器（进程内/shell/任意语言 worker）优先；
+        // 缺省走内置进程池。N3 任务日志边带出口须在构造时提供——
+        // 进程池在此刻拉起，后置注入会错过首批 worker 的 stderr 事件流。
+        let task_dispatcher: Arc<dyn TaskDispatcher> = match self.task_dispatcher.clone() {
+            Some(d) => d,
+            None => Arc::new(
+                ProcessTaskDispatcher::new(
+                    self.config.worker.num_worker_processes.max(1),
+                    WorkerLaunchSpec::new(
+                        self.config.worker.worker_program.clone(),
+                        self.config.worker.worker_args.clone(),
+                        self.config.worker.worker_env.clone(),
+                    ),
+                    self.config.worker.worker_cancel_grace_ms,
+                    self.config.payload_signing_key.clone(),
+                    Some(event_bus.clone()),
+                )
+                .map_err(|e| {
+                    ActantError::Config(format!("failed to create task dispatcher: {}", e))
+                })?,
             ),
-            self.config.worker.worker_cancel_grace_ms,
-            self.config.payload_signing_key.clone(),
-            Some(event_bus.clone()),
-        )
-        .map_err(|e| ActantError::Config(format!("failed to create task dispatcher: {}", e)))?;
-        let task_dispatcher: Arc<dyn TaskDispatcher> = Arc::new(dispatcher);
+        };
 
         // ── Capability 注册 ────────────────────────────────────────────
         // 关键顺序：先 register_defaults + register_store_handler（chain 追加），
@@ -423,8 +514,13 @@ impl RuntimeBuilder {
         // Orchestrator 状态由 WorkflowActor 独占；on_start 启动 timeout/persist 循环。
         tracing::info!("build: workflow actor spawn enter");
         let workflow_actor_id = crate::common::ActorId::workflow(&self.node_id);
-        let orchestrator =
-            init_orchestrator(self.data_dir.as_deref(), &self.node_id, &self.config).await?;
+        let orchestrator = init_orchestrator(
+            self.data_dir.as_deref(),
+            &self.node_id,
+            &self.config,
+            self.event_log.clone(),
+        )
+        .await?;
         // recover 完成后立即重建"Pending 且依赖已满足"的任务。
         // 此处 WorkflowActor 尚未 spawn，Orchestrator 状态仍为独占引用，读取安全；
         // 返回的任务在 init_worker 产出调度器后重新入队（见下方 enqueue_batch）。
@@ -554,6 +650,7 @@ impl RuntimeBuilder {
             node_id: &self.node_id,
             network: &network,
             event_bus: event_bus.clone(),
+            scheduler: self.scheduler.clone(),
             scheduler_kind: self.config.worker.scheduler_kind.as_str(),
             worker_config: &self.config.worker,
             actor_system: actor_system.clone(),

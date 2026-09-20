@@ -3,7 +3,6 @@
 
 use super::*;
 use crate::common::{TaskId, WorkflowId};
-use crate::runtime::dispatcher::WorkerLaunchSpec;
 use crate::runtime::state::LmdbStore as StateStore;
 use tempfile::tempdir;
 
@@ -375,14 +374,13 @@ async fn ask_without_codec_returns_error() {
 }
 
 #[test]
-fn builtin_capabilities_returns_all_seven() {
+fn builtin_capabilities_returns_all_six() {
     let caps = builtin_capabilities();
-    assert_eq!(caps.len(), 7);
+    assert_eq!(caps.len(), 6);
     let names: Vec<&str> = caps.iter().map(|c| c.name).collect();
     assert!(names.contains(&"Serialization"));
     assert!(names.contains(&"Transport"));
     assert!(names.contains(&"Store"));
-    assert!(names.contains(&"Execute"));
     assert!(names.contains(&"TaskLifecycle"));
     assert!(names.contains(&"WorkflowLifecycle"));
     assert!(names.contains(&"NodeLifecycle"));
@@ -394,7 +392,7 @@ fn register_defaults_registers_all_codecs() {
     register_defaults(&rt);
     // register_defaults 注册 codec 与空 layer（ensure_layer），
     // 使所有内置 capability 都有 layer entry。
-    assert_eq!(rt.capability_count(), 7);
+    assert_eq!(rt.capability_count(), 6);
     // handler_count 查 layer 中 handler 数量，应为 0（空 layer）
     assert_eq!(rt.handler_count::<Store>(), 0);
 }
@@ -438,86 +436,6 @@ async fn store_handler_put_get_delete_roundtrip() {
     assert!(matches!(get_after, Some(Ok(None))));
 }
 
-#[tokio::test]
-async fn execute_handler_dispatches_payload_and_returns_outcome() {
-    use crate::runtime::dispatcher::TaskDispatcher;
-    use async_trait::async_trait;
-
-    struct EchoDispatcher;
-    #[async_trait]
-    impl TaskDispatcher for EchoDispatcher {
-        async fn dispatch(
-            &self,
-            _task_id: &str,
-            payload: Vec<u8>,
-            _cancel: crate::runtime::dispatcher::CancelFlag,
-            _timeout: std::time::Duration,
-        ) -> crate::common::Result<Vec<u8>> {
-            Ok(payload)
-        }
-    }
-
-    let dispatcher: Arc<dyn TaskDispatcher> = Arc::new(EchoDispatcher);
-    let handler = ExecuteHandler::new(dispatcher, Vec::new());
-    let ctx = ExecuteCtx {
-        task_id: TaskId::from("t-1".to_string()),
-        workflow_id: WorkflowId::from("wf-1".to_string()),
-        payload: b"echo".to_vec(),
-        timeout_ms: 1000,
-    };
-    let result = handler.handle(ctx).await;
-    match result {
-        Some(Ok(outcome)) => {
-            assert_eq!(outcome.task_id.as_ref(), "t-1");
-            assert!(!outcome.result_payload.is_empty());
-        }
-        other => panic!("expected Ok outcome, got {:?}", other),
-    }
-}
-
-#[tokio::test]
-async fn execute_handler_returns_error_on_dispatch_failure() {
-    use crate::runtime::dispatcher::TaskDispatcher;
-    use async_trait::async_trait;
-
-    struct FailingDispatcher;
-    #[async_trait]
-    impl TaskDispatcher for FailingDispatcher {
-        async fn dispatch(
-            &self,
-            _task_id: &str,
-            _payload: Vec<u8>,
-            _cancel: crate::runtime::dispatcher::CancelFlag,
-            _timeout: std::time::Duration,
-        ) -> crate::common::Result<Vec<u8>> {
-            Err(ActantError::Internal("boom".to_string()))
-        }
-    }
-
-    let dispatcher: Arc<dyn TaskDispatcher> = Arc::new(FailingDispatcher);
-    let handler = ExecuteHandler::new(dispatcher, Vec::new());
-    let ctx = ExecuteCtx {
-        task_id: TaskId::from("t-2".to_string()),
-        workflow_id: WorkflowId::from("wf-2".to_string()),
-        payload: Vec::new(),
-        timeout_ms: 1000,
-    };
-    let result = handler.handle(ctx).await;
-    assert!(matches!(result, Some(Err(_))));
-}
-
-#[test]
-fn register_execute_handler_adds_layer() {
-    use crate::runtime::dispatcher::{ProcessTaskDispatcher, TaskDispatcher};
-    let rt = CapabilityRuntime::new();
-    let dispatcher: Arc<dyn TaskDispatcher> = Arc::new(
-        ProcessTaskDispatcher::new(0, WorkerLaunchSpec::default(), 1, Vec::new(), None).unwrap(),
-    );
-    register_execute_handler(&rt, dispatcher, Vec::new()).unwrap();
-    assert_eq!(rt.capability_count(), 1);
-    assert_eq!(rt.handler_count::<Execute>(), 1);
-}
-
 // =========================================================================
 // CapabilityRuntime::default / ensure_layer / register 覆盖
 // =========================================================================
@@ -552,7 +470,7 @@ async fn ensure_layer_after_bind_still_allowed() {
     let actor_system = Arc::new(crate::runtime::actor::ActorSystem::new());
     Arc::clone(&rt).bind_actor_system(actor_system).await;
     // bind 后 ensure_layer 不会报错
-    rt.ensure_layer::<Execute>(Execute::meta());
+    rt.ensure_layer::<Store>(Store::meta());
 }
 
 #[tokio::test]
@@ -566,10 +484,10 @@ async fn ensure_layer_after_bind_does_not_spawn_actor() {
     let actor_system = Arc::new(crate::runtime::actor::ActorSystem::new());
     Arc::clone(&rt).bind_actor_system(actor_system).await;
 
-    // Execute 没有 codec 也没有 layer，bind 后 ensure_layer 不会 spawn
-    rt.ensure_layer::<Execute>(Execute::meta());
-    // Execute 未注册 codec，所以 actor_ids 中不应有 Execute 条目
-    let type_id = std::any::TypeId::of::<Execute>();
+    // bind 后 ensure_layer 不再 spawn 新 CapabilityActor：
+    // actor 表已 snapshot，新 layer 不会出现 actor 条目。
+    rt.ensure_layer::<NodeLifecycle>(NodeLifecycle::meta());
+    let type_id = std::any::TypeId::of::<NodeLifecycle>();
     assert!(rt.actor_ids.get(&type_id).is_none());
 }
 
@@ -1094,12 +1012,12 @@ async fn bind_actor_system_spawns_actors_for_registered_codecs() {
     let actor_system = Arc::new(crate::runtime::actor::ActorSystem::new());
     Arc::clone(&rt).bind_actor_system(actor_system).await;
 
-    // 所有 10 个内置 capability 都注册了 codec + layer → 应有 10 个 actor_ids
-    // （Store 有 handler，其余 9 个空 layer）
+    // 所有 9 个内置 capability 都注册了 codec + layer → 应有 9 个 actor_ids
+    // （Store 有 handler，其余 8 个空 layer）
     let type_id_store = std::any::TypeId::of::<Store>();
     assert!(rt.actor_ids.get(&type_id_store).is_some());
-    let type_id_execute = std::any::TypeId::of::<Execute>();
-    assert!(rt.actor_ids.get(&type_id_execute).is_some());
+    let type_id_lifecycle = std::any::TypeId::of::<NodeLifecycle>();
+    assert!(rt.actor_ids.get(&type_id_lifecycle).is_some());
 }
 
 #[tokio::test]
@@ -1141,8 +1059,8 @@ async fn bind_actor_system_with_duplicate_actor_id_warns_but_continues() {
     let type_id_store = std::any::TypeId::of::<Store>();
     assert!(rt.actor_ids.get(&type_id_store).is_none());
     // 但其他 capability 应正常 spawn
-    let type_id_execute = std::any::TypeId::of::<Execute>();
-    assert!(rt.actor_ids.get(&type_id_execute).is_some());
+    let type_id_lifecycle = std::any::TypeId::of::<NodeLifecycle>();
+    assert!(rt.actor_ids.get(&type_id_lifecycle).is_some());
 }
 
 // =========================================================================
@@ -1177,117 +1095,4 @@ fn layer_chain_multiple_handlers() {
         .chain(StoreHandler::new(store1))
         .chain(StoreHandler::new(store2));
     assert_eq!(layer.len(), 2);
-}
-
-// =========================================================================
-// ExecuteHandler 签名验证
-// =========================================================================
-
-/// `timeout_ms = 0` 必须映射为"无超时"（远期硬超时），而非立即超时。
-///
-/// dispatcher 收到的 timeout 应为远期时长；同时用短任务冒烟验证 dispatch
-/// 不会被 0 值立即强杀。
-#[tokio::test]
-async fn execute_handler_timeout_zero_maps_to_no_timeout() {
-    use crate::runtime::dispatcher::TaskDispatcher;
-    use async_trait::async_trait;
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    struct SlowOkDispatcher {
-        received_timeout: Arc<parking_lot::Mutex<Option<Duration>>>,
-    }
-    #[async_trait]
-    impl TaskDispatcher for SlowOkDispatcher {
-        async fn dispatch(
-            &self,
-            _task_id: &str,
-            payload: Vec<u8>,
-            _cancel: crate::runtime::dispatcher::CancelFlag,
-            timeout: Duration,
-        ) -> crate::common::Result<Vec<u8>> {
-            *self.received_timeout.lock() = Some(timeout);
-            // 快速 handler 冒烟：若 0 被误传为立即超时，此 sleep 期间任务
-            // 会被判超时失败（历史陷阱行为）。
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            Ok(payload)
-        }
-    }
-
-    let received_timeout = Arc::new(parking_lot::Mutex::new(None));
-    let dispatcher: Arc<dyn TaskDispatcher> = Arc::new(SlowOkDispatcher {
-        received_timeout: received_timeout.clone(),
-    });
-    let handler = ExecuteHandler::new(dispatcher, Vec::new());
-    let ctx = ExecuteCtx {
-        task_id: TaskId::from("t-zero-timeout".to_string()),
-        workflow_id: WorkflowId::from("wf-zero-timeout".to_string()),
-        payload: b"smoke".to_vec(),
-        timeout_ms: 0,
-    };
-    let result = handler.handle(ctx).await;
-    let outcome = result.expect("handler must respond");
-    assert!(
-        outcome.is_ok(),
-        "timeout_ms=0 dispatch must not be killed immediately, got {:?}",
-        outcome
-    );
-
-    // 传给 dispatcher 的 timeout 必须是远期时长（≥ 1 年），而非 0。
-    let timeout = received_timeout
-        .lock()
-        .expect("dispatcher must receive a timeout");
-    assert!(
-        timeout >= Duration::from_secs(365 * 24 * 3600),
-        "timeout_ms=0 must map to a far-future timeout, got {:?}",
-        timeout
-    );
-}
-
-#[tokio::test]
-async fn execute_handler_signs_payload_before_dispatch() {
-    use crate::runtime::dispatcher::TaskDispatcher;
-    use async_trait::async_trait;
-    use std::sync::Arc;
-
-    struct CapturingDispatcher {
-        received_payload: Arc<parking_lot::Mutex<Vec<u8>>>,
-    }
-    #[async_trait]
-    impl TaskDispatcher for CapturingDispatcher {
-        async fn dispatch(
-            &self,
-            _task_id: &str,
-            payload: Vec<u8>,
-            _cancel: crate::runtime::dispatcher::CancelFlag,
-            _timeout: std::time::Duration,
-        ) -> crate::common::Result<Vec<u8>> {
-            *self.received_payload.lock() = payload.clone();
-            Ok(payload)
-        }
-    }
-
-    let received = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    let dispatcher: Arc<dyn TaskDispatcher> = Arc::new(CapturingDispatcher {
-        received_payload: received.clone(),
-    });
-    let signing_key = b"test-key-32-bytes-0123456789abcdef".to_vec();
-    let handler = ExecuteHandler::new(dispatcher, signing_key);
-    let ctx = ExecuteCtx {
-        task_id: TaskId::from("t-sign".to_string()),
-        workflow_id: WorkflowId::from("wf-sign".to_string()),
-        payload: b"original-payload".to_vec(),
-        timeout_ms: 5000,
-    };
-    let result = handler.handle(ctx).await;
-    assert!(result.is_some());
-    let outcome = result.unwrap();
-    assert!(outcome.is_ok());
-    let outcome = outcome.unwrap();
-    assert_eq!(outcome.task_id.as_ref(), "t-sign");
-
-    // 验证 dispatcher 收到的是签名后的 payload（不等于原始 payload）
-    let received_payload = received.lock().clone();
-    assert_ne!(received_payload, b"original-payload");
-    assert!(!received_payload.is_empty());
 }

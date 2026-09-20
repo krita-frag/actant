@@ -34,9 +34,7 @@ fn test_discovery_from_name_known_modes() {
     let cfg = NetworkConfig::default();
     assert!(discovery_from_name(discovery_mode::NONE, &cfg).is_ok());
     assert!(discovery_from_name(discovery_mode::LOCAL, &cfg).is_ok());
-    assert!(discovery_from_name(discovery_mode::MDNS, &cfg).is_ok());
     assert!(discovery_from_name(discovery_mode::DNS, &cfg).is_ok());
-    assert!(discovery_from_name(discovery_mode::RELAY, &cfg).is_ok());
 }
 
 #[test]
@@ -186,49 +184,12 @@ fn local_discovery_name() {
 }
 
 #[test]
-fn mdns_discovery_name() {
-    assert_eq!(MdnsDiscovery.name(), discovery_mode::MDNS);
-}
-
-#[test]
 fn boxed_discovery_delegates_name() {
     let boxed = BoxedDiscovery::new(NoDiscovery);
     assert_eq!(boxed.name(), discovery_mode::NONE);
 
     let boxed = BoxedDiscovery::new(LocalDiscovery);
     assert_eq!(boxed.name(), discovery_mode::LOCAL);
-
-    let boxed = BoxedDiscovery::new(MdnsDiscovery);
-    assert_eq!(boxed.name(), discovery_mode::MDNS);
-}
-
-// ───────────────────────── is_registered / registered_names ─────────────────────────
-
-#[test]
-fn is_registered_returns_true_for_builtin_modes() {
-    assert!(is_registered(discovery_mode::NONE));
-    assert!(is_registered(discovery_mode::LOCAL));
-    assert!(is_registered(discovery_mode::MDNS));
-    assert!(is_registered(discovery_mode::DNS));
-    assert!(is_registered(discovery_mode::RELAY));
-}
-
-#[test]
-fn is_registered_returns_false_for_unknown_mode() {
-    assert!(!is_registered("unknown"));
-    assert!(!is_registered(""));
-    assert!(!is_registered("DNS-over-HTTPS"));
-}
-
-#[test]
-fn registered_names_contains_all_builtin_modes() {
-    let names = registered_names();
-    assert_eq!(names.len(), 5);
-    assert!(names.contains(&discovery_mode::NONE.to_string()));
-    assert!(names.contains(&discovery_mode::LOCAL.to_string()));
-    assert!(names.contains(&discovery_mode::MDNS.to_string()));
-    assert!(names.contains(&discovery_mode::DNS.to_string()));
-    assert!(names.contains(&discovery_mode::RELAY.to_string()));
 }
 
 // ───────────────────────── discovery_from_name ─────────────────────────
@@ -248,13 +209,6 @@ fn discovery_from_name_local_returns_local_discovery() {
 }
 
 #[test]
-fn discovery_from_name_mdns_returns_mdns_discovery() {
-    let cfg = NetworkConfig::default();
-    let d = discovery_from_name(discovery_mode::MDNS, &cfg).unwrap();
-    assert_eq!(d.name(), discovery_mode::MDNS);
-}
-
-#[test]
 fn discovery_from_name_dns_returns_dns_discovery() {
     let cfg = NetworkConfig::default();
     let d = discovery_from_name(discovery_mode::DNS, &cfg).unwrap();
@@ -269,13 +223,6 @@ fn discovery_from_name_dns_uses_custom_origin_domain() {
     };
     let d = discovery_from_name(discovery_mode::DNS, &cfg).unwrap();
     assert_eq!(d.name(), discovery_mode::DNS);
-}
-
-#[test]
-fn discovery_from_name_relay_returns_relay_discovery() {
-    let cfg = NetworkConfig::default();
-    let d = discovery_from_name(discovery_mode::RELAY, &cfg).unwrap();
-    assert_eq!(d.name(), discovery_mode::RELAY);
 }
 
 #[test]

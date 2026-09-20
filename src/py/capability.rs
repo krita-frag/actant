@@ -19,7 +19,7 @@ use crate::runtime::capability::{
     builtin_capabilities, register_defaults, CapabilityRuntime, EffectKind,
 };
 use crate::runtime::capability::{
-    Execute, NodeLifecycle, Serialization, Store, TaskLifecycle, Transport, WorkflowLifecycle,
+    NodeLifecycle, Serialization, Store, TaskLifecycle, Transport, WorkflowLifecycle,
 };
 
 use super::gil_thread::GilThread;
@@ -288,7 +288,6 @@ crate::capability_registry! {
         "Serialization" => Serialization => super::types::SerializationCodec,
         "Transport" => Transport => super::types::TransportCodec,
         "Store" => Store => super::types::StoreCodec,
-        "Execute" => Execute => super::types::ExecuteCodec,
     }
     emit: {
         "TaskLifecycle" => TaskLifecycle => super::types::TaskLifecycleCodec,
