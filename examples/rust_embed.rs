@@ -87,6 +87,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = RuntimeBuilder::new("rust-embed-node".into(), config)
         .with_data_dir(dir.path().to_str().unwrap().to_string())
         .with_task_dispatcher(dispatcher)
+        // Rust 嵌入无 Python 事件泵：启用 core 内的本地编排回灌桥，
+        // 依赖推进（后继入队）与重试裁决由 core 承担。
+        .with_orchestrator_ingest(true)
         .build()
         .await?;
 

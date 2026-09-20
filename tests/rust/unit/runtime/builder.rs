@@ -263,6 +263,7 @@ async fn init_worker_with_fifo_scheduler_spawns_actor_and_returns_worker() {
 
     let worker = init_worker(WorkerInitParams {
         scheduler: None,
+        orchestrator_ingest: false,
         node_id: &node_id,
         network: &network,
         event_bus,
@@ -295,6 +296,7 @@ async fn init_worker_with_priority_scheduler_spawns_actor() {
 
     let worker = init_worker(WorkerInitParams {
         scheduler: None,
+        orchestrator_ingest: false,
         node_id: &node_id,
         network: &network,
         event_bus,
@@ -326,6 +328,7 @@ async fn init_worker_with_unknown_scheduler_kind_returns_config_error() {
 
     let result = init_worker(WorkerInitParams {
         scheduler: None,
+        orchestrator_ingest: false,
         node_id: &node_id,
         network: &network,
         event_bus,
@@ -361,6 +364,7 @@ async fn init_worker_attaches_optional_actor_ids_when_provided() {
 
     let worker = init_worker(WorkerInitParams {
         scheduler: None,
+        orchestrator_ingest: false,
         node_id: &node_id,
         network: &network,
         event_bus,

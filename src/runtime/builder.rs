@@ -205,6 +205,8 @@ pub struct WorkerInitParams<'a> {
     /// 预构造调度器（F4 注入）。`Some` 时忽略 `scheduler_kind` 字符串——
     /// 直接以该实现 spawn（包为 SchedulerActor）。
     pub scheduler: Option<Arc<dyn crate::runtime::workflow::Scheduler>>,
+    /// 本地编排回灌桥开关（X2），透传给 Worker。Python 绑定层保持 false。
+    pub orchestrator_ingest: bool,
     pub scheduler_kind: &'a str,
     pub worker_config: &'a crate::common::WorkerConfig,
     pub actor_system: Arc<ActorSystem>,
@@ -276,6 +278,7 @@ pub async fn init_worker(params: WorkerInitParams<'_>) -> Result<Worker, ActantE
     .with_actor_system(params.actor_system.clone())
     .with_fast_scheduler(fast_inner)
     .with_scheduler_actor_id(scheduler_actor_id)
+    .with_orchestrator_ingest(params.orchestrator_ingest)
     .with_capacity_callback(Arc::new(move |available, max| {
         failover_cb.update_local_capacity(available, max);
     }));
@@ -308,6 +311,10 @@ pub struct RuntimeBuilder {
     transport: Option<Arc<dyn Transport>>,
     discovery: Option<Arc<dyn crate::runtime::network::Discovery>>,
     event_log: Option<Arc<dyn crate::runtime::state::event_log::EventLog>>,
+    /// 本地编排回灌桥（X2）：Rust 原生 DAG 提交路径的依赖推进需要它。
+    /// **默认关闭**——Python 绑定层由事件泵承担同职责，双重回灌会产生
+    /// 重试裁决竞态；仅 Rust 嵌入方（无事件泵）应显式开启。
+    orchestrator_ingest: bool,
 }
 
 impl RuntimeBuilder {
@@ -321,7 +328,19 @@ impl RuntimeBuilder {
             transport: None,
             discovery: None,
             event_log: None,
+            orchestrator_ingest: false,
         }
+    }
+
+    /// 启用本地编排回灌桥（X2）。
+    ///
+    /// 供**纯 Rust 嵌入**使用：Rust 原生 DAG 提交（`submit` + `start`）没有
+    /// Python 事件泵，任务完成后的依赖推进（后继入队）与重试裁决须由 core
+    /// 内的回灌桥承担。Python 绑定层**不得**开启——它的事件泵已做同一件事，
+    /// 双重回灌会让重试裁决产生竞态。
+    pub fn with_orchestrator_ingest(mut self, enabled: bool) -> Self {
+        self.orchestrator_ingest = enabled;
+        self
     }
 
     /// 注入自定义任务调度器（F4）。
@@ -651,6 +670,7 @@ impl RuntimeBuilder {
             network: &network,
             event_bus: event_bus.clone(),
             scheduler: self.scheduler.clone(),
+            orchestrator_ingest: self.orchestrator_ingest,
             scheduler_kind: self.config.worker.scheduler_kind.as_str(),
             worker_config: &self.config.worker,
             actor_system: actor_system.clone(),

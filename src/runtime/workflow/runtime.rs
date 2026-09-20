@@ -209,6 +209,10 @@ pub struct Worker {
     failover: Option<Arc<crate::runtime::workflow::FailoverManager>>,
     /// 远端路由策略（G-route）：默认内置实现，可经 `with_route_policy` 注入。
     route_policy: Arc<dyn crate::runtime::workflow::RoutePolicy>,
+    /// 本地编排回灌桥开关（X2）：仅 Rust 嵌入（无 Python 事件泵）开启。
+    /// Python 绑定层保持关闭——事件泵已承担同职责，双重回灌会产生重试
+    /// 裁决竞态。
+    orchestrator_ingest: bool,
     /// 最大并发任务数。用 AtomicUsize 支持运行时扩容（`set_max_concurrent_tasks`）。
     max_concurrent_tasks: Arc<std::sync::atomic::AtomicUsize>,
     task_timeout: Duration,
@@ -301,6 +305,7 @@ impl Worker {
             capability_gossip: None,
             failover: None,
             route_policy: Arc::new(crate::runtime::workflow::DefaultRoutePolicy),
+            orchestrator_ingest: false,
             max_concurrent_tasks: Arc::new(std::sync::atomic::AtomicUsize::new(max_concurrent)),
             task_timeout: Duration::from_millis(config.default_task_timeout_ms),
             crash_failover_max_attempts: config.crash_failover_max_attempts,
@@ -419,6 +424,13 @@ impl Worker {
     /// 返回 failover 管理器句柄（节点可见性 N2：`peers()` 数据源）。
     pub fn failover_manager(&self) -> Option<Arc<crate::runtime::workflow::FailoverManager>> {
         self.failover.clone()
+    }
+
+    /// 开关本地编排回灌桥（X2）：仅 Rust 嵌入（无 Python 事件泵）开启。
+    /// 详见 [`RuntimeBuilder::with_orchestrator_ingest`]。
+    pub fn with_orchestrator_ingest(mut self, enabled: bool) -> Self {
+        self.orchestrator_ingest = enabled;
+        self
     }
 
     /// 注入自定义远端路由策略（G-route）。未注入时使用内置
@@ -1186,9 +1198,10 @@ impl Worker {
 
             // 崩溃故障转移用捕获：scheduler（重入队）、崩溃重路由上限与延迟。
             let scheduler_for_failover = self.scheduler.clone();
-            // X2 本地编排回灌桥：绑定 workflow actor 时才启用；未绑定降级为
-            // 纯事件结算（可选编排语义不变）。
-            let orchestrator_bridge =
+            // X2 本地编排回灌桥：仅当开关开启且绑定了 workflow actor。
+            // 缺省关闭——Python 绑定层的事件泵承担同职责，双重回灌会产生
+            // 重试裁决竞态。
+            let orchestrator_bridge = if self.orchestrator_ingest {
                 match (self.actor_system.clone(), self.workflow_actor_id.clone()) {
                     (Some(actor_system), Some(workflow_actor_id)) => Some(OrchestratorBridge {
                         actor_system,
@@ -1196,7 +1209,10 @@ impl Worker {
                         scheduler: self.scheduler.clone(),
                     }),
                     _ => None,
-                };
+                }
+            } else {
+                None
+            };
             let crash_failover_max = self.crash_failover_max_attempts;
             let failover_delay = self.remote_fallback_delay;
 
