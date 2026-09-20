@@ -952,6 +952,19 @@ impl PyRuntimeCore {
         Ok(())
     }
 
+    /// 删除工作流（运维清理，E5）。
+    ///
+    /// 从内存与持久化存储中移除该工作流的全部状态（DAG/execution/pending/
+    /// 结果/等待点/信号缓冲/事件水位）。与 `completed_retention_count` 的
+    /// 自动淘汰互补，供手动清理已完成/孤儿工作流。幂等：工作流不存在时为
+    /// no-op。注意：运行中的工作流删除后其任务结果将不可恢复。
+    #[tracing::instrument(name = "py.delete_workflow", level = "info", skip(self, py), fields(workflow_id = %workflow_id))]
+    fn delete_workflow(&self, py: Python<'_>, workflow_id: String) -> PyResult<()> {
+        let payload = encode(&WorkflowId::from(workflow_id)).map_err(PyErr::from)?;
+        self.call_workflow_actor::<()>(py, workflow_methods::DELETE_WORKFLOW, payload)?;
+        Ok(())
+    }
+
     /// 注册持久化等待点。
     ///
     /// 等待点是 orchestrator 状态机的挂起原语：持久化
@@ -1387,6 +1400,53 @@ impl PyRuntimeCore {
         let ids: Vec<WorkflowId> =
             self.call_workflow_actor(py, workflow_methods::ACTIVE_WORKFLOW_IDS, Vec::new())?;
         Ok(ids.into_iter().map(|id| id.as_str().to_string()).collect())
+    }
+
+    /// 枚举当前在线的 peer 节点（节点可见性 N2）。
+    ///
+    /// 返回 dict 列表，每项为 ``node_id`` / ``endpoint`` / ``available_slots`` /
+    /// ``max_slots`` / ``active_workflows`` / ``labels`` / ``platform`` /
+    /// ``last_heartbeat_ms``。在线判定复用心跳新鲜度语义；是面板与资源核算类
+    /// 第 3 层应用的数据源（核心不内置调度策略）。
+    #[tracing::instrument(name = "py.peers", level = "debug", skip(self, py))]
+    fn peers(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
+        let Some(worker) = self.runtime.as_ref().and_then(|rt| rt.worker()) else {
+            return Ok(Vec::new());
+        };
+        let Some(failover) = worker.failover_manager() else {
+            return Ok(Vec::new());
+        };
+        let infos = failover.peers();
+        let mut out = Vec::with_capacity(infos.len());
+        for info in infos {
+            let dict = pyo3::types::PyDict::new(py);
+            dict.set_item("node_id", info.node_id.as_str())?;
+            dict.set_item("endpoint", info.endpoint_addr.clone())?;
+            dict.set_item("available_slots", info.available_slots)?;
+            dict.set_item("max_slots", info.max_slots)?;
+            dict.set_item(
+                "active_workflows",
+                info.active_workflows
+                    .iter()
+                    .map(|w| w.as_str())
+                    .collect::<Vec<_>>(),
+            )?;
+            dict.set_item("labels", info.labels.clone())?;
+            match &info.platform {
+                Some(p) => {
+                    let pd = pyo3::types::PyDict::new(py);
+                    pd.set_item("os", &p.os)?;
+                    pd.set_item("arch", &p.arch)?;
+                    pd.set_item("actant_version", &p.actant_version)?;
+                    pd.set_item("host_runtime", p.host_runtime.clone())?;
+                    dict.set_item("platform", pd)?;
+                }
+                None => dict.set_item("platform", py.None())?,
+            }
+            dict.set_item("last_heartbeat_ms", info.last_heartbeat_ms)?;
+            out.push(dict.into_any().unbind());
+        }
+        Ok(out)
     }
 
     /// 注册 Python 任务结果回调。

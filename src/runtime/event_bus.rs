@@ -47,12 +47,9 @@ pub enum Topic {
     TaskSkipped,
     /// 对端连接 / 断开。
     NetworkPeer,
-    /// Actor 生命周期中的不可恢复错误（panic / 状态机非法转换 /
-    /// 持久化失败等需要外部介入的错误）。
+    /// Actor 生命周期中的不可恢复错误（panic / 状态机非法转换等
+    /// 需要外部介入的错误）。
     ActorLifecycleError,
-    /// WAL 压缩完成公告。订阅者可据此触发检查点清理、监控告警或
-    /// 外部一致性校验。
-    WalCompacted,
     /// Worker 生命周期事件（排空中、已排空、已停止）。
     WorkerLifecycle,
 }
@@ -69,7 +66,6 @@ impl Topic {
             Topic::TaskSkipped => "TaskSkipped",
             Topic::NetworkPeer => "NetworkPeer",
             Topic::ActorLifecycleError => "ActorLifecycleError",
-            Topic::WalCompacted => "WalCompacted",
             Topic::WorkerLifecycle => "WorkerLifecycle",
         }
     }
@@ -109,22 +105,12 @@ pub enum BusEvent {
     // -- Actor 生命周期（可克隆）--
     /// Actor 生命周期中的不可恢复错误。
     ///
-    /// 描述系统层拦截到的 panic / 状态机非法转换 / 持久化失败等需要
-    /// 外部介入的错误。携带 actor_id 与错误描述，便于运维订阅并触发告警。
+    /// 描述系统层拦截到的 panic / 状态机非法转换等需要外部介入的错误。携带 actor_id 与错误描述，便于运维订阅并触发告警。
     /// 常规消息失败不走本事件，由 `tracing::error!` 与
     /// `inc_actors_failed` 指标承载。
     ActorLifecycleError {
         actor_id: crate::common::ActorId,
         error: String,
-    },
-
-    // -- 持久化公告 --
-    /// WAL 压缩完成。携带节点 id 与压缩后保留的事件序号上限，
-    /// 便于订阅者触发检查点清理或一致性校验。WAL 是 per-ActorSystem
-    /// 一个文件（非 per-actor），故载荷使用 node_id 而非 actor_id。
-    WalCompacted {
-        node_id: NodeId,
-        retained_events: u64,
     },
 
     // -- Worker 生命周期（可克隆）--
@@ -154,7 +140,6 @@ impl BusEvent {
             BusEvent::TaskSkipped(_) => Topic::TaskSkipped,
             BusEvent::PeerConnected(_) | BusEvent::PeerDisconnected(_) => Topic::NetworkPeer,
             BusEvent::ActorLifecycleError { .. } => Topic::ActorLifecycleError,
-            BusEvent::WalCompacted { .. } => Topic::WalCompacted,
             BusEvent::WorkerDraining { .. }
             | BusEvent::WorkerDrained { .. }
             | BusEvent::WorkerStopped { .. } => Topic::WorkerLifecycle,

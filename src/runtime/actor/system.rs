@@ -1,25 +1,23 @@
 //! ActorSystem facade 与单 Actor 运行循环。
 //!
-//! `RunningActor` 在独立任务中驱动单个 Actor 实例的消息循环、状态持久化
-//! 与生命周期钩子；`ActorSystem` 对外提供 spawn/send/call/stop 等 API，
-//! 并串联 mailbox、persistence、event bus 等子系统。
+//! `RunningActor` 在独立任务中驱动单个 Actor 实例的消息循环与生命周期钩子；
+//! `ActorSystem` 对外提供 spawn/send/call/stop 等 API，并串联 mailbox、
+//! event bus 等子系统。定位为**系统 actor 专用本地运行时**：不做状态持久化，
+//! 工作流恢复由 orchestrator 的统一工作流历史唯一承载。
 
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use parking_lot::Mutex;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::common::{
     ActantError, ActorConfig, ActorErrorEnvelope, ActorErrorKind, ActorId, ActorMessage,
-    ActorMessageResult, ActorStatus, MessageId, NodeId, Result,
+    ActorMessageResult, ActorStatus, NodeId, Result,
 };
 use crate::runtime::actor::mailbox::MailboxRegistry;
-use crate::runtime::actor::persistence::ActorPersistence;
 use crate::runtime::actor::runtime::{Actor, ActorContext};
 use crate::runtime::event_bus::{BusEvent, EventBus};
-use crate::runtime::state::{CheckpointManager, LmdbStore, Store, WalWriter};
 
 struct ActorEntry {
     cancel: watch::Sender<bool>,
@@ -33,16 +31,13 @@ struct RunningActor {
     rx: mpsc::Receiver<ActorMessage>,
     cancel_rx: watch::Receiver<bool>,
     event_bus: EventBus,
-    registry: MailboxRegistry,
-    persistence: Arc<ActorPersistence>,
 }
 
 impl RunningActor {
     /// 发布不可恢复的 Actor 生命周期错误到 `Topic::ActorLifecycleError`。
     ///
-    /// 描述 panic / 状态机非法转换 / 持久化失败等需要外部介入的错误；
-    /// 常规消息失败不发布事件，由 `tracing::error!` 与
-    /// `inc_actors_failed` 指标承载可观测性。
+    /// 描述 panic / 状态机非法转换等需要外部介入的错误；常规消息失败不发布
+    /// 事件，由 `tracing::error!` 与 `inc_actors_failed` 指标承载可观测性。
     fn emit_lifecycle_error(&self, error: String) {
         let actor_id = self.actor_id.clone();
         self.event_bus
@@ -94,29 +89,14 @@ impl RunningActor {
                             );
                         }
                     }
-                    // 仅在处理成功后 ack：删除持久化 pending 记录，
-                    // 使 ack_message 真正承载 "已成功消费" 语义。
-                    if let Err(e) = self.registry.ack_message(&self.actor_id, &msg_id).await {
-                        tracing::warn!(
-                            actor = %self.actor_id.0,
-                            msg_id = %msg_id,
-                            error = %e,
-                            "failed to ack message"
-                        );
-                    }
                 }
                 Ok(Err(e)) => {
-                    // 失败不 ack：pending 记录保留，actor 重启后
-                    // recover_pending 重投该消息（at-least-once 语义）。
                     self.handle_message_error(msg_id, reply_tx, e);
                 }
                 Err(_panic_payload) => {
-                    // panic 不 ack：pending 记录保留，actor 重启后重投。
                     self.handle_message_panic(msg_id, reply_tx);
                 }
             }
-
-            self.persist_state().await;
         }
 
         self.cleanup();
@@ -124,7 +104,7 @@ impl RunningActor {
 
     fn handle_message_error(
         &mut self,
-        msg_id: MessageId,
+        msg_id: crate::common::MessageId,
         reply_tx: Option<oneshot::Sender<ActorMessageResult>>,
         error: ActantError,
     ) {
@@ -146,7 +126,7 @@ impl RunningActor {
 
     fn handle_message_panic(
         &mut self,
-        msg_id: MessageId,
+        msg_id: crate::common::MessageId,
         reply_tx: Option<oneshot::Sender<ActorMessageResult>>,
     ) {
         tracing::error!(actor = %self.actor_id.0, "actor panicked in handle_message");
@@ -193,40 +173,9 @@ impl RunningActor {
         }
     }
 
-    async fn persist_state(&self) {
-        if !self.actor.supports_state_persistence() {
-            return;
-        }
-
-        let save_t0 = std::time::Instant::now();
-        let save_result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.actor.save_state()));
-        crate::metrics::observe_actor_save_state_ms(save_t0.elapsed().as_millis() as u64);
-
-        let state = match save_result {
-            Err(_) => {
-                tracing::error!("actor {} panicked in save_state", self.actor_id.0);
-                self.emit_lifecycle_error("actor panicked in save_state".to_string());
-                return;
-            }
-            Ok(Err(e)) => {
-                tracing::error!("actor {} save_state error: {}", self.actor_id.0, e);
-                return;
-            }
-            Ok(Ok(state)) => state,
-        };
-
-        self.persistence
-            .persist(
-                self.actor_id.clone(),
-                self.actor.actor_type().to_string(),
-                state,
-            )
-            .await;
-    }
-
     fn cleanup(self) {
-        self.registry.unregister(&self.actor_id);
+        // registry 的注销由 ActorSystem::cleanup_actor 统一完成（stop/kill
+        // 路径都会走到）；此处仅扣减在途计数。
         crate::metrics::inc_actors_stopped();
         crate::metrics::dec_active_actors();
     }
@@ -236,10 +185,8 @@ pub struct ActorSystem {
     actors: Arc<DashMap<ActorId, ActorEntry>>,
     registry: MailboxRegistry,
     pub(crate) event_bus: EventBus,
-    persistence: Arc<ActorPersistence>,
     node_id: Option<NodeId>,
     pub(crate) config: ActorConfig,
-    compaction_cancel: Arc<Mutex<Option<watch::Sender<bool>>>>,
 }
 
 impl ActorSystem {
@@ -248,10 +195,8 @@ impl ActorSystem {
             actors: Arc::new(DashMap::new()),
             registry: MailboxRegistry::new(),
             event_bus: EventBus::new(),
-            persistence: Arc::new(ActorPersistence::new()),
             node_id: None,
             config: ActorConfig::default(),
-            compaction_cancel: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -274,17 +219,6 @@ impl ActorSystem {
         self
     }
 
-    pub fn with_checkpoint(mut self, checkpoint: CheckpointManager) -> Self {
-        self.persistence = Arc::new(self.persistence.with_checkpoint(checkpoint));
-        self
-    }
-
-    pub(crate) fn with_wal(mut self, wal_writer: WalWriter, store: LmdbStore) -> Self {
-        self.persistence = Arc::new(self.persistence.with_wal(wal_writer, store.clone()));
-        self.registry = self.registry.with_store(Store::new(store));
-        self
-    }
-
     pub fn node_id(&self) -> Option<&NodeId> {
         self.node_id.as_ref()
     }
@@ -301,26 +235,15 @@ impl ActorSystem {
             )));
         }
 
-        // 生命周期敏感操作按 "失败不留残留" 顺序执行：
-        // restore / on_start 在注册 mailbox 与 recover_pending 之前——
-        // on_start 失败时 mailbox 尚未建立、pending 消息未被消费，
-        // 下次 spawn 可原样恢复。
+        // 生命周期敏感操作按 "失败不留残留" 顺序执行：on_start 在注册
+        // mailbox 之前——on_start 失败时 mailbox 尚未建立，下次 spawn 可原样恢复。
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let ctx = ActorContext::new(actor_id.clone());
 
-        self.restore_actor_state(&actor_id, &mut actor).await;
         self.run_actor_on_start(&actor_id, &mut actor).await?;
 
         let (tx, rx) = mpsc::channel::<ActorMessage>(self.config.mailbox_capacity);
         self.registry.register(actor_id.clone(), tx);
-
-        if let Err(e) = self.registry.recover_pending(&actor_id).await {
-            tracing::warn!(
-                "failed to recover pending messages for {}: {}",
-                actor_id.as_str(),
-                e
-            );
-        }
 
         tracing::debug!(actor = %actor_id.0, "actor spawned");
 
@@ -334,8 +257,6 @@ impl ActorSystem {
             rx,
             cancel_rx,
             event_bus: self.event_bus.clone(),
-            registry: self.registry.clone(),
-            persistence: self.persistence.clone(),
         };
 
         let task = tokio::spawn(async move {
@@ -351,67 +272,6 @@ impl ActorSystem {
         );
 
         Ok(())
-    }
-
-    async fn restore_actor_state(&self, actor_id: &ActorId, actor: &mut Box<dyn Actor>) {
-        let Some((state, wal_offset)) = self.persistence.load_latest(actor_id.clone()).await else {
-            return;
-        };
-
-        let load_t0 = std::time::Instant::now();
-        let result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| actor.load_state(&state)));
-        crate::metrics::observe_actor_load_state_ms(load_t0.elapsed().as_millis() as u64);
-        match result {
-            Err(_) => {
-                tracing::error!("actor {} panicked in load_state", actor_id.as_str());
-                self.emit_lifecycle_error(
-                    actor_id.clone(),
-                    "actor panicked in load_state".to_string(),
-                );
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    "failed to load actor state for {}: {}",
-                    actor_id.as_str(),
-                    e
-                );
-            }
-            Ok(Ok(())) => {}
-        }
-
-        let Some(latest_state) = self
-            .persistence
-            .replay_after(actor_id.clone(), wal_offset)
-            .await
-        else {
-            return;
-        };
-        let replay_t0 = std::time::Instant::now();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            actor.load_state(&latest_state)
-        }));
-        crate::metrics::observe_actor_load_state_ms(replay_t0.elapsed().as_millis() as u64);
-        match result {
-            Err(_) => {
-                tracing::warn!(
-                    "actor {} panicked in WAL replay load_state",
-                    actor_id.as_str()
-                );
-                self.emit_lifecycle_error(
-                    actor_id.clone(),
-                    "actor panicked in WAL replay load_state".to_string(),
-                );
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    "WAL replay load_state failed for {}: {}",
-                    actor_id.as_str(),
-                    e
-                );
-            }
-            Ok(Ok(())) => {}
-        }
     }
 
     async fn run_actor_on_start(
@@ -515,9 +375,9 @@ impl ActorSystem {
 
     /// 发布不可恢复的 Actor 生命周期错误到 `Topic::ActorLifecycleError`。
     ///
-    /// 用于 `restore_actor_state` / `run_actor_on_start` 等 spawn 前路径
-    /// 拦截到的 panic——这些路径 RunningActor 尚未构造，无法用其
-    /// `emit_lifecycle_error`，由 ActorSystem 直接发布。
+    /// 用于 `run_actor_on_start` 等 spawn 前路径拦截到的 panic——这些路径
+    /// RunningActor 尚未构造，无法用其 `emit_lifecycle_error`，由 ActorSystem
+    /// 直接发布。
     pub(crate) fn emit_lifecycle_error(&self, actor_id: ActorId, error: String) {
         self.event_bus
             .publish(BusEvent::ActorLifecycleError { actor_id, error });
@@ -535,29 +395,6 @@ impl ActorSystem {
                 ActorStatus::Running
             }
         })
-    }
-
-    pub fn stop_compaction_task(&self) {
-        let mut cancel = self.compaction_cancel.lock();
-        if let Some(tx) = cancel.take() {
-            // send 失败仅当 compaction task 已自行退出 drop 了 receiver，
-            // 此时无需通知。
-            let _ = tx.send(true);
-        }
-    }
-
-    pub fn start_compaction_task(&self) {
-        // 通过共享 EventBus 公告 WalCompacted；node_id 用于载荷，
-        // 让订阅者区分来源节点。
-        let event_bus = self.event_bus.clone();
-        let cancel_tx = self.persistence.clone().start_compaction(
-            self.config.wal_compaction_interval_secs,
-            self.config.checkpoint_retention_count,
-            Some(event_bus),
-            self.node_id.clone(),
-        );
-        let mut cancel = self.compaction_cancel.lock();
-        *cancel = Some(cancel_tx);
     }
 }
 

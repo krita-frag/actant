@@ -12,9 +12,6 @@ use crate::common::{
     NodeId, Result,
 };
 use crate::runtime::event_bus::EventBus;
-use crate::runtime::state::{
-    ActorSnapshot, CheckpointManager, HybridLogicalClock, LmdbStore, Store, WalWriter,
-};
 
 struct EchoActor {
     received: Arc<StdMutex<Vec<String>>>,
@@ -299,56 +296,6 @@ async fn mailbox_send_to_unknown_actor_returns_error() {
     assert!(err.to_string().contains("not found in mailbox registry"));
 }
 
-#[tokio::test]
-async fn replay_after_replays_all_wal_events_in_order() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = LmdbStore::open(dir.path()).unwrap();
-    let wal_path = dir.path().join("test.wal");
-    let wal_writer = WalWriter::open(&wal_path).unwrap();
-    let persistence = ActorPersistence::new().with_wal(wal_writer, store);
-
-    let actor_id = ActorId::from("replay-actor");
-    let other_id = ActorId::from("other-actor");
-
-    // 手动写入一个较早的检查点，模拟 checkpoint 之后仍有 WAL 事件的场景。
-    {
-        let checkpoint = persistence.checkpoint.lock();
-        let cm = checkpoint.as_ref().unwrap();
-        cm.save(&ActorSnapshot {
-            actor_id: actor_id.clone(),
-            actor_type: "test".to_string(),
-            state: b"state-1".to_vec(),
-            timestamp: HybridLogicalClock::new().tick(),
-            sequence: 1,
-            wal_offset: 0,
-        })
-        .unwrap();
-    }
-
-    // 追加多个 WAL 事件，并穿插其他 Actor 的事件。
-    persistence
-        .persist(actor_id.clone(), "test".to_string(), b"state-2".to_vec())
-        .await;
-    persistence
-        .persist(
-            other_id.clone(),
-            "test".to_string(),
-            b"other-state".to_vec(),
-        )
-        .await;
-    persistence
-        .persist(actor_id.clone(), "test".to_string(), b"state-3".to_vec())
-        .await;
-
-    // 从检查点 offset 重放，应返回该 Actor 的最终状态。
-    let replayed = persistence.replay_after(actor_id.clone(), 0).await.unwrap();
-    assert_eq!(replayed, b"state-3");
-
-    // 其他 Actor 的事件应独立返回其最终状态。
-    let other_replayed = persistence.replay_after(other_id.clone(), 0).await.unwrap();
-    assert_eq!(other_replayed, b"other-state");
-}
-
 // ───────────────────────── ActorSystem builder 方法测试 ─────────────────────────
 
 #[tokio::test]
@@ -372,34 +319,6 @@ async fn with_event_bus_stores_bus() {
         }
         other => panic!("expected ActorLifecycleError, got {:?}", other),
     }
-}
-
-#[tokio::test]
-async fn with_checkpoint_sets_persistence() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = LmdbStore::open(dir.path()).unwrap();
-    let cm = CheckpointManager::new(store);
-    let system = ActorSystem::new().with_checkpoint(cm);
-    // 通过 spawn + stop 验证不 panic
-    let (actor, _) = EchoActor::new();
-    system
-        .spawn(ActorId::from("ckpt-actor"), actor)
-        .await
-        .unwrap();
-}
-
-#[tokio::test]
-async fn with_wal_sets_persistence_and_store() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = LmdbStore::open(dir.path()).unwrap();
-    let wal_path = dir.path().join("sys.wal");
-    let wal_writer = WalWriter::open(&wal_path).unwrap();
-    let system = ActorSystem::new().with_wal(wal_writer, store);
-    // spawn + persist + stop
-    let (actor, _) = EchoActor::new();
-    let actor_id = ActorId::from("wal-actor");
-    system.spawn(actor_id.clone(), actor).await.unwrap();
-    system.stop(&actor_id).await.unwrap();
 }
 
 // ───────────────────────── stop_timeout 测试 ─────────────────────────
@@ -495,32 +414,7 @@ async fn kill_removes_from_list() {
     assert_eq!(system.list_actors().len(), 0);
 }
 
-// ───────────────────────── compaction task 测试 ─────────────────────────
-
-#[tokio::test]
-async fn start_and_stop_compaction_task() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = LmdbStore::open(dir.path()).unwrap();
-    let wal_path = dir.path().join("comp.wal");
-    let wal_writer = WalWriter::open(&wal_path).unwrap();
-    let system = ActorSystem::new().with_wal(wal_writer, store);
-
-    // 启动 compaction task 不 panic
-    system.start_compaction_task();
-    // 短暂等待让 task 开始
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    // 停止 compaction task 不 panic
-    system.stop_compaction_task();
-}
-
-#[tokio::test]
-async fn stop_compaction_task_without_start_is_noop() {
-    let system = ActorSystem::new();
-    // 没有启动过 compaction task，stop 应是 noop
-    system.stop_compaction_task();
-}
-
-// ───────────────────────── MailboxRegistry 扩展测试 ─────────────────────────
+// ───────────────────────── MailboxRegistry 测试 ─────────────────────────
 
 #[tokio::test]
 async fn mailbox_register_and_unregister() {
@@ -541,52 +435,10 @@ async fn mailbox_register_and_unregister() {
     assert!(registry.send(&actor_id, msg).await.is_err());
 }
 
-#[tokio::test]
-async fn mailbox_with_store_enables_persistence() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = LmdbStore::open(dir.path()).unwrap();
-    let registry = MailboxRegistry::new().with_store(Store::new(store));
-
-    let actor_id = ActorId::from("persist-1");
-    let (tx, _rx) = mpsc::channel(8);
-    registry.register(actor_id.clone(), tx);
-
-    let msg = ActorMessage::new(actor_id.clone(), "persisted".into(), b"data".to_vec());
-    registry.send(&actor_id, msg).await.unwrap();
-    // 持久化模式下 send 应成功
-}
-
-// ───────────────────────── ActorPersistence 扩展测试 ─────────────────────────
-
-#[tokio::test]
-async fn persistence_without_wal_save_state_returns_empty() {
-    let persistence = ActorPersistence::new();
-    // 无 WAL 时持久化相关方法不应 panic
-    let actor_id = ActorId::from("no-wal");
-    // persist 在无 WAL 时应是 noop（不 panic）
-    persistence
-        .persist(actor_id.clone(), "test".to_string(), b"state".to_vec())
-        .await;
-}
-
-#[tokio::test]
-async fn persistence_load_latest_returns_none_without_checkpoint() {
-    let persistence = ActorPersistence::new();
-    let result = persistence.load_latest(ActorId::from("no-ckpt")).await;
-    assert!(result.is_none());
-}
-
-#[tokio::test]
-async fn persistence_replay_after_returns_none_without_wal() {
-    let persistence = ActorPersistence::new();
-    let result = persistence.replay_after(ActorId::from("no-wal"), 0).await;
-    assert!(result.is_none());
-}
-
 // ───────────────────────── 默认实现测试 ─────────────────────────
 
 #[tokio::test]
-async fn actor_default_save_state_returns_empty_vec() {
+async fn actor_default_lifecycle_hooks_are_noop() {
     struct DefaultActor;
     #[async_trait]
     impl Actor for DefaultActor {
@@ -601,11 +453,7 @@ async fn actor_default_save_state_returns_empty_vec() {
             })
         }
     }
-    let actor = DefaultActor;
-    assert_eq!(actor.save_state().unwrap(), Vec::<u8>::new());
-    assert!(!actor.supports_state_persistence());
-    let mut actor = actor;
-    assert!(actor.load_state(&[]).is_ok());
+    let mut actor = DefaultActor;
     assert!(actor.on_start().await.is_ok());
     assert!(actor.on_stop().await.is_ok());
 }
@@ -615,9 +463,6 @@ async fn boxed_actor_delegates_to_inner() {
     let (actor, _) = EchoActor::new();
     let mut boxed: Box<dyn Actor> = Box::new(actor);
     assert_eq!(boxed.actor_type(), "echo");
-    assert_eq!(boxed.save_state().unwrap(), Vec::<u8>::new());
-    assert!(boxed.load_state(&[]).is_ok());
-    assert!(!boxed.supports_state_persistence());
     assert!(boxed.on_start().await.is_ok());
     assert!(boxed.on_stop().await.is_ok());
 }
@@ -692,8 +537,6 @@ async fn spawn_many_actors_concurrently() {
 fn actor_config_default_has_sane_values() {
     let c = ActorConfig::default();
     assert!(c.mailbox_capacity > 0);
-    assert!(c.wal_compaction_interval_secs > 0);
-    assert!(c.checkpoint_retention_count >= 1);
     assert!(c.stop_timeout_ms > 0);
 }
 
@@ -770,304 +613,4 @@ async fn message_failure_does_not_retire_actor() {
         .await
         .unwrap();
     assert_eq!(ok.payload, b"data");
-}
-
-// ───────────────────────── pending 消息 at-least-once 语义 ─────────────────────────
-
-#[tokio::test]
-async fn pending_message_persists_until_ack() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::new(LmdbStore::open(dir.path()).unwrap());
-    let registry = MailboxRegistry::new().with_store(store.clone());
-
-    let actor_id = ActorId::from("ack-persist-1");
-    let (tx, mut rx) = mpsc::channel(8);
-    registry.register(actor_id.clone(), tx);
-
-    let msg = ActorMessage::new(actor_id.clone(), "work".into(), b"payload".to_vec());
-    let msg_id = msg.id.clone();
-    registry.send(&actor_id, msg).await.unwrap();
-    let _delivered = rx.recv().await.unwrap();
-
-    // 入队成功不删除 pending 记录（由 ack 删除）。
-    let prefix = format!("pending:{}:", actor_id.0);
-    let entries = store.scan_prefix(&prefix).await.unwrap();
-    assert_eq!(entries.len(), 1, "pending record must survive enqueue");
-
-    registry.ack_message(&actor_id, &msg_id).await.unwrap();
-    let entries = store.scan_prefix(&prefix).await.unwrap();
-    assert_eq!(entries.len(), 0, "ack_message must delete pending record");
-}
-
-#[tokio::test]
-async fn recover_pending_redelivers_unacked_messages() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::new(LmdbStore::open(dir.path()).unwrap());
-    let registry = MailboxRegistry::new().with_store(store.clone());
-
-    let actor_id = ActorId::from("recover-1");
-    let (tx, _rx) = mpsc::channel(8);
-    registry.register(actor_id.clone(), tx);
-
-    let msg = ActorMessage::new(actor_id.clone(), "work".into(), b"payload".to_vec());
-    let msg_id = msg.id.clone();
-    registry.send(&actor_id, msg).await.unwrap();
-
-    // 模拟重启：注销旧邮箱，注册新通道后恢复未确认消息。
-    registry.unregister(&actor_id);
-    let (tx2, mut rx2) = mpsc::channel(8);
-    registry.register(actor_id.clone(), tx2);
-
-    let count = registry.recover_pending(&actor_id).await.unwrap();
-    assert_eq!(count, 1, "unacked message should be redelivered");
-
-    let redelivered = rx2.recv().await.unwrap();
-    assert_eq!(redelivered.id, msg_id);
-    assert_eq!(redelivered.method, "work");
-
-    // 重投不删除 pending 记录——仅 ack_message（成功处理后）删除。
-    let prefix = format!("pending:{}:", actor_id.0);
-    let entries = store.scan_prefix(&prefix).await.unwrap();
-    assert_eq!(entries.len(), 1, "redelivery must keep pending record");
-
-    registry.ack_message(&actor_id, &msg_id).await.unwrap();
-    let entries = store.scan_prefix(&prefix).await.unwrap();
-    assert_eq!(entries.len(), 0);
-}
-
-#[tokio::test]
-async fn failed_message_redelivered_after_actor_restart() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = LmdbStore::open(dir.path()).unwrap();
-    let wal_path = dir.path().join("redeliver.wal");
-    let wal_writer = WalWriter::open(&wal_path).unwrap();
-    let system = ActorSystem::new().with_wal(wal_writer, store);
-
-    let actor_id = ActorId::from("redeliver-1");
-    let (actor, received1) = EchoActor::with_fail("boom");
-    system.spawn(actor_id.clone(), actor).await.unwrap();
-
-    system
-        .send(
-            &actor_id,
-            ActorMessage::new(actor_id.clone(), "boom".into(), vec![]),
-        )
-        .await
-        .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    assert_eq!(*received1.lock().unwrap(), vec!["boom".to_string()]);
-
-    // 失败不 ack：重启后 recover_pending 重投该消息。
-    system.stop(&actor_id).await.unwrap();
-    let (actor2, received2) = EchoActor::with_fail("boom");
-    system.spawn(actor_id.clone(), actor2).await.unwrap();
-
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    assert_eq!(
-        *received2.lock().unwrap(),
-        vec!["boom".to_string()],
-        "unacked message must be redelivered after restart"
-    );
-
-    // 成功处理的消息被 ack，再次重启不重投。
-    system
-        .send(
-            &actor_id,
-            ActorMessage::new(actor_id.clone(), "ping".into(), b"ok".to_vec()),
-        )
-        .await
-        .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    assert_eq!(*received2.lock().unwrap(), vec!["boom", "ping"]);
-
-    system.stop(&actor_id).await.unwrap();
-    let (actor3, received3) = EchoActor::new();
-    system.spawn(actor_id.clone(), actor3).await.unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    // "ping" 已 ack 不重投；"boom" 未 ack 会重投并再次失败。
-    assert_eq!(
-        *received3.lock().unwrap(),
-        vec!["boom".to_string()],
-        "acked message must not be redelivered"
-    );
-}
-
-// ───────────────────────── 毒消息 bounded-redelivery 测试 ─────────────────────────
-
-/// 捕获 tracing 输出到内存的 writer，用于断言毒消息判定发出 error 日志。
-#[derive(Clone)]
-struct PoisonLogWriter {
-    buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
-}
-
-impl PoisonLogWriter {
-    fn new() -> Self {
-        Self {
-            buf: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-        }
-    }
-    fn captured(&self) -> String {
-        String::from_utf8_lossy(&self.buf.lock().unwrap()).into_owned()
-    }
-}
-
-impl std::io::Write for PoisonLogWriter {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.buf.lock().unwrap().extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for PoisonLogWriter {
-    type Writer = PoisonLogWriter;
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
-
-fn poison_test_registry(dir: &std::path::Path) -> (MailboxRegistry, LmdbStore) {
-    let store = LmdbStore::open(dir).unwrap();
-    let registry = MailboxRegistry::new().with_store(Store::new(store.clone()));
-    (registry, store)
-}
-
-#[tokio::test]
-async fn recover_pending_increments_delivery_count() {
-    let dir = tempfile::tempdir().unwrap();
-    let (registry, store) = poison_test_registry(dir.path());
-    let actor_id = ActorId::from("redeliver-1");
-    let (tx, mut rx) = mpsc::channel(8);
-    registry.register(actor_id.clone(), tx);
-
-    let msg = ActorMessage::new(actor_id.clone(), "job".into(), b"p".to_vec());
-    let key = crate::runtime::actor::mailbox::pending_key(&actor_id, &msg.id);
-    registry.send(&actor_id, msg).await.unwrap();
-
-    let read_count = |store: &LmdbStore, key: &str| -> u32 {
-        let raw = store
-            .get(key)
-            .unwrap()
-            .expect("pending record should exist");
-        postcard::from_bytes::<crate::runtime::actor::mailbox::PersistentMessage>(&raw)
-            .unwrap()
-            .delivery_count()
-    };
-
-    // 首次投递 delivery_count = 0
-    assert_eq!(read_count(&store, &key), 0);
-
-    // 每次 recover_pending 重投成功后计数递增并回写
-    registry.recover_pending(&actor_id).await.unwrap();
-    assert_eq!(
-        read_count(&store, &key),
-        1,
-        "delivery count should increment on first redelivery"
-    );
-    registry.recover_pending(&actor_id).await.unwrap();
-    assert_eq!(
-        read_count(&store, &key),
-        2,
-        "delivery count should increment on second redelivery"
-    );
-
-    // 消息确实被重投进邮箱
-    let redelivered = rx.recv().await.unwrap();
-    assert_eq!(redelivered.method, "job");
-}
-
-#[tokio::test]
-async fn poison_pending_message_dropped_and_logged_after_max_redeliveries() {
-    let dir = tempfile::tempdir().unwrap();
-    let (registry, store) = poison_test_registry(dir.path());
-    let actor_id = ActorId::from("poison-1");
-    let (tx, mut rx) = mpsc::channel(32);
-    registry.register(actor_id.clone(), tx);
-
-    let msg = ActorMessage::new(actor_id.clone(), "doom".into(), b"p".to_vec());
-    let key = crate::runtime::actor::mailbox::pending_key(&actor_id, &msg.id);
-    registry.send(&actor_id, msg).await.unwrap();
-
-    let writer = PoisonLogWriter::new();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(writer.clone())
-        .with_max_level(tracing::Level::ERROR)
-        .with_ansi(false)
-        .finish();
-    let dispatch = tracing::dispatcher::Dispatch::new(subscriber);
-
-    // recover_pending 不依赖 tokio 运行时设施（LMDB 同步 + try_send），
-    // 可在 dispatcher 作用域内用 executor 驱动。
-    tracing::dispatcher::with_default(&dispatch, || {
-        // MAX_PENDING_REDELIVERIES = 5：前 5 次 recover 正常重投，第 6 次超限丢弃。
-        for round in 1..=5 {
-            let recovered =
-                futures::executor::block_on(registry.recover_pending(&actor_id)).unwrap();
-            assert_eq!(recovered, 1, "round {round}: message should be redelivered");
-            assert!(
-                store.get(&key).unwrap().is_some(),
-                "round {round}: record must be kept before exceeding the limit"
-            );
-        }
-
-        let recovered = futures::executor::block_on(registry.recover_pending(&actor_id)).unwrap();
-        assert_eq!(recovered, 0, "poison message must not be redelivered");
-    });
-
-    // 记录已被删除，不会随下一次 spawn 再度重投。
-    assert!(
-        store.get(&key).unwrap().is_none(),
-        "poison message record must be deleted after exceeding max redeliveries"
-    );
-    // 邮箱内应存在此前轮次重投的消息（未被消费），但不含第 6 条。
-    assert!(
-        rx.try_recv().is_ok(),
-        "earlier redeliveries should remain in the mailbox"
-    );
-
-    let captured = writer.captured();
-    assert!(
-        captured.contains("ERROR") && captured.contains("poison message"),
-        "dropping a poison message must log an error, got: {captured}"
-    );
-    assert!(
-        captured.contains(&actor_id.0) && captured.contains(&msg_id_str(&key)),
-        "error log must carry actor_id and msg_id, got: {captured}"
-    );
-}
-
-/// 从 pending key 提取 msg_id（key 形如 `pending:{actor}:{msg}`）。
-fn msg_id_str(key: &str) -> String {
-    key.rsplit(':').next().unwrap_or("").to_string()
-}
-
-#[tokio::test]
-async fn ack_message_deletes_pending_record_resetting_redelivery_state() {
-    let dir = tempfile::tempdir().unwrap();
-    let (registry, store) = poison_test_registry(dir.path());
-    let actor_id = ActorId::from("ack-1");
-    let (tx, mut rx) = mpsc::channel(8);
-    registry.register(actor_id.clone(), tx);
-
-    let msg = ActorMessage::new(actor_id.clone(), "job".into(), b"p".to_vec());
-    let key = crate::runtime::actor::mailbox::pending_key(&actor_id, &msg.id);
-    registry.send(&actor_id, msg).await.unwrap();
-    assert!(store.get(&key).unwrap().is_some());
-
-    // 成功处理后的 ack：删除 pending 记录（重投计数随之归零消失）。
-    let delivered = rx.recv().await.unwrap();
-    registry
-        .ack_message(&actor_id, &delivered.id)
-        .await
-        .unwrap();
-    assert!(
-        store.get(&key).unwrap().is_none(),
-        "acked message must have its pending record deleted"
-    );
-
-    // ack 后 recover_pending 无可重投消息。
-    let recovered = registry.recover_pending(&actor_id).await.unwrap();
-    assert_eq!(recovered, 0, "acked message must not be redelivered");
 }

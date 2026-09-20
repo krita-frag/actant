@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use pyo3::prelude::*;
 use pyo3::types::PyType;
 
@@ -202,13 +204,19 @@ pub struct PyNetworkConfig {
     /// 空字符串表示使用 n0 默认 `iroh.link`。
     #[pyo3(get)]
     pub dns_origin_domain: String,
+    /// 自定义 relay 集群 URL 列表。非空时覆盖 preset 自带的 relay 配置。
+    #[pyo3(get)]
+    pub relay_endpoints: Vec<String>,
+    /// 强制校验心跳节点记录签名。`Runtime.production()` 默认开启。
+    #[pyo3(get)]
+    pub require_signed_records: bool,
 }
 
 #[pymethods]
 impl PyNetworkConfig {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (preset=None, bootstrap_nodes=None, hlc_max_drift_ms=crate::common::NetworkConfig::DEFAULT_HLC_MAX_DRIFT_MS, max_pending_direct_requests=crate::common::NetworkConfig::DEFAULT_MAX_PENDING_DIRECT_REQUESTS, gossip_bootstrap_peers=None, max_message_size=crate::common::NetworkConfig::DEFAULT_MAX_MESSAGE_SIZE, allowed_peer_ids=None, direct_request_timeout_ms=crate::common::NetworkConfig::DEFAULT_DIRECT_REQUEST_TIMEOUT_MS, listen_port=0, listen_ip="", capability_gossip_interval_ms=crate::common::NetworkConfig::DEFAULT_CAPABILITY_GOSSIP_INTERVAL_MS, event_channel_capacity=crate::common::NetworkConfig::DEFAULT_EVENT_CHANNEL_CAPACITY, dns_origin_domain=""))]
+    #[pyo3(signature = (preset=None, bootstrap_nodes=None, hlc_max_drift_ms=crate::common::NetworkConfig::DEFAULT_HLC_MAX_DRIFT_MS, max_pending_direct_requests=crate::common::NetworkConfig::DEFAULT_MAX_PENDING_DIRECT_REQUESTS, gossip_bootstrap_peers=None, max_message_size=crate::common::NetworkConfig::DEFAULT_MAX_MESSAGE_SIZE, allowed_peer_ids=None, direct_request_timeout_ms=crate::common::NetworkConfig::DEFAULT_DIRECT_REQUEST_TIMEOUT_MS, listen_port=0, listen_ip="", capability_gossip_interval_ms=crate::common::NetworkConfig::DEFAULT_CAPABILITY_GOSSIP_INTERVAL_MS, event_channel_capacity=crate::common::NetworkConfig::DEFAULT_EVENT_CHANNEL_CAPACITY, dns_origin_domain="", relay_endpoints=None, require_signed_records=false))]
     fn new(
         preset: Option<String>,
         bootstrap_nodes: Option<Vec<String>>,
@@ -223,6 +231,8 @@ impl PyNetworkConfig {
         capability_gossip_interval_ms: u64,
         event_channel_capacity: usize,
         dns_origin_domain: &str,
+        relay_endpoints: Option<Vec<String>>,
+        require_signed_records: bool,
     ) -> Self {
         Self {
             preset: preset.unwrap_or_else(|| "local".to_string()),
@@ -238,6 +248,8 @@ impl PyNetworkConfig {
             capability_gossip_interval_ms,
             event_channel_capacity,
             dns_origin_domain: dns_origin_domain.to_string(),
+            relay_endpoints: relay_endpoints.unwrap_or_default(),
+            require_signed_records,
         }
     }
 }
@@ -261,6 +273,8 @@ impl Default for PyNetworkConfig {
                 crate::common::NetworkConfig::DEFAULT_CAPABILITY_GOSSIP_INTERVAL_MS,
             event_channel_capacity: crate::common::NetworkConfig::DEFAULT_EVENT_CHANNEL_CAPACITY,
             dns_origin_domain: String::new(),
+            relay_endpoints: Vec::new(),
+            require_signed_records: false,
         }
     }
 }
@@ -283,6 +297,8 @@ impl TryFrom<&PyNetworkConfig> for NetworkConfig {
             capability_gossip_interval_ms: c.capability_gossip_interval_ms,
             event_channel_capacity: c.event_channel_capacity,
             dns_origin_domain: c.dns_origin_domain.clone(),
+            relay_endpoints: c.relay_endpoints.clone(),
+            require_signed_records: c.require_signed_records,
         })
     }
 }
@@ -466,6 +482,42 @@ pub struct PyActantConfig {
     /// 未指定时取 Rust `WorkflowConfig::default`（3_600_000）。
     #[pyo3(get)]
     pub workflow_default_timeout_ms: u64,
+    /// 用户自定义节点标签（N2），随心跳广播给集群。超 4KB 整体丢弃。
+    #[pyo3(get)]
+    pub node_labels: BTreeMap<String, String>,
+    // ---- 高级调优字段（E6/E7，默认值全部取自 Rust 侧默认值）----
+    /// Store mmap 上限（字节）。默认 2 GiB。
+    #[pyo3(get)]
+    pub store_map_size: usize,
+    /// Store 最大子数据库数。默认 16。
+    #[pyo3(get)]
+    pub store_max_dbs: u32,
+    /// 落盘同步策略：``"sync"`` / ``"group_commit"`` / ``"no_sync"``。默认 ``"sync"``。
+    #[pyo3(get)]
+    pub store_sync_mode: String,
+    /// `group_commit` 模式的合并提交间隔（毫秒）。默认 2ms。
+    #[pyo3(get)]
+    pub store_flush_interval_ms: u64,
+    /// Worker 主循环批量 prefetch 的最小/最大批量。默认 16/64。
+    #[pyo3(get)]
+    pub prefetch_min: usize,
+    #[pyo3(get)]
+    pub prefetch_max: usize,
+    /// 取消/硬超时后等待 worker 协作退出的宽限期（毫秒）。默认 2000。
+    #[pyo3(get)]
+    pub worker_cancel_grace_ms: u64,
+    /// 远端结果投递重试队列容量。默认 256。
+    #[pyo3(get)]
+    pub pending_result_channel_capacity: usize,
+    /// 已完成工作流的自动淘汰保留数（0 = 不淘汰）。默认 1000。
+    #[pyo3(get)]
+    pub completed_retention_count: usize,
+    /// 工作流状态后台落盘刷新间隔（毫秒）。默认 200。
+    #[pyo3(get)]
+    pub persist_flush_interval_ms: u64,
+    /// 工作流状态轮询周期（毫秒），同时是等待点唤醒延迟上界。默认 500。
+    #[pyo3(get)]
+    pub state_poll_interval_ms: u64,
 }
 
 #[pymethods]
@@ -481,7 +533,7 @@ impl PyActantConfig {
     /// - `workflow_default_timeout_ms`：工作流默认超时（毫秒）。`None`（默认）
     ///   = Rust `WorkflowConfig::default` 的 3_600_000。
     #[new]
-    #[pyo3(signature = (payload_signing_key, network=None, failover=None, gossip=None, max_concurrent_tasks=None, default_task_timeout_ms=None, data_dir=None, drain_timeout_secs=None, remote_fallback_delay_ms=None, scheduler=None, require_payload_signing=false, num_worker_processes=None, crash_failover_max_attempts=None, workflow_default_timeout_ms=None))]
+    #[pyo3(signature = (payload_signing_key, network=None, failover=None, gossip=None, max_concurrent_tasks=None, default_task_timeout_ms=None, data_dir=None, drain_timeout_secs=None, remote_fallback_delay_ms=None, scheduler=None, require_payload_signing=false, num_worker_processes=None, crash_failover_max_attempts=None, workflow_default_timeout_ms=None, node_labels=None, *, store_map_size=None, store_max_dbs=None, store_sync_mode=None, store_flush_interval_ms=None, prefetch_min=None, prefetch_max=None, worker_cancel_grace_ms=None, pending_result_channel_capacity=None, completed_retention_count=None, persist_flush_interval_ms=None, state_poll_interval_ms=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         payload_signing_key: String,
@@ -498,8 +550,22 @@ impl PyActantConfig {
         num_worker_processes: Option<usize>,
         crash_failover_max_attempts: Option<u32>,
         workflow_default_timeout_ms: Option<u64>,
+        node_labels: Option<BTreeMap<String, String>>,
+        store_map_size: Option<usize>,
+        store_max_dbs: Option<u32>,
+        store_sync_mode: Option<String>,
+        store_flush_interval_ms: Option<u64>,
+        prefetch_min: Option<usize>,
+        prefetch_max: Option<usize>,
+        worker_cancel_grace_ms: Option<u64>,
+        pending_result_channel_capacity: Option<usize>,
+        completed_retention_count: Option<usize>,
+        persist_flush_interval_ms: Option<u64>,
+        state_poll_interval_ms: Option<u64>,
     ) -> Self {
         let default_worker = crate::common::WorkerConfig::default();
+        let default_store = crate::common::StoreConfig::default();
+        let default_workflow = crate::common::WorkflowConfig::default();
         // 默认并发度 = num_cpus：多数 Python 任务为 IO-bound，
         // 用户可显式传 max_concurrent_tasks 覆盖。
         let max_concurrent = max_concurrent_tasks.unwrap_or_else(default_max_concurrent_tasks);
@@ -526,7 +592,43 @@ impl PyActantConfig {
                 .unwrap_or(default_worker.crash_failover_max_attempts),
             workflow_default_timeout_ms: workflow_default_timeout_ms
                 .unwrap_or(crate::common::WorkflowConfig::default().default_timeout_ms),
+            node_labels: node_labels.unwrap_or_default(),
+            store_map_size: store_map_size.unwrap_or(default_store.map_size),
+            store_max_dbs: store_max_dbs.unwrap_or(default_store.max_dbs),
+            store_sync_mode: store_sync_mode
+                .unwrap_or_else(|| default_sync_mode_name().to_string()),
+            store_flush_interval_ms: store_flush_interval_ms.unwrap_or(default_group_commit_ms()),
+            prefetch_min: prefetch_min.unwrap_or(default_worker.prefetch_min),
+            prefetch_max: prefetch_max.unwrap_or(default_worker.prefetch_max),
+            worker_cancel_grace_ms: worker_cancel_grace_ms
+                .unwrap_or(default_worker.worker_cancel_grace_ms),
+            pending_result_channel_capacity: pending_result_channel_capacity
+                .unwrap_or(default_worker.pending_result_channel_capacity),
+            completed_retention_count: completed_retention_count
+                .unwrap_or(default_workflow.completed_retention_count),
+            persist_flush_interval_ms: persist_flush_interval_ms
+                .unwrap_or(default_workflow.persist_flush_interval_ms),
+            state_poll_interval_ms: state_poll_interval_ms
+                .unwrap_or(default_workflow.state_poll_interval_ms),
         }
+    }
+}
+
+/// [`SyncMode`] 默认值的字符串名（单一来源：Rust `SyncMode::default`）。
+fn default_sync_mode_name() -> &'static str {
+    match crate::common::SyncMode::default() {
+        crate::common::SyncMode::Sync => "sync",
+        crate::common::SyncMode::GroupCommit(_) => "group_commit",
+        crate::common::SyncMode::NoSync => "no_sync",
+    }
+}
+
+/// `GroupCommit` 默认合并间隔；当前默认策略为 `Sync`，该值仅在用户显式
+/// 选择 `group_commit` 时生效。
+fn default_group_commit_ms() -> u64 {
+    match crate::common::SyncMode::default() {
+        crate::common::SyncMode::GroupCommit(ms) => ms,
+        _ => 2,
     }
 }
 
@@ -559,6 +661,20 @@ impl Default for PyActantConfig {
             crash_failover_max_attempts: default_worker.crash_failover_max_attempts,
             workflow_default_timeout_ms: crate::common::WorkflowConfig::default()
                 .default_timeout_ms,
+            node_labels: BTreeMap::new(),
+            store_map_size: crate::common::StoreConfig::default().map_size,
+            store_max_dbs: crate::common::StoreConfig::default().max_dbs,
+            store_sync_mode: "sync".to_string(),
+            store_flush_interval_ms: 2,
+            prefetch_min: default_worker.prefetch_min,
+            prefetch_max: default_worker.prefetch_max,
+            worker_cancel_grace_ms: default_worker.worker_cancel_grace_ms,
+            pending_result_channel_capacity: default_worker.pending_result_channel_capacity,
+            completed_retention_count: crate::common::WorkflowConfig::default()
+                .completed_retention_count,
+            persist_flush_interval_ms: crate::common::WorkflowConfig::default()
+                .persist_flush_interval_ms,
+            state_poll_interval_ms: crate::common::WorkflowConfig::default().state_poll_interval_ms,
         }
     }
 }
@@ -578,25 +694,39 @@ impl TryFrom<&PyActantConfig> for ActantConfig {
             worker: crate::common::WorkerConfig {
                 max_concurrent_tasks: c.max_concurrent_tasks.max(1),
                 num_worker_processes: c.num_worker_processes.max(1),
+                // Python 语义在绑定层拼装：解释器 + 模块入口 + 模块搜索路径。
+                // 核心只认「可执行文件 + 参数 + 环境变量」三要素。
                 worker_program: python_executable(),
-                python_path: python_sys_path(),
+                worker_args: vec!["-m".into(), "actant.task._worker".into()],
+                worker_env: worker_python_env(),
                 default_task_timeout_ms: c.default_task_timeout_ms,
                 drain_timeout_secs: c.drain_timeout_secs,
                 remote_fallback_delay_ms: c.remote_fallback_delay_ms,
                 scheduler_kind: scheduler_kind_from_str(&c.scheduler)?,
                 crash_failover_max_attempts: c.crash_failover_max_attempts,
+                prefetch_min: c.prefetch_min,
+                prefetch_max: c.prefetch_max,
+                worker_cancel_grace_ms: c.worker_cancel_grace_ms,
+                pending_result_channel_capacity: c.pending_result_channel_capacity,
                 ..default.worker
             },
             store: crate::common::StoreConfig {
                 data_dir: c.data_dir.clone(),
-                ..default.store
+                map_size: c.store_map_size,
+                max_dbs: c.store_max_dbs,
+                sync_mode: sync_mode_from_str(&c.store_sync_mode, c.store_flush_interval_ms)?,
             },
             workflow: crate::common::WorkflowConfig {
                 default_timeout_ms: c.workflow_default_timeout_ms,
+                completed_retention_count: c.completed_retention_count,
+                persist_flush_interval_ms: c.persist_flush_interval_ms,
+                state_poll_interval_ms: c.state_poll_interval_ms,
                 ..default.workflow
             },
             payload_signing_key: c.payload_signing_key.as_bytes().to_vec(),
             require_payload_signing: c.require_payload_signing,
+            node_labels: c.node_labels.clone(),
+            node_host_runtime: python_runtime_description(),
             ..default
         })
     }
@@ -636,13 +766,40 @@ fn python_executable() -> String {
     })
 }
 
+/// 构造 worker 子进程的环境变量表。
+///
+/// 当前仅注入 `PYTHONPATH` = 父解释器 `sys.path`（平台路径分隔符拼接）：
+/// 进程隔离下模块级任务函数需要 by-reference 再导入。提取 `sys.path` 失败时
+/// 返回空表并记录 `error` 日志——worker 将完全继承父进程环境，模块级任务
+/// 函数可能以 `ModuleNotFoundError` 失败。
+///
+/// 条目无法拼接（例如 Windows 下某个路径含 `;`）时**不注入**并告警：一个
+/// 畸形的 `PYTHONPATH` 比不注入更难排查。
+fn worker_python_env() -> std::collections::BTreeMap<String, String> {
+    let mut env = std::collections::BTreeMap::new();
+    let path = python_sys_path();
+    if path.is_empty() {
+        return env;
+    }
+    match std::env::join_paths(path.iter()) {
+        Ok(joined) => {
+            env.insert(
+                "PYTHONPATH".to_string(),
+                joined.to_string_lossy().into_owned(),
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "failed to join sys.path into PYTHONPATH; worker will inherit \
+                 the parent environment instead"
+            );
+        }
+    }
+    env
+}
+
 /// 当前解释器的 ``sys.path``，透传给 worker 子进程作为 ``PYTHONPATH``。
-///
-/// 进程隔离下模块级任务函数需要 by-reference 再导入；Rust 嵌入场景直接配置
-/// `WorkerConfig::python_path`，不经过本函数。
-///
-/// 提取失败时返回空列表并记录 `error` 日志——空 `python_path` 会使 worker
-/// 子进程内模块级任务函数导入失败（ModuleNotFoundError）。
 fn python_sys_path() -> Vec<String> {
     pyo3::Python::attach(|py| {
         let extracted = pyo3::types::PyModule::import(py, "sys")
@@ -660,6 +817,42 @@ fn python_sys_path() -> Vec<String> {
                 Vec::new()
             }
         }
+    })
+}
+
+/// 解析用户提供的落盘同步策略字符串为 [`SyncMode`]。
+fn sync_mode_from_str(name: &str, flush_interval_ms: u64) -> PyResult<crate::common::SyncMode> {
+    match name {
+        "sync" => Ok(crate::common::SyncMode::Sync),
+        "group_commit" => Ok(crate::common::SyncMode::GroupCommit(flush_interval_ms)),
+        "no_sync" => Ok(crate::common::SyncMode::NoSync),
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "invalid store_sync_mode '{}': expected \"sync\", \"group_commit\" or \"no_sync\"",
+            other
+        ))),
+    }
+}
+
+/// 当前 Python 运行时描述（如 ``"CPython 3.12.1"``），作为节点元数据
+/// ``host_runtime`` 随心跳广播。提取失败返回 ``None``（仅损失可观测信息）。
+fn python_runtime_description() -> Option<String> {
+    pyo3::Python::attach(|py| {
+        let platform = pyo3::types::PyModule::import(py, "platform").ok()?;
+        let impl_name: String = platform
+            .getattr("python_implementation")
+            .ok()?
+            .call0()
+            .ok()?
+            .extract()
+            .ok()?;
+        let version: String = platform
+            .getattr("python_version")
+            .ok()?
+            .call0()
+            .ok()?
+            .extract()
+            .ok()?;
+        Some(format!("{impl_name} {version}"))
     })
 }
 

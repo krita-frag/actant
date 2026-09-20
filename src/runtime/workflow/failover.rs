@@ -32,7 +32,7 @@
 //!
 //! 第 2 腿刻意**不重派发**：源节点没有"该任务未执行完"的持久凭据，盲目重跑
 //! 会静默重复副作用；重跑交由显式重试策略（重试裁决）或提交方重提。
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -43,8 +43,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::common::{
     should_claim_workflow, ActorId, FailoverConfig, NodeHeartbeat, NodeId, OrchestratorClaim,
-    Result, TaskCompletion, TaskId, WireEnvelope, WireMessage, WorkflowId, STORE_KEY_LEASE,
-    TOPIC_FAILOVER, TOPIC_HEADS, TOPIC_HEARTBEAT,
+    PlatformInfo, Result, TaskCompletion, TaskId, WireEnvelope, WireMessage, WorkflowId,
+    STORE_KEY_LEASE, TOPIC_FAILOVER, TOPIC_HEADS, TOPIC_HEARTBEAT,
 };
 use crate::runtime::actor::ActorSystem;
 use crate::runtime::event_bus::{BusEvent, EventBus};
@@ -68,11 +68,14 @@ struct PersistedLease {
 }
 
 struct PeerState {
+    node_id: NodeId,
     last_heartbeat_ms: u64,
     active_workflows: HashSet<WorkflowId>,
     available_slots: u32,
     max_slots: u32,
     endpoint_addr: Option<String>,
+    labels: BTreeMap<String, String>,
+    platform: Option<PlatformInfo>,
 }
 
 /// 已转发到远端 peer、结果尚未回来的在途任务条目。
@@ -94,23 +97,32 @@ pub struct OutboundTask {
     pub forwarded_at: Instant,
 }
 
+/// 对外暴露的 peer 视图（节点可见性 N2）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerInfo {
+    pub node_id: NodeId,
     pub last_heartbeat_ms: u64,
     pub active_workflows: HashSet<WorkflowId>,
     pub available_slots: u32,
     pub max_slots: u32,
     pub endpoint_addr: Option<String>,
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+    #[serde(default)]
+    pub platform: Option<PlatformInfo>,
 }
 
 impl From<&PeerState> for PeerInfo {
     fn from(state: &PeerState) -> Self {
         Self {
+            node_id: state.node_id.clone(),
             last_heartbeat_ms: state.last_heartbeat_ms,
             active_workflows: state.active_workflows.clone(),
             available_slots: state.available_slots,
             max_slots: state.max_slots,
             endpoint_addr: state.endpoint_addr.clone(),
+            labels: state.labels.clone(),
+            platform: state.platform.clone(),
         }
     }
 }
@@ -207,6 +219,16 @@ pub struct FailoverManager {
     /// 本地事件总线：失联时把在途任务终结为 `TaskFailed` 发布出去，让提交方
     /// `AsyncResult` 得以终止。`None` 时（极简测试桩）该腿只清理登记表并告警。
     event_bus: Option<EventBus>,
+    /// 本节点平台信息（N1），随心跳广播。
+    platform: Option<PlatformInfo>,
+    /// 本节点用户自定义标签（N2），随心跳广播。
+    labels: BTreeMap<String, String>,
+    /// 节点身份密钥（endpoint keypair）。`Some` 时心跳以私钥签名。
+    signing_key: Option<iroh::SecretKey>,
+    /// `true` 时拒绝缺签/坏签的入站心跳（身份与信任）。
+    require_signed_records: bool,
+    /// 允许加入集群的 iroh endpoint id（z32 字符串）。空 = 不校验成员资格。
+    allowed_peer_ids: Vec<String>,
 }
 
 impl Drop for FailoverManager {
@@ -260,9 +282,60 @@ impl FailoverManager {
             local_max_capacity: Arc::new(AtomicU32::new(0)),
             outbound: Arc::new(DashMap::new()),
             event_bus: None,
+            platform: None,
+            labels: BTreeMap::new(),
+            signing_key: None,
+            require_signed_records: false,
+            allowed_peer_ids: Vec::new(),
         };
         fm.recover_leases_from_store();
         fm
+    }
+
+    /// 注入节点身份与信任配置（身份与信任批）。
+    ///
+    /// - `signing_key`：本节点 endpoint 私钥，`Some` 时出站心跳签名；
+    /// - `require_signed_records`：拒绝缺签/坏签的入站心跳；
+    /// - `allowed_peer_ids`：非空时入站心跳的 `endpoint_addr` 必须在列表内
+    ///   （gossip 侧成员校验；直连侧另有 ALPN 白名单）。
+    pub fn with_identity(
+        mut self,
+        signing_key: Option<iroh::SecretKey>,
+        require_signed_records: bool,
+        allowed_peer_ids: Vec<String>,
+    ) -> Self {
+        self.signing_key = signing_key;
+        self.require_signed_records = require_signed_records;
+        self.allowed_peer_ids = allowed_peer_ids;
+        self
+    }
+
+    /// 心跳签名域：`signature = None` 的心跳序列化字节。
+    fn signing_payload(hb: &NodeHeartbeat) -> Vec<u8> {
+        let unsigned = NodeHeartbeat {
+            signature: None,
+            ..hb.clone()
+        };
+        postcard::to_allocvec(&unsigned).unwrap_or_default()
+    }
+
+    /// 注入本节点元数据（平台信息 + 标签），随心跳广播（N1/N2）。
+    pub fn with_node_metadata(
+        mut self,
+        platform: Option<PlatformInfo>,
+        labels: BTreeMap<String, String>,
+    ) -> Self {
+        self.platform = platform;
+        self.labels = if crate::common::model::node_labels_within_limit(&labels) {
+            labels
+        } else {
+            tracing::warn!(
+                "node_labels exceed {} bytes; labels will not be advertised",
+                crate::common::model::NODE_LABELS_MAX_BYTES
+            );
+            BTreeMap::new()
+        };
+        self
     }
 
     /// 向 WorkflowActor 发起调用。
@@ -545,7 +618,16 @@ impl FailoverManager {
             available_slots: self.local_available_capacity.load(Ordering::Relaxed),
             max_slots: self.local_max_capacity.load(Ordering::Relaxed),
             endpoint_addr,
+            platform: self.platform.clone(),
+            labels: self.labels.clone(),
+            signature: None,
         };
+        // 节点记录签名：持有身份密钥时对签名域 ed25519 签名。签名失败不阻塞
+        // 心跳（require_signed_records 的接收方将拒绝，问题显式暴露）。
+        let mut hb = hb;
+        if let Some(ref key) = self.signing_key {
+            hb.signature = Some(key.sign(&Self::signing_payload(&hb)).to_bytes().to_vec());
+        }
         let msg = WireMessage::NodeHeartbeat(hb);
         let data = postcard::to_allocvec(&WireEnvelope::wrap(msg))
             .map_err(|e| crate::common::ActantError::Serialization(e.to_string()))?;
@@ -568,6 +650,23 @@ impl FailoverManager {
         self.peers
             .iter()
             .map(|ref_multi| (ref_multi.key().clone(), PeerInfo::from(ref_multi.value())))
+            .collect()
+    }
+
+    /// 返回当前在线的 peer 视图（节点可见性 N2）。
+    ///
+    /// 在线判定复用心跳新鲜度语义：距上次心跳超过 `failure_timeout_ms` 或
+    /// 从未收到心跳的节点不出现在结果中。返回值含节点元数据（slots/labels/
+    /// platform），是面板与资源核算类第 3 层应用的数据源。
+    pub fn peers(&self) -> Vec<PeerInfo> {
+        let now_ms = crate::common::epoch_millis();
+        self.peers
+            .iter()
+            .filter(|entry| {
+                let last = entry.value().last_heartbeat_ms;
+                last > 0 && now_ms.saturating_sub(last) <= self.failure_timeout_ms
+            })
+            .map(|entry| PeerInfo::from(entry.value()))
             .collect()
     }
 
@@ -948,12 +1047,59 @@ impl FailoverManager {
         self.probe_outbound_targets().await;
     }
 
+    /// 入站心跳的身份与信任校验。
+    ///
+    /// 依次应用（任一失败拒绝并 warn）：
+    /// 1. 成员校验：`allowed_peer_ids` 非空时，心跳的 `endpoint_addr` 必须在
+    ///    列表内（gossip 侧旁路的封闭；直连侧另有 ALPN 白名单）；
+    /// 2. 签名校验：`require_signed_records` 开启时，心跳必须携带有效签名，
+    ///    且签名公钥（`endpoint_addr` 解析出的 endpoint id）须与声称的
+    ///    来源一致——节点无法伪造他人身份的节点记录。
+    fn verify_heartbeat(&self, hb: &NodeHeartbeat) -> bool {
+        if !self.allowed_peer_ids.is_empty() {
+            let Some(ref addr) = hb.endpoint_addr else {
+                tracing::warn!(node = %hb.node_id.0, "heartbeat rejected: no endpoint_addr while allowlist is active");
+                return false;
+            };
+            if !self.allowed_peer_ids.iter().any(|a| a == addr) {
+                tracing::warn!(node = %hb.node_id.0, "heartbeat rejected: peer not in allowlist");
+                return false;
+            }
+        }
+        if !self.require_signed_records {
+            return true;
+        }
+        let (Some(sig_bytes), Some(ref addr)) = (&hb.signature, &hb.endpoint_addr) else {
+            tracing::warn!(node = %hb.node_id.0, "heartbeat rejected: unsigned while require_signed_records is on");
+            return false;
+        };
+        let Ok(pk) = addr.parse::<iroh::EndpointId>() else {
+            tracing::warn!(node = %hb.node_id.0, "heartbeat rejected: endpoint_addr is not a valid endpoint id");
+            return false;
+        };
+        let Ok(sig_arr) = <[u8; iroh::Signature::LENGTH]>::try_from(sig_bytes.as_slice()) else {
+            tracing::warn!(node = %hb.node_id.0, "heartbeat rejected: malformed signature");
+            return false;
+        };
+        let sig = iroh::Signature::from_bytes(&sig_arr);
+        match pk.verify(&Self::signing_payload(hb), &sig) {
+            Ok(()) => true,
+            Err(_) => {
+                tracing::warn!(node = %hb.node_id.0, "heartbeat rejected: signature verification failed");
+                false
+            }
+        }
+    }
+
     /// 处理远端心跳并更新 peer 视图。
     ///
     /// `last_heartbeat_ms` 记录**接收方本地时钟**的接收时刻而非发送方
     /// `timestamp_ms`：故障检测窗口由接收方度量，若使用发送方时钟，
     /// 跨节点时钟偏差会直接侵蚀/放大检测窗口（偏差大时误判失联或漏判）。
     pub fn handle_heartbeat(&self, hb: &NodeHeartbeat) {
+        if hb.node_id != self.node_id && !self.verify_heartbeat(hb) {
+            return;
+        }
         if hb.node_id != self.node_id {
             tracing::debug!(
                 "received heartbeat from {} with {} active workflows",
@@ -963,17 +1109,22 @@ impl FailoverManager {
             let is_new = !self.peers.contains_key(&hb.node_id);
             let received_at_ms = crate::common::epoch_millis();
             let mut peer = self.peers.entry(hb.node_id.clone()).or_insert(PeerState {
+                node_id: hb.node_id.clone(),
                 last_heartbeat_ms: 0,
                 active_workflows: HashSet::new(),
                 available_slots: 0,
                 max_slots: 0,
                 endpoint_addr: None,
+                labels: BTreeMap::new(),
+                platform: None,
             });
             peer.last_heartbeat_ms = received_at_ms;
             peer.active_workflows = hb.active_workflows.iter().cloned().collect();
             peer.available_slots = hb.available_slots;
             peer.max_slots = hb.max_slots;
             peer.endpoint_addr = hb.endpoint_addr.clone();
+            peer.labels = hb.labels.clone();
+            peer.platform = hb.platform.clone();
             if is_new {
                 crate::metrics::inc_connected_peers();
             }

@@ -234,6 +234,77 @@ class TestCrossNodeTaskExecution:
                 handle.result(timeout=10.0)
 
 
+class TestNodeVisibility:
+    """节点可见性（N1/N2）：peers() 返回对端 slots/labels。"""
+
+    @pytest.fixture
+    def two_nodes_with_labels(self):
+        """node-b 携带自定义标签与并发配置启动的双节点拓扑。"""
+        import tempfile
+
+        from actant.actant import _ActantConfig, _NetworkConfig
+
+        dir_a = tempfile.mkdtemp(prefix="actant-e2e-vis-a-")
+        dir_b = tempfile.mkdtemp(prefix="actant-e2e-vis-b-")
+
+        rt_a = Runtime.with_defaults(name="vis-node-a", data_dir=dir_a)
+        config_b = _ActantConfig(
+            payload_signing_key="",
+            network=_NetworkConfig(preset="local"),
+            max_concurrent_tasks=3,
+            node_labels={"role": "worker", "zone": "az-1"},
+        )
+        rt_b = Runtime.with_defaults(
+            name="vis-node-b", data_dir=dir_b, config=config_b
+        )
+        rt_a.start()
+        rt_b.start()
+
+        try:
+            connected = connect_peers(rt_a, rt_b, timeout_s=15.0)
+            if not connected:
+                pytest.skip("P2P connection not established within timeout (network env)")
+            yield rt_a, rt_b
+        finally:
+            rt_b.stop()
+            rt_a.stop()
+            import shutil
+
+            shutil.rmtree(dir_a, ignore_errors=True)
+            shutil.rmtree(dir_b, ignore_errors=True)
+
+    def test_peers_returns_remote_slots_and_labels(self, two_nodes_with_labels) -> None:
+        rt_a, rt_b = two_nodes_with_labels
+        node_b_id = rt_b.node_id
+
+        deadline = time.time() + 15
+        peer = None
+        while time.time() < deadline:
+            peers = rt_a.peers()
+            peer = next((p for p in peers if p["node_id"] == node_b_id), None)
+            if peer is not None:
+                break
+            time.sleep(0.2)
+
+        assert peer is not None, f"node-b not visible in peers(): {rt_a.peers()}"
+        # slots 来自心跳容量视图（node-b 配置 max_concurrent_tasks=3）
+        assert peer["max_slots"] == 3
+        assert peer["available_slots"] == 3
+        # labels 为用户自定义标签
+        assert peer["labels"] == {"role": "worker", "zone": "az-1"}
+        # platform 携带核心自动填充的平台三要素
+        assert peer["platform"] is not None
+        assert peer["platform"]["os"]
+        assert peer["platform"]["arch"]
+        assert peer["platform"]["actant_version"]
+        assert peer["last_heartbeat_ms"] > 0
+
+    def test_peers_excludes_unknown_nodes(self, two_nodes_with_labels) -> None:
+        rt_a, _ = two_nodes_with_labels
+        for p in rt_a.peers():
+            assert p["node_id"] != ""
+
+
 class TestGossipConvergence:
     """gossip 网络状态收敛。"""
 

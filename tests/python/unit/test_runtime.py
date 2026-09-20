@@ -9,6 +9,7 @@ import pytest
 import actant
 from actant import Runtime
 from actant._runtime import get_current_runtime, use_runtime
+from actant.actant import _NetworkConfig
 from actant.capabilities import RouteCtx, SerializationReq, TaskEvent
 
 
@@ -217,6 +218,14 @@ class TestRuntimeProduction:
         with pytest.raises(ValueError, match="data_dir"):
             Runtime.production(payload_signing_key="secret", data_dir="")
 
+    def test_production_rejects_empty_allowlist(self):
+        """空 allowlist（开放成员身份）在生产语义下必须拒启。"""
+        with pytest.raises(ValueError, match="allowed_peer_ids"):
+            Runtime.production(
+                payload_signing_key="cluster-shared-secret",
+                data_dir=tempfile.mkdtemp(),
+            )
+
     def test_production_enforces_require_payload_signing(self):
         """production() 必须设置 require_payload_signing=True。"""
         data_dir = tempfile.mkdtemp()
@@ -224,10 +233,48 @@ class TestRuntimeProduction:
             rt = Runtime.production(
                 payload_signing_key="cluster-shared-secret",
                 data_dir=data_dir,
+                network=_NetworkConfig(allowed_peer_ids=["peer-a"]),
             )
             assert rt._config is not None
             assert rt._config.require_payload_signing is True
             assert rt._config.payload_signing_key == "cluster-shared-secret"
+        finally:
+            shutil.rmtree(data_dir, ignore_errors=True)
+
+    def test_production_enforces_signed_heartbeats(self):
+        """production() 必须强制心跳节点记录签名。"""
+        data_dir = tempfile.mkdtemp()
+        try:
+            rt = Runtime.production(
+                payload_signing_key="cluster-shared-secret",
+                data_dir=data_dir,
+                network=_NetworkConfig(allowed_peer_ids=["peer-a"]),
+            )
+            assert rt._config is not None
+            assert rt._config.network.require_signed_records is True
+        finally:
+            shutil.rmtree(data_dir, ignore_errors=True)
+
+    def test_production_persists_identity_key(self):
+        """节点身份密钥持久化于 data_dir/identity.key，endpoint id 跨重启稳定。"""
+        data_dir = tempfile.mkdtemp()
+        try:
+            with Runtime.production(
+                payload_signing_key="cluster-shared-secret",
+                data_dir=data_dir,
+                network=_NetworkConfig(allowed_peer_ids=["peer-a"]),
+            ) as rt:
+                assert rt._started
+                identity_path = os.path.join(data_dir, "identity.key")
+                assert os.path.exists(identity_path)
+                peer_id_first = rt.peer_id
+            with Runtime.production(
+                payload_signing_key="cluster-shared-secret",
+                data_dir=data_dir,
+                network=_NetworkConfig(allowed_peer_ids=["peer-a"]),
+            ) as rt2:
+                # 同一 data_dir 重启 → 同一 endpoint id（白名单因此可维护）
+                assert rt2.peer_id == peer_id_first
         finally:
             shutil.rmtree(data_dir, ignore_errors=True)
 
@@ -238,6 +285,7 @@ class TestRuntimeProduction:
             with Runtime.production(
                 payload_signing_key="cluster-shared-secret",
                 data_dir=data_dir,
+                network=_NetworkConfig(allowed_peer_ids=["peer-a"]),
             ) as rt:
                 assert rt._started
                 assert get_current_runtime() is rt

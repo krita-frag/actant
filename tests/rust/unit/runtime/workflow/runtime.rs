@@ -319,6 +319,9 @@ async fn router_handle_message_heartbeat_dispatches_to_failover() {
     });
 
     let hb = NodeHeartbeat {
+        signature: None,
+        labels: std::collections::BTreeMap::new(),
+        platform: None,
         node_id: NodeId::from("node-HB".to_string()),
         active_workflows: Vec::new(),
         timestamp_ms: 12345,
@@ -1416,6 +1419,9 @@ async fn select_remote_target_filters_unavailable_peers() {
 
     // 注册一个 available_slots=0 的 peer
     let hb = NodeHeartbeat {
+        signature: None,
+        labels: std::collections::BTreeMap::new(),
+        platform: None,
         node_id: NodeId::from("node-B".to_string()),
         active_workflows: Vec::new(),
         timestamp_ms: crate::common::epoch_millis(),
@@ -1444,6 +1450,9 @@ async fn select_remote_target_returns_peer_with_more_available_slots() {
 
     // 本地有 4 个可用槽位，peer 有 8 个，应被选中
     let hb = NodeHeartbeat {
+        signature: None,
+        labels: std::collections::BTreeMap::new(),
+        platform: None,
         node_id: NodeId::from("node-B".to_string()),
         active_workflows: Vec::new(),
         timestamp_ms: crate::common::epoch_millis(),
@@ -1482,6 +1491,9 @@ async fn select_remote_target_skips_stale_heartbeat() {
         .with_failover_manager(failover.clone());
 
     let hb = NodeHeartbeat {
+        signature: None,
+        labels: std::collections::BTreeMap::new(),
+        platform: None,
         node_id: NodeId::from("node-B".to_string()),
         active_workflows: Vec::new(),
         timestamp_ms: crate::common::epoch_millis(),
@@ -1513,6 +1525,9 @@ async fn select_remote_target_peer_not_better_than_local_returns_none() {
         .with_failover_manager(failover.clone());
 
     let hb = NodeHeartbeat {
+        signature: None,
+        labels: std::collections::BTreeMap::new(),
+        platform: None,
         node_id: NodeId::from("node-B".to_string()),
         active_workflows: Vec::new(),
         timestamp_ms: crate::common::epoch_millis(),

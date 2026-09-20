@@ -5,25 +5,25 @@
 //!
 //! | 类型 | 职责 |
 //! |------|------|
-//! | `Actor` trait | 用户/系统 Actor 实现的唯一抽象 |
+//! | `Actor` trait | 系统 Actor 实现的唯一抽象 |
 //! | `ActorContext` | Actor 实例生命周期上下文 |
-//! | `MailboxRegistry` | Actor 邮箱注册表与消息持久化 |
-//! | `ActorPersistence` | Actor 状态检查点 + WAL |
+//! | `MailboxRegistry` | Actor 邮箱注册表（纯内存投递） |
 //! | `ActorSystem` | 对外 facade：spawn / send / call / stop |
 //!
 //! 子模块结构：
 //! - [`runtime`]：`Actor` trait + `ActorContext`
-//! - [`mailbox`]：`MailboxRegistry` + 持久化待发消息
-//! - [`persistence`]：`ActorPersistence`
+//! - [`mailbox`]：`MailboxRegistry`
 //! - [`system`]：`ActorSystem` facade + `RunningActor` 私有循环
+//!
+//! 定位：**系统 actor 专用本地运行时**。本模块不做任何持久化——
+//! 工作流恢复由 orchestrator 的统一工作流历史（S0）唯一承载，
+//! 不存在 mailbox 重放等第二恢复路径。
 
 pub mod mailbox;
-pub mod persistence;
 pub mod runtime;
 pub mod system;
 
 pub use mailbox::MailboxRegistry;
-pub use persistence::ActorPersistence;
 pub use runtime::{Actor, ActorContext};
 pub use system::ActorSystem;
 

@@ -1,8 +1,9 @@
+use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use super::model::{NodeId, TaskDefinition, TaskId, WorkflowId};
+use super::model::{NodeId, PlatformInfo, TaskDefinition, TaskId, WorkflowId};
 use crate::runtime::state::HlcTimestamp;
 
 /// 网络协议常量 — 所有魔法字符串与数值限制的唯一真相来源。
@@ -48,7 +49,6 @@ pub mod constants {
         /// recover 时据此只重放其后的事件（快照 + 事件重放，序号对齐）。
         pub const EVENT_SEQ: &str = "orch:eventseq:";
         pub const LEASE: &str = "lease:";
-        pub const CHECKPOINT: &str = "ckpt:";
     }
 
     // --- 限制 ---
@@ -944,6 +944,19 @@ pub struct NodeHeartbeat {
     /// Iroh endpoint ID（公钥），用于直连。
     #[serde(default)]
     pub endpoint_addr: Option<String>,
+    /// 节点宿主平台信息（N1）。`None` = 旧版本节点未上报。
+    #[serde(default)]
+    pub platform: Option<PlatformInfo>,
+    /// 用户自定义标签（N2）。发送侧校验 [`node_labels_within_limit`]，
+    /// 超限整体置空。
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+    /// 节点记录签名（身份与信任）：发送方 iroh endpoint 私钥对本结构
+    /// （`signature = None` 序列化）的 ed25519 签名。验证公钥来自
+    /// `endpoint_addr`（endpoint id 即公钥），无需密钥分发。
+    /// `None` = 未签名（`require_signed_records = false` 时接受）。
+    #[serde(default)]
+    pub signature: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

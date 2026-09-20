@@ -201,35 +201,11 @@ pub struct WorkerLaunchSpec {
 }
 
 impl WorkerLaunchSpec {
-    /// 由 worker 程序路径、入口参数与父解释器的 `sys.path` 构造启动规格。
+    /// 由 worker 程序路径、入口参数与环境变量构造启动规格。
     ///
-    /// `python_path` 非空时注入 `PYTHONPATH`，条目以**平台路径列表分隔符**
-    /// （unix `:`／Windows `;`）拼接——不是路径内的目录分隔符。进程隔离下
-    /// 模块级任务函数（cloudpickle by-reference 序列化）需在 worker 子进程内
-    /// 再次导入，缺失该注入会以 `ModuleNotFoundError` 失败；空列表表示不注入，
-    /// worker 完全继承父进程环境。
-    ///
-    /// 条目无法拼接（例如 Windows 下某个路径含 `;`）时**不注入**并告警：一个
-    /// 畸形的 `PYTHONPATH` 比不注入更难排查。
-    pub fn with_python_path(program: String, args: Vec<String>, python_path: &[String]) -> Self {
-        let mut env = BTreeMap::new();
-        if !python_path.is_empty() {
-            match std::env::join_paths(python_path.iter()) {
-                Ok(joined) => {
-                    env.insert(
-                        "PYTHONPATH".to_string(),
-                        joined.to_string_lossy().into_owned(),
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "failed to join python_path into PYTHONPATH; \
-                         worker will inherit the parent environment instead"
-                    );
-                }
-            }
-        }
+    /// `env` 非空时注入对应环境变量，未列出的变量**完全继承父进程**；调用方
+    /// 自行保证键的语义（核心不解释任何变量名，如语言运行时的模块搜索路径）。
+    pub fn new(program: String, args: Vec<String>, env: BTreeMap<String, String>) -> Self {
         Self { program, args, env }
     }
 }

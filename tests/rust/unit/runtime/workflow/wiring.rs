@@ -112,6 +112,9 @@ async fn inbound_heartbeat_creates_peer_with_capacity() {
     let wiring = make_wiring("node-wire-A").await;
 
     let hb = crate::common::NodeHeartbeat {
+        signature: None,
+        labels: std::collections::BTreeMap::new(),
+        platform: None,
         node_id: NodeId::from("node-wire-B".to_string()),
         active_workflows: vec![],
         timestamp_ms: crate::common::epoch_millis(),

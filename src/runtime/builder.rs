@@ -13,7 +13,7 @@ use crate::runtime::actor::ActorSystem;
 use crate::runtime::dispatcher::{ProcessTaskDispatcher, TaskDispatcher, WorkerLaunchSpec};
 use crate::runtime::event_bus::EventBus;
 use crate::runtime::network::Transport;
-use crate::runtime::state::{CheckpointManager, LmdbStore, Store, WalWriter};
+use crate::runtime::state::{LmdbStore, Store};
 use crate::runtime::workflow::orchestrator::Orchestrator;
 use crate::runtime::workflow::Worker;
 use crate::runtime::workflow::{ActorScheduler, FailoverManager, SchedulerActor};
@@ -96,31 +96,65 @@ pub fn validate_data_dir(data_dir: &str) -> Result<(), ActantError> {
     Ok(())
 }
 
-/// 初始化 actor 系统，可选持久化。
+/// 初始化 actor 系统（系统 actor 专用本地运行时，无持久化）。
+///
+/// 工作流恢复由 orchestrator 的统一工作流历史承载；mailbox 与 actor 状态
+/// 均为进程内存活对象，跨重启不保留。
 pub fn init_actor_system(
-    data_dir: Option<&str>,
+    _data_dir: Option<&str>,
     node_id: &NodeId,
     event_bus: &EventBus,
-    config: &crate::common::ActantConfig,
+    _config: &crate::common::ActantConfig,
 ) -> Result<Arc<ActorSystem>, ActantError> {
-    let base = ActorSystem::new()
-        .with_node_id(node_id.clone())
-        .with_event_bus(event_bus.clone());
-    let system = if let Some(dir) = data_dir {
-        let db_path = Path::new(dir).join("actor");
-        // actor 子存储与主存储使用同一 StoreConfig（map_size / max_dbs /
-        // sync_mode），保证持久化语义一致。open_with_config 内部创建目录。
-        let store = LmdbStore::open_with_config(&db_path, &config.store)
-            .map_err(|e| ActantError::Storage(format!("failed to open actor store: {}", e)))?;
-        let checkpoint = CheckpointManager::new(store.clone());
-        let wal_path = Path::new(dir).join("actor.wal");
-        let wal_writer = WalWriter::open_with_sync(&wal_path, true)
-            .map_err(|e| ActantError::Storage(format!("failed to open actor WAL: {}", e)))?;
-        Arc::new(base.with_wal(wal_writer, store).with_checkpoint(checkpoint))
-    } else {
-        Arc::new(base)
-    };
+    let system = Arc::new(
+        ActorSystem::new()
+            .with_node_id(node_id.clone())
+            .with_event_bus(event_bus.clone()),
+    );
     Ok(system)
+}
+
+/// 加载或创建节点身份密钥（identity.key）。
+///
+/// 节点身份 = iroh endpoint keypair：`data_dir/identity.key` 存 raw 32 字节
+/// ed25519 seed（unix 0600）。存在则加载（endpoint id 跨重启稳定，使
+/// `allowed_peer_ids` 白名单可维护）；否则生成并写入。调用方保证 `data_dir`
+/// 已存在（`validate_data_dir` 之后）。
+fn load_or_create_identity(data_dir: &Path) -> Result<iroh::SecretKey, ActantError> {
+    let path = data_dir.join("identity.key");
+    if path.exists() {
+        let bytes = std::fs::read(&path)
+            .map_err(|e| ActantError::Config(format!("failed to read identity.key: {e}")))?;
+        let seed: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
+            ActantError::Config(format!(
+                "identity.key corrupt: expected 32 bytes, got {}",
+                v.len()
+            ))
+        })?;
+        tracing::info!("loaded node identity key from {}", path.display());
+        return Ok(iroh::SecretKey::from_bytes(&seed));
+    }
+    let key = iroh::SecretKey::generate();
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| ActantError::Config(format!("failed to create identity.key: {e}")))?;
+        file.write_all(&key.to_bytes())
+            .map_err(|e| ActantError::Config(format!("failed to write identity.key: {e}")))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&path, key.to_bytes())
+            .map_err(|e| ActantError::Config(format!("failed to write identity.key: {e}")))?;
+    }
+    tracing::info!("generated new node identity key at {}", path.display());
+    Ok(key)
 }
 
 /// 初始化 orchestrator，可选持久化。
@@ -322,12 +356,16 @@ impl RuntimeBuilder {
         let blob_dir = Path::new(&data_dir).join("blobs");
         let blob_store = Arc::new(crate::runtime::blobs::BlobStore::open(&blob_dir).await?);
 
+        // 节点身份：endpoint keypair 随 data_dir 持久化，endpoint id 跨重启稳定。
+        let identity = load_or_create_identity(Path::new(&data_dir))?;
+
         tracing::info!("build: NetworkManager::new enter");
         let network: Arc<dyn Transport> = Arc::new(
-            NetworkManager::with_blob_store(
+            NetworkManager::with_identity(
                 self.node_id.clone(),
                 self.config.network.clone(),
                 blob_store.clone(),
+                Some(identity.clone()),
             )
             .await
             .map_err(|e| ActantError::Network(format!("network init failed: {}", e)))?,
@@ -345,11 +383,6 @@ impl RuntimeBuilder {
         )?;
         tracing::info!("build: init_actor_system done");
 
-        // 有持久化存储时启动 WAL compaction 后台任务，由 Runtime::shutdown 停止。
-        if self.data_dir.is_some() {
-            actor_system.start_compaction_task();
-        }
-
         let store_path = Path::new(&data_dir).join("store");
         // 主存储使用配置中的 StoreConfig（map_size / max_dbs / sync_mode），
         // 不再隐式退回默认配置。open_with_config 内部创建目录。
@@ -360,10 +393,10 @@ impl RuntimeBuilder {
         let task_dispatcher: Arc<dyn TaskDispatcher> = Arc::new(
             ProcessTaskDispatcher::new(
                 self.config.worker.num_worker_processes.max(1),
-                WorkerLaunchSpec::with_python_path(
+                WorkerLaunchSpec::new(
                     self.config.worker.worker_program.clone(),
-                    vec!["-m".into(), "actant.task._worker".into()],
-                    &self.config.worker.python_path,
+                    self.config.worker.worker_args.clone(),
+                    self.config.worker.worker_env.clone(),
                 ),
                 self.config.worker.worker_cancel_grace_ms,
                 self.config.payload_signing_key.clone(),
@@ -421,12 +454,24 @@ impl RuntimeBuilder {
         // ── FailoverActor ──────────────────────────────────────────────
         // 接管心跳、故障检测、租约维护。start_background_loops 启动后台循环。
         tracing::info!("build: failover actor spawn enter");
+        // 节点元数据（N1/N2）：核心自动填充平台三要素，host_runtime 由绑定层经
+        // config 提供，labels 为用户自定义。
+        let mut platform = crate::common::PlatformInfo::detect();
+        platform.host_runtime = self.config.node_host_runtime.clone();
         let failover = Arc::new(
             FailoverManager::new(
                 self.node_id.clone(),
                 network.clone(),
                 actor_system.clone(),
                 workflow_actor_id.clone(),
+            )
+            .with_node_metadata(Some(platform), self.config.node_labels.clone())
+            // 身份与信任：心跳签名密钥 = endpoint keypair；require_signed_records
+            // 开启时拒绝缺签/坏签心跳，allowlist 非空时同时校验成员资格。
+            .with_identity(
+                Some(identity),
+                self.config.network.require_signed_records,
+                self.config.network.allowed_peer_ids.clone(),
             )
             // 失联时终结在途任务的发布出口（与远端结果回灌同一 event_bus）。
             .with_event_bus(event_bus.clone()),

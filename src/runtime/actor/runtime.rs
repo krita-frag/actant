@@ -14,7 +14,6 @@ use crate::common::{ActorId, ActorMessage, ActorMessageResult, ActorStatus, Resu
 ///
 /// Actor 由 [`crate::runtime::actor::system::ActorSystem`] 独占驱动：每个 actor
 /// 实例在自己的任务中顺序处理 [`ActorMessage`]，因此实现内部通常不需要额外同步。
-/// Actor 可以选择实现状态持久化钩子；不支持持久化的 actor 使用默认 no-op 实现即可。
 ///
 /// # Lifecycle
 ///
@@ -32,32 +31,6 @@ pub trait Actor: Send + Sync + 'static {
     /// 返回错误表示消息处理失败；调用方会收到该错误，监督树也可观测到失败事件。
     /// 不要用 panic 表示业务错误，panic 只用于不可恢复的实现缺陷。
     async fn handle_message(&mut self, msg: ActorMessage) -> Result<ActorMessageResult>;
-
-    /// 序列化 actor 当前状态。
-    ///
-    /// 默认返回空字节，表示 actor 没有需要持久化的状态。
-    ///
-    /// # Errors
-    ///
-    /// 如果状态无法序列化或底层资源不可用，应返回错误。调用方会保留原状态，
-    /// 并通过 tracing 记录失败。
-    fn save_state(&self) -> Result<Vec<u8>> {
-        Ok(vec![])
-    }
-
-    /// 从已保存字节恢复 actor 状态。
-    ///
-    /// # Errors
-    ///
-    /// 如果字节格式不兼容、损坏或无法应用到当前 actor，应返回错误。
-    fn load_state(&mut self, _state: &[u8]) -> Result<()> {
-        Ok(())
-    }
-
-    /// 返回 actor 是否参与 checkpoint/WAL 恢复。
-    fn supports_state_persistence(&self) -> bool {
-        false
-    }
 
     /// actor 启动钩子。
     ///
@@ -86,18 +59,6 @@ impl Actor for Box<dyn Actor> {
 
     async fn handle_message(&mut self, msg: ActorMessage) -> Result<ActorMessageResult> {
         (**self).handle_message(msg).await
-    }
-
-    fn save_state(&self) -> Result<Vec<u8>> {
-        (**self).save_state()
-    }
-
-    fn load_state(&mut self, state: &[u8]) -> Result<()> {
-        (**self).load_state(state)
-    }
-
-    fn supports_state_persistence(&self) -> bool {
-        (**self).supports_state_persistence()
     }
 
     async fn on_start(&mut self) -> Result<()> {

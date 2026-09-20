@@ -7,6 +7,35 @@
 
 ### 破坏性变更
 
+- **Actor 持久化机器整体移除（0.3.4 B1/B2/B3，−1100 行）**：`ActorPersistence`
+  （CheckpointManager / WalWriter / WalReader / WalCompactor / ActorSnapshot，state.rs
+  同步删除）与 mailbox pending 持久化（`PersistentMessage` / `recover_pending` /
+  `ack_message` / delivery-count / 毒消息 bounded-redelivery）删除。`Actor` trait 收缩：
+  `save_state` / `load_state` / `supports_state_persistence` 钩子删除；`ActorConfig`
+  删除 `wal_compaction_interval_secs` / `checkpoint_retention_count`；`ActorSystem`
+  删除 `with_checkpoint` / `with_wal` / `start_compaction_task` / `stop_compaction_task`，
+  定位收缩为"系统 actor 专用本地运行时"；`Topic::WalCompacted` 话题与
+  `BusEvent::WalCompacted` 变体、`actant.actor.save_state_ms` / `load_state_ms` 指标、
+  wire 常量 `store_keys::CHECKPOINT` 一并删除；builder 不再创建 `data_dir/actor` 子目录
+  与 `actor.wal`。mailbox 投递语义由 at-least-once 变为**进程内 at-most-once**——工作流
+  恢复由 orchestrator 的统一工作流历史（0.3.3 S0）唯一承载，mailbox 重放作为与历史
+  重放冲突的第二恢复路径不再存在（鲁棒性净增）。零生产消费者（四个系统 actor 均未启用
+  状态持久化），已有数据目录中的 `actor/` / `actor.wal` 残留文件可手动删除。
+
+- **`WorkerConfig.python_path` 删除，worker 拉起规格语言中性化（0.3.4 F3）**：
+  字段替换为 `worker_args: Vec<String>` + `worker_env: BTreeMap<String, String>`；
+  `ProcessTaskDispatcher` 不再感知 `PYTHONPATH` 与 `-m actant.task._worker`——解释器
+  路径、模块入口与环境变量由 Python 绑定层（`src/py/config.rs`）拼装，Rust 纯嵌入
+  场景直接配置三要素。`WorkerLaunchSpec::with_python_path` 删除，改 `new(program,
+  args, env)`。同时指标边带修复：worker 发射名 `python.handler_ms` → `task.handler_ms`
+  （与 Rust 侧 0.3.3 已改名的 `METRIC_TASK_HANDLER_MS` 对齐——此前两者失配，任务
+  耗时直方图被静默丢弃）。
+
+- **`Runtime.production()` 空 allowlist 拒启（0.3.4 身份与信任）**：
+  `network.allowed_peer_ids` 为空从 warn 升级为 `ValueError`——开放成员身份不属于
+  生产语义。同时强制 `require_signed_records=True`（心跳节点记录签名）。原依赖
+  "空白名单 + 告警"跑生产的部署需显式登记集群成员 endpoint id（`peer_id` 查询）。
+
 - **SHM ring 传输移除，worker IPC 统一 stdio pipe（0.3.x 减法）**：
   `src/runtime/worker_shm.rs` / `src/runtime/worker_ring.rs` 与 dispatcher、
   `_worker.py` 中的全部共享内存 ring 路径删除——worker 子进程 IPC 回归纯 stdio
@@ -57,7 +86,48 @@
 
 - **Python-facing Actor API 移除（0.3.1 剪裁 T3/T4/T5/T6，capability 13 → 10）**：`_ActorCore`（`spawn_actor`/`call_method` 等全部方法，全仓零调用方）、`PythonActor`、`ActorMessaging`/`ActorSupervision`/`ActorLifecycle` 三个 capability 及其 ctx dataclass 与 Handler Protocol、`_Event.orchestration()`/`_Event.supervision()`（无构造路径）、`_RuntimeCore.retry_policy`/`set_retry_policy`（零调用）、`register_python_dispatch_handler`（no-op）全部删除；`_NetworkConfig.actor_router_strategy`/`actor_registry_gossip_interval_ms` 同步摘除。内置 capability 收敛为 10 个（策略型 Routing/Scheduling/RetryPolicy + Rust-backed Serialization/Transport/Store/Execute/TaskLifecycle/WorkflowLifecycle/NodeLifecycle）。本地 `ActorSystem`（spawn/mailbox/at-least-once/取消/持久化）保留，仍是四类系统 actor 的生产底座；`ActorError` 异常保留（本地 ActorSystem 仍产生 `actor` kind）。另删除 `observability::shutdown()` no-op 与未实现的 relay map 配置字段。
 
-### 新增
+### 新增（0.3.4：身份与信任 + 节点可见性 + 二次开发条件 + API 暴露）
+
+- **身份与信任**：节点身份 = iroh endpoint keypair，随 `data_dir/identity.key` 持久化
+  （raw 32 字节 ed25519 seed，unix 0600；无 data_dir 时临时随机）——endpoint id 跨重启
+  稳定，`allowed_peer_ids` 白名单因此可维护（同 data_dir 重启 peer_id 不变，测试断言）。
+  心跳节点记录签名：`NodeHeartbeat.signature`（serde default）由发送方 endpoint 私钥
+  ed25519 签名（签名域 = `signature = None` 的结构序列化），验证公钥来自心跳自带
+  `endpoint_addr`（endpoint id 即公钥），无需密钥分发；`NetworkConfig.require_signed_records`
+  （默认 false）开启时 `FailoverManager` 拒绝缺签/坏签心跳，`allowed_peer_ids` 非空时
+  同时做成员校验（堵 gossip 侧旁路，直连侧另有 ALPN 白名单）。**验收**：未持密钥的
+  对端无法提交任务（直连被 ALPN 拒 + wire MAC 验签拒 + 心跳被拒不进路由视图）；
+  伪造签名（用自己的密钥签他人的 endpoint 身份）被拒的单元测试。wire per-node
+  MAC 注册表保留为消息完整性层（对称完整性 ≠ 节点记录来源认证，见 plans/PLAN.md
+  §身份与信任裁决 4）。
+
+- **节点可见性（N1/N2）**：`NodeHeartbeat` 增 `platform: Option<PlatformInfo>`
+  （os/arch/actant_version 核心自动填充 + `host_runtime` 绑定层补充，如
+  "CPython 3.12.1"）与 `labels: BTreeMap<String,String>`（用户自定义，超 4KB 整体
+  丢弃），serde default 向后兼容混版本集群。`FailoverManager::peers()`（心跳新鲜度
+  过滤）与 py 桥 `Runtime.peers() -> list[dict]`（node_id/endpoint/slots/
+  active_workflows/labels/platform/last_heartbeat）。`ActantConfig` 增
+  `node_labels` / `node_host_runtime`；`_ActantConfig` 增 `node_labels` kwarg。
+  **验收**：双节点 e2e 中 peers() 返回对端 slots/labels/platform。
+
+- **二次开发条件（G-relay/G-route）**：`NetworkConfig.relay_endpoints: Vec<String>`
+  → iroh `RelayMode::Custom`（覆盖 preset relay，discovery 与 relay 正交）；py 层
+  `_NetworkConfig(relay_endpoints=[...])`。`RoutePolicy` trait（`workflow/route.rs`）：
+  `RouteCandidate`/`RouteContext` + 默认实现 `DefaultRoutePolicy`（复刻原
+  `Worker::select_remote_target` 硬编码逻辑：TTL 过滤 + 槽位比较 + 稳定排序），
+  `Worker::with_route_policy` 注入自定义策略。
+
+- **API 暴露批（E5-E7）**：`Runtime.delete_workflow(workflow_id)`（运维清理，
+  幂等；`evict_workflow` 与其为同一操作，按查重纪律不重复暴露）；
+  `_ActantConfig` 透出高级调优字段（暴露前逐字段确认消费点）：
+  `store_map_size`/`store_max_dbs`/`store_sync_mode`（"sync"/"group_commit"/"no_sync"
+  + `store_flush_interval_ms`）、`prefetch_min`/`prefetch_max`/`worker_cancel_grace_ms`/
+  `pending_result_channel_capacity`、`completed_retention_count`/`persist_flush_interval_ms`/
+  `state_poll_interval_ms`。死旋钮（`timeout_check_interval_ms` /
+  `completion_channel_capacity`，全仓零消费）**不暴露**，留给 T20 删除。
+
+- **量级对照（守则 3）**：0.3.4 全量 diff `+1224 / −2342`（净 −1118，含测试）；
+  其中 Actor 精简批 `+83 / −1141`。新增侧（身份/N/G/E）以配置透出与 trait 声明为主。
 
 - **核心 blob 原语（0.3.2 R1，吸收 `spike/0.3.2-iroh-blobs` spike 结论并删除验证代码）**：
   新增 `src/runtime/blobs.rs`，对仓内暴露 store / fetch / hash 三个能力的薄封装，

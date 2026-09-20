@@ -86,6 +86,8 @@ class _NetworkConfig:
         capability_gossip_interval_ms: int = 5000,
         event_channel_capacity: int = 256,
         dns_origin_domain: str = "",
+        relay_endpoints: list[str] | None = None,
+        require_signed_records: bool = False,
     ) -> _NetworkConfig: ...
     @property
     def preset(self) -> str: ...
@@ -114,6 +116,12 @@ class _NetworkConfig:
     @property
     def dns_origin_domain(self) -> str:
         """自定义 DNS 起源域，仅当 ``preset = "dns"`` 时生效；空 = n0 默认 ``iroh.link``。"""
+    @property
+    def relay_endpoints(self) -> list[str]:
+        """自定义 relay 集群 URL 列表；非空时覆盖 preset 自带的 relay 配置。"""
+    @property
+    def require_signed_records(self) -> bool:
+        """强制校验心跳节点记录签名。"""
 
 @final
 class _FailoverConfig:
@@ -184,6 +192,19 @@ class _ActantConfig:
         num_worker_processes: int | None = None,
         crash_failover_max_attempts: int | None = None,
         workflow_default_timeout_ms: int | None = None,
+        node_labels: dict[str, str] | None = None,
+        *,
+        store_map_size: int | None = None,
+        store_max_dbs: int | None = None,
+        store_sync_mode: str | None = None,
+        store_flush_interval_ms: int | None = None,
+        prefetch_min: int | None = None,
+        prefetch_max: int | None = None,
+        worker_cancel_grace_ms: int | None = None,
+        pending_result_channel_capacity: int | None = None,
+        completed_retention_count: int | None = None,
+        persist_flush_interval_ms: int | None = None,
+        state_poll_interval_ms: int | None = None,
     ) -> _ActantConfig: ...
     @property
     def payload_signing_key(self) -> str: ...
@@ -214,6 +235,31 @@ class _ActantConfig:
     def remote_fallback_delay_ms(self) -> int: ...
     @property
     def scheduler(self) -> str: ...
+    @property
+    def node_labels(self) -> dict[str, str]:
+        """用户自定义节点标签，随心跳广播给集群。"""
+    @property
+    def store_map_size(self) -> int: ...
+    @property
+    def store_max_dbs(self) -> int: ...
+    @property
+    def store_sync_mode(self) -> str: ...
+    @property
+    def store_flush_interval_ms(self) -> int: ...
+    @property
+    def prefetch_min(self) -> int: ...
+    @property
+    def prefetch_max(self) -> int: ...
+    @property
+    def worker_cancel_grace_ms(self) -> int: ...
+    @property
+    def pending_result_channel_capacity(self) -> int: ...
+    @property
+    def completed_retention_count(self) -> int: ...
+    @property
+    def persist_flush_interval_ms(self) -> int: ...
+    @property
+    def state_poll_interval_ms(self) -> int: ...
 
 
 @final
@@ -473,6 +519,8 @@ class _RuntimeCore:
         """
 
     def list_workflows(self) -> list[str]: ...
+    def peers(self) -> list[dict[str, Any]]: ...
+    def delete_workflow(self, workflow_id: str) -> None: ...
     def register_task_result_callback(self, callback: Callable[[_TaskCompletion], None]) -> None: ...
     def value_store(self, data: bytes) -> bytes:
         """将字节存入本节点内容寻址 blob 存储，返回 BlobRef wire 编码（0.3.2 R2）。"""

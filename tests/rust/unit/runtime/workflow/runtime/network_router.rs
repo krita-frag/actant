@@ -636,6 +636,9 @@ async fn handle_heartbeat_topic_dispatches_to_failover_manager() {
     });
 
     let hb = crate::common::NodeHeartbeat {
+        signature: None,
+        labels: std::collections::BTreeMap::new(),
+        platform: None,
         node_id: NodeId::from("node-B".to_string()),
         active_workflows: vec![WorkflowId::from("wf-1".to_string())],
         timestamp_ms: crate::common::epoch_millis(),

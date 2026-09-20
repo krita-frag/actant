@@ -332,8 +332,8 @@ impl Discovery for DnsDiscovery {
 /// 强制启用 iroh relay 中继的发现策略。
 ///
 /// 等价于 n0 预设但显式启用 `RelayMode::Default`，确保 NAT 穿透场景下
-/// 节点可通过 n0 公共 relay 中继。若需使用自定义 relay 集群，请扩展
-/// `NetworkConfig` 增加自定义 relay map（暂未实现）。
+/// 节点可通过 n0 公共 relay 中继。自定义 relay 集群经
+/// `NetworkConfig.relay_endpoints` 配置（覆盖 preset relay）。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RelayDiscovery;
 
@@ -512,7 +512,7 @@ impl NetworkManager {
     /// 如果配置校验失败、发现策略未知、endpoint bind 失败、router 启动失败，
     /// 或 bootstrap peer 解析失败，返回错误。
     pub async fn new(node_id: NodeId, config: NetworkConfig) -> crate::common::Result<Self> {
-        Self::build(node_id, config, None).await
+        Self::build(node_id, config, None, None).await
     }
 
     /// 创建启用了 blob 原语的 [`NetworkManager`]。
@@ -528,13 +528,27 @@ impl NetworkManager {
         config: NetworkConfig,
         blobs: Arc<BlobStore>,
     ) -> crate::common::Result<Self> {
-        Self::build(node_id, config, Some(blobs)).await
+        Self::build(node_id, config, Some(blobs), None).await
+    }
+
+    /// 同 [`Self::with_blob_store`]，另注入节点身份密钥（identity）。
+    ///
+    /// `Some(key)` 时 endpoint 以该 keypair 构造——endpoint id 由密钥决定，
+    /// 跨重启稳定；`None`（默认）时由 iroh 生成临时密钥。
+    pub async fn with_identity(
+        node_id: NodeId,
+        config: NetworkConfig,
+        blobs: Arc<BlobStore>,
+        secret_key: Option<iroh::SecretKey>,
+    ) -> crate::common::Result<Self> {
+        Self::build(node_id, config, Some(blobs), secret_key).await
     }
 
     async fn build(
         node_id: NodeId,
         config: NetworkConfig,
         blobs: Option<Arc<BlobStore>>,
+        secret_key: Option<iroh::SecretKey>,
     ) -> crate::common::Result<Self> {
         let _span = tracing::info_span!("network.new", node = %node_id).entered();
         tracing::info!(
@@ -546,7 +560,24 @@ impl NetworkManager {
         tracing::info!("network.new: discovery resolved");
 
         let builder = Endpoint::builder(iroh::endpoint::presets::Minimal);
+        let builder = match secret_key {
+            Some(key) => builder.secret_key(key),
+            None => builder,
+        };
         let builder = discovery.apply(builder);
+        // G-relay：自定义 relay 集群覆盖 preset 的 relay 配置（二者正交）。
+        let builder = if config.relay_endpoints.is_empty() {
+            builder
+        } else {
+            let map =
+                iroh::RelayMap::try_from_iter(config.relay_endpoints.iter().map(|s| s.as_str()))
+                    .map_err(|e| ActantError::Config(format!("invalid relay_endpoints: {e}")))?;
+            tracing::info!(
+                relays = config.relay_endpoints.len(),
+                "network.new: custom relay map"
+            );
+            builder.relay_mode(iroh::RelayMode::Custom(map))
+        };
         tracing::info!("network.new: discovery applied");
 
         let builder = if config.listen_port != 0 || !config.listen_ip.is_empty() {

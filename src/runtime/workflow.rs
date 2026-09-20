@@ -28,6 +28,7 @@ pub mod failover;
 pub mod gossip;
 pub mod messaging;
 pub(crate) mod orchestrator;
+pub mod route;
 pub mod runtime;
 pub mod scheduler;
 
@@ -51,6 +52,7 @@ pub use gossip::DagGossip;
 #[cfg(feature = "python")]
 pub(crate) use orchestrator::types::AddNodeOutcome;
 pub(crate) use orchestrator::Orchestrator;
+pub use route::{DefaultRoutePolicy, RouteCandidate, RouteContext, RoutePolicy};
 pub use runtime::{Worker, WorkerState};
 #[doc(hidden)]
 pub use scheduler::spawn_fast_path_scheduler;

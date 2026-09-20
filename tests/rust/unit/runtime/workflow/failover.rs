@@ -21,6 +21,9 @@ fn make_fm(node_id: &str) -> FailoverManager {
 
 fn hb(node_id: &str, ts_ms: u64, workflows: &[&str]) -> NodeHeartbeat {
     NodeHeartbeat {
+        signature: None,
+        labels: BTreeMap::new(),
+        platform: None,
         node_id: NodeId::from(node_id.to_string()),
         active_workflows: workflows
             .iter()
@@ -44,6 +47,190 @@ fn getters_return_configured_values() {
         FailoverConfig::default().failure_timeout_ms
     );
     assert_eq!(fm.node_id().as_str(), "node-A");
+}
+
+#[test]
+fn peers_returns_fresh_peers_with_metadata() {
+    let fm = make_fm("node-A");
+    fm.handle_heartbeat(&hb("node-B", crate::common::epoch_millis(), &[]));
+
+    let peers = fm.peers();
+    assert_eq!(peers.len(), 1, "fresh peer must be visible");
+    let peer = &peers[0];
+    assert_eq!(peer.node_id.as_str(), "node-B");
+    assert_eq!(peer.available_slots, 4);
+    assert_eq!(peer.max_slots, 8);
+    // 心跳携带的 labels/platform 透传到 peer 视图
+    assert!(peer.labels.is_empty());
+}
+
+#[test]
+fn peers_excludes_stale_and_unseen_peers() {
+    let fm = make_fm("node-A");
+    // 从未收到心跳的 peer 不可见
+    assert!(fm.peers().is_empty());
+
+    // last_heartbeat_ms 记录的是接收方本地时钟（handle_heartbeat 忽略发送方
+    // timestamp_ms），故直接把内部记录回拨到 failure_timeout 之外模拟过期。
+    fm.handle_heartbeat(&hb("node-stale", crate::common::epoch_millis(), &[]));
+    let stale = crate::common::epoch_millis().saturating_sub(10_000_000);
+    fm.peers
+        .get_mut(&NodeId::from("node-stale".to_string()))
+        .unwrap()
+        .last_heartbeat_ms = stale;
+    assert!(fm.peers().is_empty(), "stale peer must be excluded");
+
+    // 新鲜心跳恢复可见性
+    fm.handle_heartbeat(&hb("node-stale", crate::common::epoch_millis(), &[]));
+    assert_eq!(fm.peers().len(), 1);
+}
+
+#[test]
+fn with_node_metadata_advertises_labels_and_platform() {
+    let network: Arc<dyn crate::runtime::network::Transport> =
+        Arc::new(MockTransport::new("node-meta"));
+    let actor_system = Arc::new(ActorSystem::new());
+    let wf_id = ActorId::workflow(&NodeId::from("node-meta".to_string()));
+    let mut labels = BTreeMap::new();
+    labels.insert("role".to_string(), "worker".to_string());
+    let fm = FailoverManager::new(
+        NodeId::from("node-meta".to_string()),
+        network,
+        actor_system,
+        wf_id,
+    )
+    .with_node_metadata(Some(PlatformInfo::detect()), labels);
+
+    // 广播心跳后，peer 侧应能看到本节点的 labels/platform（结构体直读验证）。
+    assert_eq!(fm.labels.get("role").map(|s| s.as_str()), Some("worker"));
+    assert!(fm.platform.is_some());
+}
+
+#[test]
+fn with_node_metadata_drops_oversized_labels() {
+    let network: Arc<dyn crate::runtime::network::Transport> =
+        Arc::new(MockTransport::new("node-big"));
+    let actor_system = Arc::new(ActorSystem::new());
+    let wf_id = ActorId::workflow(&NodeId::from("node-big".to_string()));
+    let mut labels = BTreeMap::new();
+    labels.insert("big".to_string(), "x".repeat(8192));
+    let fm = FailoverManager::new(
+        NodeId::from("node-big".to_string()),
+        network,
+        actor_system,
+        wf_id,
+    )
+    .with_node_metadata(None, labels);
+
+    assert!(fm.labels.is_empty(), "oversized labels must be dropped");
+}
+
+// ───────────────────────── 身份与信任：心跳签名与成员校验 ─────────────────────────
+
+/// 以指定身份密钥构造开启 require_signed_records 的 manager。
+fn make_fm_with_identity(
+    node_id: &str,
+    key: Option<iroh::SecretKey>,
+    require_signed: bool,
+    allowlist: Vec<String>,
+) -> FailoverManager {
+    let network: Arc<dyn crate::runtime::network::Transport> =
+        Arc::new(MockTransport::new(node_id));
+    let actor_system = Arc::new(ActorSystem::new());
+    let wf_id = ActorId::workflow(&NodeId::from(node_id.to_string()));
+    FailoverManager::new(
+        NodeId::from(node_id.to_string()),
+        network,
+        actor_system,
+        wf_id,
+    )
+    .with_identity(key, require_signed, allowlist)
+}
+
+fn signed_hb(key: &iroh::SecretKey, node: &str, ts_ms: u64) -> NodeHeartbeat {
+    let mut hb = hb(node, ts_ms, &[]);
+    hb.endpoint_addr = Some(key.public().to_string());
+    let unsigned = NodeHeartbeat {
+        signature: None,
+        ..hb.clone()
+    };
+    let payload = postcard::to_allocvec(&unsigned).unwrap();
+    hb.signature = Some(key.sign(&payload).to_bytes().to_vec());
+    hb
+}
+
+#[test]
+fn unsigned_heartbeat_rejected_when_required() {
+    let fm = make_fm_with_identity("node-A", None, true, Vec::new());
+    fm.handle_heartbeat(&hb("node-B", crate::common::epoch_millis(), &[]));
+    assert!(
+        fm.get_peer_infos().is_empty(),
+        "unsigned heartbeat must be rejected under require_signed_records"
+    );
+}
+
+#[test]
+fn valid_signature_accepted() {
+    let key = iroh::SecretKey::generate();
+    let fm = make_fm_with_identity("node-A", None, true, Vec::new());
+    fm.handle_heartbeat(&signed_hb(&key, "node-B", crate::common::epoch_millis()));
+    assert_eq!(
+        fm.get_peer_infos().len(),
+        1,
+        "correctly signed heartbeat must be accepted"
+    );
+}
+
+#[test]
+fn forged_signature_rejected() {
+    // 攻击者用自己的密钥签名，却声称是 node-B 的 endpoint 身份。
+    let attacker = iroh::SecretKey::generate();
+    let victim = iroh::SecretKey::generate();
+    let mut hb = signed_hb(&attacker, "node-B", crate::common::epoch_millis());
+    hb.endpoint_addr = Some(victim.public().to_string());
+    let fm = make_fm_with_identity("node-A", None, true, Vec::new());
+    fm.handle_heartbeat(&hb);
+    assert!(
+        fm.get_peer_infos().is_empty(),
+        "signature made by a different key must be rejected"
+    );
+}
+
+#[test]
+fn unsigned_heartbeat_accepted_when_not_required() {
+    // 向后兼容：require_signed_records=false（默认）时缺签心跳照常入表。
+    let fm = make_fm_with_identity("node-A", None, false, Vec::new());
+    fm.handle_heartbeat(&hb("node-B", crate::common::epoch_millis(), &[]));
+    assert_eq!(fm.get_peer_infos().len(), 1);
+}
+
+#[test]
+fn heartbeat_outside_allowlist_rejected() {
+    let fm = make_fm_with_identity("node-A", None, false, vec!["peer-allowed".to_string()]);
+    // 心跳无 endpoint_addr → 无法证明成员资格，拒绝。
+    fm.handle_heartbeat(&hb("node-B", crate::common::epoch_millis(), &[]));
+    assert!(fm.get_peer_infos().is_empty());
+    // endpoint_addr 不在 allowlist → 拒绝。
+    fm.handle_heartbeat(&hb("node-C", crate::common::epoch_millis(), &[]));
+    assert!(fm.get_peer_infos().is_empty());
+
+    // 在 allowlist 内的 peer 接受。
+    let mut hb = hb("node-D", crate::common::epoch_millis(), &[]);
+    hb.endpoint_addr = Some("peer-allowed".to_string());
+    fm.handle_heartbeat(&hb);
+    assert_eq!(fm.get_peer_infos().len(), 1);
+}
+
+#[test]
+fn own_heartbeat_skips_identity_checks() {
+    // 本节点回环心跳（node_id == self）不受签名/allowlist 校验影响。
+    let key = iroh::SecretKey::generate();
+    let fm = make_fm_with_identity("node-A", Some(key), true, vec!["peer-allowed".to_string()]);
+    fm.handle_heartbeat(&hb("node-A", crate::common::epoch_millis(), &[]));
+    assert!(
+        fm.get_peer_infos().is_empty(),
+        "own heartbeat is ignored, not rejected-and-logged as foreign"
+    );
 }
 
 #[test]

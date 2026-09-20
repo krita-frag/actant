@@ -63,9 +63,8 @@ actant/
 │   │   ├── actor/                # Actor 运行时（拆分为子模块）
 │   │   │   ├── mod.rs            # 入口 + 公共 re-export
 │   │   │   ├── runtime.rs        # Actor trait + ActorContext
-│   │   │   ├── mailbox.rs        # MailboxRegistry + 持久化待发消息
-│   │   │   ├── persistence.rs    # ActorPersistence（检查点 + WAL + 定期压缩）
-│   │   │   ├── system.rs         # ActorSystem facade + RunningActor 执行循环
+│   │   │   ├── mailbox.rs        # MailboxRegistry（进程内投递，无持久化）
+│   │   │   ├── system.rs         # ActorSystem facade + RunningActor 执行循环（系统 actor 专用本地运行时，不持久化）
 │   │   ├── blobs.rs              # 内容寻址 blob 原语：store/fetch/hash 薄封装（iroh-blobs FsStore 落盘 data_dir/blobs，流式拉取 + 显式取消关闭连接）
 │   │   ├── builder.rs            # RuntimeBuilder：按 network → store → actor → workflow → capability → worker 装配
 │   │   ├── capability.rs         # ERH 核心：Capability、Handler、Layer、Runtime、capability_registry!
@@ -86,6 +85,7 @@ actant/
 │   │       ├── failover.rs       # 故障转移：心跳、租约、任务回收（含 #[cfg(test)] mod tests）
 │   │       ├── gossip.rs         # DAG 状态 Gossip 同步
 │   │       ├── messaging.rs      # 工作流消息类型与 Actor 间协议
+│   │       ├── route.rs          # RoutePolicy 远端路由策略缝 + DefaultRoutePolicy（G-route）
 │   │       ├── orchestrator.rs   # Orchestrator 状态机入口（业务方法分散在 orchestrator/ 子模块）
 │   │       ├── runtime.rs        # Worker 执行循环：网络事件路由、任务调度、结果投递
 │   │       ├── scheduler.rs      # 任务调度器抽象与 priority/fifo 实现
@@ -171,9 +171,16 @@ Actant 是 P2P 对等混合架构：每个节点同时是编排器与执行器�
 `bootstrap_nodes` 拨号）；**显式给了 `data_dir` 时为 `local`**（本地网络自动发现）。
 可用 `ACTANT_DISCOVERY=<preset>` 环境变量覆盖。
 
+**节点身份与信任（0.3.4）**：节点身份 = iroh endpoint keypair，随
+`data_dir/identity.key` 持久化（0600），endpoint id 跨重启稳定。心跳节点记录由
+endpoint 私钥 ed25519 签名，`NetworkConfig.require_signed_records` 开启时拒绝缺签/
+坏签心跳；`allowed_peer_ids` 非空时同时校验 gossip 成员资格（直连侧另有 ALPN
+白名单 + wire MAC）。`Runtime.production()` 强制：非空 `payload_signing_key`、
+非空 `allowed_peer_ids`（空则拒启）、`require_signed_records=True`。
+
 ### 进程级任务隔离
 
-任务经 `ProcessTaskDispatcher` 在 **worker 子进程** 中执行（`python -m actant.task._worker`），线程池后端已移除，进程池为**唯一执行后端**。每个 worker 进程同一时刻执行一个任务，Rust 在超时/取消时 `terminate()`/`kill()` 对应 worker 即精确终止单任务，即时释放槽位并自动拉起替补进程——硬超时能真正回收计算资源，任务崩溃（segfault / `os._exit`）仅失败该任务，节点存活。worker 是纯 Python 解释器，仅通过 stdio 长度前缀二进制帧与 Rust IPC 通信（cloudpickle 载荷），不持有 Rust 核心；父进程 `sys.path` 透传为 `PYTHONPATH` 保证模块级任务函数在子进程内可导入。worker stderr 日志转发回父进程 tracing，`python.handler_ms` 计时指标经 stderr 边带汇入 metrics。
+任务经 `ProcessTaskDispatcher` 在 **worker 子进程** 中执行（`python -m actant.task._worker`），线程池后端已移除，进程池为**唯一执行后端**。每个 worker 进程同一时刻执行一个任务，Rust 在超时/取消时 `terminate()`/`kill()` 对应 worker 即精确终止单任务，即时释放槽位并自动拉起替补进程——硬超时能真正回收计算资源，任务崩溃（segfault / `os._exit`）仅失败该任务，节点存活。worker 是纯 Python 解释器，仅通过 stdio 长度前缀二进制帧与 Rust IPC 通信（cloudpickle 载荷），不持有 Rust 核心；父进程 `sys.path` 透传为 `PYTHONPATH` 保证模块级任务函数在子进程内可导入（拼装发生在 Python 绑定层 `src/py/config.rs`——核心 `WorkerConfig` 只认 `worker_program`/`worker_args`/`worker_env` 三要素，语言中性，0.3.4 F3）。worker stderr 日志转发回父进程 tracing，`task.handler_ms` 计时指标经 stderr 边带汇入 metrics。
 
 **崩溃故障转移**：worker 进程崩溃（非逻辑失败、非硬超时）属基础设施级失败，任务清空 `target_node` 重新入队，由路由器重选本地或远端节点执行（3.1）。重路由受 `crash_failover_max_attempts`（默认 3）上限约束，达到上限才降级为正常失败路径；超时与业务失败不参与该上限。
 

@@ -91,8 +91,6 @@ struct Instruments {
     task_handler_ms: Histogram<u64>,
     event_bridge_ms: Histogram<u64>,
     actor_handle_message_ms: Histogram<u64>,
-    actor_save_state_ms: Histogram<u64>,
-    actor_load_state_ms: Histogram<u64>,
     direct_request_ms: Histogram<u64>,
 }
 
@@ -295,14 +293,6 @@ impl Instruments {
             actor_handle_message_ms: meter
                 .u64_histogram("actant.actor.handle_message_ms")
                 .with_description("Actor handle_message latency in ms")
-                .build(),
-            actor_save_state_ms: meter
-                .u64_histogram("actant.actor.save_state_ms")
-                .with_description("Actor save_state latency in ms")
-                .build(),
-            actor_load_state_ms: meter
-                .u64_histogram("actant.actor.load_state_ms")
-                .with_description("Actor load_state latency in ms")
                 .build(),
             direct_request_ms: meter
                 .u64_histogram("actant.network.direct_request_ms")
@@ -655,14 +645,6 @@ pub fn observe_event_bridge_ms(value: u64) {
 
 pub fn observe_actor_handle_message_ms(value: u64) {
     instruments().actor_handle_message_ms.record(value, &[]);
-}
-
-pub fn observe_actor_save_state_ms(value: u64) {
-    instruments().actor_save_state_ms.record(value, &[]);
-}
-
-pub fn observe_actor_load_state_ms(value: u64) {
-    instruments().actor_load_state_ms.record(value, &[]);
 }
 
 pub fn observe_direct_request_ms(value: u64) {

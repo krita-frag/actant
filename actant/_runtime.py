@@ -447,8 +447,16 @@ class Runtime:
           防止生产部署因默认空密钥导致 payload 完整性保护被静默禁用。
         - 显式设置 ``require_payload_signing=True``：任一节点密钥不匹配
           时跨节点消息会被对端拒绝，提供集群身份认证。
+        - **强制心跳节点记录签名**（``require_signed_records=True``）：
+          节点记录必须由其 iroh endpoint 私钥签名，未持密钥的对端无法伪造
+          身份加入集群视图。
+        - **空 allowlist 拒启**：``network.allowed_peer_ids`` 为空时直接
+          ``ValueError``——开放成员身份不属于生产语义。节点 endpoint id 可在
+          启动前经 ``Runtime`` 的 ``peer_id`` 查询，逐一登记进各节点的白名单。
         - ``data_dir`` 必填：生产部署必须显式指定持久化目录，
-          避免使用临时目录导致重启后状态丢失。
+          避免使用临时目录导致重启后状态丢失。节点身份密钥持久化于
+          ``data_dir/identity.key``，endpoint id 因此跨重启稳定，
+          白名单登记一次即长期有效。
 
         Args:
             payload_signing_key: 集群共享密钥，所有节点必须一致。空字符串
@@ -465,7 +473,8 @@ class Runtime:
             gossip: ``_GossipConfig``，``None`` 用默认。
 
         Raises:
-            ValueError: ``payload_signing_key`` 为空，或 ``data_dir`` 为空。
+            ValueError: ``payload_signing_key`` 为空、``data_dir`` 为空，
+                或 ``network.allowed_peer_ids`` 为空。
         """
         if not payload_signing_key:
             raise ValueError(
@@ -479,18 +488,36 @@ class Runtime:
             )
         from actant.actant import _ActantConfig, _NetworkConfig
 
-        # 生产安全告警：allowed_peer_ids 为空时 peer_allowed 返回 true（allow-all），
-        # 任意 iroh 节点都可加入集群 gossip，存在被恶意节点投递伪造消息的风险。
-        # 此处仅 warn 而非强制报错——某些受信内网环境（如 K8s pod 间通信）
-        # 确实依赖默认的 "接受所有 peer" 行为；让用户根据告警决定是否收紧。
+        # 生产安全硬约束：空 allowlist = 任意 iroh 节点都能加入集群 gossip 视图，
+        # 存在被恶意节点投递伪造消息的风险。生产语义下要求显式登记集群成员。
         effective_network = network if network is not None else _NetworkConfig(preset="local")
         if not effective_network.allowed_peer_ids:
-            _logger.warning(
+            raise ValueError(
                 "Runtime.production(): network.allowed_peer_ids is empty — "
-                "the node will accept gossip/wire messages from ANY iroh peer. "
-                "For production clusters, pass network=_NetworkConfig("
-                "allowed_peer_ids=['node-a', 'node-b', ...]) to restrict "
-                "membership to known peers."
+                "open membership is not safe for production. Pass network="
+                "_NetworkConfig(allowed_peer_ids=['node-a', ...], "
+                "require_signed_records=True) to restrict membership to known "
+                "peers; query each node's endpoint id via its peer_id."
+            )
+        if not effective_network.require_signed_records:
+            # 用户显式传入 network 时补齐心跳签名强制；已在白名单校验之后，
+            # 构造新 _NetworkConfig 保留其余字段。
+            effective_network = _NetworkConfig(
+                preset=effective_network.preset,
+                bootstrap_nodes=effective_network.bootstrap_nodes,
+                hlc_max_drift_ms=effective_network.hlc_max_drift_ms,
+                max_pending_direct_requests=effective_network.max_pending_direct_requests,
+                gossip_bootstrap_peers=effective_network.gossip_bootstrap_peers,
+                max_message_size=effective_network.max_message_size,
+                allowed_peer_ids=effective_network.allowed_peer_ids,
+                direct_request_timeout_ms=effective_network.direct_request_timeout_ms,
+                listen_port=effective_network.listen_port,
+                listen_ip=effective_network.listen_ip,
+                capability_gossip_interval_ms=effective_network.capability_gossip_interval_ms,
+                event_channel_capacity=effective_network.event_channel_capacity,
+                dns_origin_domain=effective_network.dns_origin_domain,
+                relay_endpoints=effective_network.relay_endpoints,
+                require_signed_records=True,
             )
 
         config = _ActantConfig(
@@ -1745,6 +1772,41 @@ class Runtime:
         if core is None:
             raise InvalidStateError("Runtime not started: rust_core is None")
         return list(core.list_workflows())
+
+    def delete_workflow(self, workflow_id: str) -> None:
+        """删除工作流（运维清理）。
+
+        从内存与持久化存储中移除该工作流的全部状态。与
+        ``completed_retention_count`` 的自动淘汰互补，供手动清理已完成/
+        孤儿工作流。幂等：工作流不存在时为 no-op。
+
+        Warning:
+            运行中的工作流删除后其任务结果将不可恢复。
+
+        Raises:
+            InvalidStateError: Runtime 未启动。
+        """
+        core = self._rust_core
+        if core is None:
+            raise InvalidStateError("Runtime not started: rust_core is None")
+        core.delete_workflow(workflow_id)
+
+    def peers(self) -> list[dict[str, Any]]:
+        """枚举当前在线的 peer 节点（节点可见性）。
+
+        每项为 ``node_id`` / ``endpoint`` / ``available_slots`` / ``max_slots`` /
+        ``active_workflows`` / ``labels`` / ``platform`` / ``last_heartbeat_ms``。
+        在线判定复用心跳新鲜度语义（超过 failure_timeout 未更新即不在线）。
+
+        用于节点可见性与资源核算；基于此数据的路由/调度策略属第 3 层。
+
+        Raises:
+            InvalidStateError: Runtime 未启动。
+        """
+        core = self._rust_core
+        if core is None:
+            raise InvalidStateError("Runtime not started: rust_core is None")
+        return [dict(item) for item in core.peers()]
 
     def metrics_text(self) -> str:
         """返回所有已注册指标的 Prometheus exposition format 文本。

@@ -10,7 +10,7 @@
 //! |------|------|
 //! | [`common`] | 跨模块共享协议、ID、配置、wire message 与错误类型 |
 //! | [`runtime::actor`] | Actor trait、邮箱、监督、ActorSystem facade |
-//! | [`runtime::state`] | LMDB store、HLC、checkpoint、WAL 与事件日志 |
+//! | [`runtime::state`] | LMDB store、HLC 与事件日志 |
 //! | [`runtime::capability`] | Capability/Handler/Layer 统一扩展模型 |
 //! | [`runtime::network`] | iroh 传输、gossip topic、直连请求响应 |
 //! | [`runtime::workflow`] | DAG、Orchestrator、Worker、调度、故障转移与 gossip |

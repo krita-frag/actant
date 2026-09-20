@@ -395,8 +395,9 @@ def _run_dispatch(payload: bytes, cancel_event: threading.Event) -> bytes:
             task_id, workflow_id, token, silent=True,
         )
     # 任务实际执行时段内（含重试的全部尝试）耗时上报到 stderr 边带，由父进程
-    # drain_stderr 汇入 python.handler_ms 直方图——保持进程池隔离后可观测性不丢失。
-    _emit_metric("python.handler_ms", _elapsed_ms(time.monotonic() - t0))
+    # drain_stderr 汇入 actant.task.handler_ms 直方图——保持进程池隔离后可观测性
+    # 不丢失。指标名与 Rust 侧 METRIC_TASK_HANDLER_MS 是跨语言契约，改名须两侧同步。
+    _emit_metric("task.handler_ms", _elapsed_ms(time.monotonic() - t0))
     return _pack_result(success, payload_obj)
 
 

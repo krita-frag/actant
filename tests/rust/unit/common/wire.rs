@@ -220,6 +220,9 @@ fn test_decode_logs_warning_on_version_mismatch() {
     let envelope = WireEnvelope {
         version: 255, // 不存在的版本
         message: WireMessage::NodeHeartbeat(NodeHeartbeat {
+            signature: None,
+            labels: BTreeMap::new(),
+            platform: None,
             node_id: node("n"),
             active_workflows: vec![],
             timestamp_ms: 0,
@@ -257,6 +260,9 @@ fn test_decode_logs_warning_on_version_mismatch() {
 #[test]
 fn wire_envelope_wrap_injects_w3c_traceparent() {
     let msg = WireMessage::NodeHeartbeat(NodeHeartbeat {
+        signature: None,
+        labels: BTreeMap::new(),
+        platform: None,
         node_id: node("n1"),
         active_workflows: vec![],
         timestamp_ms: 0,
@@ -280,6 +286,9 @@ fn wire_envelope_wrap_injects_w3c_traceparent() {
 #[test]
 fn wire_envelope_roundtrip_preserves_traceparent() {
     let msg = WireMessage::NodeHeartbeat(NodeHeartbeat {
+        signature: None,
+        labels: BTreeMap::new(),
+        platform: None,
         node_id: node("n2"),
         active_workflows: vec![],
         timestamp_ms: 0,
@@ -305,6 +314,9 @@ fn wire_envelope_wrap_within_scope_produces_child_traceparent() {
     let _scope = current_trace_scope(parent.clone());
 
     let msg = WireMessage::NodeHeartbeat(NodeHeartbeat {
+        signature: None,
+        labels: BTreeMap::new(),
+        platform: None,
         node_id: node("n3"),
         active_workflows: vec![],
         timestamp_ms: 0,
@@ -334,6 +346,9 @@ fn wire_envelope_wrap_after_scope_drop_returns_to_root() {
     let child_tp = {
         let _scope = current_trace_scope(parent);
         let envelope = WireEnvelope::wrap(WireMessage::NodeHeartbeat(NodeHeartbeat {
+            signature: None,
+            labels: BTreeMap::new(),
+            platform: None,
             node_id: node("n4"),
             active_workflows: vec![],
             timestamp_ms: 0,
@@ -346,6 +361,9 @@ fn wire_envelope_wrap_after_scope_drop_returns_to_root() {
 
     // scope 退出后，wrap 应生成新的 root trace。
     let envelope = WireEnvelope::wrap(WireMessage::NodeHeartbeat(NodeHeartbeat {
+        signature: None,
+        labels: BTreeMap::new(),
+        platform: None,
         node_id: node("n4"),
         active_workflows: vec![],
         timestamp_ms: 0,
@@ -372,6 +390,9 @@ fn wire_mac_protects_traceparent_field() {
     crate::common::set_wire_signing_key(b"test-key-c3".to_vec());
 
     let envelope = WireEnvelope::wrap(WireMessage::NodeHeartbeat(NodeHeartbeat {
+        signature: None,
+        labels: BTreeMap::new(),
+        platform: None,
         node_id: node("n5"),
         active_workflows: vec![],
         timestamp_ms: 0,
@@ -483,6 +504,9 @@ static MAC_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn heartbeat_msg(n: &str) -> WireMessage {
     WireMessage::NodeHeartbeat(NodeHeartbeat {
+        signature: None,
+        labels: BTreeMap::new(),
+        platform: None,
         node_id: node(n),
         active_workflows: vec![],
         timestamp_ms: 42_000,
@@ -614,6 +638,9 @@ fn trace_scope_guard_restore_recovers_previous_scope() {
 
     let wrap_under_outer = || {
         WireEnvelope::wrap(WireMessage::NodeHeartbeat(NodeHeartbeat {
+            signature: None,
+            labels: BTreeMap::new(),
+            platform: None,
             node_id: node("nested"),
             active_workflows: vec![],
             timestamp_ms: 0,

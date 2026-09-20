@@ -289,11 +289,6 @@ impl Runtime {
             let _ = tokio::time::timeout(stop_timeout, self.actor_system.stop(&cap_id)).await;
         }
 
-        // 5.5 停止 WAL compaction 后台任务。
-        // 必须在 ActorSystem 其他 Actor 停止后、任务分发器关闭前执行，
-        // 避免 compaction 任务在 Actor 停止过程中访问已被 drop 的资源。
-        self.actor_system.stop_compaction_task();
-
         // 6. 关闭任务分发器线程池（等待在途任务完成或超时放弃 join）。
         //    必须在 Actor / 后台循环停止后、网络关闭前执行：线程池中的任务
         //    handler 可能访问 network / capability 等共享资源。

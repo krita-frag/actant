@@ -264,19 +264,6 @@ impl Actor for WorkflowActor {
         Ok(())
     }
 
-    /// WorkflowActor **不接入** ActorSystem 的 checkpoint/WAL 持久化。
-    ///
-    /// 原因：Orchestrator 持有大量工作流状态（DAG + execution + pending），
-    /// 通过 `Store` 独立落盘（见 `start_persist_flush` / `flush_dirty`）。
-    /// 若再通过 ActorSystem checkpoint 序列化为单一 `Vec<u8>`，会产生
-    /// 双写不一致且性能不可接受。
-    ///
-    /// 恢复路径：节点重启时由 builder 调用 `Orchestrator::recover(store, config, event_log)`
-    /// 从 Store 恢复工作流状态。
-    fn supports_state_persistence(&self) -> bool {
-        false
-    }
-
     async fn handle_message(&mut self, msg: ActorMessage) -> Result<ActorMessageResult> {
         let msg_id = msg.id.clone();
         match msg.method.as_str() {

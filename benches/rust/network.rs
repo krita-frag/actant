@@ -46,6 +46,9 @@ fn make_node_heartbeat() -> WireMessage {
         .map(|i| WorkflowId::from(format!("wf-bench-{i:04}").as_str()))
         .collect();
     WireMessage::NodeHeartbeat(NodeHeartbeat {
+        signature: None,
+        labels: std::collections::BTreeMap::new(),
+        platform: None,
         node_id: NodeId::from("node-bench-self"),
         active_workflows,
         timestamp_ms: 1_700_000_000_000,

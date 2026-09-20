@@ -544,6 +544,46 @@ pub struct ActorMessageResult {
     pub error: Option<ActorErrorEnvelope>,
 }
 
+/// 节点宿主平台信息，随心跳广播（节点可见性 N1）。
+///
+/// 核心自动填充 `os`/`arch`/`actant_version`；`host_runtime` 由绑定层补充
+/// （如 Python 层填 `platform.python_version()`），核心不感知任何语言语义。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlatformInfo {
+    /// 操作系统（`std::env::consts::OS`）。
+    pub os: String,
+    /// CPU 架构（`std::env::consts::ARCH`）。
+    pub arch: String,
+    /// Actant crate 版本。
+    pub actant_version: String,
+    /// 宿主语言运行时描述（如 "CPython 3.12.1"）；纯 Rust 嵌入为 `None`。
+    #[serde(default)]
+    pub host_runtime: Option<String>,
+}
+
+impl PlatformInfo {
+    /// 以本机平台信息构造；`host_runtime` 由调用方（绑定层）按需补充。
+    pub fn detect() -> Self {
+        Self {
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            actant_version: env!("CARGO_PKG_VERSION").to_string(),
+            host_runtime: None,
+        }
+    }
+}
+
+/// 单个标签集的序列化字节上限（key + value 长度之和）。
+///
+/// 标签由用户自定义且随心跳周期广播，超限直接整体丢弃并告警，防止
+/// 恶意/误用配置把心跳载荷放大成带宽攻击面。
+pub const NODE_LABELS_MAX_BYTES: usize = 4096;
+
+/// 校验标签集总字节量是否在 [`NODE_LABELS_MAX_BYTES`] 之内。
+pub fn node_labels_within_limit(labels: &std::collections::BTreeMap<String, String>) -> bool {
+    labels.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>() <= NODE_LABELS_MAX_BYTES
+}
+
 #[cfg(test)]
 #[path = "../../tests/rust/unit/common/model.rs"]
 mod tests;

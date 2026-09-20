@@ -281,14 +281,6 @@ fn bus_event_topic_all_variants() {
         .topic(),
         Topic::ActorLifecycleError
     );
-    assert_eq!(
-        BusEvent::WalCompacted {
-            node_id: nid,
-            retained_events: 0,
-        }
-        .topic(),
-        Topic::WalCompacted
-    );
 }
 
 // ───────────────────────── subscribe_with_capacity ─────────────────────────

@@ -48,8 +48,9 @@ pub use error::{format_error_kind, ActantError, Result};
 pub use wire::TopicRoute;
 // 领域类型 — 公共 API
 pub use model::{
-    ActorErrorEnvelope, ActorErrorKind, ActorId, ActorMessage, ActorMessageResult, ActorStatus,
-    BlobHash, MessageId, NodeId, RetryPolicy, TaskCompletion, TaskDefinition, TaskId, WorkflowId,
+    node_labels_within_limit, ActorErrorEnvelope, ActorErrorKind, ActorId, ActorMessage,
+    ActorMessageResult, ActorStatus, BlobHash, MessageId, NodeId, PlatformInfo, RetryPolicy,
+    TaskCompletion, TaskDefinition, TaskId, WorkflowId, NODE_LABELS_MAX_BYTES,
 };
 // 协议类型 — crate 内部
 pub(crate) use wire::{

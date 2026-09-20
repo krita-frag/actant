@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// 发现模式 — 内置策略名称。
@@ -105,6 +107,16 @@ pub struct ActantConfig {
     /// 调用 validate，因此无法绕过。
     #[serde(default)]
     pub require_payload_signing: bool,
+    /// 用户自定义节点标签（N2），随心跳广播给集群。
+    ///
+    /// 总字节量（key + value 长度之和）超过 [`crate::common::model::NODE_LABELS_MAX_BYTES`]
+    /// 时心跳整体置空标签并告警。
+    #[serde(default)]
+    pub node_labels: BTreeMap<String, String>,
+    /// 宿主语言运行时描述（N1），由绑定层填充（如 "CPython 3.12.1"）。
+    /// 核心/纯 Rust 嵌入为 `None`。核心自动填充 os/arch/actant_version。
+    #[serde(default)]
+    pub node_host_runtime: Option<String>,
 }
 
 impl ActantConfig {
@@ -137,9 +149,6 @@ impl ActantConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActorConfig {
     pub mailbox_capacity: usize,
-    pub wal_compaction_interval_secs: u64,
-    /// WAL 压缩后每个 Actor 保留的最新检查点数量。旧检查点将被清理。默认为 1。
-    pub checkpoint_retention_count: usize,
     /// 单个 Actor stop 超时（毫秒）。超时后放弃等待，使 shutdown 路径总能完成
     /// （如 network.shutdown）。默认 500ms（M1 改进：从硬编码提取为配置）。
     pub stop_timeout_ms: u64,
@@ -149,8 +158,6 @@ impl Default for ActorConfig {
     fn default() -> Self {
         Self {
             mailbox_capacity: 1024,
-            wal_compaction_interval_secs: 60,
-            checkpoint_retention_count: 1,
             stop_timeout_ms: 500,
         }
     }
@@ -235,11 +242,21 @@ pub struct WorkerConfig {
     /// worker 子进程数（进程池大小）。每个 worker 进程同一时刻执行一个任务，
     /// 杀进程即精确终止一个任务。默认 `num_cpus`。
     pub num_worker_processes: usize,
-    /// 拉起 worker 子进程的解释器路径（如 Python 的 `sys.executable`）。
-    /// 进程池以 `[worker_program, -m, actant.task._worker]` 启动 worker。
-    /// 仅 Rust 纯嵌入场景由嵌入方显式配置；Python 层始终注入 `sys.executable`。
+    /// 拉起 worker 子进程的可执行文件路径。
+    /// 进程池以 `[worker_program, worker_args…]` 启动 worker；参数与环境变量
+    /// 由绑定层或嵌入方提供（核心不感知任何语言语义）。Python 绑定层始终注入
+    /// 运行中的解释器路径。
     #[serde(default)]
     pub worker_program: String,
+    /// 传给 `worker_program` 的参数（不含 program 自身）。Python 绑定层注入
+    /// 模块入口形如 `["-m", "actant.task._worker"]`。
+    #[serde(default)]
+    pub worker_args: Vec<String>,
+    /// 注入 worker 子进程的环境变量。空表 = 完全继承父进程环境。
+    /// Python 绑定层经此注入模块搜索路径（`PYTHONPATH`）；键唯一，重复注入
+    /// 以最后一次为准。
+    #[serde(default)]
+    pub worker_env: BTreeMap<String, String>,
     /// worker 进程崩溃后任务重新入队重路由的最大执行次数（含首次执行）。
     ///
     /// 进程崩溃（`ActantError::Worker`，worker 进程异常退出）属于基础设施级失败，
@@ -247,13 +264,6 @@ pub struct WorkerConfig {
     /// 本地或远端节点重试。该次数即为上限，防止持久性崩溃在无退路时无限重路由。
     /// 默认 3（首次 + 最多 2 次转移）；超时与业务失败不参与此上限，保持原有失败语义。
     pub crash_failover_max_attempts: u32,
-    /// worker 子进程的 `PYTHONPATH`，继承父解释器的 `sys.path`。
-    ///
-    /// 进程隔离下，模块级任务函数（cloudpickle by-reference 序列化）需在
-    /// worker 子进程内被再次导入；将父进程 `sys.path` 透传为 `PYTHONPATH`
-    /// 保证用户/测试模块在子进程内可导入。空 = 继承父进程环境变量。
-    #[serde(default)]
-    pub python_path: Vec<String>,
     /// 取消/硬超时触发后，向 worker 发送 `Cancel` 帧等待其协作退出的宽限期（毫秒）。
     /// 宽限期过后仍未退出则强杀进程。默认 2000ms。
     pub worker_cancel_grace_ms: u64,
@@ -302,7 +312,8 @@ impl Default for WorkerConfig {
             num_worker_processes: proc_count,
             crash_failover_max_attempts: 3,
             worker_program: String::new(),
-            python_path: Vec::new(),
+            worker_args: Vec::new(),
+            worker_env: BTreeMap::new(),
             worker_cancel_grace_ms: 2000,
             pending_result_channel_capacity: 256,
             prefetch_min: default_prefetch_min(),
@@ -370,6 +381,20 @@ pub struct NetworkConfig {
     /// 其他节点通过相同域查询。
     #[serde(default)]
     pub dns_origin_domain: String,
+    /// 自定义 relay 集群 URL 列表（G-relay）。
+    ///
+    /// 非空时以 `RelayMode::Custom` **覆盖** preset 自带的 relay 配置
+    /// （discovery 与 relay 正交：preset 决定发现机制，本字段决定中继）。
+    /// 空（默认）= 沿用 preset 的 relay 设置。
+    #[serde(default)]
+    pub relay_endpoints: Vec<String>,
+    /// 强制校验心跳节点记录签名（身份与信任）。
+    ///
+    /// `true` 时 `FailoverManager` 拒绝缺签或验签失败的 gossip 心跳——
+    /// 节点记录必须由其 iroh endpoint 私钥签名，防止伪造他人节点身份。
+    /// `false`（默认，向后兼容）跳过校验。`Runtime.production()` 默认开启。
+    #[serde(default)]
+    pub require_signed_records: bool,
 }
 
 fn default_capability_gossip_interval_ms() -> u64 {
@@ -423,6 +448,8 @@ impl Default for NetworkConfig {
             capability_gossip_interval_ms: default_capability_gossip_interval_ms(),
             event_channel_capacity: default_event_channel_capacity(),
             dns_origin_domain: String::new(),
+            relay_endpoints: Vec::new(),
+            require_signed_records: false,
         }
     }
 }
@@ -467,7 +494,7 @@ impl Default for WorkflowConfig {
 /// | 模式 | 单 key 写延迟 | 数据丢失窗口 | 适用场景 |
 /// |------|---------------|--------------|----------|
 /// | `Sync` | ~2.9 ms（含 fsync） | 0（提交即持久） | 关键状态、低写入速率 |
-/// | `GroupCommit(ms)` | ~1-10 µs（仅入队） | `ms` 毫秒 | 高吞吐 mailbox/event_log |
+/// | `GroupCommit(ms)` | ~1-10 µs（仅入队） | `ms` 毫秒 | 高吞吐 event_log / 等待点快照 |
 /// | `NoSync` | ~10-50 µs（mmap 写入） | 进程崩溃时未 fsync 部分 | 可重建的缓存型数据 |
 ///
 /// # `GroupCommit` 语义
@@ -476,9 +503,8 @@ impl Default for WorkflowConfig {
 /// 进入有界通道，后台任务每 `ms` 毫秒或满 `BATCH_FLUSH_THRESHOLD` 条时
 /// 合并为单次 LMDB 事务提交（一次 fsync）。崩溃时丢失最近 `ms` 毫秒内的写入。
 ///
-/// 这对 mailbox 持久化（`MailboxRegistry::send` 的 write-then-delete 模式）
-/// 尤为关键：原实现每次 `send` 触发 2 次 fsync（写入 + 删除），高 QPS 时
-/// 成为瓶颈；GroupCommit 将 N 次 send 的 2N 次 fsync 合并为 1 次。
+/// 高频写入路径（工作流快照 / 事件水位）由此把多次单 key 写的 fsync
+/// 合并为一次事务提交；正确性语义不依赖该合并（崩溃丢失窗口见上表）。
 ///
 /// # `NoSync` 语义
 ///

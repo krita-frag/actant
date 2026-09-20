@@ -205,6 +205,8 @@ pub struct Worker {
     capability_gossip: Option<Arc<crate::runtime::capability::gossip::CapabilityGossipActor>>,
     /// 远端 peer 容量视图，用于 unrouted task 的自动路由。
     failover: Option<Arc<crate::runtime::workflow::FailoverManager>>,
+    /// 远端路由策略（G-route）：默认内置实现，可经 `with_route_policy` 注入。
+    route_policy: Arc<dyn crate::runtime::workflow::RoutePolicy>,
     /// 最大并发任务数。用 AtomicUsize 支持运行时扩容（`set_max_concurrent_tasks`）。
     max_concurrent_tasks: Arc<std::sync::atomic::AtomicUsize>,
     task_timeout: Duration,
@@ -296,6 +298,7 @@ impl Worker {
             dag_gossip_actor_id: None,
             capability_gossip: None,
             failover: None,
+            route_policy: Arc::new(crate::runtime::workflow::DefaultRoutePolicy),
             max_concurrent_tasks: Arc::new(std::sync::atomic::AtomicUsize::new(max_concurrent)),
             task_timeout: Duration::from_millis(config.default_task_timeout_ms),
             crash_failover_max_attempts: config.crash_failover_max_attempts,
@@ -408,6 +411,21 @@ impl Worker {
         gossip: Arc<crate::runtime::capability::gossip::CapabilityGossipActor>,
     ) -> Self {
         self.capability_gossip = Some(gossip);
+        self
+    }
+
+    /// 返回 failover 管理器句柄（节点可见性 N2：`peers()` 数据源）。
+    pub fn failover_manager(&self) -> Option<Arc<crate::runtime::workflow::FailoverManager>> {
+        self.failover.clone()
+    }
+
+    /// 注入自定义远端路由策略（G-route）。未注入时使用内置
+    /// [`DefaultRoutePolicy`]（心跳新鲜度过滤 + 槽位比较）。
+    pub fn with_route_policy(
+        mut self,
+        policy: Arc<dyn crate::runtime::workflow::RoutePolicy>,
+    ) -> Self {
+        self.route_policy = policy;
         self
     }
 
@@ -1540,45 +1558,22 @@ impl Worker {
         let failover = self.failover.as_ref()?;
         let local_available =
             u32::try_from(self.running_tasks.available_permits()).unwrap_or(u32::MAX);
-        // 心跳 TTL 过滤：排除心跳超时的 peer，避免将任务路由到
-        // 已失联的节点。使用 failover 的 failure_timeout_ms 作为 TTL 阈值。
-        let now_ms = crate::common::epoch_millis();
-        let heartbeat_ttl_ms = failover.failure_timeout_ms();
-        let mut peers: Vec<_> = failover
+        let ctx = crate::runtime::workflow::RouteContext {
+            local_available_slots: local_available,
+            heartbeat_ttl_ms: failover.failure_timeout_ms(),
+        };
+        let candidates: Vec<crate::runtime::workflow::RouteCandidate> = failover
             .get_peer_infos()
             .into_iter()
-            .filter(|(_, info)| {
-                // available > 0 且 max > 0
-                if info.available_slots == 0 || info.max_slots == 0 {
-                    return false;
-                }
-                // 心跳 TTL：last_heartbeat_ms == 0 表示从未收到心跳，跳过；
-                // 若距上次心跳超过 failure_timeout_ms，视为失联，跳过。
-                if info.last_heartbeat_ms == 0 {
-                    return false;
-                }
-                now_ms.saturating_sub(info.last_heartbeat_ms) <= heartbeat_ttl_ms
+            .map(|(node_id, info)| crate::runtime::workflow::RouteCandidate {
+                node_id,
+                endpoint_addr: info.endpoint_addr,
+                available_slots: info.available_slots,
+                max_slots: info.max_slots,
+                last_heartbeat_ms: info.last_heartbeat_ms,
             })
             .collect();
-        if peers.is_empty() {
-            return None;
-        }
-        peers.sort_by(|(a_id, a_info), (b_id, b_info)| {
-            b_info
-                .available_slots
-                .cmp(&a_info.available_slots)
-                .then_with(|| b_info.max_slots.cmp(&a_info.max_slots))
-                .then_with(|| a_id.as_str().cmp(b_id.as_str()))
-        });
-        let (node_id, info) = peers.into_iter().next()?;
-        if info.available_slots <= local_available {
-            return None;
-        }
-        Some((
-            node_id.clone(),
-            info.endpoint_addr
-                .unwrap_or_else(|| node_id.as_str().to_string()),
-        ))
+        self.route_policy.select_target(&ctx, &candidates)
     }
 
     async fn forward_remote_task(&self, task: &TaskDefinition, target: &NodeId) -> Result<()> {

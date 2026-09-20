@@ -144,7 +144,7 @@ fn init_actor_system_without_data_dir_returns_in_memory_system() {
 }
 
 #[test]
-fn init_actor_system_with_data_dir_creates_persistence_files() {
+fn init_actor_system_with_data_dir_is_stateless() {
     let dir = tempdir().unwrap();
     let node_id = make_node("node-B");
     let event_bus = EventBus::new();
@@ -156,21 +156,38 @@ fn init_actor_system_with_data_dir_creates_persistence_files() {
         &config,
     )
     .unwrap();
-    // 验证 actor 子目录与 WAL 文件已创建。
-    assert!(dir.path().join("actor").exists());
-    assert!(dir.path().join("actor.wal").exists());
+    // actor 系统为系统 actor 专用本地运行时：不落任何持久化文件
+    //（工作流恢复由 orchestrator 的统一历史承载）。
+    assert!(!dir.path().join("actor").exists());
+    assert!(!dir.path().join("actor.wal").exists());
     drop(system);
 }
 
+// ───────────────────────── 节点身份（identity.key）测试 ─────────────────────────
+
 #[test]
-fn init_actor_system_with_invalid_data_dir_returns_storage_io_error() {
-    let node_id = make_node("node-C");
-    let event_bus = EventBus::new();
-    let config = crate::common::ActantConfig::default();
-    // /dev/null 是文件而非目录，LmdbStore::open_with_config 内部的
-    // create_dir_all 应失败（错误经 map_err 包装为 Storage）。
-    let result = init_actor_system(Some("/dev/null"), &node_id, &event_bus, &config);
-    assert!(matches!(result, Err(ActantError::Storage(_))));
+fn identity_key_created_with_owner_only_permissions() {
+    let dir = tempdir().unwrap();
+    let key1 = load_or_create_identity(dir.path()).unwrap();
+    let path = dir.path().join("identity.key");
+    assert!(path.exists());
+    // 0600：仅属主可读写（unix）
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "identity.key must be owner-only");
+    }
+    // 重启加载同一密钥
+    let key2 = load_or_create_identity(dir.path()).unwrap();
+    assert_eq!(key1.to_bytes(), key2.to_bytes());
+}
+
+#[test]
+fn identity_key_corrupt_file_rejected() {
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("identity.key"), b"short").unwrap();
+    assert!(load_or_create_identity(dir.path()).is_err());
 }
 
 // ───────────────────────── init_orchestrator 测试 ─────────────────────────
@@ -449,17 +466,16 @@ async fn build_creates_expected_subdirectories() {
         .await
         .expect("build should succeed");
 
-    // build 应创建 actor、orchestrator、store 子目录及 actor.wal 文件。
-    assert!(dir.path().join("actor").exists(), "actor dir should exist");
-    assert!(
-        dir.path().join("actor.wal").exists(),
-        "actor.wal should exist"
-    );
+    // build 应创建 orchestrator、store 子目录；actor 系统不再落盘。
     assert!(
         dir.path().join("orchestrator").exists(),
         "orchestrator dir should exist"
     );
     assert!(dir.path().join("store").exists(), "store dir should exist");
+    assert!(
+        !dir.path().join("actor").exists(),
+        "actor dir must not exist"
+    );
 
     runtime.shutdown().await.expect("shutdown ok");
 }
