@@ -48,6 +48,8 @@ pub mod metrics;
 pub mod observability;
 pub mod runtime;
 
-#[cfg(test)]
+/// 框架测试支撑（X6）：内存假件（MockTransport / MockScheduler 等）。
+/// 仅在 `test-support` feature（或 crate 内测试）下编译。
+#[cfg(any(test, feature = "test-support"))]
 #[path = "../../../tests/rust/test_support.rs"]
-mod test_support;
+pub mod test_support;

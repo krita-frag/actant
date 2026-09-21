@@ -58,6 +58,9 @@ dhat = { version = "0.3.3" }
 
 [features]
 dhat-heap = ["dep:dhat"]
+# 框架测试支撑（X6）：导出内存假件（MemoryEventLog / MockTransport / MockScheduler），
+# 供框架用户写自己的引擎测试。发布为依赖时 `actant-core = { features = ["test-support"] }`。
+test-support = []
 # tokio-console 支持（ACTANT_TOKIO_CONSOLE=1 激活）
 tokio-console = ["dep:console-subscriber"]
 
