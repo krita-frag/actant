@@ -17,8 +17,8 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 
-use actant::runtime::actor::ActorSystem;
-use actant::runtime::capability::{
+use actant_core::runtime::actor::ActorSystem;
+use actant_core::runtime::capability::{
     Capability, CapabilityMeta, CapabilityRuntime, EffectKind, Handler, Layer,
 };
 

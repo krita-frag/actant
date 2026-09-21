@@ -15,10 +15,10 @@ use pyo3::prelude::*;
 use pyo3::types::PyList;
 use pyo3::Bound;
 
-use crate::runtime::capability::{
+use actant_core::runtime::capability::{
     builtin_capabilities, register_defaults, CapabilityRuntime, EffectKind,
 };
-use crate::runtime::capability::{
+use actant_core::runtime::capability::{
     NodeLifecycle, Serialization, Store, TaskLifecycle, Transport, WorkflowLifecycle,
 };
 
@@ -46,7 +46,7 @@ pub struct PyCapabilityRuntime {
 impl PyCapabilityRuntime {
     /// 从已存在的统一 Runtime 构造 capability 视图。
     pub(crate) fn from_runtime(
-        runtime: &crate::runtime::Runtime,
+        runtime: &actant_core::runtime::Runtime,
         tokio: Arc<tokio::runtime::Runtime>,
         gil_thread: GilThread,
     ) -> Self {

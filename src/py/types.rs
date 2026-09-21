@@ -9,19 +9,19 @@ use pyo3::exceptions::PyStopIteration;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use crate::common::{NodeId, TaskId, WorkflowId};
 use crate::py::gil_thread::GilThread;
-use crate::runtime::capability::{
+use actant_core::common::{NodeId, TaskId, WorkflowId};
+use actant_core::runtime::capability::{
     NodeEvent, NodeLifecycle, Serialization, SerializationReq, Store, StoreReq, TaskEvent,
     TaskLifecycle, Transport, TransportReq, WorkflowEvent, WorkflowLifecycle,
 };
-use crate::runtime::dispatcher::CancelFlag;
+use actant_core::runtime::dispatcher::CancelFlag;
 
 /// `ask` effect 的 PyO3 编解码 trait。
 ///
 /// `Runtime::ask` 返回 `Option<C::Response>`（第一个返回 `Some` 的 handler），
 /// 因此 `encode_response` 接收的是 `Option<C::Response>`。
-pub trait PyAskCodec<C: crate::runtime::capability::Capability> {
+pub trait PyAskCodec<C: actant_core::runtime::capability::Capability> {
     fn decode_request(ob: &Bound<'_, PyAny>) -> PyResult<C::Request>;
     fn encode_response(
         py: Python<'_>,
@@ -30,25 +30,25 @@ pub trait PyAskCodec<C: crate::runtime::capability::Capability> {
 }
 
 /// `perform` effect 的 PyO3 编解码 trait。
-pub trait PyPerformCodec<C: crate::runtime::capability::Capability> {
+pub trait PyPerformCodec<C: actant_core::runtime::capability::Capability> {
     fn decode_request(ob: &Bound<'_, PyAny>) -> PyResult<C::Request>;
     fn encode_response(py: Python<'_>, resp: C::Response) -> PyResult<Bound<'_, PyAny>>;
 }
 
 /// `emit` effect 的 PyO3 解码 trait（emit 无返回值）。
-pub trait PyEmitCodec<C: crate::runtime::capability::Capability> {
+pub trait PyEmitCodec<C: actant_core::runtime::capability::Capability> {
     fn decode_request(ob: &Bound<'_, PyAny>) -> PyResult<C::Request>;
 }
 
 /// 将 Rust 请求编码为 Python 对象，并把 Python handler 的返回值解码回 Rust 响应。
 ///
 /// 用于把 Python callable 注册为 Rust `CapabilityRuntime` handler，实现单一路径分发。
-pub trait PyHandlerPerformCodec<C: crate::runtime::capability::Capability> {
+pub trait PyHandlerPerformCodec<C: actant_core::runtime::capability::Capability> {
     fn encode_request<'py>(py: Python<'py>, req: &C::Request) -> PyResult<Bound<'py, PyAny>>;
     fn decode_response<'py>(py: Python<'py>, obj: &Bound<'py, PyAny>) -> PyResult<C::Response>;
 }
 
-pub trait PyHandlerEmitCodec<C: crate::runtime::capability::Capability> {
+pub trait PyHandlerEmitCodec<C: actant_core::runtime::capability::Capability> {
     fn encode_request<'py>(py: Python<'py>, req: &C::Request) -> PyResult<Bound<'py, PyAny>>;
 }
 
@@ -143,7 +143,7 @@ pub struct SerializationCodec;
 
 impl PyPerformCodec<Serialization> for SerializationCodec {
     fn decode_request(ob: &Bound<'_, PyAny>) -> PyResult<SerializationReq> {
-        ob.extract()
+        extract_serializationreq(ob)
     }
 
     fn encode_response(
@@ -191,7 +191,7 @@ pub struct TransportCodec;
 
 impl PyPerformCodec<Transport> for TransportCodec {
     fn decode_request(ob: &Bound<'_, PyAny>) -> PyResult<TransportReq> {
-        ob.extract()
+        extract_transportreq(ob)
     }
 
     fn encode_response(py: Python<'_>, resp: Result<(), String>) -> PyResult<Bound<'_, PyAny>> {
@@ -240,7 +240,7 @@ pub struct StoreCodec;
 
 impl PyPerformCodec<Store> for StoreCodec {
     fn decode_request(ob: &Bound<'_, PyAny>) -> PyResult<StoreReq> {
-        ob.extract()
+        extract_storereq(ob)
     }
 
     fn encode_response(
@@ -515,166 +515,66 @@ pub fn dict_response<'py>(py: Python<'py>) -> Bound<'py, PyDict> {
 // `IntoPyObject`，使 codec 可以一次性 `extract()` / `into_pyobject()` 完成转换，
 // 避免逐字段重复 getattr/set_item。Python 侧仍使用 dataclass，无需同步修改。
 
-impl<'a, 'py> FromPyObject<'a, 'py> for SerializationReq {
-    type Error = PyErr;
-    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> Result<Self, Self::Error> {
-        let ob = ob.to_owned();
-        let op: String = get_string(&ob, "op")?;
-        match op.as_str() {
-            "dump" => Ok(SerializationReq::Dump {
-                payload: get_bytes(&ob, "data")?,
-            }),
-            "load" => Ok(SerializationReq::Load {
-                data: get_bytes(&ob, "data")?,
-            }),
-            _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "unknown SerializationReq op: {}",
-                op
-            ))),
-        }
+/// F2a：孤儿规则禁止跨 crate 实现 `FromPyObject`——由 codec 的
+/// `decode_request` 直接调用本函数替代 trait 实现。
+fn extract_serializationreq(ob: &Bound<'_, PyAny>) -> PyResult<SerializationReq> {
+    let op: String = get_string(ob, "op")?;
+    match op.as_str() {
+        "dump" => Ok(SerializationReq::Dump {
+            payload: get_bytes(ob, "data")?,
+        }),
+        "load" => Ok(SerializationReq::Load {
+            data: get_bytes(ob, "data")?,
+        }),
+        _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "unknown SerializationReq op: {}",
+            op
+        ))),
     }
 }
 
-impl<'a, 'py> FromPyObject<'a, 'py> for TransportReq {
-    type Error = PyErr;
-    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> Result<Self, Self::Error> {
-        let ob = ob.to_owned();
-        let op: String = get_string(&ob, "op")?;
-        match op.as_str() {
-            "send_task" => Ok(TransportReq::SendTask {
-                target: node_id(&ob, "target")?,
-                payload: get_bytes(&ob, "payload")?,
-            }),
-            "send_actor_message" => Ok(TransportReq::SendActorMessage {
-                target: node_id(&ob, "target")?,
-                payload: get_bytes(&ob, "payload")?,
-            }),
-            "broadcast_heartbeat" => Ok(TransportReq::BroadcastHeartbeat {
-                payload: get_bytes(&ob, "payload")?,
-            }),
-            _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "unknown TransportReq op: {}",
-                op
-            ))),
-        }
+/// F2a：孤儿规则禁止跨 crate 实现 `FromPyObject`——由 codec 的
+/// `decode_request` 直接调用本函数替代 trait 实现。
+fn extract_transportreq(ob: &Bound<'_, PyAny>) -> PyResult<TransportReq> {
+    let op: String = get_string(ob, "op")?;
+    match op.as_str() {
+        "send_task" => Ok(TransportReq::SendTask {
+            target: node_id(ob, "target")?,
+            payload: get_bytes(ob, "payload")?,
+        }),
+        "send_actor_message" => Ok(TransportReq::SendActorMessage {
+            target: node_id(ob, "target")?,
+            payload: get_bytes(ob, "payload")?,
+        }),
+        "broadcast_heartbeat" => Ok(TransportReq::BroadcastHeartbeat {
+            payload: get_bytes(ob, "payload")?,
+        }),
+        _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "unknown TransportReq op: {}",
+            op
+        ))),
     }
 }
 
-impl<'a, 'py> FromPyObject<'a, 'py> for StoreReq {
-    type Error = PyErr;
-    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> Result<Self, Self::Error> {
-        let ob = ob.to_owned();
-        let op: String = get_string(&ob, "op")?;
-        match op.as_str() {
-            "put" => Ok(StoreReq::Put {
-                key: get_bytes(&ob, "key")?,
-                value: get_bytes(&ob, "value")?,
-            }),
-            "get" => Ok(StoreReq::Get {
-                key: get_bytes(&ob, "key")?,
-            }),
-            "delete" => Ok(StoreReq::Delete {
-                key: get_bytes(&ob, "key")?,
-            }),
-            _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "unknown StoreReq op: {}",
-                op
-            ))),
-        }
-    }
-}
-
-impl<'a, 'py> FromPyObject<'a, 'py> for TaskEvent {
-    type Error = PyErr;
-    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> Result<Self, Self::Error> {
-        let ob = ob.to_owned();
-        let kind: String = get_string(&ob, "kind")?;
-        match kind.as_str() {
-            "started" => Ok(TaskEvent::Started {
-                task_id: task_id(&ob, "task_id")?,
-                workflow_id: workflow_id(&ob, "workflow_id")?,
-            }),
-            "completed" => Ok(TaskEvent::Completed {
-                task_id: task_id(&ob, "task_id")?,
-                result_payload: get_bytes(&ob, "result_payload")?,
-            }),
-            "failed" => Ok(TaskEvent::Failed {
-                task_id: task_id(&ob, "task_id")?,
-                error: get_string(&ob, "error")?,
-                attempt: get_u32(&ob, "attempt")?,
-            }),
-            "retried" => Ok(TaskEvent::Retried {
-                task_id: task_id(&ob, "task_id")?,
-                next_attempt: get_u32(&ob, "next_attempt")?,
-            }),
-            "cancelled" => Ok(TaskEvent::Cancelled {
-                task_id: task_id(&ob, "task_id")?,
-            }),
-            _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "unknown TaskEvent kind: {}",
-                kind
-            ))),
-        }
-    }
-}
-
-impl<'a, 'py> FromPyObject<'a, 'py> for WorkflowEvent {
-    type Error = PyErr;
-    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> Result<Self, Self::Error> {
-        let ob = ob.to_owned();
-        let kind: String = get_string(&ob, "kind")?;
-        match kind.as_str() {
-            "submitted" => Ok(WorkflowEvent::Submitted {
-                workflow_id: workflow_id(&ob, "workflow_id")?,
-            }),
-            "started" => Ok(WorkflowEvent::Started {
-                workflow_id: workflow_id(&ob, "workflow_id")?,
-            }),
-            "completed" => Ok(WorkflowEvent::Completed {
-                workflow_id: workflow_id(&ob, "workflow_id")?,
-            }),
-            "failed" => Ok(WorkflowEvent::Failed {
-                workflow_id: workflow_id(&ob, "workflow_id")?,
-                error: get_string(&ob, "error")?,
-            }),
-            "cancelled" => Ok(WorkflowEvent::Cancelled {
-                workflow_id: workflow_id(&ob, "workflow_id")?,
-            }),
-            _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "unknown WorkflowEvent kind: {}",
-                kind
-            ))),
-        }
-    }
-}
-
-impl<'a, 'py> FromPyObject<'a, 'py> for NodeEvent {
-    type Error = PyErr;
-    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> Result<Self, Self::Error> {
-        let ob = ob.to_owned();
-        let kind: String = get_string(&ob, "kind")?;
-        match kind.as_str() {
-            "started" => Ok(NodeEvent::Started {
-                node_id: node_id(&ob, "node_id")?,
-            }),
-            "stopped" => Ok(NodeEvent::Stopped {
-                node_id: node_id(&ob, "node_id")?,
-            }),
-            "peer_joined" => Ok(NodeEvent::PeerJoined {
-                peer_id: node_id(&ob, "peer_id")?,
-            }),
-            "peer_left" => Ok(NodeEvent::PeerLeft {
-                peer_id: node_id(&ob, "peer_id")?,
-            }),
-            "heartbeat" => Ok(NodeEvent::Heartbeat {
-                node_id: node_id(&ob, "node_id")?,
-                timestamp_ms: get_u64(&ob, "timestamp_ms")?,
-            }),
-            _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "unknown NodeEvent kind: {}",
-                kind
-            ))),
-        }
+/// F2a：孤儿规则禁止跨 crate 实现 `FromPyObject`——由 codec 的
+/// `decode_request` 直接调用本函数替代 trait 实现。
+fn extract_storereq(ob: &Bound<'_, PyAny>) -> PyResult<StoreReq> {
+    let op: String = get_string(ob, "op")?;
+    match op.as_str() {
+        "put" => Ok(StoreReq::Put {
+            key: get_bytes(ob, "key")?,
+            value: get_bytes(ob, "value")?,
+        }),
+        "get" => Ok(StoreReq::Get {
+            key: get_bytes(ob, "key")?,
+        }),
+        "delete" => Ok(StoreReq::Delete {
+            key: get_bytes(ob, "key")?,
+        }),
+        _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "unknown StoreReq op: {}",
+            op
+        ))),
     }
 }
 
@@ -938,7 +838,7 @@ macro_rules! capability_registry {
             py: pyo3::Python<'py>,
             name: &str,
             request: &pyo3::Bound<'_, pyo3::PyAny>,
-            inner: std::sync::Arc<$crate::runtime::capability::CapabilityRuntime>,
+            inner: std::sync::Arc<actant_core::runtime::capability::CapabilityRuntime>,
             tokio: &tokio::runtime::Runtime,
         ) -> pyo3::PyResult<Option<pyo3::Bound<'py, pyo3::PyAny>>> {
             match name {
@@ -951,7 +851,7 @@ macro_rules! capability_registry {
                         let resp = py.detach(move || {
                             tokio.block_on(inner.ask::<$ask_cap>(req))
                         })
-                            .map_err(PyErr::from)?;
+                            .map_err($crate::py::error::actant_error_to_pyerr)?;
                         tracing::trace!(cap = $ask_name, ms = _t.elapsed().as_millis() as u64, "dispatch_ask");
                         <$ask_codec as PyAskCodec<$ask_cap>>::encode_response(py, resp)
                     }
@@ -967,7 +867,7 @@ macro_rules! capability_registry {
             py: pyo3::Python<'py>,
             name: &str,
             request: &pyo3::Bound<'_, pyo3::PyAny>,
-            inner: std::sync::Arc<$crate::runtime::capability::CapabilityRuntime>,
+            inner: std::sync::Arc<actant_core::runtime::capability::CapabilityRuntime>,
             tokio: &tokio::runtime::Runtime,
         ) -> pyo3::PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
             match name {
@@ -980,7 +880,7 @@ macro_rules! capability_registry {
                         let resp = py.detach(move || {
                             tokio.block_on(inner.perform::<$perf_cap>(req))
                         })
-                            .map_err(PyErr::from)?;
+                            .map_err($crate::py::error::actant_error_to_pyerr)?;
                         tracing::trace!(cap = $perf_name, ms = _t.elapsed().as_millis() as u64, "dispatch_perform");
                         <$perf_codec as PyPerformCodec<$perf_cap>>::encode_response(py, resp)
                     }
@@ -996,7 +896,7 @@ macro_rules! capability_registry {
             py: pyo3::Python<'_>,
             name: &str,
             request: &pyo3::Bound<'_, pyo3::PyAny>,
-            inner: std::sync::Arc<$crate::runtime::capability::CapabilityRuntime>,
+            inner: std::sync::Arc<actant_core::runtime::capability::CapabilityRuntime>,
             tokio: &tokio::runtime::Runtime,
         ) -> pyo3::PyResult<()> {
             match name {
@@ -1009,7 +909,7 @@ macro_rules! capability_registry {
                         py.detach(move || {
                             tokio.block_on(inner.emit::<$emit_cap>(req))
                         })
-                            .map_err(PyErr::from)?;
+                            .map_err($crate::py::error::actant_error_to_pyerr)?;
                         tracing::trace!(cap = $emit_name, ms = _t.elapsed().as_millis() as u64, "dispatch_emit");
                         Ok(())
                     }
@@ -1033,7 +933,7 @@ macro_rules! capability_registry {
             py: pyo3::Python<'py>,
             name: &str,
             request: &pyo3::Bound<'_, pyo3::PyAny>,
-            inner: std::sync::Arc<$crate::runtime::capability::CapabilityRuntime>,
+            inner: std::sync::Arc<actant_core::runtime::capability::CapabilityRuntime>,
             tokio_handle: tokio::runtime::Handle,
             gil_thread: &$crate::py::gil_thread::GilThread,
         ) -> pyo3::PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
@@ -1065,7 +965,7 @@ macro_rules! capability_registry {
                                         })
                                     }
                                     Err(e) => FutureResultToPy::Err(
-                                        PyErr::from(e)
+                                        $crate::py::error::actant_error_to_pyerr(e)
                                     ),
                                 }
                             },
@@ -1085,7 +985,7 @@ macro_rules! capability_registry {
             py: pyo3::Python<'py>,
             name: &str,
             request: &pyo3::Bound<'_, pyo3::PyAny>,
-            inner: std::sync::Arc<$crate::runtime::capability::CapabilityRuntime>,
+            inner: std::sync::Arc<actant_core::runtime::capability::CapabilityRuntime>,
             tokio_handle: tokio::runtime::Handle,
             gil_thread: &$crate::py::gil_thread::GilThread,
         ) -> pyo3::PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
@@ -1113,7 +1013,7 @@ macro_rules! capability_registry {
                                         })
                                     }
                                     Err(e) => FutureResultToPy::Err(
-                                        PyErr::from(e)
+                                        $crate::py::error::actant_error_to_pyerr(e)
                                     ),
                                 }
                             },
@@ -1146,7 +1046,7 @@ macro_rules! capability_registry {
         fn dispatch_perform_batch_async<'py>(
             py: pyo3::Python<'py>,
             items: &pyo3::Bound<'py, pyo3::types::PyList>,
-            inner: std::sync::Arc<$crate::runtime::capability::CapabilityRuntime>,
+            inner: std::sync::Arc<actant_core::runtime::capability::CapabilityRuntime>,
             tokio_handle: tokio::runtime::Handle,
             gil_thread: &$crate::py::gil_thread::GilThread,
         ) -> pyo3::PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
@@ -1198,7 +1098,7 @@ macro_rules! capability_registry {
                                         })
                                     }
                                     Err(e) => $crate::py::types::FutureResultToPy::Err(
-                                        PyErr::from(e)
+                                        $crate::py::error::actant_error_to_pyerr(e)
                                     ),
                                 }
                             });

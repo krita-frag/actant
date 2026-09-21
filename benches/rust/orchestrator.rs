@@ -14,8 +14,8 @@ use std::collections::HashMap;
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 
-use actant::common::TaskId;
-use actant::runtime::workflow::{Dag, DagNode};
+use actant_core::common::TaskId;
+use actant_core::runtime::workflow::{Dag, DagNode};
 
 /// 构造一个 N 节点的线性 DAG：n0 → n1 → n2 → ... → n(N-1)。
 ///

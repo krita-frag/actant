@@ -13,12 +13,12 @@
 use std::hint::black_box;
 use std::sync::Arc;
 
-use actant::common::{
+use actant_core::common::{
     serialize_rkyv, ActorId, RetryPolicy, StoreConfig, TaskDefinition, TaskId, WorkflowId,
 };
-use actant::runtime::actor::ActorSystem;
-use actant::runtime::state::Store;
-use actant::runtime::workflow::{
+use actant_core::runtime::actor::ActorSystem;
+use actant_core::runtime::state::Store;
+use actant_core::runtime::workflow::{
     fifo_scheduler_actor, priority_scheduler_actor, ActorScheduler, Dag, DagNode, Scheduler,
 };
 

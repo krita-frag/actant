@@ -3,171 +3,44 @@ name = "actant"
 version = "0.3.0"
 edition = "2021"
 rust-version = "1.91"
-description = "基于 Actor 模型的跨平台通用分布式任务编排引擎 — 0.3.0"
+description = "基于 Actor 模型的跨平台通用分布式任务编排引擎"
+
+[workspace]
+members = ["crates/actant-common", "crates/actant-core"]
 
 [dependencies]
-async-trait = "0.1"
+actant-common = { path = "crates/actant-common" }
+actant-core = { path = "crates/actant-core" }
 crossbeam-channel = "0.5"
-dashmap = { version = "6.1", features = ["serde"] }
-heed = { version = "0.22.1", default-features = false }
 num_cpus = "1.17"
+log = "0.4"
+async-trait = "0.1"
+futures = "0.3"
+thiserror = "2.0.18"
+bytes = "1.12.0"
+uuid = { version = "1.0", features = ["v4", "serde"] }
+serde_json = "1.0"
+data-encoding = "2.11.0"
 parking_lot = "0.12"
 postcard = { version = "1.1", default-features = false, features = ["use-std"] }
-rkyv = { version = "0.8", features = ["std", "uuid-1"] }
 serde = { version = "1.0", features = ["derive", "rc"] }
-thiserror = "2.0.18"
+rkyv = { version = "0.8", features = ["std", "uuid-1"] }
 tokio = { version = "1", features = ["full", "rt-multi-thread", "macros", "time", "fs", "io-util"] }
 tracing = { version = "0.1", features = ["log"] }
-uuid = { version = "1.0", features = ["v4", "serde"] }
-xxhash-rust = { version = "0.8", features = ["xxh3", "const_xxh3", "xxh32"] }
-fs-err = "3.3.0"
-futures = "0.3"
-iroh = { version = "1.0", default-features = false, features = ["tls-ring"] }
-iroh-gossip = { version = "0.101", default-features = false, features = ["net"] }
-# 内容寻址 blob 原语（0.3.2 R1，spike/0.3.2-iroh-blobs 裁决吸收）：bao/blake3 逐块
-# 校验流式传输。feature 取舍（spike Q4，+32 crates 约 +10%）：
-#   fs-store = redb 落盘 store（生产需要持久化，Ref 可能跨重启消费）
-#   rpc      = 进程内 BlobRpc 客户端（irpc local channel），+0 crate（noq 已在 iroh 树内）
-#   hide-proto-docs = 仅文档裁剪，零成本
-iroh-blobs = { version = "0.103", default-features = false, features = ["fs-store", "rpc", "hide-proto-docs"] }
-# bao-tree：流式拉取路径需要解构 BaoContentItem（iroh-blobs 未 re-export）；
-# 与 iroh-blobs 内部依赖同版本 0.16，无额外编译成本。
-bao-tree = { version = "0.16", default-features = false }
-blake3 = "1.8.5"
-subtle = "2"
-data-encoding = "2.11.0"
-bytes = "1.12.0"
 pyo3 = { version = "0.29", optional = true }
 pyo3-log = { version = "0.13", optional = true }
-log = "0.4"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "registry", "json"] }
-opentelemetry = { version = "0.32", features = ["metrics"] }
-opentelemetry_sdk = { version = "0.32", features = ["metrics"] }
-opentelemetry-prometheus = "0.32"
-opentelemetry-appender-tracing = "0.32"
-opentelemetry-semantic-conventions = "0.32"
-# OTLP gRPC exporter（C1）：通过 `OTEL_EXPORTER_OTLP_ENDPOINT` 自动启用。
-# 使用 grpc-tonic 子 feature，遵循 OTel 规范默认传输协议。
-# 当不启用 OTLP 时不影响其他 exporter。
-# tonic 直接依赖：用于 metrics init() 中解析 headers 为 MetadataMap（避免依赖 opentelemetry-otlp 内部类型）。
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["metrics", "grpc-tonic"] }
-tonic = { version = "0.14", default-features = false }
-prometheus = "0.14"
-dhat = { version = "0.3.3", optional = true }
-console-subscriber = { version = "0.4", optional = true }
-
-
-# Worker 子进程 IPC 辅助 FFI（最小绑定，已在依赖树中，零新增编译成本）：
-#   - libc：Unix 侧 dup/fcntl——取消帧独立写端（dup stdin + O_NONBLOCK，见 dispatcher.rs）
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3.24.0"
-criterion = { version = "0.5", features = ["html_reports"] }
-serde_json = "1.0"
-proptest = "1.5"
 # auto-initialize：Rust 单元测试（cargo test，非 maturin/pytest 驱动）需自动初始化
-# Python 解释器才能调用 Python::attach。生产 cdylib 由 Python 解释器加载，已初始化，
-# 此 feature 不参与 release 构建（dev-dependencies 仅在 test/bench 时激活）。
+# Python 解释器才能调用 Python::attach。生产 cdylib 由 Python 解释器加载，已初始化。
 pyo3 = { version = "0.29", features = ["auto-initialize"] }
 
 [features]
-dhat-heap = ["dep:dhat"]
 python = ["dep:pyo3", "dep:pyo3-log"]
-# tokio-console 支持（ACTANT_TOKIO_CONSOLE=1 激活）
-tokio-console = ["dep:console-subscriber"]
 default = ["python"]
 
 [lib]
 name = "actant"
 path = "src/lib.rs"
 crate-type = ["cdylib", "rlib"]
-
-[profile.release]
-opt-level = 3
-lto = "fat"
-codegen-units = 1
-strip = true
-# 必须 unwind：worker/dispatcher.rs 的 catch_unwind 依赖 unwind 语义
-# 来隔离 Python task handler 的 panic，避免单个任务崩溃终止整个 worker。
-panic = "unwind"
-
-[profile.bench]
-inherits = "release"
-lto = false
-strip = false
-debug = true
-
-# ---------------------------------------------------------------------------
-# Criterion 基准测试目标
-# ---------------------------------------------------------------------------
-# 每个目标聚焦一个热点路径，便于独立运行与回归对比：
-#   cargo bench --bench scheduler       # 调度器 enqueue/dequeue/enqueue_batch
-#   cargo bench --bench serialization  # rkyv 序列化/反序列化
-#   cargo bench --bench store           # LMDB 读写
-# 全量运行：cargo bench
-# 基准测试不依赖 Python（关闭 default features），避免拉入 pyo3。
-
-[[bench]]
-name = "scheduler"
-path = "benches/rust/scheduler.rs"
-harness = false
-required-features = []
-
-[[bench]]
-name = "serialization"
-path = "benches/rust/serialization.rs"
-harness = false
-required-features = []
-
-[[bench]]
-name = "store"
-path = "benches/rust/store.rs"
-harness = false
-required-features = []
-
-[[bench]]
-name = "capability_dispatch"
-path = "benches/rust/capability_dispatch.rs"
-harness = false
-required-features = []
-
-[[bench]]
-name = "event_bus"
-path = "benches/rust/event_bus.rs"
-harness = false
-required-features = []
-
-# Orchestrator DAG 拓扑计算基准（topological_sort / roots / sinks / successors_of）。
-# 运行：cargo bench --bench orchestrator
-[[bench]]
-name = "orchestrator"
-path = "benches/rust/orchestrator.rs"
-harness = false
-required-features = []
-
-# 网络层 wire 协议编解码基准（WireEnvelope wrap / decode / round_trip）。
-# 运行：cargo bench --bench network
-[[bench]]
-name = "network"
-path = "benches/rust/network.rs"
-harness = false
-required-features = []
-
-# 内存分配跟踪测试 — 通过 dhat 测量热点路径的堆分配。
-# 运行：cargo test --bench mem_profile --features dhat-heap -- --nocapture
-[[bench]]
-name = "mem_profile"
-path = "benches/rust/mem_profile.rs"
-harness = false
-required-features = ["dhat-heap"]
-
-# ---------------------------------------------------------------------------
-# Property-based 测试（proptest）
-# ---------------------------------------------------------------------------
-# 验证 payload 编解码与 DAG 拓扑的不变量，覆盖手写测试难以穷举的边界情况。
-# 运行：cargo test --test property
-[[test]]
-name = "property"
-path = "tests/rust/property/main.rs"

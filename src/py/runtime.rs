@@ -4,6 +4,7 @@
 //! - 跨边界传递的纯数据类型（`PyNode`、`PyTask`）
 //! - `_RuntimeCore`：对 `runtime::Runtime` 的薄 PyO3 包装，供 Python 层持有
 
+use super::error::actant_error_to_pyerr;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
@@ -11,17 +12,17 @@ use parking_lot::Mutex;
 
 use pyo3::prelude::*;
 
-use crate::common::{
+use actant_core::common::{
     decode_blob_ref, encode_blob_ref, ActantConfig, ActantError, BlobRef, NodeId, RetryPolicy,
     TaskCompletion, TaskDefinition, TaskId, WorkflowId,
 };
-use crate::runtime::builder::RuntimeBuilder;
-use crate::runtime::event_bus::{BusEvent, Topic as BusTopic};
-use crate::runtime::workflow::actor::TaskResultOutcome;
-use crate::runtime::workflow::messaging::{decode, encode};
-use crate::runtime::workflow::orchestrator::types::WorkflowEventPayload;
-use crate::runtime::workflow::orchestrator::DagSnapshot;
-use crate::runtime::workflow::{
+use actant_core::runtime::builder::RuntimeBuilder;
+use actant_core::runtime::event_bus::{BusEvent, Topic as BusTopic};
+use actant_core::runtime::workflow::actor::TaskResultOutcome;
+use actant_core::runtime::workflow::messaging::{decode, encode};
+use actant_core::runtime::workflow::orchestrator::types::WorkflowEventPayload;
+use actant_core::runtime::workflow::orchestrator::DagSnapshot;
+use actant_core::runtime::workflow::{
     workflow_methods, AddNodeOutcome, Dag, DagNode, FailureStrategy, WaitCondition,
     WorkflowExecution,
 };
@@ -50,7 +51,7 @@ fn shared_tokio_runtime() -> PyResult<Arc<tokio::runtime::Runtime>> {
         })
         .clone()
         .map_err(ActantError::Internal)
-        .map_err(PyErr::from)
+        .map_err(actant_error_to_pyerr)
 }
 
 // ---------------------------------------------------------------------------
@@ -181,8 +182,8 @@ pub struct PyListenAddresses {
     pub endpoint_addr: String,
 }
 
-impl From<crate::runtime::network::ListenAddresses> for PyListenAddresses {
-    fn from(a: crate::runtime::network::ListenAddresses) -> Self {
+impl From<actant_core::runtime::network::ListenAddresses> for PyListenAddresses {
+    fn from(a: actant_core::runtime::network::ListenAddresses) -> Self {
         Self {
             endpoint_id: a.endpoint_id,
             relay_url: a.relay_url,
@@ -202,7 +203,7 @@ pub struct PyRuntimeCore {
     /// `Option` 以便 Drop 时 take 出来，在释放 GIL 的状态下显式 drop。
     /// 否则 PyRuntimeCore drop 时 GIL 被持有，iroh router / actor system 的
     /// Drop 可能阻塞等待 tokio worker，而 worker 的 pyo3_log 回调需要 GIL → 死锁。
-    runtime: Option<Arc<crate::runtime::Runtime>>,
+    runtime: Option<Arc<actant_core::runtime::Runtime>>,
     tokio: Mutex<Option<Arc<tokio::runtime::Runtime>>>,
     /// `serve()` spawn 的 worker.run() 任务句柄。shutdown 时先 abort 它，
     /// 避免 worker 循环仍在使用 network 时 endpoint.close() 被调用。
@@ -267,8 +268,8 @@ impl PyRuntimeCore {
         // 两者均为幂等：多次调用（如一个进程创建多个 _RuntimeCore）会替换之前的管道。
         // 失败不阻断 Runtime 构造——metrics/tracing 不可用不应使节点无法启动；
         // 错误经 tracing::error! 上报，调用方可通过 RUST_LOG=actant=error 观察。
-        crate::observability::init();
-        if let Err(e) = crate::metrics::init() {
+        actant_core::observability::init();
+        if let Err(e) = actant_core::metrics::init() {
             tracing::error!(error = %e, "metrics::init() failed; Prometheus /metrics endpoint will be empty");
         }
 
@@ -317,7 +318,7 @@ impl PyRuntimeCore {
                         .await
                 })
             })
-            .map_err(PyErr::from)?;
+            .map_err(actant_error_to_pyerr)?;
         tracing::info!(
             build_ms = t_build.elapsed().as_millis() as u64,
             total_ms = t0.elapsed().as_millis() as u64,
@@ -380,7 +381,10 @@ impl PyRuntimeCore {
         let runtime = self.runtime.as_ref().ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err("runtime already shut down")
         })?;
-        let addrs = runtime.network().listen_addresses().map_err(PyErr::from)?;
+        let addrs = runtime
+            .network()
+            .listen_addresses()
+            .map_err(actant_error_to_pyerr)?;
         Ok(PyListenAddresses::from(addrs))
     }
 
@@ -401,7 +405,7 @@ impl PyRuntimeCore {
         py.detach(move || {
             tokio
                 .block_on(async move { network.dial(&addr).await })
-                .map_err(PyErr::from)
+                .map_err(actant_error_to_pyerr)
         })?;
         Ok(())
     }
@@ -425,7 +429,7 @@ impl PyRuntimeCore {
         future_into_py_iter(py, tokio.handle().clone(), &gil_thread, async move {
             match network.dial(&addr).await {
                 Ok(()) => Python::attach(|py| FutureResultToPy::Value(py.None())),
-                Err(e) => Python::attach(|_py| FutureResultToPy::Err(PyErr::from(e))),
+                Err(e) => Python::attach(|_py| FutureResultToPy::Err(actant_error_to_pyerr(e))),
             }
         })
         .map(|b| b.unbind())
@@ -448,7 +452,7 @@ impl PyRuntimeCore {
         py.detach(move || {
             tokio
                 .block_on(async move { network.add_gossip_peer(&peer_id).await })
-                .map_err(PyErr::from)
+                .map_err(actant_error_to_pyerr)
         })?;
         Ok(())
     }
@@ -469,7 +473,7 @@ impl PyRuntimeCore {
         future_into_py_iter(py, tokio.handle().clone(), &gil_thread, async move {
             match network.add_gossip_peer(&peer_id).await {
                 Ok(()) => Python::attach(|py| FutureResultToPy::Value(py.None())),
-                Err(e) => Python::attach(|_py| FutureResultToPy::Err(PyErr::from(e))),
+                Err(e) => Python::attach(|_py| FutureResultToPy::Err(actant_error_to_pyerr(e))),
             }
         })
         .map(|b| b.unbind())
@@ -489,7 +493,7 @@ impl PyRuntimeCore {
             tokio
                 .block_on(async move { network.discover_peers().await })
                 .map(|peers| peers.into_iter().map(|p| p.0.to_string()).collect())
-                .map_err(PyErr::from)
+                .map_err(actant_error_to_pyerr)
         })
     }
 
@@ -515,7 +519,7 @@ impl PyRuntimeCore {
                         Err(e) => FutureResultToPy::Err(e),
                     }
                 }),
-                Err(e) => Python::attach(|_py| FutureResultToPy::Err(PyErr::from(e))),
+                Err(e) => Python::attach(|_py| FutureResultToPy::Err(actant_error_to_pyerr(e))),
             }
         })
         .map(|b| b.unbind())
@@ -640,7 +644,7 @@ impl PyRuntimeCore {
                 })
             })
         })
-        .map_err(PyErr::from)
+        .map_err(actant_error_to_pyerr)
     }
 
     /// 按 `BlobRef` wire 编码取回值字节。
@@ -650,7 +654,7 @@ impl PyRuntimeCore {
     /// 不是吞错误），未命中再按 `ref.node` 跨节点流式拉取（逐 leaf 已校验）。
     #[tracing::instrument(name = "py.value_fetch", level = "debug", skip(self, py, ref_bytes))]
     fn value_fetch(&self, py: Python<'_>, ref_bytes: Vec<u8>) -> PyResult<Vec<u8>> {
-        let r = decode_blob_ref(&ref_bytes).map_err(PyErr::from)?;
+        let r = decode_blob_ref(&ref_bytes).map_err(actant_error_to_pyerr)?;
         let runtime = self
             .runtime
             .as_ref()
@@ -681,7 +685,7 @@ impl PyRuntimeCore {
                 Ok(data)
             })
         })
-        .map_err(PyErr::from)
+        .map_err(actant_error_to_pyerr)
     }
 
     /// 解码 `BlobRef` wire 编码为 ``(hash_hex, node)``。
@@ -689,7 +693,7 @@ impl PyRuntimeCore {
     /// 供 Python `Ref.hash` / `.node` 展示使用，避免在 Python 侧引入 postcard
     /// 解码器。
     fn value_ref_parts(&self, ref_bytes: Vec<u8>) -> PyResult<(String, String)> {
-        let r = decode_blob_ref(&ref_bytes).map_err(PyErr::from)?;
+        let r = decode_blob_ref(&ref_bytes).map_err(actant_error_to_pyerr)?;
         Ok((r.hash.to_string(), r.node.as_str().to_string()))
     }
 
@@ -707,7 +711,7 @@ impl PyRuntimeCore {
     /// `endpoint_addr` 在首次调用时 lazy 缓存（iroh endpoint 启动后不变）。
     #[tracing::instrument(name = "py.submit_task", level = "debug", skip(self, py, task), fields(task_id = %task.task_id))]
     fn submit_task(&self, py: Python<'_>, task: PyTask) -> PyResult<()> {
-        crate::metrics::inc_tasks_submitted();
+        actant_core::metrics::inc_tasks_submitted();
         let runtime = self
             .runtime
             .as_ref()
@@ -768,7 +772,7 @@ impl PyRuntimeCore {
     #[tracing::instrument(name = "py.submit_tasks_batch", level = "debug", skip(self, py, tasks), fields(n = tasks.len()))]
     fn submit_tasks_batch(&self, py: Python<'_>, tasks: Vec<PyTask>) -> PyResult<()> {
         let n = tasks.len();
-        crate::metrics::inc_tasks_submitted_by(n as u64);
+        actant_core::metrics::inc_tasks_submitted_by(n as u64);
         let runtime = self
             .runtime
             .as_ref()
@@ -847,12 +851,12 @@ impl PyRuntimeCore {
             })?,
         };
         let wf = WorkflowId::from(workflow_id);
-        crate::metrics::inc_workflows_submitted();
+        actant_core::metrics::inc_workflows_submitted();
         if timeout_ms > 0 {
-            let payload = encode(&(wf, dag, timeout_ms)).map_err(PyErr::from)?;
+            let payload = encode(&(wf, dag, timeout_ms)).map_err(actant_error_to_pyerr)?;
             self.call_workflow_actor::<()>(py, workflow_methods::SUBMIT_WITH_TIMEOUT, payload)?;
         } else {
-            let payload = encode(&(wf, dag)).map_err(PyErr::from)?;
+            let payload = encode(&(wf, dag)).map_err(actant_error_to_pyerr)?;
             self.call_workflow_actor::<()>(py, workflow_methods::SUBMIT, payload)?;
         }
         Ok(())
@@ -896,8 +900,8 @@ impl PyRuntimeCore {
             metadata: node.metadata.unwrap_or_default(),
         };
         let deps: Vec<TaskId> = deps.into_iter().map(TaskId::new).collect();
-        let payload =
-            encode(&(WorkflowId::from(workflow_id), dag_node, deps)).map_err(PyErr::from)?;
+        let payload = encode(&(WorkflowId::from(workflow_id), dag_node, deps))
+            .map_err(actant_error_to_pyerr)?;
         let outcome: AddNodeOutcome =
             self.call_workflow_actor(py, workflow_methods::ADD_NODE, payload)?;
         let dict = pyo3::types::PyDict::new(py);
@@ -947,7 +951,7 @@ impl PyRuntimeCore {
     /// 将工作流及运行中任务置为 Cancelled 终态；已终态的工作流为幂等 no-op。
     #[tracing::instrument(name = "py.cancel_workflow", level = "info", skip(self, py), fields(workflow_id = %workflow_id))]
     fn cancel_workflow(&self, py: Python<'_>, workflow_id: String) -> PyResult<()> {
-        let payload = encode(&WorkflowId::from(workflow_id)).map_err(PyErr::from)?;
+        let payload = encode(&WorkflowId::from(workflow_id)).map_err(actant_error_to_pyerr)?;
         self.call_workflow_actor::<()>(py, workflow_methods::CANCEL_WORKFLOW, payload)?;
         Ok(())
     }
@@ -960,7 +964,7 @@ impl PyRuntimeCore {
     /// no-op。注意：运行中的工作流删除后其任务结果将不可恢复。
     #[tracing::instrument(name = "py.delete_workflow", level = "info", skip(self, py), fields(workflow_id = %workflow_id))]
     fn delete_workflow(&self, py: Python<'_>, workflow_id: String) -> PyResult<()> {
-        let payload = encode(&WorkflowId::from(workflow_id)).map_err(PyErr::from)?;
+        let payload = encode(&WorkflowId::from(workflow_id)).map_err(actant_error_to_pyerr)?;
         self.call_workflow_actor::<()>(py, workflow_methods::DELETE_WORKFLOW, payload)?;
         Ok(())
     }
@@ -1024,8 +1028,8 @@ impl PyRuntimeCore {
                 )))
             }
         };
-        let payload =
-            encode(&(WorkflowId::from(workflow_id), wait_key, condition)).map_err(PyErr::from)?;
+        let payload = encode(&(WorkflowId::from(workflow_id), wait_key, condition))
+            .map_err(actant_error_to_pyerr)?;
         self.call_workflow_actor::<()>(py, workflow_methods::REGISTER_WAIT_POINT, payload)?;
         Ok(())
     }
@@ -1063,7 +1067,8 @@ impl PyRuntimeCore {
         workflow_id: String,
         wait_key: String,
     ) -> PyResult<Option<Vec<u8>>> {
-        let payload = encode(&(WorkflowId::from(workflow_id), wait_key)).map_err(PyErr::from)?;
+        let payload =
+            encode(&(WorkflowId::from(workflow_id), wait_key)).map_err(actant_error_to_pyerr)?;
         self.call_workflow_actor(py, workflow_methods::SIGNAL_WAIT_POINT, payload)
     }
 
@@ -1085,7 +1090,7 @@ impl PyRuntimeCore {
         fields(workflow_id = %workflow_id)
     )]
     fn resume_suspended(&self, py: Python<'_>, workflow_id: String) -> PyResult<usize> {
-        let payload = encode(&WorkflowId::from(workflow_id)).map_err(PyErr::from)?;
+        let payload = encode(&WorkflowId::from(workflow_id)).map_err(actant_error_to_pyerr)?;
         self.call_workflow_actor(py, workflow_methods::RESUME_SUSPENDED, payload)
     }
 
@@ -1094,7 +1099,7 @@ impl PyRuntimeCore {
     /// 与其它工作流方法不同，本方法**不经 actor 消息循环**：actor 消息处理是
     /// 单线程顺序执行的，在 `handle_message` 内阻塞会让整个 WorkflowActor
     /// （全部工作流）停摆。因此改为持有编排器只读句柄
-    /// （[`crate::runtime::context::Runtime::orchestrator_handle`]，与 actor 共享
+    /// （[`actant_core::runtime::context::Runtime::orchestrator_handle`]，与 actor 共享
     /// 同一个 `Arc<OrchestratorState>`）在 actor 之外阻塞。
     ///
     /// **调用方必须先 `register_wait_point`**：注册是将等待点写入历史/快照的
@@ -1161,7 +1166,7 @@ impl PyRuntimeCore {
     /// 封口后 orchestrator 才允许工作流终态判定；全部任务已终态时立即收尾。
     #[tracing::instrument(name = "py.seal_workflow", level = "debug", skip(self, py), fields(workflow_id = %workflow_id))]
     fn seal_workflow(&self, py: Python<'_>, workflow_id: String) -> PyResult<()> {
-        let payload = encode(&WorkflowId::from(workflow_id)).map_err(PyErr::from)?;
+        let payload = encode(&WorkflowId::from(workflow_id)).map_err(actant_error_to_pyerr)?;
         self.call_workflow_actor::<()>(py, workflow_methods::SEAL_WORKFLOW, payload)?;
         Ok(())
     }
@@ -1235,7 +1240,7 @@ impl PyRuntimeCore {
         // 回调与持有 GIL 的调用方 block_on 互相等待。
         let response = py
             .detach(move || tokio.block_on(worker.report_task_result(&wf, &tid, outcome)))
-            .map_err(PyErr::from)?;
+            .map_err(actant_error_to_pyerr)?;
         let dict = pyo3::types::PyDict::new(py);
         dict.set_item("retry", response.retry)?;
         dict.set_item("delay_ms", response.delay_ms)?;
@@ -1249,7 +1254,8 @@ impl PyRuntimeCore {
     /// ``tasks`` 为 ``{task_id: {state, result, error, retry_count, attempt}}``。
     #[tracing::instrument(name = "py.get_workflow_state", level = "debug", skip(self, py), fields(workflow_id = %workflow_id))]
     fn get_workflow_state(&self, py: Python<'_>, workflow_id: String) -> PyResult<Py<PyAny>> {
-        let payload = encode(&WorkflowId::from(workflow_id.clone())).map_err(PyErr::from)?;
+        let payload =
+            encode(&WorkflowId::from(workflow_id.clone())).map_err(actant_error_to_pyerr)?;
         let state: Option<WorkflowExecution> =
             self.call_workflow_actor(py, workflow_methods::GET_STATE, payload)?;
         let Some(exec) = state else {
@@ -1291,7 +1297,7 @@ impl PyRuntimeCore {
     /// 时无法在 Python 侧还原生效策略（``Dag::effective_retry_policy`` 的输入）。
     #[tracing::instrument(name = "py.get_dag", level = "debug", skip(self, py), fields(workflow_id = %workflow_id))]
     fn get_dag(&self, py: Python<'_>, workflow_id: String) -> PyResult<Py<PyAny>> {
-        let payload = encode(&WorkflowId::from(workflow_id)).map_err(PyErr::from)?;
+        let payload = encode(&WorkflowId::from(workflow_id)).map_err(actant_error_to_pyerr)?;
         let snapshot: Option<DagSnapshot> =
             self.call_workflow_actor(py, workflow_methods::GET_DAG, payload)?;
         let Some(snap) = snapshot else {
@@ -1359,14 +1365,15 @@ impl PyRuntimeCore {
         workflow_id: String,
         after: Option<(u64, u64)>,
     ) -> PyResult<Py<PyAny>> {
-        use crate::runtime::state::event_log::EventId;
-        use crate::runtime::state::HlcTimestamp;
+        use actant_core::runtime::state::event_log::EventId;
+        use actant_core::runtime::state::HlcTimestamp;
 
         let cursor = after.map(|(sequence, timestamp_ms)| EventId {
             timestamp: HlcTimestamp::from_parts(timestamp_ms, 0),
             sequence,
         });
-        let payload = encode(&(WorkflowId::from(workflow_id), cursor)).map_err(PyErr::from)?;
+        let payload =
+            encode(&(WorkflowId::from(workflow_id), cursor)).map_err(actant_error_to_pyerr)?;
         let entries: Vec<(EventId, Vec<u8>)> =
             self.call_workflow_actor(py, workflow_methods::GET_HISTORY, payload)?;
 
@@ -1378,9 +1385,9 @@ impl PyRuntimeCore {
             item.set_item("payload", pyo3::types::PyBytes::new(py, raw))?;
             match postcard::from_bytes::<WorkflowEventPayload>(raw) {
                 Ok(ev) => {
-                    item.set_item("kind", ev.kind_name())?;
-                    item.set_item("task_id", ev.task_id().map(|t| t.as_str().to_string()))?;
-                    item.set_item("error", ev.error().map(|s| s.to_string()))?;
+                    item.set_item("kind", event_payload_kind(&ev))?;
+                    item.set_item("task_id", event_payload_task_id(&ev).map(|t| t.to_string()))?;
+                    item.set_item("error", event_payload_error(&ev).map(|s| s.to_string()))?;
                 }
                 Err(_) => {
                     // 解码失败（历史格式变更）仍回传字节，但观测字段为 None。
@@ -1517,7 +1524,9 @@ impl PyRuntimeCore {
                         if let Err(e) = cb_ref.call1(py, (py_completion,)) {
                             tracing::warn!("task result callback error: {}", e);
                         }
-                        crate::metrics::observe_event_bridge_ms(t0.elapsed().as_millis() as u64);
+                        actant_core::metrics::observe_event_bridge_ms(
+                            t0.elapsed().as_millis() as u64
+                        );
                     });
                 });
             }
@@ -1579,7 +1588,9 @@ impl PyRuntimeCore {
                         if let Err(e) = cb_ref.call1(py, (dict,)) {
                             tracing::warn!("task log callback error: {}", e);
                         }
-                        crate::metrics::observe_event_bridge_ms(t0.elapsed().as_millis() as u64);
+                        actant_core::metrics::observe_event_bridge_ms(
+                            t0.elapsed().as_millis() as u64
+                        );
                     });
                 });
             }
@@ -1636,7 +1647,9 @@ impl PyRuntimeCore {
                         if let Err(e) = cb_ref.call1(py, (dict,)) {
                             tracing::warn!("worker state callback error: {}", e);
                         }
-                        crate::metrics::observe_event_bridge_ms(t0.elapsed().as_millis() as u64);
+                        actant_core::metrics::observe_event_bridge_ms(
+                            t0.elapsed().as_millis() as u64
+                        );
                     });
                 });
             }
@@ -1864,7 +1877,10 @@ impl PyRuntimeCore {
         if let Some(addr) = cache.as_ref() {
             return Ok(addr.clone());
         }
-        let addrs = runtime.network().listen_addresses().map_err(PyErr::from)?;
+        let addrs = runtime
+            .network()
+            .listen_addresses()
+            .map_err(actant_error_to_pyerr)?;
         *cache = Some(addrs.endpoint_addr.clone());
         Ok(addrs.endpoint_addr)
     }
@@ -1873,7 +1889,6 @@ impl PyRuntimeCore {
     ///
     /// GIL 在 `block_on` 期间释放（与其它网络/actor 调用一致），避免
     /// tokio worker 的 pyo3_log 回调与主线程在持有 GIL 时 block_on 死锁。
-    /// Actor 返回错误时转换为对应的 `ActantError` 异常。
     fn call_workflow_actor<T: serde::de::DeserializeOwned>(
         &self,
         py: Python<'_>,
@@ -1894,11 +1909,11 @@ impl PyRuntimeCore {
             .detach(move || {
                 tokio.block_on(async move { system.call(&actor_id, &method, payload).await })
             })
-            .map_err(PyErr::from)?;
+            .map_err(actant_error_to_pyerr)?;
         if let Some(err) = result.error {
-            return Err(PyErr::from(ActantError::from(err)));
+            return Err(actant_error_to_pyerr(ActantError::from(err)));
         }
-        decode(&result.payload).map_err(PyErr::from)
+        decode(&result.payload).map_err(actant_error_to_pyerr)
     }
 }
 
@@ -1921,10 +1936,45 @@ impl Drop for PyRuntimeCore {
     }
 }
 
-/// 将 Rust ``TaskCompletion`` 转换为 Python ``_TaskCompletion``。
-/// 重试策略 → Python dict；``None`` → Python ``None``。
-///
-/// `DagSnapshot` 有两处策略字段（DAG 级默认 + 每节点），共用本函数以免
+/// Actor 返回错误时转换为对应的 `ActantError` 异常。
+/// F2a：`WorkflowEventPayload` 的观测访问器在 core 内按 `python` 特性门控
+/// （纯框架构建零 dead_code），绑定壳在此自行实现（enum 变体字段天然可见）。
+fn event_payload_task_id(ev: &WorkflowEventPayload) -> Option<&str> {
+    match ev {
+        WorkflowEventPayload::TaskDispatched { task_id, .. }
+        | WorkflowEventPayload::TaskRunning { task_id, .. }
+        | WorkflowEventPayload::TaskCompleted { task_id, .. }
+        | WorkflowEventPayload::TaskFailed { task_id, .. }
+        | WorkflowEventPayload::TaskCancelled { task_id, .. } => Some(task_id.as_str()),
+        _ => None,
+    }
+}
+fn event_payload_error(ev: &WorkflowEventPayload) -> Option<&str> {
+    match ev {
+        WorkflowEventPayload::Failed { error, .. }
+        | WorkflowEventPayload::TaskFailed { error, .. } => Some(error.as_str()),
+        _ => None,
+    }
+}
+fn event_payload_kind(ev: &WorkflowEventPayload) -> &'static str {
+    match ev {
+        WorkflowEventPayload::Submitted { .. } => "Submitted",
+        WorkflowEventPayload::NodeAdded { .. } => "NodeAdded",
+        WorkflowEventPayload::TaskDispatched { .. } => "TaskDispatched",
+        WorkflowEventPayload::Started { .. } => "Started",
+        WorkflowEventPayload::TaskRunning { .. } => "TaskRunning",
+        WorkflowEventPayload::TaskCompleted { .. } => "TaskCompleted",
+        WorkflowEventPayload::TaskFailed { .. } => "TaskFailed",
+        WorkflowEventPayload::TaskCancelled { .. } => "TaskCancelled",
+        WorkflowEventPayload::Completed { .. } => "Completed",
+        WorkflowEventPayload::Failed { .. } => "Failed",
+        WorkflowEventPayload::Cancelled { .. } => "Cancelled",
+        WorkflowEventPayload::WaitPointRegistered { .. } => "WaitPointRegistered",
+        WorkflowEventPayload::SignalReceived { .. } => "SignalReceived",
+        WorkflowEventPayload::TimerFired { .. } => "TimerFired",
+        WorkflowEventPayload::Recovered { .. } => "Recovered",
+    }
+}
 /// "同一结构两处构造"漂移。
 fn retry_policy_to_py(py: Python<'_>, policy: Option<&RetryPolicy>) -> PyResult<Py<PyAny>> {
     let Some(p) = policy else {
@@ -2018,5 +2068,5 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 /// （如纯 Python 测试场景），返回空字符串。
 #[pyfunction]
 fn prometheus_text() -> String {
-    crate::metrics::prometheus_text()
+    actant_core::metrics::prometheus_text()
 }

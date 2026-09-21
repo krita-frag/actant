@@ -4,7 +4,7 @@
 //! 这些测试使用 `proptest` 验证 payload 编解码的不变量，
 //! 覆盖手写单元测试难以穷举的边界情况。
 
-use actant::common::{pack_group, pack_single, sign, unpack_payload, verify};
+use actant_core::common::{pack_group, pack_single, sign, unpack_payload, verify};
 use proptest::prelude::*;
 
 proptest! {

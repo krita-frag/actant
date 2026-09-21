@@ -4,8 +4,8 @@
 //! 验证 DAG 的核心不变量：拓扑排序合法性、环检测、roots/sinks 正确性。
 //! 使用 `proptest` 生成随机 DAG（通过随机边序列），覆盖手写测试难以穷举的图结构。
 
-use actant::common::TaskId;
-use actant::runtime::workflow::{Dag, DagNode};
+use actant_core::common::TaskId;
+use actant_core::runtime::workflow::{Dag, DagNode};
 use proptest::prelude::*;
 
 /// 生成随机 TaskId（基于索引，确保唯一）。

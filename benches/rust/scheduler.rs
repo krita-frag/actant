@@ -16,9 +16,9 @@ use std::sync::Arc;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use tokio::runtime::Runtime;
 
-use actant::common::{ActorId, RetryPolicy, TaskDefinition, TaskId, WorkflowId};
-use actant::runtime::actor::ActorSystem;
-use actant::runtime::workflow::{
+use actant_core::common::{ActorId, RetryPolicy, TaskDefinition, TaskId, WorkflowId};
+use actant_core::runtime::actor::ActorSystem;
+use actant_core::runtime::workflow::{
     fifo_scheduler_actor, priority_scheduler_actor, spawn_fast_path_scheduler, ActorScheduler,
     Scheduler,
 };

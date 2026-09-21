@@ -298,7 +298,7 @@ fn wire_envelope_roundtrip_preserves_traceparent() {
     });
     let envelope = WireEnvelope::wrap(msg);
     let original_tp = envelope.traceparent.clone().unwrap();
-    let bytes = crate::common::encode_postcard(&envelope).unwrap();
+    let bytes = crate::encode_postcard(&envelope).unwrap();
     let (decoded_msg, decoded_tp) = WireEnvelope::decode(&bytes).expect("decode should succeed");
     // 消息本体保留。
     assert!(matches!(decoded_msg, WireMessage::NodeHeartbeat(_)));
@@ -387,7 +387,7 @@ fn wire_mac_protects_traceparent_field() {
     // 复用模块级 MAC_TEST_LOCK，与 D2 测试串行执行避免全局密钥污染。
     let _guard = MAC_TEST_LOCK.lock().unwrap();
 
-    crate::common::set_wire_signing_key(b"test-key-c3".to_vec());
+    crate::set_wire_signing_key(b"test-key-c3".to_vec());
 
     let envelope = WireEnvelope::wrap(WireMessage::NodeHeartbeat(NodeHeartbeat {
         signature: None,
@@ -401,7 +401,7 @@ fn wire_mac_protects_traceparent_field() {
         endpoint_addr: None,
     }));
     let original_tp = envelope.traceparent.clone().unwrap();
-    let mut bytes = crate::common::encode_postcard(&envelope).unwrap();
+    let mut bytes = crate::encode_postcard(&envelope).unwrap();
 
     // 构造篡改后的 envelope：替换 traceparent 为攻击者伪造值。
     let forged_ctx = TraceContext::new_root(true);
@@ -412,7 +412,7 @@ fn wire_mac_protects_traceparent_field() {
         traceparent: Some(forged_tp.clone()),
         mac: envelope.mac, // 攻击者无法重算 MAC（无密钥）
     };
-    let forged_bytes = crate::common::encode_postcard(&forged_envelope).unwrap();
+    let forged_bytes = crate::encode_postcard(&forged_envelope).unwrap();
 
     // 用篡改字节覆盖（确保长度一致——postcard 序列化使 traceparent 字符串
     // 长度变化会导致字节流变化，但 decode 仍应因 MAC 不匹配而失败）。
@@ -426,12 +426,12 @@ fn wire_mac_protects_traceparent_field() {
     );
 
     // 原始 envelope decode 应该成功，且 traceparent 与原始一致。
-    let original_bytes = crate::common::encode_postcard(&envelope).unwrap();
+    let original_bytes = crate::encode_postcard(&envelope).unwrap();
     let (_, decoded_tp) = WireEnvelope::decode(&original_bytes).unwrap();
     assert_eq!(decoded_tp.as_deref(), Some(original_tp.as_str()));
 
     // 清理全局状态。
-    crate::common::set_wire_signing_key(Vec::new());
+    crate::set_wire_signing_key(Vec::new());
 }
 
 // --- WireTaskState / WireTaskOutcome 字符串映射 ---
@@ -692,7 +692,7 @@ fn mac_input_segments_match_unsigned_envelope_serialization() {
         traceparent: Some(TraceContext::new_root(true).to_header()),
         mac: None,
     };
-    let whole = crate::common::encode_postcard(&unsigned).unwrap();
+    let whole = crate::encode_postcard(&unsigned).unwrap();
     let segments =
         mac_input_bytes(unsigned.version, &unsigned.message, &unsigned.traceparent).unwrap();
     assert_eq!(
@@ -705,7 +705,7 @@ fn mac_input_segments_match_unsigned_envelope_serialization() {
         traceparent: None,
         ..unsigned
     };
-    let whole_no_tp = crate::common::encode_postcard(&unsigned_no_tp).unwrap();
+    let whole_no_tp = crate::encode_postcard(&unsigned_no_tp).unwrap();
     let segments_no_tp =
         mac_input_bytes(unsigned_no_tp.version, &unsigned_no_tp.message, &None).unwrap();
     assert_eq!(segments_no_tp, whole_no_tp);
@@ -721,12 +721,12 @@ fn two_runtimes_with_different_keys_do_not_interfere() {
     let _guard = MAC_TEST_LOCK.lock().unwrap();
     let node_a = node("rt-a");
     let node_b = node("rt-b");
-    crate::common::register_wire_signing_key(&node_a, b"cluster-key-a".to_vec());
+    crate::register_wire_signing_key(&node_a, b"cluster-key-a".to_vec());
     let env_a_before = WireEnvelope::wrap(heartbeat_msg("rt-a"));
     assert!(env_a_before.mac.is_some());
 
     // 另一 Runtime 以不同密钥注册（旧全局单密钥行为会在此覆盖 rt-a 的密钥）。
-    crate::common::register_wire_signing_key(&node_b, b"cluster-key-b".to_vec());
+    crate::register_wire_signing_key(&node_b, b"cluster-key-b".to_vec());
 
     // rt-a 出站仍用 key-a 签名：以 key-a 手工重算 MAC 必须一致。
     let env_a_after = WireEnvelope::wrap(heartbeat_msg("rt-a"));
@@ -736,9 +736,9 @@ fn two_runtimes_with_different_keys_do_not_interfere() {
         mac: None,
         ..env_a_after
     };
-    let expected_a = crate::common::payload::wire_mac(
+    let expected_a = crate::payload::wire_mac(
         b"cluster-key-a",
-        &crate::common::encode_postcard(&unsigned_a).unwrap(),
+        &crate::encode_postcard(&unsigned_a).unwrap(),
     )
     .unwrap();
     assert_eq!(
@@ -751,9 +751,9 @@ fn two_runtimes_with_different_keys_do_not_interfere() {
     let bytes_b = postcard::to_allocvec(&env_b).unwrap();
     let mac_b = env_b.mac.expect("rt-b envelope must be signed");
     let unsigned_b = WireEnvelope { mac: None, ..env_b };
-    let expected_b = crate::common::payload::wire_mac(
+    let expected_b = crate::payload::wire_mac(
         b"cluster-key-b",
-        &crate::common::encode_postcard(&unsigned_b).unwrap(),
+        &crate::encode_postcard(&unsigned_b).unwrap(),
     )
     .unwrap();
     assert_eq!(mac_b, expected_b);
@@ -772,9 +772,9 @@ fn two_runtimes_with_different_keys_do_not_interfere() {
         traceparent: Some(TraceContext::new_root(true).to_header()),
         mac: None,
     };
-    let rogue_mac = crate::common::payload::wire_mac(
+    let rogue_mac = crate::payload::wire_mac(
         b"cluster-key-c",
-        &crate::common::encode_postcard(&rogue_unsigned).unwrap(),
+        &crate::encode_postcard(&rogue_unsigned).unwrap(),
     )
     .unwrap();
     let rogue = WireEnvelope {
@@ -788,8 +788,8 @@ fn two_runtimes_with_different_keys_do_not_interfere() {
     );
 
     // 清理全局注册表，避免污染其他 MAC 测试。
-    crate::common::register_wire_signing_key(&node_a, Vec::new());
-    crate::common::register_wire_signing_key(&node_b, Vec::new());
+    crate::register_wire_signing_key(&node_a, Vec::new());
+    crate::register_wire_signing_key(&node_b, Vec::new());
     set_wire_signing_key(Vec::new());
 }
 
@@ -806,8 +806,8 @@ fn wire_mac_matches_oneshot_unsigned_serialization() {
     set_wire_signing_key(Vec::new());
 
     let unsigned = WireEnvelope { mac: None, ..env };
-    let whole = crate::common::encode_postcard(&unsigned).unwrap();
-    let oneshot = crate::common::payload::wire_mac(&key, &whole).unwrap();
+    let whole = crate::encode_postcard(&unsigned).unwrap();
+    let oneshot = crate::payload::wire_mac(&key, &whole).unwrap();
     assert_eq!(
         wrapped_mac, oneshot,
         "segment-assembled MAC input must equal one-shot unsigned serialization"

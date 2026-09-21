@@ -19,8 +19,8 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use pyo3::prelude::*;
 
-use crate::common::ActantError;
-use crate::runtime::capability::{
+use actant_core::common::ActantError;
+use actant_core::runtime::capability::{
     Capability, CapabilityRuntime, ErasedHandler, NodeLifecycle, Serialization, Store,
     TaskLifecycle, Transport, WorkflowLifecycle,
 };
@@ -78,7 +78,7 @@ where
                     .call1(py, (&py_req,))
                     .map_err(|e| ActantError::Internal(format!("python handler: {}", e)))?
                     .into_bound(py);
-                crate::metrics::observe_task_handler_ms(t0.elapsed().as_millis() as u64);
+                actant_core::metrics::observe_task_handler_ms(t0.elapsed().as_millis() as u64);
                 let resp = Codec::decode_response(py, &py_resp)
                     .map_err(|e| ActantError::Internal(format!("decode response: {}", e)))?;
                 Ok(resp)
@@ -147,7 +147,7 @@ where
                     Ok(_) => (),
                     Err(e) => return Err(ActantError::Internal(format!("python handler: {}", e))),
                 }
-                crate::metrics::observe_task_handler_ms(t0.elapsed().as_millis() as u64);
+                actant_core::metrics::observe_task_handler_ms(t0.elapsed().as_millis() as u64);
                 Ok(())
             })
         })

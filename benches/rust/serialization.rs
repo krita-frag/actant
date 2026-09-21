@@ -8,10 +8,10 @@
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 
-use actant::common::{
+use actant_core::common::{
     deserialize_rkyv_value, serialize_rkyv, RetryPolicy, TaskDefinition, TaskId, WorkflowId,
 };
-use actant::runtime::workflow::{Dag, DagNode};
+use actant_core::runtime::workflow::{Dag, DagNode};
 
 fn make_task(idx: usize) -> TaskDefinition {
     TaskDefinition {

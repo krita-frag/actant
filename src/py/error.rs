@@ -2,7 +2,7 @@ use pyo3::exceptions::{PyBaseException, PyRuntimeError};
 use pyo3::prelude::*;
 use std::sync::OnceLock;
 
-use crate::common::ActantError;
+use actant_core::common::ActantError;
 
 // 缓存 Python 端异常类对象（在 register_exceptions 中初始化）。
 //
@@ -55,31 +55,31 @@ fn make_pyerr(cls: &OnceLock<Py<PyAny>>, message: &str) -> PyErr {
 /// 使用 `register_exceptions` 中缓存的 Python 端异常类构造 `PyErr`，
 /// 确保 Rust 抛出的异常与 Python 用户 `except` 的类是同一个，
 /// 跨语言边界保留错误类型信息。
-impl From<ActantError> for PyErr {
-    fn from(err: ActantError) -> Self {
-        let message = err.to_string();
-        match &err {
-            ActantError::Storage(_) | ActantError::StorageIo(_) | ActantError::Heed(_) => {
-                make_pyerr(&EXC_STORAGE, &message)
-            }
-            ActantError::Network(_) => make_pyerr(&EXC_NETWORK, &message),
-            ActantError::Serialization(_) | ActantError::Postcard(_) => {
-                make_pyerr(&EXC_SERIALIZATION, &message)
-            }
-            ActantError::Actor(_) => make_pyerr(&EXC_ACTOR, &message),
-            ActantError::Workflow(_) => make_pyerr(&EXC_WORKFLOW, &message),
-            ActantError::Task(_) => make_pyerr(&EXC_TASK, &message),
-            ActantError::Worker(_) => make_pyerr(&EXC_WORKER, &message),
-            ActantError::Config(_) => make_pyerr(&EXC_CONFIG, &message),
-            ActantError::Metrics(_) => make_pyerr(&EXC_METRICS, &message),
-            ActantError::NotFound(_) => make_pyerr(&EXC_NOT_FOUND, &message),
-            ActantError::AlreadyExists(_) => make_pyerr(&EXC_ALREADY_EXISTS, &message),
-            ActantError::Timeout(_) => make_pyerr(&EXC_TIMEOUT, &message),
-            ActantError::Cancelled(_) => make_pyerr(&EXC_CANCELLED, &message),
-            ActantError::InvalidState(_) => make_pyerr(&EXC_INVALID_STATE, &message),
-            ActantError::Replay(_) => make_pyerr(&EXC_REPLAY, &message),
-            ActantError::Internal(_) => make_pyerr(&EXC_INTERNAL, &message),
+/// F2a：孤儿规则禁止跨 crate 实现 `From<ActantError> for PyErr`——
+/// 改用自由函数；调用点经 `actant_error_to_pyerr(x)` 的全部替换为 `actant_error_to_pyerr(x)`。
+pub fn actant_error_to_pyerr(err: ActantError) -> PyErr {
+    let message = err.to_string();
+    match &err {
+        ActantError::Storage(_) | ActantError::StorageIo(_) | ActantError::Heed(_) => {
+            make_pyerr(&EXC_STORAGE, &message)
         }
+        ActantError::Network(_) => make_pyerr(&EXC_NETWORK, &message),
+        ActantError::Serialization(_) | ActantError::Postcard(_) => {
+            make_pyerr(&EXC_SERIALIZATION, &message)
+        }
+        ActantError::Actor(_) => make_pyerr(&EXC_ACTOR, &message),
+        ActantError::Workflow(_) => make_pyerr(&EXC_WORKFLOW, &message),
+        ActantError::Task(_) => make_pyerr(&EXC_TASK, &message),
+        ActantError::Worker(_) => make_pyerr(&EXC_WORKER, &message),
+        ActantError::Config(_) => make_pyerr(&EXC_CONFIG, &message),
+        ActantError::Metrics(_) => make_pyerr(&EXC_METRICS, &message),
+        ActantError::NotFound(_) => make_pyerr(&EXC_NOT_FOUND, &message),
+        ActantError::AlreadyExists(_) => make_pyerr(&EXC_ALREADY_EXISTS, &message),
+        ActantError::Timeout(_) => make_pyerr(&EXC_TIMEOUT, &message),
+        ActantError::Cancelled(_) => make_pyerr(&EXC_CANCELLED, &message),
+        ActantError::InvalidState(_) => make_pyerr(&EXC_INVALID_STATE, &message),
+        ActantError::Replay(_) => make_pyerr(&EXC_REPLAY, &message),
+        ActantError::Internal(_) => make_pyerr(&EXC_INTERNAL, &message),
     }
 }
 

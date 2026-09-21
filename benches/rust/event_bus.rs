@@ -12,8 +12,8 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use tokio::runtime::Runtime;
 
-use actant::common::{TaskCompletion, TaskId, WorkflowId};
-use actant::runtime::event_bus::{BusEvent, EventBus, Topic};
+use actant_core::common::{TaskCompletion, TaskId, WorkflowId};
+use actant_core::runtime::event_bus::{BusEvent, EventBus, Topic};
 
 /// 创建一个 TaskCompleted 事件用于基准测试。
 fn make_task_completed() -> BusEvent {

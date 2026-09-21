@@ -12,8 +12,8 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use tokio::runtime::Runtime;
 
-use actant::common::{StoreConfig, SyncMode};
-use actant::runtime::state::Store;
+use actant_core::common::{StoreConfig, SyncMode};
+use actant_core::runtime::state::Store;
 
 /// 创建临时 LMDB 目录，返回 (Store, 临时目录路径)。
 /// 临时目录在基准测试进程退出时由系统清理。

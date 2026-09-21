@@ -5,7 +5,7 @@
 //! HLC 算法的单调性保证）。随机生成 merge 序列覆盖物理时钟主导、
 //! 本地历史主导、远端主导、并列主导与 drift cap 全部分支。
 
-use actant::runtime::state::{HlcTimestamp, HybridLogicalClock};
+use actant_core::runtime::state::{HlcTimestamp, HybridLogicalClock};
 use proptest::prelude::*;
 
 /// 参与互 merge 的节点数。

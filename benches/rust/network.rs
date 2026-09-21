@@ -18,8 +18,8 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 
 // wire 模块本身是 pub(crate)，类型通过 common 的 #[doc(hidden)] re-export 暴露
 // 供测试与基准测试使用。
-use actant::common::{NodeHeartbeat, WireEnvelope, WireMessage};
-use actant::common::{NodeId, TaskDefinition, TaskId, WorkflowId};
+use actant_core::common::{NodeHeartbeat, WireEnvelope, WireMessage};
+use actant_core::common::{NodeId, TaskDefinition, TaskId, WorkflowId};
 
 /// 构造一个典型大小的 TaskDispatch 消息（payload 256 字节）。
 fn make_task_dispatch() -> WireMessage {

@@ -12,8 +12,8 @@ Actant 采用 **Rust + iroh** 构建核心运行时，通过 **PyO3** 暴露给 
 
 | 层级 | 位置 | 职责 | 边界约束 |
 |------|------|------|----------|
-| **第 1 层** Rust 核心 | `src/`（除 `src/py/`） | Actor 运行时、DAG 协议、调度、持久化、网络、Capability/Effect、事件总线；载荷为不透明 `Vec<u8>` | **不感知任何 Python 概念** |
-| **PyO3 边界** | `src/py/` | Rust 与 Python 的唯一通道 | 封装 Rust 原语为 Python 对象 |
+| **第 1 层** Rust 核心 | `crates/actant-common` + `crates/actant-core` | 共享类型层 + 框架主体（Actor 运行时、DAG 协议、调度、持久化、网络、Capability/Effect、事件总线）；载荷为不透明 `Vec<u8>` | **不感知任何 Python 概念** |
+| **PyO3 边界** | `src/`（`src/py/`） | Rust 与 Python 的唯一通道 | 封装 Rust 原语为 Python 对象；maturin 编译入口 |
 | **第 2 层** Python 封装 | `actant/` | `Runtime` / `Layer` / effect 原语（`ask`/`perform`/`emit`）、capability 声明、`@task`/`@flow` 高层 API、异常镜像 | 通过 `cloudpickle` 序列化任务 payload 为字节后交给 Rust，Rust 不解析其语义 |
 | **第 3 层** 用户扩展 | 仓库外 | 业务路由、定时任务、资源管理、监控面板、DSL 风格变体、工作流模板 | 由用户自行实现 |
 
@@ -50,70 +50,37 @@ Actant 采用 **Rust + iroh** 构建核心运行时，通过 **PyO3** 暴露给 
 
 ```
 actant/
-├── src/                          # Rust 核心（第 1 层）
-│   ├── common/                   # 共享类型与协议
-│   │   ├── backoff.rs            # 统一指数退避 ExponentialBackoff（gossip 广播重试）
-│   │   ├── config.rs             # ActantConfig / NetworkConfig / FailoverConfig / GossipConfig / WorkerConfig
-│   │   ├── error.rs              # ActantError 枚举与 Result 别名
-│   │   ├── model.rs              # TaskId / WorkflowId / NodeId / BlobHash / RetryPolicy / TaskCompletion 等领域类型
-│   │   ├── payload.rs            # payload 打包/解包与 MAC 签名/验证
-│   │   ├── serialization.rs      # rkyv 序列化与 postcard 编解码
-│   │   └── wire.rs               # Wire message / Topic / 跨节点协议
-│   ├── runtime/                  # 运行时四盒
-│   │   ├── actor/                # Actor 运行时（拆分为子模块）
-│   │   │   ├── mod.rs            # 入口 + 公共 re-export
-│   │   │   ├── runtime.rs        # Actor trait + ActorContext
-│   │   │   ├── mailbox.rs        # MailboxRegistry（进程内投递，无持久化）
-│   │   │   ├── system.rs         # ActorSystem facade + RunningActor 执行循环（系统 actor 专用本地运行时，不持久化）
-│   │   ├── blobs.rs              # 内容寻址 blob 原语：store/fetch/hash 薄封装（iroh-blobs FsStore 落盘 data_dir/blobs，流式拉取 + 显式取消关闭连接）
-│   │   ├── builder.rs            # RuntimeBuilder：按 network → store → actor → workflow → capability → worker 装配
-│   │   ├── capability.rs         # ERH 核心：Capability、Handler、Layer、Runtime、capability_registry!
-│   │   ├── context.rs            # Runtime 上下文：CapabilityRuntime + ActorSystem + State + Iroh + shutdown
-│   │   ├── dispatcher.rs         # ProcessTaskDispatcher / TaskDispatcher trait / CancelFlag（stdio 长度前缀二进制帧传输）
-│   │   ├── event_bus.rs          # 非阻塞观测 tap（try_send 尽力投递、满即丢，不承载正确性语义；控制面消息走 network_router 直连分发）
-│   │   ├── network.rs            # iroh 网络、Discovery trait、Transport trait、直连协议
-│   │   ├── state.rs              # 统一持久化：Store、HLC、Checkpoint、WAL
-│   │   ├── capability/           # Capability 子模块
-│   │   │   ├── actor.rs          # CapabilityActor：capability 的 Actor 化执行器（ask/perform/emit 分发）
-│   │   │   ├── builtins.rs       # 内置 capability 注册：register_defaults、StoreHandler、ExecuteHandler
-│   │   │   └── gossip.rs         # Capability 元信息 Gossip 同步：CapabilityGossipActor
-│   │   ├── state/                # State 子模块
-│   │   │   └── event_log.rs      # 事件日志与序号恢复
-│   │   └── workflow/             # 工作流运行时
-│   │       ├── actor.rs          # WorkflowActor / SchedulerActor / FailoverActor / DagGossipActor
-│   │       ├── dag.rs            # DAG 数据结构与拓扑计算（含 #[cfg(test)] mod tests）
-│   │       ├── failover.rs       # 故障转移：心跳、租约、任务回收（含 #[cfg(test)] mod tests）
-│   │       ├── gossip.rs         # DAG 状态 Gossip 同步
-│   │       ├── messaging.rs      # 工作流消息类型与 Actor 间协议
-│   │       ├── route.rs          # RoutePolicy 远端路由策略缝 + DefaultRoutePolicy（G-route）
-│   │       ├── orchestrator.rs   # Orchestrator 状态机入口（业务方法分散在 orchestrator/ 子模块）
-│   │       ├── runtime.rs        # Worker 执行循环：网络事件路由、任务调度、结果投递
-│   │       ├── scheduler.rs      # 任务调度器抽象与 priority/fifo 实现
-│   │       ├── orchestrator/     # Orchestrator 职责拆分子模块
-│   │       │   ├── execution.rs  # 提交、启动、任务完成处理、条件边求值、取消、重试
-│   │       │   ├── keys.rs       # Store key 生成、task payload 构造（带 MAC 签名）
-│   │       │   ├── persistence.rs # 状态恢复、事件日志记录、后台落盘、工作流淘汰
-│   │       │   ├── queries.rs    # 只读查询：状态快照、DAG 读取、结果聚合、重试信息
-│   │       │   ├── state.rs      # Orchestrator 结构体定义、构造器、字段访问器
-│   │       │   └── types.rs      # WorkflowEventPayload / ConditionEvaluator / WorkflowSlot / OrchestratorState
-│   │       └── runtime/          # Worker 运行时子模块
-│   │           ├── cancel.rs             # 远端取消标记 TTL 清理
-│   │           ├── network_router.rs     # 网络事件路由：wire 解码、topic 分类、直连请求分发
-│   │           └── result_delivery.rs    # 远端任务结果投递重试队列
-│   ├── py/                       # PyO3 绑定子模块
-│   │   ├── capability.rs         # _CapabilityRuntime：capability PyO3 桥
-│   │   ├── config.rs             # _ActantConfig / _NetworkConfig / _RetryPolicy 等 PyO3 类
-│   │   ├── error.rs              # Python 异常镜像（OnceLock 缓存异常类 + raise_for_kind）
-│   │   ├── gil_thread.rs         # GIL 管理辅助
-│   │   ├── handler.rs            # chain_python_handler：Python handler → Rust capability
-│   │   ├── runtime.rs            # _RuntimeCore / _DagNode / _TaskDef / _ListenAddresses
-│   │   └── types.rs              # _Event / _TaskCompletion / CancelToken / register
-│   ├── common.rs                 # common 模块入口与公共 re-export
-│   ├── lib.rs                    # crate 入口：模块声明、#[pymodule] actant、test_support 引用
-│   ├── metrics.rs                # Rust 侧指标（prometheus）
-│   ├── observability.rs          # tracing 初始化与日志回调桥
+├── crates/                       # Rust workspace 成员（0.3.5 F2a 拆分，依赖方向 common ← core ← 门面）
+│   ├── actant-common/            # 共享类型层 crate（依赖图根）
+│   │   └── src/                  # backoff / config / error / model / payload / serialization / wire
+│   ├── actant-core/              # 框架主体 crate（不依赖 PyO3；纯 Rust 嵌入 = -p actant-core --no-default-features）
+│   │   └── src/
+│   │       ├── metrics.rs        # Rust 侧指标（prometheus / OTel）
+│   │       ├── observability.rs  # tracing 初始化与日志回调桥
+│   │       ├── runtime.rs        # runtime 模块入口与 Runtime re-export
+│   │       └── runtime/          # 运行时四盒
+│   │           ├── actor/        # Actor 运行时（mailbox 纯内存投递；系统 actor 专用本地运行时）
+│   │           ├── blobs.rs      # 内容寻址 blob 原语（iroh-blobs FsStore）
+│   │           ├── builder.rs    # RuntimeBuilder：network → store → actor → workflow → capability → worker 装配；F4 注入缝（with_scheduler/with_task_dispatcher/with_transport/with_discovery/with_event_log/with_orchestrator_ingest）
+│   │           ├── capability.rs + capability/  # ERH 核心 + 内置 capability（TaskLifecycle/WorkflowLifecycle/NodeLifecycle/Serialization/Transport/Store）
+│   │           ├── context.rs    # Runtime 上下文与 shutdown
+│   │           ├── dispatcher.rs # ProcessTaskDispatcher / TaskDispatcher trait / WorkerLaunchSpec（语言中性三要素）
+│   │           ├── event_bus.rs  # 非阻塞观测 tap（TaskLog/WorkerLifecycle/Task* 话题）
+│   │           ├── network.rs    # iroh 网络、Discovery trait（none/local/dns preset + relay_endpoints）、Transport trait
+│   │           ├── state.rs      # 统一持久化：Store、HLC、事件日志（state/event_log.rs）
+│   │           └── workflow/     # 编排运行时：dag / orchestrator/ / scheduler / failover / gossip / route / messaging / runtime(Worker)
+│   └── （workspace 门面 = 根 Cargo.toml + src/）
+├── src/                          # PyO3 绑定壳（第 2 层边界，maturin 编译入口，module-name = actant.actant）
+│   ├── lib.rs                    # crate 入口：模块声明与 py 门控
 │   ├── py.rs                     # py 模块入口：register 分派、get_version、refresh_logger
-│   └── runtime.rs                # runtime 模块入口与 Runtime re-export
+│   └── py/                       # PyO3 绑定子模块
+│       ├── capability.rs         # _CapabilityRuntime：capability PyO3 桥
+│       ├── config.rs             # _ActantConfig / _NetworkConfig / _RetryPolicy 等 PyO3 类（worker 三要素拼装在此）
+│       ├── error.rs              # Python 异常镜像（OnceLock 缓存异常类 + actant_error_to_pyerr）
+│       ├── gil_thread.rs         # GIL 管理辅助
+│       ├── handler.rs            # chain_python_handler：Python handler → Rust capability
+│       ├── runtime.rs            # _RuntimeCore / _DagNode / _TaskDef / _ListenAddresses / peers / on_task_log
+│       └── types.rs              # _Event / _TaskCompletion / CancelToken / capability codec / register
 ├── actant/                       # Python 封装（第 2 层）
 │   ├── __init__.py               # 顶层 re-export：Runtime / Layer / task / flow / ask/perform/emit / capability / ctx 类型
 │   ├── _runtime.py               # Runtime + Layer + effect dispatcher + 默认 handler（LocalRouter/FifoScheduler/DefaultRetryPolicy）+ 任务注册表

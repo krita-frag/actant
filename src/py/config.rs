@@ -1,12 +1,13 @@
 use std::collections::BTreeMap;
 
+use super::error::actant_error_to_pyerr;
 use pyo3::prelude::*;
 use pyo3::types::PyType;
 
-use crate::common::{
+use actant_core::common::{
     ActantConfig, DiscoveryMode, FailoverConfig, GossipConfig, NetworkConfig, RetryPolicy,
 };
-use crate::runtime::workflow::Phase;
+use actant_core::runtime::workflow::Phase;
 
 #[pyclass(name = "_WorkflowState", from_py_object)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,7 +76,7 @@ impl From<PyWorkflowState> for Phase {
 /// 将用户提供的网络 preset 字符串解析为内部 `DiscoveryMode`。
 ///
 /// 此处接受任何非空字符串；discovery 注册表在启动时通过
-/// [`crate::common::DiscoveryMode::validate`] 验证名称，
+/// [`actant_core::common::DiscoveryMode::validate`] 验证名称，
 /// 并以 `Config` 错误拒绝未知名称（无静默回退）。
 /// 这允许 Python 层在 runtime 启动前注册自定义发现策略。
 ///
@@ -129,7 +130,7 @@ impl PyRetryPolicy {
     fn to_bytes(&self) -> PyResult<Vec<u8>> {
         let policy = RetryPolicy::from(self.clone());
         postcard::to_allocvec(&policy).map_err(|e| {
-            pyo3::PyErr::from(crate::common::ActantError::Serialization(format!(
+            actant_error_to_pyerr(actant_core::common::ActantError::Serialization(format!(
                 "RetryPolicy serialization failed: {}",
                 e
             )))
@@ -216,7 +217,7 @@ pub struct PyNetworkConfig {
 impl PyNetworkConfig {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (preset=None, bootstrap_nodes=None, hlc_max_drift_ms=crate::common::NetworkConfig::DEFAULT_HLC_MAX_DRIFT_MS, max_pending_direct_requests=crate::common::NetworkConfig::DEFAULT_MAX_PENDING_DIRECT_REQUESTS, gossip_bootstrap_peers=None, max_message_size=crate::common::NetworkConfig::DEFAULT_MAX_MESSAGE_SIZE, allowed_peer_ids=None, direct_request_timeout_ms=crate::common::NetworkConfig::DEFAULT_DIRECT_REQUEST_TIMEOUT_MS, listen_port=0, listen_ip="", capability_gossip_interval_ms=crate::common::NetworkConfig::DEFAULT_CAPABILITY_GOSSIP_INTERVAL_MS, event_channel_capacity=crate::common::NetworkConfig::DEFAULT_EVENT_CHANNEL_CAPACITY, dns_origin_domain="", relay_endpoints=None, require_signed_records=false))]
+    #[pyo3(signature = (preset=None, bootstrap_nodes=None, hlc_max_drift_ms=actant_core::common::NetworkConfig::DEFAULT_HLC_MAX_DRIFT_MS, max_pending_direct_requests=actant_core::common::NetworkConfig::DEFAULT_MAX_PENDING_DIRECT_REQUESTS, gossip_bootstrap_peers=None, max_message_size=actant_core::common::NetworkConfig::DEFAULT_MAX_MESSAGE_SIZE, allowed_peer_ids=None, direct_request_timeout_ms=actant_core::common::NetworkConfig::DEFAULT_DIRECT_REQUEST_TIMEOUT_MS, listen_port=0, listen_ip="", capability_gossip_interval_ms=actant_core::common::NetworkConfig::DEFAULT_CAPABILITY_GOSSIP_INTERVAL_MS, event_channel_capacity=actant_core::common::NetworkConfig::DEFAULT_EVENT_CHANNEL_CAPACITY, dns_origin_domain="", relay_endpoints=None, require_signed_records=false))]
     fn new(
         preset: Option<String>,
         bootstrap_nodes: Option<Vec<String>>,
@@ -259,19 +260,20 @@ impl Default for PyNetworkConfig {
         Self {
             preset: "local".to_string(),
             bootstrap_nodes: Vec::new(),
-            hlc_max_drift_ms: crate::common::NetworkConfig::DEFAULT_HLC_MAX_DRIFT_MS,
+            hlc_max_drift_ms: actant_core::common::NetworkConfig::DEFAULT_HLC_MAX_DRIFT_MS,
             max_pending_direct_requests:
-                crate::common::NetworkConfig::DEFAULT_MAX_PENDING_DIRECT_REQUESTS,
+                actant_core::common::NetworkConfig::DEFAULT_MAX_PENDING_DIRECT_REQUESTS,
             gossip_bootstrap_peers: Vec::new(),
-            max_message_size: crate::common::NetworkConfig::DEFAULT_MAX_MESSAGE_SIZE,
+            max_message_size: actant_core::common::NetworkConfig::DEFAULT_MAX_MESSAGE_SIZE,
             allowed_peer_ids: Vec::new(),
             direct_request_timeout_ms:
-                crate::common::NetworkConfig::DEFAULT_DIRECT_REQUEST_TIMEOUT_MS,
+                actant_core::common::NetworkConfig::DEFAULT_DIRECT_REQUEST_TIMEOUT_MS,
             listen_port: 0,
             listen_ip: String::new(),
             capability_gossip_interval_ms:
-                crate::common::NetworkConfig::DEFAULT_CAPABILITY_GOSSIP_INTERVAL_MS,
-            event_channel_capacity: crate::common::NetworkConfig::DEFAULT_EVENT_CHANNEL_CAPACITY,
+                actant_core::common::NetworkConfig::DEFAULT_CAPABILITY_GOSSIP_INTERVAL_MS,
+            event_channel_capacity:
+                actant_core::common::NetworkConfig::DEFAULT_EVENT_CHANNEL_CAPACITY,
             dns_origin_domain: String::new(),
             relay_endpoints: Vec::new(),
             require_signed_records: false,
@@ -428,16 +430,16 @@ impl From<PyGossipConfig> for GossipConfig {
 /// 将用户提供的 scheduler kind 字符串解析为内部 `SchedulerKind`。
 ///
 /// 此处接受任何非空字符串；scheduler 注册表在启动时通过
-/// [`crate::common::SchedulerKind::validate`] 验证名称，
+/// [`actant_core::common::SchedulerKind::validate`] 验证名称，
 /// 并以 `Config` 错误拒绝未知名称（无静默回退）。
 /// 这允许 Python 层在 runtime 启动前注册自定义调度策略。
-fn scheduler_kind_from_str(kind: &str) -> PyResult<crate::common::SchedulerKind> {
+fn scheduler_kind_from_str(kind: &str) -> PyResult<actant_core::common::SchedulerKind> {
     if kind.is_empty() {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "scheduler kind must not be empty",
         ));
     }
-    Ok(crate::common::SchedulerKind::new_unchecked(kind))
+    Ok(actant_core::common::SchedulerKind::new_unchecked(kind))
 }
 
 #[pyclass(name = "_ActantConfig", from_py_object)]
@@ -563,9 +565,9 @@ impl PyActantConfig {
         persist_flush_interval_ms: Option<u64>,
         state_poll_interval_ms: Option<u64>,
     ) -> Self {
-        let default_worker = crate::common::WorkerConfig::default();
-        let default_store = crate::common::StoreConfig::default();
-        let default_workflow = crate::common::WorkflowConfig::default();
+        let default_worker = actant_core::common::WorkerConfig::default();
+        let default_store = actant_core::common::StoreConfig::default();
+        let default_workflow = actant_core::common::WorkflowConfig::default();
         // 默认并发度 = num_cpus：多数 Python 任务为 IO-bound，
         // 用户可显式传 max_concurrent_tasks 覆盖。
         let max_concurrent = max_concurrent_tasks.unwrap_or_else(default_max_concurrent_tasks);
@@ -591,7 +593,7 @@ impl PyActantConfig {
             crash_failover_max_attempts: crash_failover_max_attempts
                 .unwrap_or(default_worker.crash_failover_max_attempts),
             workflow_default_timeout_ms: workflow_default_timeout_ms
-                .unwrap_or(crate::common::WorkflowConfig::default().default_timeout_ms),
+                .unwrap_or(actant_core::common::WorkflowConfig::default().default_timeout_ms),
             node_labels: node_labels.unwrap_or_default(),
             store_map_size: store_map_size.unwrap_or(default_store.map_size),
             store_max_dbs: store_max_dbs.unwrap_or(default_store.max_dbs),
@@ -616,18 +618,18 @@ impl PyActantConfig {
 
 /// [`SyncMode`] 默认值的字符串名（单一来源：Rust `SyncMode::default`）。
 fn default_sync_mode_name() -> &'static str {
-    match crate::common::SyncMode::default() {
-        crate::common::SyncMode::Sync => "sync",
-        crate::common::SyncMode::GroupCommit(_) => "group_commit",
-        crate::common::SyncMode::NoSync => "no_sync",
+    match actant_core::common::SyncMode::default() {
+        actant_core::common::SyncMode::Sync => "sync",
+        actant_core::common::SyncMode::GroupCommit(_) => "group_commit",
+        actant_core::common::SyncMode::NoSync => "no_sync",
     }
 }
 
 /// `GroupCommit` 默认合并间隔；当前默认策略为 `Sync`，该值仅在用户显式
 /// 选择 `group_commit` 时生效。
 fn default_group_commit_ms() -> u64 {
-    match crate::common::SyncMode::default() {
-        crate::common::SyncMode::GroupCommit(ms) => ms,
+    match actant_core::common::SyncMode::default() {
+        actant_core::common::SyncMode::GroupCommit(ms) => ms,
         _ => 2,
     }
 }
@@ -643,7 +645,7 @@ fn default_max_concurrent_tasks() -> usize {
 
 impl Default for PyActantConfig {
     fn default() -> Self {
-        let default_worker = crate::common::WorkerConfig::default();
+        let default_worker = actant_core::common::WorkerConfig::default();
         let max_concurrent = default_max_concurrent_tasks();
         Self {
             payload_signing_key: String::new(),
@@ -659,22 +661,23 @@ impl Default for PyActantConfig {
             require_payload_signing: false,
             num_worker_processes: max_concurrent,
             crash_failover_max_attempts: default_worker.crash_failover_max_attempts,
-            workflow_default_timeout_ms: crate::common::WorkflowConfig::default()
+            workflow_default_timeout_ms: actant_core::common::WorkflowConfig::default()
                 .default_timeout_ms,
             node_labels: BTreeMap::new(),
-            store_map_size: crate::common::StoreConfig::default().map_size,
-            store_max_dbs: crate::common::StoreConfig::default().max_dbs,
+            store_map_size: actant_core::common::StoreConfig::default().map_size,
+            store_max_dbs: actant_core::common::StoreConfig::default().max_dbs,
             store_sync_mode: "sync".to_string(),
             store_flush_interval_ms: 2,
             prefetch_min: default_worker.prefetch_min,
             prefetch_max: default_worker.prefetch_max,
             worker_cancel_grace_ms: default_worker.worker_cancel_grace_ms,
             pending_result_channel_capacity: default_worker.pending_result_channel_capacity,
-            completed_retention_count: crate::common::WorkflowConfig::default()
+            completed_retention_count: actant_core::common::WorkflowConfig::default()
                 .completed_retention_count,
-            persist_flush_interval_ms: crate::common::WorkflowConfig::default()
+            persist_flush_interval_ms: actant_core::common::WorkflowConfig::default()
                 .persist_flush_interval_ms,
-            state_poll_interval_ms: crate::common::WorkflowConfig::default().state_poll_interval_ms,
+            state_poll_interval_ms: actant_core::common::WorkflowConfig::default()
+                .state_poll_interval_ms,
         }
     }
 }
@@ -691,7 +694,7 @@ impl TryFrom<&PyActantConfig> for ActantConfig {
             network: NetworkConfig::try_from(&c.network)?,
             failover: FailoverConfig::from(c.failover.clone()),
             gossip: GossipConfig::from(c.gossip.clone()),
-            worker: crate::common::WorkerConfig {
+            worker: actant_core::common::WorkerConfig {
                 max_concurrent_tasks: c.max_concurrent_tasks.max(1),
                 num_worker_processes: c.num_worker_processes.max(1),
                 // Python 语义在绑定层拼装：解释器 + 模块入口 + 模块搜索路径。
@@ -710,13 +713,13 @@ impl TryFrom<&PyActantConfig> for ActantConfig {
                 pending_result_channel_capacity: c.pending_result_channel_capacity,
                 ..default.worker
             },
-            store: crate::common::StoreConfig {
+            store: actant_core::common::StoreConfig {
                 data_dir: c.data_dir.clone(),
                 map_size: c.store_map_size,
                 max_dbs: c.store_max_dbs,
                 sync_mode: sync_mode_from_str(&c.store_sync_mode, c.store_flush_interval_ms)?,
             },
-            workflow: crate::common::WorkflowConfig {
+            workflow: actant_core::common::WorkflowConfig {
                 default_timeout_ms: c.workflow_default_timeout_ms,
                 completed_retention_count: c.completed_retention_count,
                 persist_flush_interval_ms: c.persist_flush_interval_ms,
@@ -821,11 +824,16 @@ fn python_sys_path() -> Vec<String> {
 }
 
 /// 解析用户提供的落盘同步策略字符串为 [`SyncMode`]。
-fn sync_mode_from_str(name: &str, flush_interval_ms: u64) -> PyResult<crate::common::SyncMode> {
+fn sync_mode_from_str(
+    name: &str,
+    flush_interval_ms: u64,
+) -> PyResult<actant_core::common::SyncMode> {
     match name {
-        "sync" => Ok(crate::common::SyncMode::Sync),
-        "group_commit" => Ok(crate::common::SyncMode::GroupCommit(flush_interval_ms)),
-        "no_sync" => Ok(crate::common::SyncMode::NoSync),
+        "sync" => Ok(actant_core::common::SyncMode::Sync),
+        "group_commit" => Ok(actant_core::common::SyncMode::GroupCommit(
+            flush_interval_ms,
+        )),
+        "no_sync" => Ok(actant_core::common::SyncMode::NoSync),
         other => Err(pyo3::exceptions::PyValueError::new_err(format!(
             "invalid store_sync_mode '{}': expected \"sync\", \"group_commit\" or \"no_sync\"",
             other
