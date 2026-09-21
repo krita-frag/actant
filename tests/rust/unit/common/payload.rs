@@ -1,5 +1,5 @@
-//! Unit tests extracted from `src/common/payload.rs`.
-//! Compiled via `#[path]` attribute — retains `super::` access to private items.
+// Unit tests extracted from `src/common/payload.rs`.
+// Compiled via `#[path]` attribute — retains `super::` access to private items.
 
 use super::*;
 
@@ -311,4 +311,111 @@ proptest! {
         let bogus = vec![0u8; mac_len];
         prop_assert!(verify_wire_mac(&key, &bytes, &bogus).is_err());
     }
+}
+
+// C5：payload 签名/验证直测（关键路径）。
+//
+// `sign`/`verify` 是任务载荷完整性防线的唯一实现：提交侧签名（builder 注入
+// 密钥）、worker 侧派发前验证（dispatcher）、执行编排侧构造带 MAC 的节点
+// 载荷（keys.rs `build_task_payload` 直通 `sign`）。本文件不经过任何上层
+// 包装，直接对二进制契约断言：帧布局（MAC_PREFIX | mac | payload）、空密钥
+// 降级语义、篡改/截断/伪造拒绝。
+
+use super::{sign, verify, wire_mac, wire_mac_incremental, MAC_LEN, MAC_PREFIX, WIRE_MAC_LEN};
+
+const KEY: &[u8] = b"c5-direct-test-key";
+const PAYLOAD: &[u8] = b"cloudpickle-envelope-bytes";
+
+#[test]
+fn signed_payload_has_prefix_mac_body_layout() {
+    let signed = sign(KEY, PAYLOAD).unwrap();
+    // 布局：MAC_PREFIX | 32B mac | 原始 payload。
+    assert_eq!(&signed[..MAC_PREFIX.len()], MAC_PREFIX);
+    assert_eq!(signed.len(), MAC_PREFIX.len() + MAC_LEN + PAYLOAD.len());
+    assert_eq!(&signed[MAC_PREFIX.len() + MAC_LEN..], PAYLOAD);
+}
+
+#[test]
+fn verify_roundtrip_returns_original_payload() {
+    let signed = sign(KEY, PAYLOAD).unwrap();
+    let recovered = verify(KEY, &signed).unwrap();
+    assert_eq!(recovered, PAYLOAD);
+}
+
+#[test]
+fn empty_key_bypasses_signing_both_directions() {
+    // 空密钥 = 禁用签名：sign 原样返回；verify 接受未签名数据。
+    let unsigned = sign(b"", PAYLOAD).unwrap();
+    assert_eq!(unsigned, PAYLOAD);
+    assert_eq!(verify(b"", PAYLOAD).unwrap(), PAYLOAD);
+    // 但禁用签名的节点拒绝"本应签名"的数据（防误处理）。
+    let signed = sign(KEY, PAYLOAD).unwrap();
+    assert!(verify(b"", &signed).is_err());
+}
+
+#[test]
+fn tampered_mac_rejected() {
+    let mut signed = sign(KEY, PAYLOAD).unwrap();
+    let i = MAC_PREFIX.len(); // 翻转 MAC 首字节
+    signed[i] ^= 0xFF;
+    assert!(
+        verify(KEY, &signed).is_err(),
+        "tampered MAC must be rejected"
+    );
+}
+
+#[test]
+fn tampered_body_rejected() {
+    let mut signed = sign(KEY, PAYLOAD).unwrap();
+    let last = signed.len() - 1;
+    signed[last] ^= 0x01;
+    assert!(
+        verify(KEY, &signed).is_err(),
+        "tampered payload body must be rejected"
+    );
+}
+
+#[test]
+fn truncated_payload_rejected() {
+    let signed = sign(KEY, PAYLOAD).unwrap();
+    assert!(verify(KEY, &signed[..MAC_PREFIX.len() + MAC_LEN - 1]).is_err());
+    assert!(verify(KEY, &signed[..MAC_PREFIX.len()]).is_err());
+}
+
+#[test]
+fn wrong_key_rejected() {
+    let signed = sign(KEY, PAYLOAD).unwrap();
+    assert!(
+        verify(b"another-key", &signed).is_err(),
+        "foreign key must be rejected"
+    );
+}
+
+#[test]
+fn unsigned_input_rejected_when_key_set() {
+    assert!(
+        verify(KEY, PAYLOAD).is_err(),
+        "unsigned payload must be rejected under signing key"
+    );
+}
+
+#[test]
+fn wire_mac_incremental_matches_buffered() {
+    // C2 字节序不变红线：分段喂 hasher 与单缓冲必须产出同一 MAC。
+    let segs: Vec<&[u8]> = vec![b"version-byte", PAYLOAD, b"traceparent", &[0x00]];
+    let joined: Vec<u8> = segs.concat();
+    assert_eq!(wire_mac_incremental(KEY, &segs), wire_mac(KEY, &joined));
+}
+
+#[test]
+fn wire_mac_empty_key_returns_none() {
+    assert!(wire_mac(b"", b"x").is_none());
+    assert!(wire_mac_incremental(b"", &[b"x"]).is_none());
+}
+
+#[test]
+fn wire_mac_len_is_32() {
+    assert_eq!(WIRE_MAC_LEN, 32);
+    let m = wire_mac(KEY, b"data").unwrap();
+    assert_eq!(m.len(), WIRE_MAC_LEN);
 }

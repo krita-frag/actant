@@ -692,13 +692,31 @@ fn mac_input_segments_match_unsigned_envelope_serialization() {
         traceparent: Some(TraceContext::new_root(true).to_header()),
         mac: None,
     };
+    // C2 等价性验证：分段拼接必须与 unsigned envelope 序列化逐字节一致
+    // （字节序不变红线）。
     let whole = crate::encode_postcard(&unsigned).unwrap();
-    let segments =
-        mac_input_bytes(unsigned.version, &unsigned.message, &unsigned.traceparent).unwrap();
+    let message_bytes = crate::encode_postcard(&unsigned.message).unwrap();
+    let traceparent_bytes = crate::encode_postcard(&unsigned.traceparent).unwrap();
+    let version_bytes = [unsigned.version];
+    let joined: Vec<u8> = [
+        &version_bytes[..],
+        &message_bytes,
+        &traceparent_bytes,
+        &[0x00],
+    ]
+    .concat();
     assert_eq!(
-        segments, whole,
+        joined, whole,
         "MAC input segments must be byte-identical to unsigned envelope serialization"
     );
+    // 且流式 MAC 与单缓冲 MAC 对同一输入产出一致。
+    let incremental = crate::payload::wire_mac_incremental(
+        b"k",
+        &mac_input_segments(&version_bytes, &message_bytes, &traceparent_bytes),
+    )
+    .unwrap();
+    let buffered = crate::payload::wire_mac(b"k", &joined).unwrap();
+    assert_eq!(incremental, buffered);
 
     // traceparent 为 None 时同样成立。
     let unsigned_no_tp = WireEnvelope {
@@ -706,9 +724,17 @@ fn mac_input_segments_match_unsigned_envelope_serialization() {
         ..unsigned
     };
     let whole_no_tp = crate::encode_postcard(&unsigned_no_tp).unwrap();
-    let segments_no_tp =
-        mac_input_bytes(unsigned_no_tp.version, &unsigned_no_tp.message, &None).unwrap();
-    assert_eq!(segments_no_tp, whole_no_tp);
+    let message_bytes = crate::encode_postcard(&unsigned_no_tp.message).unwrap();
+    let traceparent_bytes = crate::encode_postcard(&None::<Option<String>>).unwrap();
+    let version_bytes = [unsigned_no_tp.version];
+    let joined_no_tp: Vec<u8> = [
+        &version_bytes[..],
+        &message_bytes,
+        &traceparent_bytes,
+        &[0x00],
+    ]
+    .concat();
+    assert_eq!(joined_no_tp, whole_no_tp);
 }
 
 /// H6.2：同进程两个不同密钥 Runtime 互不干扰。

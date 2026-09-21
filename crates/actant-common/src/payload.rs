@@ -153,10 +153,10 @@ pub fn decode_blob_ref(bytes: &[u8]) -> crate::Result<BlobRef> {
 }
 
 /// MAC 标签长度（BLAKE3 输出 256 位 = 32 字节）。
-const MAC_LEN: usize = 32;
+pub const MAC_LEN: usize = 32;
 
 /// MAC 前缀，用于区分签名 payload。
-const MAC_PREFIX: &[u8] = b"ACT1";
+pub const MAC_PREFIX: &[u8] = b"ACT1";
 
 /// 从用户提供的密钥材料派生 32 字节 BLAKE3 key。
 fn derive_key(key: &[u8]) -> [u8; 32] {
@@ -223,6 +223,27 @@ pub const WIRE_MAC_LEN: usize = 32;
 
 /// 使用共享密钥为 wire message 字节计算 BLAKE3 keyed MAC。
 ///
+/// 流式计算 wire MAC（C2 增量化）：逐段 update，避免先组装与消息等大的
+/// 覆盖字节 `Vec`（一次额外全量 memcpy）。段序与 [`wire_mac`] 的单缓冲
+/// 输入完全一致——`version 字节 | message | traceparent | mac=None 字节`，
+/// 字节序不变红线：两函数对同一 (version, message, traceparent) 必产出
+/// 相同 MAC。
+///
+/// `segments` 按顺序喂给 keyed hasher。空密钥返回 `None`。
+pub fn wire_mac_incremental(key: &[u8], segments: &[&[u8]]) -> Option<[u8; WIRE_MAC_LEN]> {
+    if key.is_empty() {
+        return None;
+    }
+    let derived = derive_key(key);
+    let mut hasher = blake3::Hasher::new_keyed(&derived);
+    for seg in segments {
+        hasher.update(seg);
+    }
+    let mut out = [0u8; WIRE_MAC_LEN];
+    out.copy_from_slice(hasher.finalize().as_bytes());
+    Some(out)
+}
+
 /// 返回固定 32 字节 MAC。空密钥返回 `None`（表示禁用 wire 签名）。
 ///
 /// 与 [`sign`] 共享密钥派生逻辑，但语义独立：wire MAC 防止跨节点消息伪造，

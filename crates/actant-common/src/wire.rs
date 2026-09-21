@@ -738,19 +738,24 @@ fn message_origin_node(msg: &WireMessage) -> Option<&NodeId> {
 /// `mac: None` 的 unsigned [`WireEnvelope`]」逐字节一致——MAC 覆盖的字节内容
 /// 与顺序保持不变（跨节点兼容红线）。借引用编码使 decode 校验路径无需为
 /// 验证 MAC 克隆整个 message。
-fn mac_input_bytes(
-    version: u8,
-    message: &WireMessage,
-    traceparent: &Option<String>,
-) -> crate::Result<Vec<u8>> {
-    let mut buf = Vec::new();
-    // u8 的 postcard 编码即原字节。
-    buf.push(version);
-    buf.extend_from_slice(&crate::encode_postcard(message)?);
-    buf.extend_from_slice(&crate::encode_postcard(traceparent)?);
-    // Option<[u8; 32]> 的 None 编码为单字节变体索引 0。
-    buf.push(0x00);
-    Ok(buf)
+/// C2：MAC 覆盖字节的分段形态。段序 = `version 字节 | message |
+/// traceparent | mac=None 字节`，与旧单缓冲 `mac_input_bytes` 逐字节一致
+/// （字节序不变红线）。消除了与消息等大的中间 `Vec` 组装；
+/// message 本体的 postcard 编码一次仍必要（postcard 无流式 API）。
+const MAC_NONE_BYTE: [u8; 1] = [0x00];
+
+fn mac_input_segments<'a>(
+    version_bytes: &'a [u8; 1],
+    message_bytes: &'a [u8],
+    traceparent_bytes: &'a [u8],
+) -> [&'a [u8]; 4] {
+    // u8 的 postcard 编码即原字节；Option::None 编码为单字节变体索引 0x00。
+    [
+        version_bytes as &[u8],
+        message_bytes,
+        traceparent_bytes,
+        MAC_NONE_BYTE.as_slice(),
+    ]
 }
 
 impl WireEnvelope {
@@ -769,7 +774,7 @@ impl WireEnvelope {
     /// 若已注册签名密钥（按消息来源节点选择，见 [`WireSigningKeys`]），
     /// 计算 MAC 并填入 `mac` 字段。MAC 覆盖 `version` + `message` +
     /// `traceparent` 三字段序列化字节，不含 `mac` 字段自身（见
-    /// [`mac_input_bytes`]）。
+    /// [`mac_input_segments`]）。
     pub fn wrap(msg: WireMessage) -> Self {
         // C3：生成 W3C traceparent。
         //
@@ -799,21 +804,23 @@ impl WireEnvelope {
         };
 
         // 计算可选 MAC：仅当按消息来源节点（或 primary 退化）找到已注册密钥时。
+        // C2：流式分段喂 hasher，不再组装与消息等大的覆盖字节 Vec。
         let mac = signing_key_for(&unsigned.message).and_then(|key| {
-            // 分段组装 MAC 覆盖字节（见 [`mac_input_bytes`]），与序列化整个
-            // unsigned envelope 逐字节一致。parking_lot::RwLock 非 async，
-            // 读锁不跨 await（signing_key_for 返回前已释放）。
-            match mac_input_bytes(unsigned.version, &unsigned.message, &unsigned.traceparent) {
-                Ok(bytes) => crate::payload::wire_mac(&key, &bytes),
+            let message_bytes = match crate::encode_postcard(&unsigned.message) {
+                Ok(b) => b,
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
                         "encode_postcard for MAC computation failed; \
                          message will be sent without integrity protection"
                     );
-                    None
+                    return None;
                 }
-            }
+            };
+            let traceparent_bytes = crate::encode_postcard(&unsigned.traceparent).ok()?;
+            let version_bytes = [unsigned.version];
+            let segments = mac_input_segments(&version_bytes, &message_bytes, &traceparent_bytes);
+            crate::payload::wire_mac_incremental(&key, &segments)
         });
 
         Self { mac, ..unsigned }
@@ -856,7 +863,7 @@ impl WireEnvelope {
         }
 
         // MAC 校验：若注册表中存在密钥，所有入站消息必须携带有效 MAC。
-        // 验证方式：分段重组 unsigned 字节（见 [`mac_input_bytes`]，借引用编码、
+        // 验证方式：分段重组 unsigned 字节（见 [`mac_input_segments`]，借引用编码、
         // 不克隆 message），与发送方计算的覆盖字节逐字节一致后比对 MAC。
         // 接收侧尝试全部已注册密钥（去重）：单个 Runtime 自身集群的收发不受
         // 其他 Runtime 密钥影响（语义见 [`WireSigningKeys`] 文档）。
@@ -886,24 +893,26 @@ impl WireEnvelope {
                         return None;
                     }
                 };
+                // C2：流式分段验证（与发送侧同段序，字节序不变）。
                 candidates.iter().any(|key| {
-                    match mac_input_bytes(
-                        envelope.version,
-                        &envelope.message,
-                        &envelope.traceparent,
-                    ) {
-                        Ok(unsigned_bytes) => {
-                            crate::payload::verify_wire_mac(key, &unsigned_bytes, mac)
-                                .is_ok()
-                        }
+                    let message_bytes = match crate::encode_postcard(&envelope.message) {
+                        Ok(b) => b,
                         Err(e) => {
                             tracing::warn!(
                                 error = %e,
-                                "dropping message: failed to assemble unsigned bytes for MAC verification"
+                                "dropping message: failed to encode message for MAC verification"
                             );
-                            false
+                            return false;
                         }
-                    }
+                    };
+                    let traceparent_bytes = match crate::encode_postcard(&envelope.traceparent) {
+                        Ok(b) => b,
+                        Err(_) => return false,
+                    };
+                    let version_bytes = [envelope.version];
+                    let segments =
+                        mac_input_segments(&version_bytes, &message_bytes, &traceparent_bytes);
+                    crate::payload::verify_wire_mac(key, &segments.concat(), mac).is_ok()
                 })
             }
         };
