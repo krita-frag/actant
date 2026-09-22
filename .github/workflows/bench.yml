@@ -54,7 +54,7 @@ jobs:
       - uses: astral-sh/setup-uv@v5
 
       - name: Sync Python 依赖
-        run: uv sync
+        run: uv sync --extra dev
 
       - name: 构建 PyO3 扩展
         run: uv run maturin develop
