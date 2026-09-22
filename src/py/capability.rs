@@ -19,7 +19,7 @@ use actant_core::runtime::capability::{
     builtin_capabilities, register_defaults, CapabilityRuntime, EffectKind,
 };
 use actant_core::runtime::capability::{
-    NodeLifecycle, Serialization, Store, TaskLifecycle, Transport, WorkflowLifecycle,
+    NodeLifecycle, Serialization, Store, TaskLifecycle, WorkflowLifecycle,
 };
 
 use super::gil_thread::GilThread;
@@ -286,7 +286,6 @@ crate::capability_registry! {
     ask: {}
     perform: {
         "Serialization" => Serialization => super::types::SerializationCodec,
-        "Transport" => Transport => super::types::TransportCodec,
         "Store" => Store => super::types::StoreCodec,
     }
     emit: {

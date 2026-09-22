@@ -87,12 +87,14 @@ class TestWithDefaultsPythonHandlers:
 class TestPerformFallback:
     """Serialization 等 Rust-backed capability 回退到 Rust。"""
 
-    def test_serialization_perform_falls_back_to_rust(self) -> None:
+    def test_serialization_perform_without_handler_errors(self) -> None:
+        # SerializationHandler 直通实现已删（0.3.6 减法）：无 Python handler 时
+        # 经 Rust 分发报"no handler registered"——用户链 handler 即恢复语义。
         rt = Runtime()
         with rt:
             req = SerializationReq(op="dump", data=b"rust-payload")
-            result = actant.perform("Serialization", req)
-        assert result == b"rust-payload"
+            with pytest.raises(Exception, match="no handler"):
+                actant.perform("Serialization", req)
 
     def test_python_handler_overrides_rust_perform(self) -> None:
         rt = Runtime()

@@ -135,17 +135,14 @@ class TestPerformSemantics:
         with pytest.raises(RuntimeError, match="has no handlers"), rt:
             actant.perform("CustomPerform", "x")
 
-    def test_perform_falls_back_to_rust_when_no_python_handlers(self):
+    def test_perform_without_any_handler_errors(self):
+        # SerializationHandler 直通实现已删（0.3.5 减法）：capability 注册面保留，
+        # 无 handler 时经 Rust 分发报错——用户链自己的 handler 即恢复语义。
         rt = Runtime()
         with rt:
             req = SerializationReq(op="dump", data=b"payload")
-            assert actant.perform("Serialization", req) == b"payload"
-
-    def test_builtin_serialization_passthrough(self):
-        rt = Runtime.with_defaults()
-        with rt:
-            req = SerializationReq(op="dump", data=b"payload")
-            assert actant.perform("Serialization", req) == b"payload"
+            with pytest.raises(Exception, match="no handler"):
+                actant.perform("Serialization", req)
 
 
 class TestEmitSemantics:

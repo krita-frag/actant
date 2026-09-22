@@ -397,7 +397,6 @@ impl RuntimeBuilder {
     pub async fn build(self) -> Result<Arc<crate::runtime::Runtime>, ActantError> {
         use crate::runtime::capability::gossip::CapabilityGossipActor;
         use crate::runtime::capability::register_defaults;
-        use crate::runtime::capability::register_serialization_handler;
         use crate::runtime::capability::register_store_handler;
         use crate::runtime::capability::CapabilityRuntime;
         use crate::runtime::context::Runtime as ActantRuntime;
@@ -522,7 +521,6 @@ impl RuntimeBuilder {
         tracing::info!("build: capability register enter");
         let capability = Arc::new(CapabilityRuntime::new());
         register_defaults(&capability);
-        register_serialization_handler(&capability)?;
         register_store_handler(&capability, lmdb_store.clone())?;
         Arc::clone(&capability)
             .bind_actor_system(actor_system.clone())

@@ -22,12 +22,12 @@ use pyo3::prelude::*;
 use actant_core::common::ActantError;
 use actant_core::runtime::capability::{
     Capability, CapabilityRuntime, ErasedHandler, NodeLifecycle, Serialization, Store,
-    TaskLifecycle, Transport, WorkflowLifecycle,
+    TaskLifecycle, WorkflowLifecycle,
 };
 
 use super::types::{
     NodeLifecycleCodec, PyHandlerEmitCodec, PyHandlerPerformCodec, SerializationCodec, StoreCodec,
-    TaskLifecycleCodec, TransportCodec, WorkflowLifecycleCodec,
+    TaskLifecycleCodec, WorkflowLifecycleCodec,
 };
 
 /// Perform effect 的 Python handler 包装。
@@ -217,10 +217,6 @@ impl PythonHandlerRegistry {
             Box::new(PerformFactory::<Serialization, SerializationCodec>::new()),
         );
         factories.insert(
-            "Transport".to_string(),
-            Box::new(PerformFactory::<Transport, TransportCodec>::new()),
-        );
-        factories.insert(
             "Store".to_string(),
             Box::new(PerformFactory::<Store, StoreCodec>::new()),
         );
@@ -277,7 +273,6 @@ fn chain_by_name(
 ) -> Result<(), ActantError> {
     match name {
         "Serialization" => runtime.chain::<Serialization>(handler),
-        "Transport" => runtime.chain::<Transport>(handler),
         "Store" => runtime.chain::<Store>(handler),
         "TaskLifecycle" => runtime.chain::<TaskLifecycle>(handler),
         "WorkflowLifecycle" => runtime.chain::<WorkflowLifecycle>(handler),

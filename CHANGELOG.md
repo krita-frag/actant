@@ -7,6 +7,16 @@
 
 ### 破坏性变更
 
+- **Transport capability 删除 + Serialization 直通 handler 删除（0.3.6 减法，capability 10→9）**：
+  引用计数审计确认二者零生产消费者——Rust 网络通信全走 `NetworkManager` 直接方法调用
+  （Transport capability 是 SHM ring 时代的接口形状），Python 序列化走 cloudpickle 不经
+  ERH。`Transport` capability / `TransportReq` / `TransportCodec` / `TransportHandler`
+  与 py 导出（`TRANSPORT`/`TRANSPORT_REQ` 等）整体删除；`SerializationHandler`
+  （dump/load 原样返回的直通实现）与 `register_serialization_handler` 删除——
+  `Serialization` capability 的**注册面保留**（codec + layer 照常，用户经
+  `rt.layer("Serialization").chain(h)` 链自己的 handler），无 handler 时 perform 报
+  "no handler registered"。扩展路径不变：需要传输语义 = `with_transport` 注入
+  `Transport` trait 实现（F4 注入缝），需要自定义序列化 = chain handler。
 - **crate 切分：workspace 三 crate（0.3.5 F2a）**：`crates/actant-common`（共享类型层）+
   `crates/actant-core`（框架主体，不依赖 PyO3）+ 根 crate `actant`（PyO3 绑定壳，
   maturin 编译入口不变，`module-name = "actant.actant"` 不变）。纯 Rust 消费者依赖

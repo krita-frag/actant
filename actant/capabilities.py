@@ -27,7 +27,6 @@ RETRY_POLICY = "RetryPolicy"
 
 #: 副作用型（Rust 提供默认 handler，Python 可覆盖）
 SERIALIZATION = "Serialization"
-TRANSPORT = "Transport"
 STORE = "Store"
 
 #: 副作用型（默认 handler 为 Python→Rust blob 桥，Python 可覆盖，如 S3 后端）
@@ -37,7 +36,6 @@ VALUE_STORE = "ValueStore"
 TASK_LIFECYCLE = "TaskLifecycle"
 WORKFLOW_LIFECYCLE = "WorkflowLifecycle"
 NODE_LIFECYCLE = "NodeLifecycle"
-
 
 @dataclass
 class CapabilityMeta:
@@ -55,7 +53,6 @@ class RouteCtx:
     tags: list[str] = field(default_factory=list)
     local_node: str = ""
 
-
 @dataclass
 class ScheduleCtx:
     """`Scheduling` capability 的请求上下文。"""
@@ -63,7 +60,6 @@ class ScheduleCtx:
     workflow_id: str
     pending: list[str] = field(default_factory=list)
     max_concurrent: int = 4
-
 
 @dataclass
 class RetryCtx:
@@ -81,16 +77,6 @@ class SerializationReq:
     op: Literal["dump", "load"]
     data: bytes
 
-
-@dataclass
-class TransportReq:
-    """`Transport` capability 的请求。"""
-
-    op: Literal["send_task", "send_actor_message", "broadcast_heartbeat"]
-    target: str
-    payload: bytes
-
-
 @dataclass
 class StoreReq:
     """`Store` capability 的请求。"""
@@ -98,8 +84,6 @@ class StoreReq:
     op: Literal["put", "get", "delete"]
     key: bytes
     value: bytes = b""
-
-
 
 @dataclass
 class ValueStoreReq:
@@ -126,7 +110,6 @@ class TaskEvent:
     attempt: int = 0
     next_attempt: int = 0
 
-
 @dataclass
 class WorkflowEvent:
     """`WorkflowLifecycle` capability 的事件。"""
@@ -134,7 +117,6 @@ class WorkflowEvent:
     kind: Literal["submitted", "started", "completed", "failed", "cancelled"]
     workflow_id: str
     error: str = ""
-
 
 @dataclass
 class NodeEvent:
@@ -145,13 +127,11 @@ class NodeEvent:
     peer_id: str = ""
     timestamp_ms: int = 0
 
-
 @runtime_checkable
 class RoutingHandler(Protocol):
     """决策型：任务路由。返回目标节点 ID，`None` 表示放弃决策。"""
 
     def __call__(self, ctx: RouteCtx) -> str | None: ...
-
 
 @runtime_checkable
 class SchedulingHandler(Protocol):
@@ -159,13 +139,11 @@ class SchedulingHandler(Protocol):
 
     def __call__(self, ctx: ScheduleCtx) -> str | None: ...
 
-
 @runtime_checkable
 class RetryPolicyHandler(Protocol):
     """决策型：决定是否重试。返回 `True` 重试，`None` 放弃。"""
 
     def __call__(self, ctx: RetryCtx) -> bool | None: ...
-
 
 @runtime_checkable
 class SerializationHandler(Protocol):
@@ -173,20 +151,11 @@ class SerializationHandler(Protocol):
 
     def __call__(self, req: SerializationReq) -> bytes: ...
 
-
-@runtime_checkable
-class TransportHandler(Protocol):
-    """副作用型：网络传输。"""
-
-    def __call__(self, req: TransportReq) -> None: ...
-
-
 @runtime_checkable
 class StoreHandler(Protocol):
     """副作用型：持久化存储。返回 `Optional[bytes]`（get 返回值，put/delete 返回 None）。"""
 
     def __call__(self, req: StoreReq) -> bytes | None: ...
-
 
 @runtime_checkable
 class ValueStoreHandler(Protocol):
@@ -199,13 +168,11 @@ class ValueStoreHandler(Protocol):
 
     def __call__(self, req: ValueStoreReq) -> bytes: ...
 
-
 @runtime_checkable
 class TaskLifecycleHandler(Protocol):
     """反应型：任务生命周期事件订阅。"""
 
     def __call__(self, event: TaskEvent) -> None: ...
-
 
 @runtime_checkable
 class WorkflowLifecycleHandler(Protocol):
@@ -213,13 +180,11 @@ class WorkflowLifecycleHandler(Protocol):
 
     def __call__(self, event: WorkflowEvent) -> None: ...
 
-
 @runtime_checkable
 class NodeLifecycleHandler(Protocol):
     """反应型：节点生命周期事件订阅。"""
 
     def __call__(self, event: NodeEvent) -> None: ...
-
 
 #: 所有内置 capability 的元数据。
 #:
@@ -227,7 +192,7 @@ class NodeLifecycleHandler(Protocol):
 #: - `Routing` / `Scheduling` / `RetryPolicy`：策略型，**仅 Python 层**实现，
 #:   Rust 核心不提供默认 handler。用户必须通过 `rt.layer(name).chain(handler)`
 #:   或 `Runtime.with_defaults()` 注册 Python handler，否则 ask 返回 None。
-#: - `Serialization` / `Transport` / `Store` / `Execute`：Rust 核心提供 codec
+#: - `Serialization` / `Store`：Rust 核心提供 codec
 #:   （`register_defaults`），具体 handler 由 `RuntimeBuilder` 注入（如
 #:   StoreHandler / ExecuteHandler）或 Python 层覆盖。
 #: - `ValueStore`：默认 handler 为 Python 层的 Rust blob 桥
@@ -240,7 +205,6 @@ BUILTIN_CAPABILITIES: dict[str, CapabilityMeta] = {
     "RetryPolicy": CapabilityMeta("RetryPolicy", "ask"),
     # ── 副作用型（Rust 提供默认 handler，Python 可覆盖）──
     "Serialization": CapabilityMeta("Serialization", "perform"),
-    "Transport": CapabilityMeta("Transport", "perform"),
     "Store": CapabilityMeta("Store", "perform"),
     # ── 副作用型（默认 handler 为 Python→Rust blob 桥，Python 可覆盖）──
     "ValueStore": CapabilityMeta("ValueStore", "perform"),
@@ -271,7 +235,6 @@ RUST_BACKED_CAPABILITIES: frozenset[str] = frozenset(
     BUILTIN_CAPABILITIES.keys() - PYTHON_ONLY_CAPABILITIES
 )
 
-
 def get_builtin_capability_meta(name: str) -> CapabilityMeta:
     """返回指定**内置** capability 的元数据。
 
@@ -290,10 +253,8 @@ def get_builtin_capability_meta(name: str) -> CapabilityMeta:
         )
     return BUILTIN_CAPABILITIES[name]
 
-
 # 用户自定义 capability 通过 `rt.layer(name, kind)` 直接注册，
 # layer() 会自动创建 CapabilityMeta 并存入 Runtime._metas。
-
 
 __all__ = [
     "BUILTIN_CAPABILITIES",
@@ -306,7 +267,6 @@ __all__ = [
     "SERIALIZATION",
     "STORE",
     "TASK_LIFECYCLE",
-    "TRANSPORT",
     "VALUE_STORE",
     "WORKFLOW_LIFECYCLE",
     "CapabilityMeta",
@@ -325,8 +285,6 @@ __all__ = [
     "StoreReq",
     "TaskEvent",
     "TaskLifecycleHandler",
-    "TransportHandler",
-    "TransportReq",
     "ValueStoreHandler",
     "ValueStoreReq",
     "WorkflowEvent",

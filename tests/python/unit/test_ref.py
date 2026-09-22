@@ -47,7 +47,7 @@ def test_value_store_capability_declared() -> None:
     assert BUILTIN_CAPABILITIES[VALUE_STORE].kind == "perform"
     assert VALUE_STORE in PYTHON_ONLY_CAPABILITIES
     assert VALUE_STORE not in RUST_BACKED_CAPABILITIES
-    assert len(BUILTIN_CAPABILITIES) == 10
+    assert len(BUILTIN_CAPABILITIES) == 9
 
 
 def test_value_store_roundtrip_via_rust_bridge() -> None:

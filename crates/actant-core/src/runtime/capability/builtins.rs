@@ -35,24 +35,6 @@ pub enum SerializationReq {
     Load { data: Vec<u8> },
 }
 
-pub struct Transport;
-impl Capability for Transport {
-    type Request = TransportReq;
-    type Response = Result<(), String>;
-}
-impl Transport {
-    pub fn meta() -> CapabilityMeta {
-        CapabilityMeta::new::<Self>("Transport", EffectKind::Perform)
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum TransportReq {
-    SendTask { target: NodeId, payload: Vec<u8> },
-    SendActorMessage { target: NodeId, payload: Vec<u8> },
-    BroadcastHeartbeat { payload: Vec<u8> },
-}
-
 pub struct Store;
 impl Capability for Store {
     type Request = StoreReq;
@@ -161,7 +143,6 @@ pub enum NodeEvent {
 pub fn builtin_capabilities() -> Vec<CapabilityMeta> {
     vec![
         Serialization::meta(),
-        Transport::meta(),
         Store::meta(),
         TaskLifecycle::meta(),
         WorkflowLifecycle::meta(),
@@ -177,36 +158,16 @@ pub fn builtin_capabilities() -> Vec<CapabilityMeta> {
 /// "not bound to actor system"。
 pub fn register_defaults(runtime: &CapabilityRuntime) {
     runtime.register_codec::<Serialization>();
-    runtime.register_codec::<Transport>();
     runtime.register_codec::<Store>();
     runtime.register_codec::<TaskLifecycle>();
     runtime.register_codec::<WorkflowLifecycle>();
     runtime.register_codec::<NodeLifecycle>();
 
     runtime.ensure_layer::<Serialization>(Serialization::meta());
-    runtime.ensure_layer::<Transport>(Transport::meta());
     runtime.ensure_layer::<Store>(Store::meta());
     runtime.ensure_layer::<TaskLifecycle>(TaskLifecycle::meta());
     runtime.ensure_layer::<WorkflowLifecycle>(WorkflowLifecycle::meta());
     runtime.ensure_layer::<NodeLifecycle>(NodeLifecycle::meta());
-}
-
-/// `Serialization` capability 的内置 handler。
-///
-/// `dump` 返回原始 payload，`load` 返回原始 data。
-/// 这是一个直通 handler，使 `Serialization` capability 在无 Python handler 时
-/// 有合理的默认行为。
-#[derive(Clone)]
-pub struct SerializationHandler;
-
-#[async_trait]
-impl Handler<Serialization> for SerializationHandler {
-    async fn handle(&self, req: SerializationReq) -> Option<Result<Vec<u8>, String>> {
-        Some(match req {
-            SerializationReq::Dump { payload } => Ok(payload),
-            SerializationReq::Load { data } => Ok(data),
-        })
-    }
 }
 
 /// 基于真实 `Store` 的 `Store` capability handler。
@@ -252,13 +213,5 @@ pub(crate) fn register_store_handler(
 ) -> Result<(), ActantError> {
     runtime.register(
         Layer::<Store>::new(Store::meta()).chain_erased(erase_handler(StoreHandler::new(store))),
-    )
-}
-
-/// 注册 `Serialization` 内置 handler（直通：dump/load 返回原始 payload）。
-pub fn register_serialization_handler(runtime: &CapabilityRuntime) -> Result<(), ActantError> {
-    runtime.register(
-        Layer::<Serialization>::new(Serialization::meta())
-            .chain_erased(erase_handler(SerializationHandler)),
     )
 }

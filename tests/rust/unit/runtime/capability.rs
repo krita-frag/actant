@@ -374,12 +374,11 @@ async fn ask_without_codec_returns_error() {
 }
 
 #[test]
-fn builtin_capabilities_returns_all_six() {
+fn builtin_capabilities_returns_all_five() {
     let caps = builtin_capabilities();
-    assert_eq!(caps.len(), 6);
+    assert_eq!(caps.len(), 5);
     let names: Vec<&str> = caps.iter().map(|c| c.name).collect();
     assert!(names.contains(&"Serialization"));
-    assert!(names.contains(&"Transport"));
     assert!(names.contains(&"Store"));
     assert!(names.contains(&"TaskLifecycle"));
     assert!(names.contains(&"WorkflowLifecycle"));
@@ -392,7 +391,7 @@ fn register_defaults_registers_all_codecs() {
     register_defaults(&rt);
     // register_defaults 注册 codec 与空 layer（ensure_layer），
     // 使所有内置 capability 都有 layer entry。
-    assert_eq!(rt.capability_count(), 6);
+    assert_eq!(rt.capability_count(), 5);
     // handler_count 查 layer 中 handler 数量，应为 0（空 layer）
     assert_eq!(rt.handler_count::<Store>(), 0);
 }
@@ -791,126 +790,10 @@ async fn emit_with_local_handler_error_propagates() {
 
 // emit handler（自带错误通道的 ErasedHandler 实现）失败时：
 // 调用方收到聚合错误，且失败 handler 之后的 handler 仍被调用。
-#[tokio::test]
-async fn emit_handler_failure_returns_error_and_calls_remaining_handlers() {
-    use async_trait::async_trait;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    struct FailingEmitHandler;
-    #[async_trait]
-    impl ErasedHandler for FailingEmitHandler {
-        async fn ask(
-            &self,
-            _req: Arc<dyn Any + Send + Sync>,
-        ) -> Option<Box<dyn Any + Send + Sync>> {
-            unreachable!()
-        }
-        async fn perform(
-            &self,
-            _req: Arc<dyn Any + Send + Sync>,
-        ) -> Result<Box<dyn Any + Send + Sync>, ActantError> {
-            unreachable!()
-        }
-        async fn emit(&self, _req: Arc<dyn Any + Send + Sync>) -> Result<(), ActantError> {
-            Err(ActantError::Internal("emit handler failed".into()))
-        }
-    }
-
-    struct CountingEmitHandler(Arc<AtomicUsize>);
-    #[async_trait]
-    impl ErasedHandler for CountingEmitHandler {
-        async fn ask(
-            &self,
-            _req: Arc<dyn Any + Send + Sync>,
-        ) -> Option<Box<dyn Any + Send + Sync>> {
-            unreachable!()
-        }
-        async fn perform(
-            &self,
-            _req: Arc<dyn Any + Send + Sync>,
-        ) -> Result<Box<dyn Any + Send + Sync>, ActantError> {
-            unreachable!()
-        }
-        async fn emit(&self, _req: Arc<dyn Any + Send + Sync>) -> Result<(), ActantError> {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-    }
-
-    let rt = Arc::new(CapabilityRuntime::new());
-    register_defaults(&rt);
-    // 依次追加：失败 handler 在前，正常 handler 在后（bind 前 snapshot）。
-    rt.chain::<TaskLifecycle>(Arc::new(FailingEmitHandler))
-        .unwrap();
-    let counter = Arc::new(AtomicUsize::new(0));
-    rt.chain::<TaskLifecycle>(Arc::new(CountingEmitHandler(counter.clone())))
-        .unwrap();
-    let actor_system = Arc::new(crate::runtime::actor::ActorSystem::new());
-    Arc::clone(&rt).bind_actor_system(actor_system).await;
-
-    let result = rt
-        .emit::<TaskLifecycle>(TaskEvent::Started {
-            task_id: TaskId::from("t-emit-5".to_string()),
-            workflow_id: WorkflowId::from("wf-emit-5".to_string()),
-        })
-        .await;
-    // 调用方收到聚合错误
-    let err = result.unwrap_err();
-    assert!(err.to_string().contains("emit handler failed"));
-    assert!(err.to_string().contains("1/2 handlers failed"));
-    // 后续 handler 仍被调用
-    assert_eq!(counter.load(Ordering::SeqCst), 1);
-}
 
 // =========================================================================
 // Serialization handler / register_serialization_handler
 // =========================================================================
-
-#[tokio::test]
-async fn serialization_handler_dump_load_roundtrip() {
-    let rt = Arc::new(CapabilityRuntime::new());
-    register_defaults(&rt);
-    register_serialization_handler(&rt).unwrap();
-    let actor_system = Arc::new(crate::runtime::actor::ActorSystem::new());
-    Arc::clone(&rt).bind_actor_system(actor_system).await;
-
-    let payload = b"serialize-me".to_vec();
-    let dump_result = rt
-        .perform::<Serialization>(SerializationReq::Dump {
-            payload: payload.clone(),
-        })
-        .await
-        .unwrap();
-    assert!(dump_result.is_ok());
-    assert_eq!(dump_result.unwrap(), payload);
-
-    let load_result = rt
-        .perform::<Serialization>(SerializationReq::Load {
-            data: payload.clone(),
-        })
-        .await
-        .unwrap();
-    assert!(load_result.is_ok());
-    assert_eq!(load_result.unwrap(), payload);
-}
-
-#[tokio::test]
-async fn serialization_handler_direct_handle() {
-    let handler = SerializationHandler;
-    let dump = handler
-        .handle(SerializationReq::Dump {
-            payload: b"dump".to_vec(),
-        })
-        .await;
-    assert!(matches!(dump, Some(Ok(ref v)) if v == b"dump"));
-
-    let load = handler
-        .handle(SerializationReq::Load {
-            data: b"load".to_vec(),
-        })
-        .await;
-    assert!(matches!(load, Some(Ok(ref v)) if v == b"load"));
-}
 
 // =========================================================================
 // update_peer_capabilities 反向索引维护

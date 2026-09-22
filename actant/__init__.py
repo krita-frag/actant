@@ -1,7 +1,7 @@
 """Actant - 基于 Actor 模型的跨平台通用分布式任务编排引擎。
 
 采用 Effect-Resource-Handler 统一扩展架构：所有扩展点（Routing、Scheduling、
-Transport、Store、Lifecycle）统一为 `Capability`（能力声明）+ `Handler`
+Store、Lifecycle）统一为 `Capability`（能力声明）+ `Handler`
 （能力实现）+ `Layer`（handler 组合）+ `Effect`（请求能力）。
 
 典型用法::
@@ -45,7 +45,6 @@ from actant.capabilities import (
     SERIALIZATION,
     STORE,
     TASK_LIFECYCLE,
-    TRANSPORT,
     VALUE_STORE,
     WORKFLOW_LIFECYCLE,
     CapabilityMeta,
@@ -58,14 +57,10 @@ from actant.capabilities import (
     RoutingHandler,
     ScheduleCtx,
     SchedulingHandler,
-    SerializationHandler,
-    SerializationReq,
     StoreHandler,
     StoreReq,
     TaskEvent,
     TaskLifecycleHandler,
-    TransportHandler,
-    TransportReq,
     ValueStoreHandler,
     ValueStoreReq,
     WorkflowEvent,
@@ -130,7 +125,6 @@ __all__ = [
     "SERIALIZATION",
     "STORE",
     "TASK_LIFECYCLE",
-    "TRANSPORT",
     "VALUE_STORE",
     "WORKFLOW_LIFECYCLE",
     "ActantError",
@@ -160,8 +154,6 @@ __all__ = [
     "ScheduleCtx",
     "SchedulingHandler",
     "SerializationError",
-    "SerializationHandler",
-    "SerializationReq",
     "StorageError",
     "StoreHandler",
     "StoreReq",
@@ -172,8 +164,6 @@ __all__ = [
     "TaskEvent",
     "TaskLifecycleHandler",
     "TaskState",
-    "TransportHandler",
-    "TransportReq",
     "ValueStoreHandler",
     "ValueStoreReq",
     "WorkerError",

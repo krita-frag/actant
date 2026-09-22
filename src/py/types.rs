@@ -13,7 +13,7 @@ use crate::py::gil_thread::GilThread;
 use actant_core::common::{NodeId, TaskId, WorkflowId};
 use actant_core::runtime::capability::{
     NodeEvent, NodeLifecycle, Serialization, SerializationReq, Store, StoreReq, TaskEvent,
-    TaskLifecycle, Transport, TransportReq, WorkflowEvent, WorkflowLifecycle,
+    TaskLifecycle, WorkflowEvent, WorkflowLifecycle,
 };
 use actant_core::runtime::dispatcher::CancelFlag;
 
@@ -184,55 +184,6 @@ impl PyHandlerPerformCodec<Serialization> for SerializationCodec {
             Ok(data) => Ok(Ok(data)),
             Err(e) => Ok(Err(e.to_string())),
         }
-    }
-}
-
-pub struct TransportCodec;
-
-impl PyPerformCodec<Transport> for TransportCodec {
-    fn decode_request(ob: &Bound<'_, PyAny>) -> PyResult<TransportReq> {
-        extract_transportreq(ob)
-    }
-
-    fn encode_response(py: Python<'_>, resp: Result<(), String>) -> PyResult<Bound<'_, PyAny>> {
-        use pyo3::conversion::IntoPyObject;
-        match resp {
-            Ok(()) => {
-                let b = true.into_pyobject(py)?;
-                Ok(b.to_owned().into_any())
-            }
-            Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e)),
-        }
-    }
-}
-
-impl PyHandlerPerformCodec<Transport> for TransportCodec {
-    fn encode_request<'py>(py: Python<'py>, req: &TransportReq) -> PyResult<Bound<'py, PyAny>> {
-        let dict = dict_response(py);
-        match req {
-            TransportReq::SendTask { target, payload } => {
-                dict.set_item("op", "send_task")?;
-                dict.set_item("target", target.to_string())?;
-                dict.set_item("payload", bytes_response(py, payload)?)?;
-            }
-            TransportReq::SendActorMessage { target, payload } => {
-                dict.set_item("op", "send_actor_message")?;
-                dict.set_item("target", target.to_string())?;
-                dict.set_item("payload", bytes_response(py, payload)?)?;
-            }
-            TransportReq::BroadcastHeartbeat { payload } => {
-                dict.set_item("op", "broadcast_heartbeat")?;
-                dict.set_item("payload", bytes_response(py, payload)?)?;
-            }
-        }
-        Ok(dict.into_any())
-    }
-
-    fn decode_response<'py>(
-        _py: Python<'py>,
-        _obj: &Bound<'py, PyAny>,
-    ) -> PyResult<Result<(), String>> {
-        Ok(Ok(()))
     }
 }
 
@@ -528,29 +479,6 @@ fn extract_serializationreq(ob: &Bound<'_, PyAny>) -> PyResult<SerializationReq>
         }),
         _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
             "unknown SerializationReq op: {}",
-            op
-        ))),
-    }
-}
-
-/// F2a：孤儿规则禁止跨 crate 实现 `FromPyObject`——由 codec 的
-/// `decode_request` 直接调用本函数替代 trait 实现。
-fn extract_transportreq(ob: &Bound<'_, PyAny>) -> PyResult<TransportReq> {
-    let op: String = get_string(ob, "op")?;
-    match op.as_str() {
-        "send_task" => Ok(TransportReq::SendTask {
-            target: node_id(ob, "target")?,
-            payload: get_bytes(ob, "payload")?,
-        }),
-        "send_actor_message" => Ok(TransportReq::SendActorMessage {
-            target: node_id(ob, "target")?,
-            payload: get_bytes(ob, "payload")?,
-        }),
-        "broadcast_heartbeat" => Ok(TransportReq::BroadcastHeartbeat {
-            payload: get_bytes(ob, "payload")?,
-        }),
-        _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "unknown TransportReq op: {}",
             op
         ))),
     }

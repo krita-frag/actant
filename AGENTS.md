@@ -31,7 +31,7 @@ Actant 采用 **Rust + iroh** 构建核心运行时，通过 **PyO3** 暴露给 
 | `perform` | 副作用型 | 调用最后注册的 handler | handler 返回值 |
 | `emit` | 反应型 | 顺序调用所有 handler | `None` |
 
-后注册的 handler 优先级更高（`ask` 逆序决策，自定义覆盖默认）。内置 11 个 capability：策略型 `Routing`/`Scheduling`/`RetryPolicy`（纯 Python）与 `ValueStore`（默认 handler 为 Python→Rust blob 桥，Python 可覆盖），其余由 Rust 核心提供 codec 与默认 handler、Python 可覆盖。
+后注册的 handler 优先级更高（`ask` 逆序决策，自定义覆盖默认）。内置 9 个 capability（0.3.6 起：Transport capability 与 Serialization 直通 handler 已删）：策略型 `Routing`/`Scheduling`/`RetryPolicy`（纯 Python）与 `ValueStore`（默认 handler 为 Python→Rust blob 桥，Python 可覆盖），其余由 Rust 核心提供 codec 与注册面（Serialization 直通 handler 已删，用户链自己的 handler；Store 默认 handler 路由到 LMDB），Python 可覆盖。
 
 ## 高层 API（@task / @flow）
 
@@ -95,7 +95,7 @@ actant/
 │   │   ├── _task_obj.py          # Task 类、@task 装饰器
 │   │   └── _worker.py            # worker 子进程循环（`python -m actant.task._worker` 入口）
 │   ├── flow.py                   # @flow 工作流编排装饰器（动态 DAG 记录 + 提交 Rust Orchestrator + 生命周期事件广播）
-│   ├── capabilities.py           # 内置 11 capability 声明、ctx dataclass、Handler Protocol、capability 常量
+│   ├── capabilities.py           # 内置 9 capability 声明、ctx dataclass、Handler Protocol、capability 常量
 │   ├── exceptions.py             # ActantError 层级（19 个异常类），kind 镜像 Rust
 │   ├── cli.py                    # `actant worker` CLI 入口（--log-level / --max-concurrent-tasks 等参数）
 │   ├── actant.pyi                # PyO3 模块类型存根
