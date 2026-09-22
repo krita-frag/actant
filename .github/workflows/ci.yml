@@ -63,7 +63,7 @@ jobs:
       # 当前已满足；门禁用于防止边界随时间腐蚀。
       - name: 框架边界门禁（runtime/common 零 crate::py 引用）
         run: |
-          if grep -rn "crate::py" src crates/actant-core/src crates/actant-common/src --include='*.rs'; then
+          if grep -rn "crate::py" crates --include='*.rs'; then
             echo "::error::框架边界腐蚀：src/runtime 或 src/common 出现 crate::py 引用（第 1 层不得依赖绑定层）"
             exit 1
           fi

@@ -44,9 +44,9 @@ pub fn pack_single(pickle_bytes: Vec<u8>) -> Vec<u8> {
 /// 返回 `Err` 当 `results.len()` 或任一 `data.len()` 超过 `u32::MAX`——
 /// payload 格式用 u32 LE 编码长度，超过会静默截断，导致 unpack 时读到
 /// 错误长度而解码出乱码。返回 `Result` 使此类边界错误显式失败。
-pub fn pack_group(results: &[Vec<u8>]) -> crate::Result<Vec<u8>> {
+pub fn pack_group(results: &[Vec<u8>]) -> crate::common::Result<Vec<u8>> {
     let count = u32::try_from(results.len()).map_err(|_| {
-        crate::ActantError::Serialization(format!(
+        crate::common::ActantError::Serialization(format!(
             "pack_group: results count {} exceeds u32::MAX",
             results.len()
         ))
@@ -56,7 +56,7 @@ pub fn pack_group(results: &[Vec<u8>]) -> crate::Result<Vec<u8>> {
     buf.extend_from_slice(&count.to_le_bytes());
     for data in results {
         let len = u32::try_from(data.len()).map_err(|_| {
-            crate::ActantError::Serialization(format!(
+            crate::common::ActantError::Serialization(format!(
                 "pack_group: item len {} exceeds u32::MAX",
                 data.len()
             ))
@@ -70,9 +70,9 @@ pub fn pack_group(results: &[Vec<u8>]) -> crate::Result<Vec<u8>> {
 /// 解包由 `pack_single` 或 `pack_group` 打包的负载。
 ///
 /// 仅用于 Rust 侧测试和内部校验，Python 侧有自己的解包逻辑。
-pub fn unpack_payload(data: &[u8]) -> crate::Result<Vec<Vec<u8>>> {
+pub fn unpack_payload(data: &[u8]) -> crate::common::Result<Vec<Vec<u8>>> {
     if data.is_empty() {
-        return Err(crate::ActantError::Serialization(
+        return Err(crate::common::ActantError::Serialization(
             "empty payload".to_string(),
         ));
     }
@@ -80,7 +80,7 @@ pub fn unpack_payload(data: &[u8]) -> crate::Result<Vec<Vec<u8>>> {
         TAG_SINGLE | TAG_SINGLE_KW => Ok(vec![data[1..].to_vec()]),
         TAG_GROUP => {
             if data.len() < 5 {
-                return Err(crate::ActantError::Serialization(
+                return Err(crate::common::ActantError::Serialization(
                     "group payload too short".to_string(),
                 ));
             }
@@ -89,7 +89,7 @@ pub fn unpack_payload(data: &[u8]) -> crate::Result<Vec<Vec<u8>>> {
             let mut offset = 5;
             for _ in 0..count {
                 if offset + 4 > data.len() {
-                    return Err(crate::ActantError::Serialization(
+                    return Err(crate::common::ActantError::Serialization(
                         "group payload truncated".to_string(),
                     ));
                 }
@@ -101,7 +101,7 @@ pub fn unpack_payload(data: &[u8]) -> crate::Result<Vec<Vec<u8>>> {
                 ]) as usize;
                 offset += 4;
                 if offset + len > data.len() {
-                    return Err(crate::ActantError::Serialization(
+                    return Err(crate::common::ActantError::Serialization(
                         "group payload truncated".to_string(),
                     ));
                 }
@@ -110,7 +110,7 @@ pub fn unpack_payload(data: &[u8]) -> crate::Result<Vec<Vec<u8>>> {
             }
             Ok(results)
         }
-        _ => Err(crate::ActantError::Serialization(format!(
+        _ => Err(crate::common::ActantError::Serialization(format!(
             "unknown payload tag: 0x{:02x}",
             data[0]
         ))),
@@ -125,18 +125,18 @@ pub fn unpack_payload(data: &[u8]) -> crate::Result<Vec<Vec<u8>>> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobRef {
     /// 内容寻址 blake3 哈希（32 字节）。
-    pub hash: crate::model::BlobHash,
+    pub hash: crate::common::model::BlobHash,
     /// 持有该 blob 的来源节点（endpoint 地址字符串，同直连协议的 peer 寻址）。
-    pub node: crate::model::NodeId,
+    pub node: crate::common::model::NodeId,
 }
 
 /// 将 [`BlobRef`] 编码为 wire 字节（postcard）。
 ///
 /// # Errors
 ///
-/// 序列化失败时返回 [`crate::ActantError::Serialization`]。
-pub fn encode_blob_ref(r: &BlobRef) -> crate::Result<Vec<u8>> {
-    crate::encode_postcard(r)
+/// 序列化失败时返回 [`crate::common::ActantError::Serialization`]。
+pub fn encode_blob_ref(r: &BlobRef) -> crate::common::Result<Vec<u8>> {
+    crate::common::encode_postcard(r)
 }
 
 /// 从 wire 字节解码 [`BlobRef`]。
@@ -148,8 +148,8 @@ pub fn encode_blob_ref(r: &BlobRef) -> crate::Result<Vec<u8>> {
 /// # Errors
 ///
 /// 长度超限、字节被截断或字段解码失败时返回错误，不吞。
-pub fn decode_blob_ref(bytes: &[u8]) -> crate::Result<BlobRef> {
-    crate::decode_postcard(bytes)
+pub fn decode_blob_ref(bytes: &[u8]) -> crate::common::Result<BlobRef> {
+    crate::common::decode_postcard(bytes)
 }
 
 /// MAC 标签长度（BLAKE3 输出 256 位 = 32 字节）。
@@ -286,5 +286,5 @@ pub fn verify_wire_mac(key: &[u8], bytes: &[u8], mac_bytes: &[u8]) -> Result<(),
 }
 
 #[cfg(test)]
-#[path = "../../../tests/rust/unit/common/payload.rs"]
+#[path = "../../../../tests/rust/unit/common/payload.rs"]
 mod tests;

@@ -119,15 +119,15 @@ impl std::fmt::Display for BlobHash {
 }
 
 impl std::str::FromStr for BlobHash {
-    type Err = crate::ActantError;
+    type Err = crate::common::ActantError;
 
     /// 从 64 字符小写 hex 解析。
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let bytes = data_encoding::HEXLOWER.decode(s.as_bytes()).map_err(|e| {
-            crate::ActantError::Serialization(format!("invalid blob hash hex '{s}': {e}"))
+            crate::common::ActantError::Serialization(format!("invalid blob hash hex '{s}': {e}"))
         })?;
         let arr: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
-            crate::ActantError::Serialization(format!(
+            crate::common::ActantError::Serialization(format!(
                 "blob hash must be 32 bytes, got {}",
                 v.len()
             ))
@@ -365,45 +365,45 @@ impl TaskCompletion {
     }
 
     /// 转换为网络传输用的协议结果。
-    pub fn to_wire_result(&self, workflow_id: WorkflowId) -> crate::WireTaskResult {
+    pub fn to_wire_result(&self, workflow_id: WorkflowId) -> crate::common::WireTaskResult {
         match self {
             TaskCompletion::Completed {
                 task_id,
                 task_name,
                 result,
                 ..
-            } => crate::WireTaskResult {
+            } => crate::common::WireTaskResult {
                 workflow_id,
                 task_id: task_id.clone(),
                 task_name: task_name.clone(),
-                outcome: crate::WireTaskOutcome::Completed(result.clone()),
+                outcome: crate::common::WireTaskOutcome::Completed(result.clone()),
             },
             TaskCompletion::Failed {
                 task_id,
                 task_name,
                 error,
                 ..
-            } => crate::WireTaskResult {
+            } => crate::common::WireTaskResult {
                 workflow_id,
                 task_id: task_id.clone(),
                 task_name: task_name.clone(),
-                outcome: crate::WireTaskOutcome::Failed(error.clone()),
+                outcome: crate::common::WireTaskOutcome::Failed(error.clone()),
             },
             TaskCompletion::Cancelled {
                 task_id, task_name, ..
-            } => crate::WireTaskResult {
+            } => crate::common::WireTaskResult {
                 workflow_id,
                 task_id: task_id.clone(),
                 task_name: task_name.clone(),
-                outcome: crate::WireTaskOutcome::Cancelled,
+                outcome: crate::common::WireTaskOutcome::Cancelled,
             },
             TaskCompletion::Skipped {
                 task_id, task_name, ..
-            } => crate::WireTaskResult {
+            } => crate::common::WireTaskResult {
                 workflow_id,
                 task_id: task_id.clone(),
                 task_name: task_name.clone(),
-                outcome: crate::WireTaskOutcome::Skipped,
+                outcome: crate::common::WireTaskOutcome::Skipped,
             },
         }
     }
@@ -479,9 +479,9 @@ pub enum ActorErrorKind {
     Internal,
 }
 
-impl From<&crate::ActantError> for ActorErrorEnvelope {
-    fn from(err: &crate::ActantError) -> Self {
-        use crate::ActantError;
+impl From<&crate::common::ActantError> for ActorErrorEnvelope {
+    fn from(err: &crate::common::ActantError) -> Self {
+        use crate::common::ActantError;
         let (kind, message) = match err {
             ActantError::Storage(m) => (ActorErrorKind::Storage, m.clone()),
             ActantError::StorageIo(e) => (ActorErrorKind::StorageIo, e.to_string()),
@@ -507,13 +507,13 @@ impl From<&crate::ActantError> for ActorErrorEnvelope {
     }
 }
 
-impl From<crate::ActantError> for ActorErrorEnvelope {
-    fn from(err: crate::ActantError) -> Self {
+impl From<crate::common::ActantError> for ActorErrorEnvelope {
+    fn from(err: crate::common::ActantError) -> Self {
         Self::from(&err)
     }
 }
 
-impl From<ActorErrorEnvelope> for crate::ActantError {
+impl From<ActorErrorEnvelope> for crate::common::ActantError {
     fn from(envelope: ActorErrorEnvelope) -> Self {
         match envelope.kind {
             ActorErrorKind::Storage => Self::Storage(envelope.message),
@@ -755,7 +755,7 @@ impl Default for HybridLogicalClock {
 }
 
 #[cfg(test)]
-#[path = "../../../tests/rust/unit/common/model.rs"]
+#[path = "../../../../tests/rust/unit/common/model.rs"]
 mod tests;
 
 /// HLC merge 单调性测试。

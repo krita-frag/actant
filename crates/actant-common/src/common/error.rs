@@ -87,7 +87,9 @@ impl ActantError {
     /// 错误消息前缀（见 [`format_error_kind`]），Python 侧
     /// `decode_error_kind` 解析前缀重建对应异常子类。
     pub fn kind_str(&self) -> &'static str {
-        crate::model::ActorErrorEnvelope::from(self).kind.as_str()
+        crate::common::model::ActorErrorEnvelope::from(self)
+            .kind
+            .as_str()
     }
 }
 
@@ -110,7 +112,7 @@ impl From<Arc<std::io::Error>> for ActantError {
 /// # 示例
 ///
 /// ```
-/// # use actant_common::format_error_kind;
+/// # use actant_common::common::error::format_error_kind;
 /// assert_eq!(
 ///     format_error_kind("timeout", "task timed out after 5000ms"),
 ///     "[actant:timeout] task timed out after 5000ms",
@@ -121,5 +123,5 @@ pub fn format_error_kind(kind: &str, message: &str) -> String {
 }
 
 #[cfg(test)]
-#[path = "../../../tests/rust/unit/common/error.rs"]
+#[path = "../../../../tests/rust/unit/common/error.rs"]
 mod tests;

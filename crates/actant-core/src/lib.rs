@@ -2,7 +2,7 @@
 //!
 //! Actant 的 Rust 框架层：Actor 运行时、DAG 编排状态机、ERH 能力分发、
 //! iroh 网络与持久化。**不含任何 Python 语义**——载荷为不透明字节，
-//! PyO3 绑定位于独立的 `actant` crate（`crates/actant`）。
+//! PyO3 绑定位于 workspace 门面 crate `actant` 的 `src/py` 模块。
 //!
 //! ## 架构地图
 //!
@@ -26,23 +26,14 @@
 //!
 //! ## 边界约束
 //!
-//! - 本 crate 不依赖 PyO3；`crates/actant`（绑定壳）单向依赖本 crate。
+//! - 本 crate 不依赖 PyO3；`src/`（绑定壳）单向依赖本 crate。
 //! - 共享类型（协议 / ID / 配置 / wire / 错误）来自 `actant-common`，
 //!   本 crate 不反向暴露它们之外的新共享面。
 //! - 跨节点消息必须经过 `WireEnvelope` 或 payload signing/verification。
 
 /// 共享类型层 re-export：框架用户经 `actant_core::common` 访问，
 /// 模块路径（`common::model` / `common::wire` / ...）与单 crate 时期一致。
-pub mod common {
-    pub use actant_common::backoff;
-    pub use actant_common::config;
-    pub use actant_common::error;
-    pub use actant_common::model;
-    pub use actant_common::payload;
-    pub use actant_common::serialization;
-    pub use actant_common::wire;
-    pub use actant_common::*;
-}
+pub use actant_common::common;
 
 pub mod metrics;
 pub mod observability;

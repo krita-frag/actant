@@ -210,7 +210,7 @@ fn test_task_completion_accessors() {
 
 #[test]
 fn test_task_completion_to_wire_result_all_variants() {
-    use crate::{WireTaskOutcome, WireTaskResult};
+    use crate::common::{WireTaskOutcome, WireTaskResult};
 
     let wf = WorkflowId::from("wf-1");
     let task = TaskId::from("t-1");

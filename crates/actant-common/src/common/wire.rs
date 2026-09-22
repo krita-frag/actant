@@ -4,7 +4,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use super::model::{NodeId, PlatformInfo, TaskDefinition, TaskId, WorkflowId};
-use crate::model::HlcTimestamp;
+use crate::common::model::HlcTimestamp;
 
 /// 网络协议常量 — 所有魔法字符串与数值限制的唯一真相来源。
 ///
@@ -363,7 +363,7 @@ pub mod traceparent {
 // 重新导出 TraceContext 供外部使用。
 pub use traceparent::TraceContext;
 
-// 在模块根重新导出常量，供单名导入使用（`crate::WIRE_PROTOCOL_VERSION` 等）。
+// 在模块根重新导出常量，供单名导入使用（`crate::common::WIRE_PROTOCOL_VERSION` 等）。
 // 仅重新导出在 `wire.rs` 外部实际使用的常量。话题前缀常量保持内部可见：
 // 所有话题构造必须通过 `Topic::task(...)` 等构造器进行。
 pub use constants::{
@@ -559,7 +559,7 @@ pub struct WireEnvelope {
     /// 不包含本字段自身（避免循环）。这样 MAC 与 wire 协议版本耦合，版本不匹配
     /// 时 MAC 也会失败，提供双保险。
     #[serde(default)]
-    pub mac: Option<[u8; crate::payload::WIRE_MAC_LEN]>,
+    pub mac: Option<[u8; crate::common::payload::WIRE_MAC_LEN]>,
 }
 
 /// 进程级 wire message 签名密钥注册表。
@@ -806,7 +806,7 @@ impl WireEnvelope {
         // 计算可选 MAC：仅当按消息来源节点（或 primary 退化）找到已注册密钥时。
         // C2：流式分段喂 hasher，不再组装与消息等大的覆盖字节 Vec。
         let mac = signing_key_for(&unsigned.message).and_then(|key| {
-            let message_bytes = match crate::encode_postcard(&unsigned.message) {
+            let message_bytes = match crate::common::encode_postcard(&unsigned.message) {
                 Ok(b) => b,
                 Err(e) => {
                     tracing::warn!(
@@ -817,10 +817,10 @@ impl WireEnvelope {
                     return None;
                 }
             };
-            let traceparent_bytes = crate::encode_postcard(&unsigned.traceparent).ok()?;
+            let traceparent_bytes = crate::common::encode_postcard(&unsigned.traceparent).ok()?;
             let version_bytes = [unsigned.version];
             let segments = mac_input_segments(&version_bytes, &message_bytes, &traceparent_bytes);
-            crate::payload::wire_mac_incremental(&key, &segments)
+            crate::common::payload::wire_mac_incremental(&key, &segments)
         });
 
         Self { mac, ..unsigned }
@@ -842,7 +842,7 @@ impl WireEnvelope {
     /// 调用方应使用该字符串创建 `wire.recv` 子 span 以串联跨节点日志与 OTLP span 树。
     pub fn decode(payload: &[u8]) -> Option<(WireMessage, Option<String>)> {
         // 远端 gossip 输入：先校验大小上限，避免恶意嵌套结构 OOM。
-        let envelope = match crate::decode_postcard::<WireEnvelope>(payload) {
+        let envelope = match crate::common::decode_postcard::<WireEnvelope>(payload) {
             Ok(env) => env,
             Err(e) => {
                 tracing::warn!(
@@ -895,7 +895,7 @@ impl WireEnvelope {
                 };
                 // C2：流式分段验证（与发送侧同段序，字节序不变）。
                 candidates.iter().any(|key| {
-                    let message_bytes = match crate::encode_postcard(&envelope.message) {
+                    let message_bytes = match crate::common::encode_postcard(&envelope.message) {
                         Ok(b) => b,
                         Err(e) => {
                             tracing::warn!(
@@ -905,14 +905,15 @@ impl WireEnvelope {
                             return false;
                         }
                     };
-                    let traceparent_bytes = match crate::encode_postcard(&envelope.traceparent) {
-                        Ok(b) => b,
-                        Err(_) => return false,
-                    };
+                    let traceparent_bytes =
+                        match crate::common::encode_postcard(&envelope.traceparent) {
+                            Ok(b) => b,
+                            Err(_) => return false,
+                        };
                     let version_bytes = [envelope.version];
                     let segments =
                         mac_input_segments(&version_bytes, &message_bytes, &traceparent_bytes);
-                    crate::payload::verify_wire_mac(key, &segments.concat(), mac).is_ok()
+                    crate::common::payload::verify_wire_mac(key, &segments.concat(), mac).is_ok()
                 })
             }
         };
@@ -1119,5 +1120,5 @@ pub struct HeadsExchange {
 }
 
 #[cfg(test)]
-#[path = "../../../tests/rust/unit/common/wire.rs"]
+#[path = "../../../../tests/rust/unit/common/wire.rs"]
 mod tests;

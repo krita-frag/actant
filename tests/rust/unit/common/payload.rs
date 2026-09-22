@@ -156,8 +156,8 @@ fn empty_data_rejected_with_key() {
 #[test]
 fn blob_ref_roundtrip() {
     let r = BlobRef {
-        hash: crate::model::BlobHash::from_bytes([7u8; 32]),
-        node: crate::model::NodeId::new("node-a".into()),
+        hash: crate::common::model::BlobHash::from_bytes([7u8; 32]),
+        node: crate::common::model::NodeId::new("node-a".into()),
     };
     let bytes = encode_blob_ref(&r).unwrap();
     assert_eq!(decode_blob_ref(&bytes).unwrap(), r);
@@ -166,8 +166,8 @@ fn blob_ref_roundtrip() {
 #[test]
 fn blob_ref_hash_is_raw_32_bytes_on_wire() {
     let r = BlobRef {
-        hash: crate::model::BlobHash::from_bytes([0xAB; 32]),
-        node: crate::model::NodeId::new("node-a".into()),
+        hash: crate::common::model::BlobHash::from_bytes([0xAB; 32]),
+        node: crate::common::model::NodeId::new("node-a".into()),
     };
     let bytes = encode_blob_ref(&r).unwrap();
     // postcard 编码 [u8;32] 为裸 32 字节，无长度前缀。
@@ -178,8 +178,8 @@ fn blob_ref_hash_is_raw_32_bytes_on_wire() {
 #[test]
 fn blob_ref_tampering_is_detectable() {
     let r = BlobRef {
-        hash: crate::model::BlobHash::from_bytes([3u8; 32]),
-        node: crate::model::NodeId::new("node-b".into()),
+        hash: crate::common::model::BlobHash::from_bytes([3u8; 32]),
+        node: crate::common::model::NodeId::new("node-b".into()),
     };
     let bytes = encode_blob_ref(&r).unwrap();
     for i in 0..bytes.len() {
@@ -200,8 +200,8 @@ fn blob_ref_tampering_is_detectable() {
 #[test]
 fn blob_ref_truncated_rejected() {
     let r = BlobRef {
-        hash: crate::model::BlobHash::from_bytes([1u8; 32]),
-        node: crate::model::NodeId::new("node-c".into()),
+        hash: crate::common::model::BlobHash::from_bytes([1u8; 32]),
+        node: crate::common::model::NodeId::new("node-c".into()),
     };
     let bytes = encode_blob_ref(&r).unwrap();
     for len in 0..bytes.len() {
@@ -215,16 +215,19 @@ fn blob_ref_truncated_rejected() {
 #[test]
 fn blob_hash_hex_display_and_parse_roundtrip() {
     use std::str::FromStr;
-    let hash = crate::model::BlobHash::from_bytes([
+    let hash = crate::common::model::BlobHash::from_bytes([
         0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         0, 0, 0, 0, 0, 0xFF,
     ]);
     let text = hash.to_string();
     assert_eq!(text.len(), 64);
-    assert_eq!(crate::model::BlobHash::from_str(&text).unwrap(), hash);
+    assert_eq!(
+        crate::common::model::BlobHash::from_str(&text).unwrap(),
+        hash
+    );
     // 非 hex / 错误长度均拒绝。
-    assert!(crate::model::BlobHash::from_str("xyz").is_err());
-    assert!(crate::model::BlobHash::from_str(&"aa".repeat(31)).is_err());
+    assert!(crate::common::model::BlobHash::from_str("xyz").is_err());
+    assert!(crate::common::model::BlobHash::from_str(&"aa".repeat(31)).is_err());
 }
 
 // ───────────────────────── wire_mac / verify_wire_mac 属性测试 ─────────────────────────

@@ -51,7 +51,7 @@ Actant 采用 **Rust + iroh** 构建核心运行时，通过 **PyO3** 暴露给 
 ```
 actant/
 ├── crates/                       # Rust workspace 成员（0.3.5 F2a 拆分，依赖方向 common ← core ← 门面）
-│   ├── actant-common/            # 共享类型层 crate（依赖图根）
+│   ├── actant-common/            # 共享类型层 crate（依赖图根）；src/common.rs + src/common/（模块路径 = 拆分前 actant::common::*）
 │   │   └── src/                  # backoff / config / error / model / payload / serialization / wire
 │   ├── actant-core/              # 框架主体 crate（不依赖 PyO3；纯 Rust 嵌入 = -p actant-core --no-default-features）
 │   │   └── src/

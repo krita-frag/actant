@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 /// 发现模式 — 内置策略名称。
 ///
 /// 包装 `String` 的新类型，构造须经过 [`DiscoveryMode::parse`] 校验。
-/// 未知名称在启动时返回 [`crate::ActantError::Config`] 而非静默回退默认值。
+/// 未知名称在启动时返回 [`crate::common::ActantError::Config`] 而非静默回退默认值。
 ///
 /// 内置名称见 [`discovery_mode`] 模块。自定义发现策略应通过 Rust `Discovery` trait
 /// 扩展（纯 Rust 嵌入场景）或后续由 Python 层注入。
@@ -24,15 +24,15 @@ impl DiscoveryMode {
     /// 校验构造器。
     ///
     /// 仅当名称是内置发现模式时返回 `Ok`，否则返回
-    /// [`crate::ActantError::Config`] — 不做静默回退。
-    pub fn parse(s: &str) -> Result<Self, crate::ActantError> {
+    /// [`crate::common::ActantError::Config`] — 不做静默回退。
+    pub fn parse(s: &str) -> Result<Self, crate::common::ActantError> {
         if matches!(
             s,
             discovery_mode::NONE | discovery_mode::LOCAL | discovery_mode::DNS
         ) {
             Ok(Self(s.to_string()))
         } else {
-            Err(crate::ActantError::Config(format!(
+            Err(crate::common::ActantError::Config(format!(
                 "unknown discovery mode '{}': expected one of {}, {}, {}",
                 s,
                 discovery_mode::NONE,
@@ -43,7 +43,7 @@ impl DiscoveryMode {
     }
 
     /// 校验此名称已注册。在启动时调用。
-    pub fn validate(&self) -> Result<(), crate::ActantError> {
+    pub fn validate(&self) -> Result<(), crate::common::ActantError> {
         Self::parse(self.as_str()).map(|_| ())
     }
 
@@ -103,7 +103,7 @@ pub struct ActantConfig {
     /// - `false`（默认）：`payload_signing_key` 为空时仅 `warn` 日志，不阻止启动
     ///   （向后兼容 0.2 行为，用于开发/测试）。
     /// - `true`：`payload_signing_key` 为空时启动直接返回
-    ///   [`crate::ActantError::Config`]，防止生产环境静默运行无签名模式。
+    ///   [`crate::common::ActantError::Config`]，防止生产环境静默运行无签名模式。
     ///
     /// 由 `ActantConfig::validate` 在启动时强制检查，RuntimeBuilder 在 build 前
     /// 调用 validate，因此无法绕过。
@@ -111,7 +111,7 @@ pub struct ActantConfig {
     pub require_payload_signing: bool,
     /// 用户自定义节点标签（N2），随心跳广播给集群。
     ///
-    /// 总字节量（key + value 长度之和）超过 [`crate::model::NODE_LABELS_MAX_BYTES`]
+    /// 总字节量（key + value 长度之和）超过 [`crate::common::model::NODE_LABELS_MAX_BYTES`]
     /// 时心跳整体置空标签并告警。
     #[serde(default)]
     pub node_labels: BTreeMap<String, String>,
@@ -130,14 +130,14 @@ impl ActantConfig {
     /// # Payload 签名约束
     ///
     /// 当 `require_payload_signing = true` 时，`payload_signing_key` 必须非空，
-    /// 否则返回 [`crate::ActantError::Config`]。这为生产环境提供硬失败
+    /// 否则返回 [`crate::common::ActantError::Config`]。这为生产环境提供硬失败
     /// 语义，避免依赖运行时 `warn` 日志被忽视。
-    pub fn validate(&self) -> Result<(), crate::ActantError> {
+    pub fn validate(&self) -> Result<(), crate::common::ActantError> {
         self.worker.scheduler_kind.validate()?;
         self.network.discovery_mode.validate()?;
         self.failover.validate()?;
         if self.require_payload_signing && self.payload_signing_key.is_empty() {
-            return Err(crate::ActantError::Config(
+            return Err(crate::common::ActantError::Config(
                 "require_payload_signing=true but payload_signing_key is empty; \
                  configure a non-empty shared secret or set require_payload_signing=false \
                  for development"
@@ -168,7 +168,7 @@ impl Default for ActorConfig {
 /// 调度器类型 — 内置策略名称。
 ///
 /// 包装 `String` 的新类型，通过 [`SchedulerKind::parse`] 校验。
-/// 未知名称在启动时返回 [`crate::ActantError::Config`] 而非静默回退默认值。
+/// 未知名称在启动时返回 [`crate::common::ActantError::Config`] 而非静默回退默认值。
 ///
 /// 内置名称见 [`scheduler_kind`] 模块。自定义调度策略应通过 Rust `Scheduler` trait
 /// 扩展（纯 Rust 嵌入场景）或后续由 Python 层注入。
@@ -183,11 +183,11 @@ impl SchedulerKind {
     }
 
     /// 校验构造器 — 检查内置调度器种类。
-    pub fn parse(s: &str) -> Result<Self, crate::ActantError> {
+    pub fn parse(s: &str) -> Result<Self, crate::common::ActantError> {
         if matches!(s, scheduler_kind::FIFO | scheduler_kind::PRIORITY) {
             Ok(Self(s.to_string()))
         } else {
-            Err(crate::ActantError::Config(format!(
+            Err(crate::common::ActantError::Config(format!(
                 "unknown scheduler kind '{}': expected one of {}, {}",
                 s,
                 scheduler_kind::FIFO,
@@ -197,7 +197,7 @@ impl SchedulerKind {
     }
 
     /// 校验此名称已注册。在启动时调用。
-    pub fn validate(&self) -> Result<(), crate::ActantError> {
+    pub fn validate(&self) -> Result<(), crate::common::ActantError> {
         Self::parse(self.as_str()).map(|_| ())
     }
 
@@ -498,7 +498,7 @@ impl Default for WorkflowConfig {
 ///
 /// # `GroupCommit` 语义
 ///
-/// `GroupCommit(ms)` 启用 [`crate::runtime::state::WriteBatcher`]：单 key 写入
+/// `GroupCommit(ms)` 启用 [`crate::common::runtime::state::WriteBatcher`]：单 key 写入
 /// 进入有界通道，后台任务每 `ms` 毫秒或满 `BATCH_FLUSH_THRESHOLD` 条时
 /// 合并为单次 LMDB 事务提交（一次 fsync）。崩溃时丢失最近 `ms` 毫秒内的写入。
 ///
@@ -510,7 +510,7 @@ impl Default for WorkflowConfig {
 /// `NoSync` 在 LMDB 打开时设置 `MDB_NOSYNC`：写事务 commit 时跳过 fsync，
 /// 由 OS page cache 异步刷盘。进程崩溃但 OS 正常运行时数据不丢失；
 /// OS 崩溃或断电时丢失最近未刷盘的写入。需配合周期性
-/// [`crate::runtime::state::Store::sync`] 显式刷盘。
+/// [`crate::common::runtime::state::Store::sync`] 显式刷盘。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(tag = "mode", content = "flush_interval_ms")]
 pub enum SyncMode {
@@ -523,7 +523,7 @@ pub enum SyncMode {
     GroupCommit(u64),
     /// 跳过 fsync，依赖 OS page cache 异步刷盘。
     ///
-    /// 调用方需周期性调用 [`crate::runtime::state::Store::sync`] 显式持久化。
+    /// 调用方需周期性调用 [`crate::common::runtime::state::Store::sync`] 显式持久化。
     NoSync,
 }
 
@@ -665,27 +665,27 @@ impl FailoverConfig {
     /// 3. `lease_duration_ms > failure_timeout_ms`：租约时长必须大于故障检测阈值，
     ///    防止双主。
     /// 4. `lease_expiry_check_interval_secs > 0`：扫描周期必须为正。
-    pub fn validate(&self) -> Result<(), crate::ActantError> {
+    pub fn validate(&self) -> Result<(), crate::common::ActantError> {
         if self.heartbeat_interval_ms == 0 {
-            return Err(crate::ActantError::Config(format!(
+            return Err(crate::common::ActantError::Config(format!(
                 "failover.heartbeat_interval_ms must be > 0, got {}",
                 self.heartbeat_interval_ms
             )));
         }
         if self.failure_timeout_ms <= self.heartbeat_interval_ms {
-            return Err(crate::ActantError::Config(format!(
+            return Err(crate::common::ActantError::Config(format!(
                 "failover.failure_timeout_ms ({}) must be > heartbeat_interval_ms ({})",
                 self.failure_timeout_ms, self.heartbeat_interval_ms
             )));
         }
         if self.lease_duration_ms <= self.failure_timeout_ms {
-            return Err(crate::ActantError::Config(format!(
+            return Err(crate::common::ActantError::Config(format!(
                 "failover.lease_duration_ms ({}) must be > failure_timeout_ms ({}) to prevent split-brain",
                 self.lease_duration_ms, self.failure_timeout_ms
             )));
         }
         if self.lease_expiry_check_interval_secs == 0 {
-            return Err(crate::ActantError::Config(format!(
+            return Err(crate::common::ActantError::Config(format!(
                 "failover.lease_expiry_check_interval_secs must be > 0, got {}",
                 self.lease_expiry_check_interval_secs
             )));
@@ -719,5 +719,5 @@ impl Default for GossipConfig {
 }
 
 #[cfg(test)]
-#[path = "../../../tests/rust/unit/common/config.rs"]
+#[path = "../../../../tests/rust/unit/common/config.rs"]
 mod tests;

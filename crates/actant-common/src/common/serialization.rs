@@ -30,7 +30,7 @@ where
 /// 将值序列化为 postcard 字节向量。
 ///
 /// 与 [`decode_postcard`] 配对，集中处理 postcard 序列化错误。
-/// 用于 wire message 签名前的字节化（[`crate::WireEnvelope::wrap`]）
+/// 用于 wire message 签名前的字节化（[`crate::common::WireEnvelope::wrap`]）
 /// 与发送方发送前的最终序列化。
 pub fn encode_postcard<T>(value: &T) -> Result<Vec<u8>>
 where
@@ -73,5 +73,5 @@ where
 }
 
 #[cfg(test)]
-#[path = "../../../tests/rust/unit/common/serialization.rs"]
+#[path = "../../../../tests/rust/unit/common/serialization.rs"]
 mod tests;

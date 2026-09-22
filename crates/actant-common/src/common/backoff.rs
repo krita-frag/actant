@@ -80,5 +80,5 @@ impl ExponentialBackoff {
 pub const REMOTE_CALL_MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 #[cfg(test)]
-#[path = "../../../tests/rust/unit/common/backoff.rs"]
+#[path = "../../../../tests/rust/unit/common/backoff.rs"]
 mod tests;
