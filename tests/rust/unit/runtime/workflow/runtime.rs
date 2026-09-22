@@ -1,6 +1,7 @@
 //! Unit tests extracted from `src/runtime/workflow/runtime.rs`.
 //! Compiled via `#[path]` attribute — retains `super::` access to private items.
 
+use super::result_delivery::try_enqueue_pending_result;
 use super::DispatchResult;
 use super::*;
 
