@@ -7,6 +7,25 @@
 
 ### 破坏性变更
 
+- **crate 切分：workspace 三 crate（0.3.5 F2a）**：`crates/actant-common`（共享类型层）+
+  `crates/actant-core`（框架主体，不依赖 PyO3）+ 根 crate `actant`（PyO3 绑定壳，
+  maturin 编译入口不变，`module-name = "actant.actant"` 不变）。纯 Rust 消费者依赖
+  `actant-core`（`default-features = false` 路径等价于 `-p actant-core`）。随边界
+  公开的符号（原 `pub(crate)`，唯一外部消费者是绑定层，净新增 0）：
+  common 侧模块与 wire re-export、`epoch_millis`/`should_claim_workflow`、ID 内字段；
+  core 侧 `orchestrator` 子模块、`AddNodeOutcome`/`DagSnapshot`/`WorkflowExecution`、
+  `messaging::encode/decode`。`TaskCompletion`/`ActorStatus`/`Phase`/`ActantError`
+  移除 `#[non_exhaustive]`（同仓双 crate 共同演进，0.x 语义变更由 CHANGELOG 承担）。
+  孤儿 impl 改自由函数：`actant_error_to_pyerr`（原 `From<ActantError> for PyErr`）、
+  capability 请求提取函数（原 `FromPyObject` impl）。
+- **发现 preset 收敛（0.3.5 T17/T18）**：`mdns` 与 `relay` preset 删除
+  （`local`≡`relay` 字节相同、`mdns` 不做 mDNS 名字撒谎），保留 `none`/`local`/`dns`；
+  discovery/scheduler 两套字符串注册表（`is_registered`/`registered_names`）删除，
+  校验改本地白名单。**Execute capability 删除（T19）**：capability 10→9，提交路径
+  本就绕过它，`with_task_dispatcher` 注入后彻底冗余；
+  `register_execute_handler`/`ExecuteHandler`/py 侧 `ExecuteCtx`/`ExecuteOutcome`/
+  `EXECUTE` 一并删除。**死旋钮删除（T20）**：`WorkerConfig.timeout_check_interval_ms`
+  /`completion_channel_capacity`（全仓零消费，配置面承诺了却不生效）。
 - **Actor 持久化机器整体移除（0.3.4 B1/B2/B3，−1100 行）**：`ActorPersistence`
   （CheckpointManager / WalWriter / WalReader / WalCompactor / ActorSnapshot，state.rs
   同步删除）与 mailbox pending 持久化（`PersistentMessage` / `recover_pending` /
@@ -85,6 +104,24 @@
 - **CRDT 模块移除（0.3.1 剪裁 T2）**：`src/runtime/state/crdt.rs`（ORSet/GCounter/LWWRegister）为死码，全仓零引用，整文件删除。DAG gossip 状态合并使用 HLC 比较语义，不受影响。
 
 - **Python-facing Actor API 移除（0.3.1 剪裁 T3/T4/T5/T6，capability 13 → 10）**：`_ActorCore`（`spawn_actor`/`call_method` 等全部方法，全仓零调用方）、`PythonActor`、`ActorMessaging`/`ActorSupervision`/`ActorLifecycle` 三个 capability 及其 ctx dataclass 与 Handler Protocol、`_Event.orchestration()`/`_Event.supervision()`（无构造路径）、`_RuntimeCore.retry_policy`/`set_retry_policy`（零调用）、`register_python_dispatch_handler`（no-op）全部删除；`_NetworkConfig.actor_router_strategy`/`actor_registry_gossip_interval_ms` 同步摘除。内置 capability 收敛为 10 个（策略型 Routing/Scheduling/RetryPolicy + Rust-backed Serialization/Transport/Store/Execute/TaskLifecycle/WorkflowLifecycle/NodeLifecycle）。本地 `ActorSystem`（spawn/mailbox/at-least-once/取消/持久化）保留，仍是四类系统 actor 的生产底座；`ActorError` 异常保留（本地 ActorSystem 仍产生 `actor` kind）。另删除 `observability::shutdown()` no-op 与未实现的 relay map 配置字段。
+
+### 新增（0.3.5：日志流 + 框架化 + 收尾）
+
+- **任务级日志流（0.3.5 N3 档 1）**：worker 任务执行期捕获 `logging`（WARNING+）
+  与 `print` 为 `actant_log:` stderr 边带，父进程解析发布 `BusEvent::TaskLog`
+  （tap 语义）；py 出口 `rt.on_task_log`。顺带修复任务内 `print` 直写 fd 1
+  损坏 stdout 帧流的隐患。EventBridge 增 `rt.on_worker_state`（X4，
+  draining/drained/stopped）。
+- **框架化（0.3.5 F4/F5/F1/X2/X3/X5/X6）**：`RuntimeBuilder` 注入缝五件
+  （with_scheduler/with_task_dispatcher/with_transport/with_discovery/with_event_log）+
+  `with_orchestrator_ingest`（Rust 嵌入依赖推进开关，Python 层禁用）；
+  `common → runtime` 断环（HLC/EventBusConfig 下移）；`docs/FRAMEWORK.md`
+  契约文档（X3 帧协议版本承诺 / X5 子工作流模式 / 护栏五条）；
+  `examples/rust_embed.rs` 纯 Rust 嵌入验收实验（自定义 dispatcher 跑通
+  提交→DAG→执行→聚合）；`test-support` feature 导出测试假件（X6）。
+- **0.4 拐点评估**：维持 0.3.x 行，触发清单见 plans/PLAN.md §0.3.5 收尾结论。
+- **量级对照（守则 3）**：0.3.5 全量 diff 净负（F4+F5 −393、F2a 纯移动、
+  C1/C4 纯移动、P0/N3 增量以测试为主）。
 
 ### 新增（0.3.4：身份与信任 + 节点可见性 + 二次开发条件 + API 暴露）
 

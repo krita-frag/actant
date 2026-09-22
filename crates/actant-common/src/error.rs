@@ -110,7 +110,7 @@ impl From<Arc<std::io::Error>> for ActantError {
 /// # 示例
 ///
 /// ```
-/// # use actant::common::format_error_kind;
+/// # use actant_common::format_error_kind;
 /// assert_eq!(
 ///     format_error_kind("timeout", "task timed out after 5000ms"),
 ///     "[actant:timeout] task timed out after 5000ms",
