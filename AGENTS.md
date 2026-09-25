@@ -31,7 +31,7 @@ Actant 采用 **Rust + iroh** 构建核心运行时，通过 **PyO3** 暴露给 
 | `perform` | 副作用型 | 调用最后注册的 handler | handler 返回值 |
 | `emit` | 反应型 | 顺序调用所有 handler | `None` |
 
-后注册的 handler 优先级更高（`ask` 逆序决策，自定义覆盖默认）。内置 9 个 capability（0.3.6 起：Transport capability 与 Serialization 直通 handler 已删）：策略型 `Routing`/`Scheduling`/`RetryPolicy`（纯 Python）与 `ValueStore`（默认 handler 为 Python→Rust blob 桥，Python 可覆盖），其余由 Rust 核心提供 codec 与注册面（Serialization 直通 handler 已删，用户链自己的 handler；Store 默认 handler 路由到 LMDB），Python 可覆盖。
+后注册的 handler 优先级更高（`ask` 逆序决策，自定义覆盖默认）。内置 9 个 capability：策略型 `Routing`/`Scheduling`/`RetryPolicy`（纯 Python）与 `ValueStore`（默认 handler 为 Python→Rust blob 桥，Python 可覆盖），其余由 Rust 核心提供 codec 与注册面（Serialization 由用户链自己的 handler；Store 默认 handler 路由到 LMDB），Python 可覆盖。
 
 ## 高层 API（@task / @flow）
 
@@ -50,8 +50,8 @@ Actant 采用 **Rust + iroh** 构建核心运行时，通过 **PyO3** 暴露给 
 
 ```
 actant/
-├── crates/                       # Rust workspace 成员（0.3.5 F2a 拆分，依赖方向 common ← core ← 门面）
-│   ├── actant-common/            # 共享类型层 crate（依赖图根）；src/common.rs + src/common/（模块路径 = 拆分前 actant::common::*）
+├── crates/                       # Rust workspace 成员（依赖方向 common ← core ← 门面）
+│   ├── actant-common/            # 共享类型层 crate（依赖图根）；src/common.rs + src/common/（模块路径 = actant::common::*）
 │   │   └── src/                  # backoff / config / error / model / payload / serialization / wire
 │   ├── actant-core/              # 框架主体 crate（不依赖 PyO3；纯 Rust 嵌入 = -p actant-core --no-default-features）
 │   │   └── src/
@@ -61,7 +61,7 @@ actant/
 │   │       └── runtime/          # 运行时四盒
 │   │           ├── actor/        # Actor 运行时（mailbox 纯内存投递；系统 actor 专用本地运行时）
 │   │           ├── blobs.rs      # 内容寻址 blob 原语（iroh-blobs FsStore）
-│   │           ├── builder.rs    # RuntimeBuilder：network → store → actor → workflow → capability → worker 装配；F4 注入缝（with_scheduler/with_task_dispatcher/with_transport/with_discovery/with_event_log/with_orchestrator_ingest）
+│   │           ├── builder.rs    # RuntimeBuilder：network → store → actor → workflow → capability → worker 装配；注入缝（with_scheduler/with_task_dispatcher/with_transport/with_discovery/with_event_log/with_orchestrator_ingest）
 │   │           ├── capability.rs + capability/  # ERH 核心 + 内置 capability（TaskLifecycle/WorkflowLifecycle/NodeLifecycle/Serialization/Transport/Store）
 │   │           ├── context.rs    # Runtime 上下文与 shutdown
 │   │           ├── dispatcher.rs # ProcessTaskDispatcher / TaskDispatcher trait / WorkerLaunchSpec（语言中性三要素）
@@ -90,8 +90,8 @@ actant/
 │   │   ├── _async_result.py      # AsyncResult（小结果对象缓存 / 大结果 Ref 两态）、_collect_dep_ids（依赖解析）
 │   │   ├── _context.py           # TaskContext、get_task_context（协作式取消）
 │   │   ├── _gather.py            # gather 并行等待原语
-│   │   ├── _helpers.py           # dispatch 桥接复用件：_execute_with_retries、_safe_serialize、_run_with_timeout、_EventBatcher 等
-│   │   ├── _ref.py               # Ref 值引用句柄、REF_INLINE_THRESHOLD 降级、_RefArg 哨兵（0.3.2 R3）
+│   │   ├── _helpers.py           # dispatch 桥接复用件：_execute_with_retries、_execute_with_cancellation、_safe_serialize、_EventBatcher 等
+│   │   ├── _ref.py               # Ref 值引用句柄、REF_INLINE_THRESHOLD 降级、_RefArg 哨兵
 │   │   ├── _task_obj.py          # Task 类、@task 装饰器
 │   │   └── _worker.py            # worker 子进程循环（`python -m actant.task._worker` 入口）
 │   ├── flow.py                   # @flow 工作流编排装饰器（动态 DAG 记录 + 提交 Rust Orchestrator + 生命周期事件广播）
@@ -138,7 +138,7 @@ Actant 是 P2P 对等混合架构：每个节点同时是编排器与执行器�
 `bootstrap_nodes` 拨号）；**显式给了 `data_dir` 时为 `local`**（本地网络自动发现）。
 可用 `ACTANT_DISCOVERY=<preset>` 环境变量覆盖。
 
-**节点身份与信任（0.3.4）**：节点身份 = iroh endpoint keypair，随
+**节点身份与信任**：节点身份 = iroh endpoint keypair，随
 `data_dir/identity.key` 持久化（0600），endpoint id 跨重启稳定。心跳节点记录由
 endpoint 私钥 ed25519 签名，`NetworkConfig.require_signed_records` 开启时拒绝缺签/
 坏签心跳；`allowed_peer_ids` 非空时同时校验 gossip 成员资格（直连侧另有 ALPN
@@ -147,9 +147,9 @@ endpoint 私钥 ed25519 签名，`NetworkConfig.require_signed_records` 开启�
 
 ### 进程级任务隔离
 
-任务经 `ProcessTaskDispatcher` 在 **worker 子进程** 中执行（`python -m actant.task._worker`），线程池后端已移除，进程池为**唯一执行后端**。每个 worker 进程同一时刻执行一个任务，Rust 在超时/取消时 `terminate()`/`kill()` 对应 worker 即精确终止单任务，即时释放槽位并自动拉起替补进程——硬超时能真正回收计算资源，任务崩溃（segfault / `os._exit`）仅失败该任务，节点存活。worker 是纯 Python 解释器，仅通过 stdio 长度前缀二进制帧与 Rust IPC 通信（cloudpickle 载荷），不持有 Rust 核心；父进程 `sys.path` 透传为 `PYTHONPATH` 保证模块级任务函数在子进程内可导入（拼装发生在 Python 绑定层 `src/py/config.rs`——核心 `WorkerConfig` 只认 `worker_program`/`worker_args`/`worker_env` 三要素，语言中性，0.3.4 F3）。worker stderr 日志转发回父进程 tracing，`task.handler_ms` 计时指标经 stderr 边带汇入 metrics。
+任务经 `ProcessTaskDispatcher` 在 **worker 子进程** 中执行（`python -m actant.task._worker`），进程池是**唯一执行后端**。每个 worker 进程同一时刻执行一个任务，Rust 在超时/取消时 `terminate()`/`kill()` 对应 worker 即精确终止单任务，即时释放槽位并自动拉起替补进程——硬超时能真正回收计算资源，任务崩溃（segfault / `os._exit`）仅失败该任务，节点存活。worker 是纯 Python 解释器，仅通过 stdio 长度前缀二进制帧与 Rust IPC 通信（cloudpickle 载荷），不持有 Rust 核心；父进程 `sys.path` 透传为 `PYTHONPATH` 保证模块级任务函数在子进程内可导入（拼装发生在 Python 绑定层 `src/py/config.rs`——核心 `WorkerConfig` 只认 `worker_program`/`worker_args`/`worker_env` 三要素，语言中性）。worker stderr 日志转发回父进程 tracing，`task.handler_ms` 计时指标经 stderr 边带汇入 metrics。
 
-**崩溃故障转移**：worker 进程崩溃（非逻辑失败、非硬超时）属基础设施级失败，任务清空 `target_node` 重新入队，由路由器重选本地或远端节点执行（3.1）。重路由受 `crash_failover_max_attempts`（默认 3）上限约束，达到上限才降级为正常失败路径；超时与业务失败不参与该上限。
+**崩溃故障转移**：worker 进程崩溃（非逻辑失败、非硬超时）属基础设施级失败，任务清空 `target_node` 重新入队，由路由器重选本地或远端节点执行。重路由受 `crash_failover_max_attempts`（默认 3）上限约束，达到上限才降级为正常失败路径；超时与业务失败不参与该上限。
 
 ### Worker 可调参数
 

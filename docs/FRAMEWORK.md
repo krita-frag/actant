@@ -1,7 +1,7 @@
 # Actant 框架契约（FRAMEWORK）
 
 > 本文是 `actant-core` 作为**可复用编排框架**的契约文档：嵌入方可以依赖哪些面、
-> 按什么规则扩展、哪些承诺不做出。0.3.5 F1/X3/X5 交付物。
+> 按什么规则扩展、哪些承诺不做出。
 > 配套验收实验：`examples/rust_embed.rs`（纯 Rust 引擎，不依赖 PyO3）。
 
 ## 一、定位与分层
@@ -24,12 +24,12 @@ Actant 的身份 = **P2P 无中心 fabric + ERH 能力分发 + 进程级隔离 +
 | 缝 | trait | 注入点 | 内置实现 | 第二实现验证 |
 |----|-------|--------|----------|--------------|
 | 任务分发 | `TaskDispatcher` | `RuntimeBuilder::with_task_dispatcher` | `ProcessTaskDispatcher`（Python 进程池，绑定层注入） | ✅ `examples/rust_embed.rs` 的 `ClosureDispatcher` |
-| 调度策略 | `Scheduler` | `RuntimeBuilder::with_scheduler` | priority / fifo（`SchedulerActor`） | 缝可用，未验证 |
-| 节点发现 | `Discovery` | `with_discovery` / `NetworkManager::with_identity` | `none` / `local` / `dns` preset | 缝可用，未验证 |
-| 传输层 | `Transport` | `with_transport` | `NetworkManager` | 缝可用，未验证 |
+| 调度策略 | `Scheduler` | `RuntimeBuilder::with_scheduler` | priority / fifo（`SchedulerActor`） | ✅ `tests/rust/unit/runtime/builder.rs` `SentinelScheduler` |
+| 节点发现 | `Discovery` | `with_discovery` / `NetworkManager::with_identity` | `none` / `local` / `dns` preset | ✅ 同上 `SeamDiscovery` |
+| 传输层 | `Transport` | `with_transport` | `NetworkManager` | ✅ 同上 `MockTransport` 订阅断言 |
 | 事件日志 | `EventLog` | `with_event_log` | LMDB / Memory | Memory 即第二实现 |
 | 远端路由 | `RoutePolicy` | `Worker::with_route_policy` | `DefaultRoutePolicy` | 单测覆盖 |
-| 能力 | `Capability` + `Handler<C>` | `CapabilityRuntime::register_*` | 6 个内置 | ✅ 双语言多实现 |
+| 能力 | `Capability` + `Handler<C>` | `CapabilityRuntime::register_*` | 5 个内置（Rust 侧 codec + layer） | ✅ 双语言多实现 |
 | 条件边 | `ConditionEvaluator` | `OrchestratorState::with_condition_evaluator` | 无（策略留空、使用者提供） | **正确形状模板** |
 
 ### Rust 嵌入最小清单
@@ -46,7 +46,30 @@ Actant 的身份 = **P2P 无中心 fabric + ERH 能力分发 + 进程级隔离 +
 
 完整可运行示例：`cargo run --no-default-features --example rust_embed`。
 
-## 三、进程内 worker 协议（X3 帧协议版本承诺）
+### Python 侧 capability 扩展路径
+
+Python 层有两条扩展路径，均经 `rt.layer(...)` 登记 handler，**只作用于 Python 发起的
+`actant.ask/perform/emit` 调用**：
+
+| 路径 | 入口 | 适用 |
+|------|------|------|
+| 覆盖内置 capability | `rt.layer(name).chain(handler)` 或 `rt.chain(name, handler)` | 替换/追加内置 capability 的 handler（如 `ValueStore` 换 S3 后端、`Routing` 换自定义路由） |
+| 新增自定义 capability | `rt.layer(name, kind).chain(handler)` | 声明新的 `ask`/`perform`/`emit` 扩展点，供自建的第 3 层代码组合 |
+
+**双分发规则（关键契约）**：Python handler 与 Rust 内部 handler 是两条独立分发路径。
+
+- Python 侧：`_dispatch_ask/perform/emit` 先走 Python handler 链；Python handler
+  缺失或弃权时，**仅** `RUST_BACKED_CAPABILITIES`（`Serialization` / `Store` /
+  `TaskLifecycle` / `WorkflowLifecycle` / `NodeLifecycle`）回退到 Rust 内置 handler。
+- Rust 内部：Worker 执行、orchestrator 持久化等 Rust 内部分发路径**不咨询**
+  Python `_layers`——Python handler 永不进入 Rust 内部 dispatch。
+- 纯 Python 策略（`Routing` / `Scheduling` / `RetryPolicy`）与 `ValueStore` 无 Rust
+  内部分发参与，只有 Python 这一条路径。
+
+要覆盖 **Rust 内部行为**（任务执行、存储、传输等），只能用 Rust 侧
+`RuntimeBuilder` 的注入缝（见上表），不能靠 `layer().chain()`。
+
+## 三、进程内 worker 协议（帧协议版本承诺）
 
 worker 子进程（或任意语言的自定义 worker）与父进程经 **stdio** 通信：
 
@@ -64,7 +87,7 @@ worker 子进程（或任意语言的自定义 worker）与父进程经 **stdio*
 1.0 冻结时加版本字节与握手。Dispatch 载荷自带 `version` 字节（当前 0x02），
 核心拒绝未知版本。
 
-## 四、子工作流组合模式（X5）
+## 四、子工作流组合模式
 
 任务执行体内提交另一个工作流即天然组合：
 
@@ -87,9 +110,9 @@ def parent_step(x):
 
 1. **不插件化**：无运行时插件装载、无配置驱动的 handler 加载、无 dylib/WASM
    ABI。扩展 = 编译期实现 trait + builder 注入；
-2. **状态面不抽象**：LMDB 内嵌是身份（J6）；"数据面任意，状态面固定 LMDB"。
+2. **状态面不抽象**：LMDB 内嵌是身份；"数据面任意，状态面固定 LMDB"。
    `Store` 不是 trait，不出 `StoreBackend` 配置；
-3. **0.x 无 API 稳定性**：trait 签名随里程碑演进（CHANGELOG 登记）；
+3. **0.x 无 API 稳定性**：trait 签名随版本演进（CHANGELOG 登记）；
    1.0 冻结时统一承诺；
 4. **Rust 嵌入的高层 API**：`@task`/`@flow` 是 Python 语义。Rust 嵌入面对的是
    "DAG + dispatcher 原语层"，不是 DSL；DSL 引擎属第 3 层 crate（不在本仓库）；

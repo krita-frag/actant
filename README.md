@@ -179,10 +179,10 @@ def long_pipeline(items: list) -> list:
 
 **Flow 级超时（`@flow(timeout_ms=...)`）**
 
-- `timeout_ms` 是**工作流级 deadline**（S5 起）。唯一决策者是 orchestrator 的超时 watcher，它按 `state_poll_interval_ms`（默认 500ms）轮询，到期把工作流标为 `Failed`（error = `workflow timeout exceeded`）**并真正取消全部运行中任务**，worker 在协作检查点退出。
+- `timeout_ms` 是**工作流级 deadline**。唯一决策者是 orchestrator 的超时 watcher，它按 `state_poll_interval_ms`（默认 500ms）轮询，到期把工作流标为 `Failed`（error = `workflow timeout exceeded`）**并真正取消全部运行中任务**，worker 在协作检查点退出。
 - 取消同时覆盖**本节点与远端**：watcher 除 gossip 广播 `CancelBroadcast` 外，还把同一份载荷自投递回本节点事件通道。gossip 广播只投递给邻居、**不回环给发送者**，只靠广播会漏掉本节点自己执行的在途任务（工作流已 `Failed`，而阻塞在任务等待上的函数体会永久挂起）。
 - 调用方语义：任务级终态是 `Cancelled`（这是事实），对外归一为 `ActantTimeoutError`。
-- 返回时刻为 `deadline + 轮询周期`（默认 500ms 量级），**不再是"超时瞬间立即返回"**。
+- 返回时刻为 `deadline + 轮询周期`（默认 500ms 量级），**并非超时瞬间立即返回**。
 - **函数体本身不可中断**：Python 无法抢占正在执行的字节码。若函数体已正常返回而 deadline 已到期，调用方**仍抛 `ActantTimeoutError`**——返回值不会被当作成功。
 - **不含任何 `Task.submit` 的 flow 不创建编排外壳**（沿用惰性创建工作流的既有语义），deadline 因此无宿主、不生效。长耗时段落应拆成 `Task.submit`，既能被工作流 deadline 取消，也自动获得任务级硬超时兜底：
 
