@@ -412,8 +412,7 @@ async fn worker_cancel_task_returns_false_for_unknown_task() {
 ///
 /// 任务尚在调度器队列（无 `cancel_flag` 可置）时若只返回 false 而不登记，
 /// 取消请求会被静默丢弃——任务照常执行到完成，`propagate=True` 的级联取消
-/// 形同虚设。远端 `CancelBroadcast` 路径一直是「置 flag + 登记」双写，本地
-/// 路径此前缺了这一半。
+/// 形同虚设。远端 `CancelBroadcast` 路径与本地路径都须「置 flag + 登记」双写。
 #[tokio::test]
 async fn worker_cancel_task_registers_pre_dispatch_cancellation() {
     let worker = make_worker("node-cancel-pending");
@@ -2482,7 +2481,7 @@ async fn forward_remote_task_network_error_returns_error() {
     assert!(result.is_err());
 }
 
-// ───────────────────────── P1：重入队弹跳上限 ─────────────────────────
+// ───────────────────────── 重入队弹跳上限 ─────────────────────────
 
 #[tokio::test]
 async fn record_reroute_bounce_fails_task_after_limit() {
@@ -2501,7 +2500,7 @@ async fn record_reroute_bounce_fails_task_after_limit() {
     assert!(!worker.record_reroute_bounce("task-bounce"));
 }
 
-// ───────────────────────── P1：drain 丢任务补偿 ─────────────────────────
+// ───────────────────────── drain 丢任务补偿 ─────────────────────────
 
 #[tokio::test]
 async fn publish_drained_task_cancellation_publishes_local_cancelled_event() {
@@ -2600,7 +2599,7 @@ async fn publish_drained_task_cancellation_enqueues_remote_result_for_origin() {
     assert_eq!(pending.target, "node-origin");
 }
 
-// ───────────────────────── P1：result_delivery 超限补偿事件 ─────────────────────────
+// ───────────────────────── result_delivery 超限补偿事件 ─────────────────────────
 
 #[tokio::test]
 async fn pending_result_loop_publishes_compensation_event_on_max_attempts() {

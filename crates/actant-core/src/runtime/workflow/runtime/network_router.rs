@@ -122,7 +122,7 @@ impl NetworkEventRouter {
             WireEnvelope::decode(payload)
         };
         let traceparent = decoded.as_ref().and_then(|(_, tp)| tp.clone());
-        // C3：解析入站 W3C traceparent，若成功则：
+        // 解析入站 W3C traceparent，若成功则：
         //   1. 创建 `wire.recv` span，把 traceparent 字符串与解析出的 trace-id/span-id
         //      记录为 span field，便于日志检索与 OTLP 桥接；
         //   2. 通过 `current_trace_scope` 把入站 TraceContext 压入 thread-local，
@@ -169,7 +169,7 @@ impl NetworkEventRouter {
     /// 按话题分类分发已解码的 wire message。
     ///
     /// 在调用方 `wire.recv` span 的 `Instrument` 作用域内执行；`parsed_ctx`
-    /// 在此同步压入 thread-local（guard 生命周期等同本 future，与原先行为一致），
+    /// 在此同步压入 thread-local（guard 生命周期等同本 future），
     /// 使分发路径中的同步 `WireEnvelope::wrap()` 调用延续入站 trace。
     async fn dispatch_topic(
         &self,
@@ -541,7 +541,7 @@ impl NetworkEventRouter {
                 // 重试裁决：orchestrator 判定重试时随响应返回重派发任务，
                 // 由本节点调度器延迟入队（远端执行的 flow 任务其编排者在本
                 // 节点）；终局结果发布到 event_bus，使提交方 `AsyncResult`
-                // 解析（远端执行路径此前没有事件，flow 句柄无法跨节点解析）。
+                // 解析（远端执行路径若无事件，flow 句柄无法跨节点解析）。
                 let retry: Option<(TaskDefinition, u64)> = if result.payload.is_empty() {
                     None
                 } else {

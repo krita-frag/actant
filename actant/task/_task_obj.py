@@ -1,6 +1,6 @@
 """``Task`` 类与 ``@task`` 装饰器。
 
-依赖 ``_async_result``（``AsyncResult`` / ``_resolve_value``）、``_context``
+依赖 ``_async_result``（``AsyncResult`` / ``_resolve_args_with_deps``）、``_context``
 （``TaskContext``）、``_helpers``（``_safe_serialize``）。``actant.flow`` 与
 ``actant.actant`` 的引用延迟导入，避免循环依赖。
 """
@@ -238,8 +238,8 @@ class Task:
 
         # 工作流外壳惰性创建：首个节点提交前持久化空 workflow（含失败策略与
         # 工作流级 deadline）；空 flow 不创建工作流。
-        # 经 flow 侧的唯一入口，顺带在真正建槽**之后**广播 submitted/started
-        # ——此处不再自己写一遍创建块，否则事件时序会再次漂移。
+        # 经 flow 侧的唯一入口创建，顺带在真正建槽**之后**广播 submitted/started
+        # ——创建只此一处，事件时序才能稳定；各自实现一遍会让时序漂移。
         from actant.flow import _ensure_workflow_created
 
         _ensure_workflow_created(runtime, state)

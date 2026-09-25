@@ -268,7 +268,7 @@ pub struct ProcessTaskDispatcher {
     cancel_grace: Duration,
     /// 关闭时终止空闲 worker。
     shutting_down: AtomicBool,
-    /// 任务日志边带出口（N3）。`None` 时 actant_log 行仅经 tracing 转发。
+    /// 任务日志边带出口。`None` 时 actant_log 行仅经 tracing 转发。
     log_bus: Option<EventBus>,
 }
 
@@ -279,7 +279,7 @@ impl ProcessTaskDispatcher {
     /// 核心不解释其中任何语言语义；解释器路径、模块入口与环境变量的拼装由
     /// 绑定层或嵌入方负责（见 [`WorkerLaunchSpec`]）。
     ///
-    /// `log_bus` 是任务日志边带出口（N3）：`Some` 时池内 worker 的
+    /// `log_bus` 是任务日志边带出口：`Some` 时池内 worker 的
     /// `actant_log:` 行发布为 `BusEvent::TaskLog`（tap 语义）；`None` 时仅经
     /// tracing 转发。进程池在构造时即拉起，出口必须在此提供——后置注入会
     /// 错过首批 worker。
@@ -595,7 +595,7 @@ impl ProcessTaskDispatcher {
 /// 指标边带行前缀：worker 经 stderr 单行上报从属计时指标。
 const METRIC_LINE_PREFIX: &str = "actant_metric: ";
 
-/// 任务日志边带行前缀：worker 经 stderr 单行上报任务执行期间日志（N3 档 1）。
+/// 任务日志边带行前缀：worker 经 stderr 单行上报任务执行期间日志。
 /// 行格式：``actant_log: <ts_ms> <level> <task_id> <message>``（message 单行，
 /// 多行文本由 worker 侧拆行）。**跨语言契约**：与帧类型常量同级，改名须两侧同步。
 const LOG_LINE_PREFIX: &str = "actant_log: ";

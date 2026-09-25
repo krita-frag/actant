@@ -48,6 +48,10 @@ def gather(
         b = task2.submit(y)
         c = task3.submit(z)
         results = actant.gather(a, b, c)  # 并行等待，返回 [ra, rb, rc]
+
+    大批量扇出推荐与 :meth:`Task.submit_batch` 配对：``submit_batch`` 用单次
+    Rust 调用投递全部任务（省去 N 次 Python→Rust 边界），``gather`` 并行等待
+    全部完成——即高吞吐基准验证的最优路径（``submit_batch(…); gather(*handles)``）。
     """
     if not handles:
         raise ValueError("gather() requires at least one AsyncResult")

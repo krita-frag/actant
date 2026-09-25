@@ -57,7 +57,7 @@ class OwnerRouter:
         if not self.nodes:
             return None
         owner = ctx.task_name.split("/", 1)[0]
-        # M4 改进：使用 crc32 替代内置 hash()，避免受 PYTHONHASHSEED 影响
+        # 使用 crc32 替代内置 hash()，避免受 PYTHONHASHSEED 影响
         # 导致同一 owner 在不同进程路由到不同节点。
         idx = zlib.crc32(owner.encode("utf-8")) % len(self.nodes)
         return self.nodes[idx]
@@ -89,7 +89,7 @@ class ExponentialBackoffRetry:
     事件记录决策（演示 handler 内组合 effect）。超出上限返回 ``None``（放弃）。
 
     约定 ``attempt`` 从 1 起算（首次失败 attempt=1），与默认 ``DefaultRetryPolicy``
-    的 ``<`` 语义保持一致（H1 改进）。
+    的 ``<`` 语义保持一致。
     """
 
     def __init__(self, max_retries: int = 3) -> None:

@@ -83,7 +83,7 @@ impl From<PyWorkflowState> for Phase {
 /// # 环境变量覆盖
 ///
 /// `ACTANT_DISCOVERY` 环境变量设置时优先于配置的 preset。
-/// 用于无互联网访问、需避开 iroh 公共 relay（N0 preset）的
+/// 用于无互联网访问、需避开 iroh 公共 relay（preset）的
 /// 测试/CI 环境 — 设置 `ACTANT_DISCOVERY=none` 强制离线
 /// `Minimal` preset，使 runtime 无需联系任何外部服务即可立即启动。
 /// 该值与任何 preset 一样通过 discovery 注册表验证。
@@ -484,10 +484,10 @@ pub struct PyActantConfig {
     /// 未指定时取 Rust `WorkflowConfig::default`（3_600_000）。
     #[pyo3(get)]
     pub workflow_default_timeout_ms: u64,
-    /// 用户自定义节点标签（N2），随心跳广播给集群。超 4KB 整体丢弃。
+    /// 用户自定义节点标签，随心跳广播给集群。超 4KB 整体丢弃。
     #[pyo3(get)]
     pub node_labels: BTreeMap<String, String>,
-    // ---- 高级调优字段（E6/E7，默认值全部取自 Rust 侧默认值）----
+    // ---- 高级调优字段（默认值全部取自 Rust 侧默认值）----
     /// Store mmap 上限（字节）。默认 2 GiB。
     #[pyo3(get)]
     pub store_map_size: usize,

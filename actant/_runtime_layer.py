@@ -1,4 +1,4 @@
-"""Layer：capability handler 链的可组合视图（C4 移动性拆分自 `_runtime.py`）。
+"""Layer：capability handler 链的可组合视图。
 
 独立于 Runtime 内部实现：经构造器注入 runtime 与 capability 元数据，
 对 handler 列表的操作直接作用于 ``runtime._layers[name]``。
@@ -45,22 +45,17 @@ class Layer:
         handler 立即注册到 Runtime，对后续 **Python 端** effect 调用可见。
 
         .. warning::
-            ``start()`` 后追加 Rust-backed capability（如 ``Execute`` / ``Store`` /
-            ``Transport``）的 handler 存在**预期外限制**：
-            Rust 内部分发路径（如 Worker 执行任务时调用 ``task_dispatcher.dispatch()``）
-            **不经过** Python ``_layers``，因此新追加的 Python handler 不会被
-            Rust 内部调用所咨询。Python handler 仅在用户代码显式调用
-            ``actant.ask/perform/emit(name, ...)`` 时生效。
+            **Python handler 永不进入 Rust 内部 dispatch。** Rust 内部分发路径
+            （如 Worker 执行任务时调用 ``task_dispatcher.dispatch()``）不经过
+            Python ``_layers``——无论 ``start()`` 前后注册，Python handler 仅
+            在用户代码显式调用 ``actant.ask/perform/emit(name, ...)`` 时生效。
 
-            如需覆盖 Rust 内部 dispatch 行为（如自定义任务执行逻辑），
-            ``Runtime.layer(name).chain(handler)`` **做不到**——它只登记在
-            Python 侧，不会桥接到 Rust（桥接能力 ``PyCapabilityRuntime``
-            的 ``chain_python_handler`` 存在，但 Python 层默认不调用它）。
-            要走通请用 Rust 侧配置（``RuntimeBuilder``），或在 Rust 嵌入场景
-            下显式 ``register_execute_handler`` 等注册函数。
+            覆盖 Rust 内部行为（如自定义任务执行逻辑）应使用 Rust 侧配置
+            （``RuntimeBuilder`` 的 ``with_*`` 注入缝），或 Rust 嵌入场景下显式
+            ``register_execute_handler`` 等注册函数。
 
             纯 Python capability（``Routing`` / ``Scheduling`` / ``RetryPolicy``）
-            无此限制——它们始终走 Python 分发路径，``start()`` 后追加立即生效。
+            始终走 Python 分发路径，无此限制。
         """
         if not callable(handler):
             raise TypeError(f"handler must be callable, got {type(handler)}")
@@ -75,10 +70,9 @@ class Layer:
                     "this Python handler will NOT be consulted by Rust-internal "
                     "dispatch paths (e.g. Worker task execution). It only takes "
                     "effect for Python-initiated actant.ask/perform/emit calls. "
-                    "For Routing/Scheduling/RetryPolicy this is fine (Python-only "
-                    "capabilities). For Execute/Store/Transport, "
-                    "register before start() or configure Rust-side handlers via "
-                    "RuntimeBuilder to override Rust-internal behavior.",
+                    "This is expected for Routing/Scheduling/RetryPolicy "
+                    "(Python-only capabilities). To override Rust-internal "
+                    "behavior, configure Rust-side handlers via RuntimeBuilder.",
                     self._meta.name,
                 )
         return self

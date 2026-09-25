@@ -1,4 +1,4 @@
-//! 纯 Rust 嵌入示例（X2）：**框架化验收实验**。
+//! 纯 Rust 嵌入示例。
 //!
 //! 目标：在不依赖 PyO3 / Python 解释器的前提下，用 Actant 核心 API 跑通
 //! 「提交 → DAG 依赖 → 任务执行 → 结果聚合」全链路：
@@ -176,6 +176,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     worker_task.abort();
     runtime.shutdown().await?;
-    println!("X2 验收通过：纯 Rust 引擎跑通 提交 → DAG → 执行 → 聚合 全链路");
+    println!("验收通过：纯 Rust 引擎跑通 提交 → DAG → 执行 → 聚合 全链路");
     Ok(())
 }

@@ -310,8 +310,8 @@ fn cancel_task_cancels_running_task_only() {
 /// 回归：fail-fast（默认）策略下「全部节点被取消」必须使工作流进入
 /// `Cancelled` 终态。
 ///
-/// 此前终态判定为 `succeeded + skipped == total` 走 Completed、且仅 continue
-/// 策略才检查「全部节点终态」。全取消（succeeded=0）既不满足和式、又不进
+/// 终态判定不能只按 `succeeded + skipped == total` 走 Completed、且仅 continue
+/// 策略才检查「全部节点终态」：全取消（succeeded=0）既不满足和式、又不进
 /// continue 分支，工作流永久停在 `Running`——flow 的终态轮询
 /// （`_wait_terminal_and_emit`）因此永不返回，表现为测试挂起。
 #[test]

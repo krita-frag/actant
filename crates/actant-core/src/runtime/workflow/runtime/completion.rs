@@ -1,11 +1,11 @@
-//! Worker 完成结算与结果投递辅助（C1 移动性拆分自 `runtime.rs`）。
+//! Worker 完成结算与结果投递辅助。
 //!
 //! 本文件承载任务完成路径的纯辅助逻辑：
 //! - `is_worker_crash`：dispatcher 结果的崩溃分类；
 //! - `build_completion_from_dispatch_result`：派发结果 → `TaskCompletion` 映射
 //!   （超时/取消/业务失败的终态归类）；
 //! - `settle_local_completion`：本地任务终态结算入口（编排回灌 + 事件发布）；
-//! - `OrchestratorBridge`：本地结果 → orchestrator 的回灌桥（X2，仅 Rust 嵌入启用）；
+//! - `OrchestratorBridge`：本地结果 → orchestrator 的回灌桥（仅 Rust 嵌入启用）；
 //! - `publish_drained_task_cancellation`：drain 丢弃任务的 Cancelled 通知。
 //!
 //! 全部为模块级自由函数/类型；Worker 主循环（`runtime.rs`）按名调用。
@@ -226,10 +226,10 @@ pub(super) async fn settle_local_completion(
     pending_capacity: usize,
     orchestrator_bridge: Option<&OrchestratorBridge>,
 ) {
-    // 本地编排回灌（X2 验收实验发现的缺口）：workflow 任务的完成事件此前只
-    // 发布到 EventBus——Python 路径的后继派发由「提交方阻塞解析依赖 + 事件泵
-    // 回灌」驱动，而 Rust 原生 DAG 提交（submit + start）没有事件泵，依赖
-    // 推进产出的后继任务无人入队，DAG 永不推进。core 内补齐：Completed 经
+    // 本地编排回灌：workflow 任务的完成事件除发布到 EventBus 外，还回灌
+    // orchestrator——Python 路径的后继派发由「提交方阻塞解析依赖 + 事件泵
+    // 回灌」驱动，而 Rust 原生 DAG 提交（submit + start）没有事件泵，若不回灌，
+    // 依赖推进产出的后继任务无人入队，DAG 永不推进。core 内补齐：Completed 经
     // COMPLETE_TASK 通道取 ready_successors 入队；Failed 经 ON_TASK_RESULT
     // 做重试裁决（bridge.ingest 内部处理）。
     if let Some(bridge) = orchestrator_bridge {
@@ -268,7 +268,7 @@ pub(super) async fn settle_local_completion(
     .await;
 }
 
-/// 本地结果 → orchestrator 的回灌桥（X2）。
+/// 本地结果 → orchestrator 的回灌桥。
 ///
 /// 持有 ON_TASK_RESULT 通道两端（actor_system + workflow_actor_id）与调度器
 /// 引用；`ingest` 返回 `Some(OrchestratorRetry)` 表示 orchestrator 裁决重试。

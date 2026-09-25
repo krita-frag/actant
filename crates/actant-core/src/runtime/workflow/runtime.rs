@@ -205,9 +205,9 @@ pub struct Worker {
     capability_gossip: Option<Arc<crate::runtime::capability::gossip::CapabilityGossipActor>>,
     /// 远端 peer 容量视图，用于 unrouted task 的自动路由。
     failover: Option<Arc<crate::runtime::workflow::FailoverManager>>,
-    /// 远端路由策略（G-route）：默认内置实现，可经 `with_route_policy` 注入。
+    /// 远端路由策略：默认内置实现，可经 `with_route_policy` 注入。
     route_policy: Arc<dyn crate::runtime::workflow::RoutePolicy>,
-    /// 本地编排回灌桥开关（X2）：仅 Rust 嵌入（无 Python 事件泵）开启。
+    /// 本地编排回灌桥开关：仅 Rust 嵌入（无 Python 事件泵）开启。
     /// Python 绑定层保持关闭——事件泵已承担同职责，双重回灌会产生重试
     /// 裁决竞态。
     orchestrator_ingest: bool,
@@ -419,19 +419,19 @@ impl Worker {
         self
     }
 
-    /// 返回 failover 管理器句柄（节点可见性 N2：`peers()` 数据源）。
+    /// 返回 failover 管理器句柄（`peers()` 数据源）。
     pub fn failover_manager(&self) -> Option<Arc<crate::runtime::workflow::FailoverManager>> {
         self.failover.clone()
     }
 
-    /// 开关本地编排回灌桥（X2）：仅 Rust 嵌入（无 Python 事件泵）开启。
+    /// 开关本地编排回灌桥：仅 Rust 嵌入（无 Python 事件泵）开启。
     /// 详见 [`RuntimeBuilder::with_orchestrator_ingest`]。
     pub fn with_orchestrator_ingest(mut self, enabled: bool) -> Self {
         self.orchestrator_ingest = enabled;
         self
     }
 
-    /// 注入自定义远端路由策略（G-route）。未注入时使用内置
+    /// 注入自定义远端路由策略。未注入时使用内置
     /// [`DefaultRoutePolicy`]（心跳新鲜度过滤 + 槽位比较）。
     pub fn with_route_policy(
         mut self,
@@ -496,9 +496,9 @@ impl Worker {
     /// `cancel_flag`）时，把请求登记到「派发前取消」注册表（`cancelled_tasks`）：
     /// 主循环取出该任务时据此短路为 `TaskCompletion::Cancelled`，不执行任务体。
     ///
-    /// **为什么必须双写**：远端的 `CancelBroadcast` 路径一直是「置 flag +
-    /// 登记注册表」双写（见 `runtime/network_router.rs` 的 `TopicRoute::Cancel`），
-    /// 而本地路径此前只置 flag。未进执行的任务没有 flag 可置，本地取消请求因此
+    /// **为什么必须双写**：远端与本地取消路径都须「置 flag +
+    /// 登记注册表」双写（见 `runtime/network_router.rs` 的 `TopicRoute::Cancel`）。
+    /// 只置 flag 时，未进执行的任务没有 flag 可置，本地取消请求因此
     /// 被静默丢弃——任务照常执行到完成，`propagate=True` 的级联取消形同虚设。
     ///
     /// 返回 `true` 表示存在运行中的任务且已置位取消标志；返回 `false` 表示没有
@@ -1196,7 +1196,7 @@ impl Worker {
 
             // 崩溃故障转移用捕获：scheduler（重入队）、崩溃重路由上限与延迟。
             let scheduler_for_failover = self.scheduler.clone();
-            // X2 本地编排回灌桥：仅当开关开启且绑定了 workflow actor。
+            // 本地编排回灌桥：仅当开关开启且绑定了 workflow actor。
             // 缺省关闭——Python 绑定层的事件泵承担同职责，双重回灌会产生
             // 重试裁决竞态。
             let orchestrator_bridge = if self.orchestrator_ingest {
@@ -1229,7 +1229,7 @@ impl Worker {
             // 本地派发状态推进（Running）。
             //
             // 远端任务经 gossip 的 `MARK_TASK_RUNNING` 进入 Running；本地路径
-            // 此前只记录 `TaskDispatched` 历史而**无状态迁移**，任务在整个执行
+            // 若只记录 `TaskDispatched` 历史而**不做状态迁移**，任务在整个执行
             // 期间仍是 `Pending`。这会让本地任务的真实失败与「编排合成的、从未
             // 派发的失败」无法区分——`handle_task_failure` 的迟到守卫据此丢弃
             // 前者，重试永不触发、任务永远停在 Pending。
@@ -1412,7 +1412,7 @@ impl Worker {
                 // 硬超时由 ProcessTaskDispatcher 内部执行：dispatch 以
                 // `effective_timeout` 为硬上限，超时后立即强杀对应 worker 进程
                 // 并回收并发槽位（kill_and_replace，不等待取消宽限），返回
-                // `Err(ActantError::Timeout)`。Worker 侧不再套内层 tokio 超时。
+                // `Err(ActantError::Timeout)`。Worker 侧不套内层 tokio 超时。
                 // 用 catch_unwind 包裹 dispatcher future，避免 spawn 句柄被丢弃后
                 // panic 让 workflow 永久挂起。panic 时降级为 TaskCompletion::Failed。
                 use futures::future::FutureExt as _;
@@ -1626,7 +1626,7 @@ impl Worker {
 /// dispatcher.dispatch 的结果类型别名，避免在 spawn 与测试中长期写嵌套 Result。
 ///
 /// 无 `Elapsed` 外层：硬超时由 `ProcessTaskDispatcher` 内部强杀 worker 后
-/// 返回 `Err(ActantError::Timeout)`，不再依赖外层 tokio 超时。
+/// 返回 `Err(ActantError::Timeout)`，不依赖外层 tokio 超时。
 /// 判定一次派发是否为**进程崩溃**（worker 子进程异常退出），而非业务失败或硬超时。
 ///
 /// `Ok(Err(ActantError::Worker(_)))`：dispatcher 在读取结果帧时读到 EOF / 写入失败 /

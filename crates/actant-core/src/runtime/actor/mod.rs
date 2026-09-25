@@ -16,7 +16,7 @@
 //! - [`system`]：`ActorSystem` facade + `RunningActor` 私有循环
 //!
 //! 定位：**系统 actor 专用本地运行时**。本模块不做任何持久化——
-//! 工作流恢复由 orchestrator 的统一工作流历史（S0）唯一承载，
+//! 工作流恢复由 orchestrator 的统一工作流历史唯一承载，
 //! 不存在 mailbox 重放等第二恢复路径。
 
 pub mod mailbox;

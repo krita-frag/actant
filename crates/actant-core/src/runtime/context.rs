@@ -22,7 +22,7 @@ use crate::runtime::builder::{init_worker, WorkerInitParams};
 /// 非 Actor 化后台任务的取消句柄集合类型。
 ///
 /// 使用 `parking_lot::Mutex` 而非 `std::sync::Mutex`，避免持锁线程 panic 后
-/// 传播 poison 错误导致 `shutdown` 路径也 panic（C2 改进）。
+/// 传播 poison 错误导致 `shutdown` 路径也 panic。
 type BackgroundCancels = parking_lot::Mutex<Vec<tokio::sync::watch::Sender<bool>>>;
 
 /// Actant 统一运行时。
@@ -228,7 +228,7 @@ impl Runtime {
 
         // 每个 actor stop 设超时，确保 network.shutdown() 总能被执行。
         // actor stop 卡住时（如网络阻塞），放弃等待——endpoint.close() 会使
-        // 其网络调用自然失败。超时由 config.actor.stop_timeout_ms 控制（M1 改进）。
+        // 其网络调用自然失败。超时由 config.actor.stop_timeout_ms 控制。
         let stop_timeout = std::time::Duration::from_millis(self.config.actor.stop_timeout_ms);
 
         // 0. 先取消非 Actor 化的后台循环（如 capability gossip），

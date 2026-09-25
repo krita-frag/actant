@@ -91,7 +91,7 @@ impl Drop for DagGossip {
 impl DagGossip {
     /// 从任意 [`Transport`] 实现创建一个 `DagGossip`。
     ///
-    /// `DagGossip` 不再直接持有 `Orchestrator`，而是通过 `actor_system`
+    /// `DagGossip` 不直接持有 `Orchestrator`，而是通过 `actor_system`
     /// 向 `WorkflowActor` 发送消息，使编排器状态完全由 Actor 独占持有。
     pub fn new(
         network: Arc<dyn Transport>,

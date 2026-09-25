@@ -56,7 +56,7 @@ fn empty_key_disables_signing() {
     assert_eq!(&verified, payload);
 }
 
-// --- Wire MAC（D2）---
+// --- Wire MAC ---
 
 #[test]
 fn wire_mac_roundtrip() {
@@ -100,7 +100,7 @@ fn wire_mac_wrong_length_fails() {
     assert!(verify_wire_mac(b"key", b"bytes", &short).is_err());
 }
 
-/// 回归测试（SE1）：所有字节位错的 MAC 都应被拒绝，且不依赖前缀提前返回。
+/// 回归测试：所有字节位错的 MAC 都应被拒绝，且不依赖前缀提前返回。
 ///
 /// 必须使用 `subtle::ConstantTimeEq` 恒定时间比较：`==` 的短路语义会因前缀不匹配提前返回，泄露时间侧信道
 /// 后，无论错位在 MAC 的哪个字节，行为应一致。
@@ -316,7 +316,7 @@ proptest! {
     }
 }
 
-// C5：payload 签名/验证直测（关键路径）。
+// payload 签名/验证直测（关键路径）。
 //
 // `sign`/`verify` 是任务载荷完整性防线的唯一实现：提交侧签名（builder 注入
 // 密钥）、worker 侧派发前验证（dispatcher）、执行编排侧构造带 MAC 的节点
@@ -404,7 +404,7 @@ fn unsigned_input_rejected_when_key_set() {
 
 #[test]
 fn wire_mac_incremental_matches_buffered() {
-    // C2 字节序不变红线：分段喂 hasher 与单缓冲必须产出同一 MAC。
+    // 字节序不变红线：分段喂 hasher 与单缓冲必须产出同一 MAC。
     let segs: Vec<&[u8]> = vec![b"version-byte", PAYLOAD, b"traceparent", &[0x00]];
     let joined: Vec<u8> = segs.concat();
     assert_eq!(wire_mac_incremental(KEY, &segs), wire_mac(KEY, &joined));

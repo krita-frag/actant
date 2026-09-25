@@ -290,7 +290,7 @@ def test_collect_dep_ids_pending_failure_propagates() -> None:
 
 
 def _no_await_threads() -> None:
-    """await 桥接不得派生 ``actant-await`` 守护线程（D6 回归）。"""
+    """await 桥接不得派生 ``actant-await`` 守护线程（回归）。"""
     assert not any(t.name == "actant-await" for t in threading.enumerate())
 
 

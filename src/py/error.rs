@@ -8,7 +8,7 @@ use actant_core::common::ActantError;
 //
 // Python 异常类对象经 OnceLock 缓存为单例（而非 create_exception! 派生独立类型），
 // 中 Python 定义的类形成两套独立继承链，导致 Rust 抛出的异常无法被
-// `except actant.ActantError` 捕获。改为缓存 Python 端的类对象，使
+// `except actant.ActantError` 捕获。缓存 Python 端的类对象，使
 // `impl From<ActantError> for PyErr` 抛出的就是 Python 端的类。
 static EXC_ACTANT: OnceLock<Py<PyAny>> = OnceLock::new();
 static EXC_STORAGE: OnceLock<Py<PyAny>> = OnceLock::new();
@@ -55,7 +55,7 @@ fn make_pyerr(cls: &OnceLock<Py<PyAny>>, message: &str) -> PyErr {
 /// 使用 `register_exceptions` 中缓存的 Python 端异常类构造 `PyErr`，
 /// 确保 Rust 抛出的异常与 Python 用户 `except` 的类是同一个，
 /// 跨语言边界保留错误类型信息。
-/// F2a：孤儿规则禁止跨 crate 实现 `From<ActantError> for PyErr`——
+/// 孤儿规则禁止跨 crate 实现 `From<ActantError> for PyErr`——
 /// 改用自由函数；调用点经 `actant_error_to_pyerr(x)` 的全部替换为 `actant_error_to_pyerr(x)`。
 pub fn actant_error_to_pyerr(err: ActantError) -> PyErr {
     let message = err.to_string();
@@ -95,7 +95,7 @@ pub fn register_exceptions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     macro_rules! reg {
         ($lock:ident, $name:literal) => {{
             let cls: Py<PyAny> = exc_mod.getattr(pyo3::intern!(py, $name))?.into();
-            // PyO3 0.29 中 `Py<T>` 不再直接 impl Clone；通过 `clone_ref(py)`
+            // `Py<T>` 不直接 impl Clone；通过 `clone_ref(py)`
             // 显式克隆引用，一份给 OnceLock 缓存，一份注册到模块。
             let _ = $lock.set(cls.clone_ref(py));
             m.add($name, cls)?;

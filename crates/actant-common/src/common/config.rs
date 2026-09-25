@@ -109,13 +109,13 @@ pub struct ActantConfig {
     /// 调用 validate，因此无法绕过。
     #[serde(default)]
     pub require_payload_signing: bool,
-    /// 用户自定义节点标签（N2），随心跳广播给集群。
+    /// 用户自定义节点标签，随心跳广播给集群。
     ///
     /// 总字节量（key + value 长度之和）超过 [`crate::common::model::NODE_LABELS_MAX_BYTES`]
     /// 时心跳整体置空标签并告警。
     #[serde(default)]
     pub node_labels: BTreeMap<String, String>,
-    /// 宿主语言运行时描述（N1），由绑定层填充（如 "CPython 3.12.1"）。
+    /// 宿主语言运行时描述，由绑定层填充（如 "CPython 3.12.1"）。
     /// 核心/纯 Rust 嵌入为 `None`。核心自动填充 os/arch/actant_version。
     #[serde(default)]
     pub node_host_runtime: Option<String>,
@@ -152,7 +152,7 @@ impl ActantConfig {
 pub struct ActorConfig {
     pub mailbox_capacity: usize,
     /// 单个 Actor stop 超时（毫秒）。超时后放弃等待，使 shutdown 路径总能完成
-    /// （如 network.shutdown）。默认 500ms（M1 改进：从硬编码提取为配置）。
+    /// （如 network.shutdown）。默认 500ms（从硬编码提取为配置）。
     pub stop_timeout_ms: u64,
 }
 
@@ -380,7 +380,7 @@ pub struct NetworkConfig {
     /// 其他节点通过相同域查询。
     #[serde(default)]
     pub dns_origin_domain: String,
-    /// 自定义 relay 集群 URL 列表（G-relay）。
+    /// 自定义 relay 集群 URL 列表。
     ///
     /// 非空时以 `RelayMode::Custom` **覆盖** preset 自带的 relay 配置
     /// （discovery 与 relay 正交：preset 决定发现机制，本字段决定中继）。
@@ -551,7 +551,7 @@ impl Default for StoreConfig {
     }
 }
 
-/// EventBus 配置（F5 下移：纯配置结构，与 runtime 无依赖）。
+/// EventBus 配置（纯配置结构，与 runtime 无依赖）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventBusConfig {
     /// 每个订阅者的默认通道容量。

@@ -138,7 +138,7 @@ impl Orchestrator {
 
         // **不要**写成"先判存在、再 get().expect()"：两次取表之间有窗口，
         // 并发的 `evict_workflow` / `remove_workflow` 会让第二次拿到 `None`
-        // 然后 panic（审查发现的 TOCTOU）。这里一次取表到底，不存在就走缓冲。
+        // 然后 panic。这里**一次取表到底**（先取后验，避免 TOCTOU），不存在就走缓冲。
         // `buffer_signal` 只碰 `pending_signals`（另一张表），故持着本表 guard
         // 调用它不会死锁。
         let Some(table) = self.state.waitpoints.get(workflow_id) else {

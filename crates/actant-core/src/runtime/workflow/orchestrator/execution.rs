@@ -328,7 +328,7 @@ impl Orchestrator {
     /// Pending（attempt 同步递增，fencing 前提），返回重派发的
     /// [`TaskDefinition`] 与重试间隔，调用方延迟入队调度器；余量耗尽或不可
     /// 重试 → 回退到既有 `WorkflowLevel` 失败语义。派发侧 payload 头部
-    /// retries 已剥离（Python flow 提交路径置 0），worker 层不再重试，两层
+    /// retries 为 0（Python flow 提交路径置 0），worker 层不重试，两层
     /// 不会叠加。
     ///
     /// 返回 `None` 表示失败为最终结果，调用方应将结果事件发布给提交方。
@@ -895,8 +895,8 @@ impl Orchestrator {
     ///
     /// 取消是终态事件：若本次取消使工作流全部节点终态（典型为「最后一个在途
     /// 节点被取消」），立即走 [`Self::complete_terminal`] 收尾——持久化终态
-    /// 快照、追加终态事件、更新指标并唤醒等待者。此前该路径只改节点状态、
-    /// 不触发收尾，工作流会永久停留在 `Running`（flow 的终态轮询因此挂起）。
+    /// 快照、追加终态事件、更新指标并唤醒等待者——取消必须触发收尾，否则
+    /// 工作流会永久停留在 `Running`（flow 的终态轮询因此挂起）。
     pub async fn cancel_task(&self, workflow_id: &WorkflowId, task_id: &TaskId) -> Result<bool> {
         let (cancelled, terminal_snapshot) = {
             let mut slot = self.state.slots.get_mut(workflow_id).ok_or_else(|| {
@@ -938,7 +938,7 @@ impl Orchestrator {
     /// Spawns a background task that periodically checks for expired workflows
     /// and marks them failed. Returns a watch sender for shutdown signaling.
     ///
-    /// B2：当 `network` 已注入时，超时处理路径会主动广播 `CancelBroadcast`
+    /// 当 `network` 已注入时，超时处理路径会主动广播 `CancelBroadcast`
     /// 给所有正在运行的任务，触发本地与远端 Worker 协作式取消。这确保
     /// 即使任务自身没有超时（per-task timeout），工作流级硬超时也能及时
     /// 释放资源。未注入 `network` 时（如单元测试）仅标记状态，不广播取消。
@@ -968,7 +968,7 @@ impl Orchestrator {
                         // 避免在 expired 列表较长时产生 N 次独立 LMDB 事务。
                         let mut persist_batch: Vec<(String, Vec<u8>)> = Vec::new();
                         let mut to_fire: Vec<WorkflowId> = Vec::new();
-                        // B2：收集 (workflow_id, task_id) 对，统一在持久化后广播取消。
+                        // 收集 (workflow_id, task_id) 对，统一在持久化后广播取消。
                         // 先收集再 mark_workflow_failed，因为 mark 会将 Running 状态
                         // 改为 Failed，导致 running_task_ids 在后续读取时为空。
                         let mut cancels_to_broadcast: Vec<(WorkflowId, TaskId)> = Vec::new();
@@ -1034,7 +1034,7 @@ impl Orchestrator {
                                 }
                             }
                         }
-                        // B2：广播取消消息。即使持久化失败也要尝试取消，否则运行中的
+                        // 广播取消消息。即使持久化失败也要尝试取消，否则运行中的
                         // 任务会继续占用 Worker 槽位直到自身完成或超时。
                         //
                         // 注意这里有**两条腿**，缺一不可：
@@ -1096,8 +1096,8 @@ impl Orchestrator {
 
                         // 扫描到期的 `Timer` 等待点。
                         //
-                        // 此前 `poll_expired_timers` 的唯一调用者是测试——生产路径
-                        // 没有任何定时任务调用它，导致 Timer 类等待点**永不自动到期**，
+                        // Timer 类等待点必须自动到期：生产路径若无定时任务调用
+                        // `poll_expired_timers`，等待点**永不自动到期**，
                         // 在等待点 park 的 flow 线程永久挂起。这里复用超时 watcher 已有
                         // 的轮询周期（`state_poll_interval_ms`），故：
                         //   **等待点唤醒延迟上界 = state_poll_interval_ms（默认 500ms）**。
@@ -1261,7 +1261,7 @@ impl Orchestrator {
     ///
     /// The `mode` parameter controls the scope:
     /// - `FailureScope::TaskOnly`: Only mark the task as Failed. The workflow
-    ///   remains non-terminal. 当前生产路径不再使用（重试裁决在
+    ///   remains non-terminal. 当前生产路径不使用（重试裁决在
     ///   `handle_task_failure` 内完成，失败终局一律 WorkflowLevel），
     ///   保留供 DAG 层 API 完整性与绕过入口的最终防线。
     /// - `FailureScope::WorkflowLevel`: Mark the task as Failed AND apply workflow-level
@@ -1498,8 +1498,8 @@ impl Orchestrator {
     /// 全量扫描兜底。
     ///
     /// 同时释放该工作流**等待点 park 的等待者**。`AsyncResult` 的等待由
-    /// `BusEvent::TaskCancelled` 结算，而等待点 park 是另一条阻塞原语，此前唯一
-    /// 的释放点是运行时的 `release_all_wait_point_waiters`（关停）。缺了这一步，
+    /// `BusEvent::TaskCancelled` 结算，而等待点 park 是另一条阻塞原语，
+    /// 仅靠运行时关停的 `release_all_wait_point_waiters` 释放不够：缺了这一步，
     /// cancel / fail / deadline 都到不了 park 中的 flow 体——工作流已终态而函数体
     /// 永久挂起（实测：8s 观察窗内纹丝不动）。
     /// 三个终态入口（`fail_task` / `complete_terminal` / `mark_workflow_failed`）

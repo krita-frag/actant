@@ -466,7 +466,7 @@ pub fn dict_response<'py>(py: Python<'py>) -> Bound<'py, PyDict> {
 // `IntoPyObject`，使 codec 可以一次性 `extract()` / `into_pyobject()` 完成转换，
 // 避免逐字段重复 getattr/set_item。Python 侧仍使用 dataclass，无需同步修改。
 
-/// F2a：孤儿规则禁止跨 crate 实现 `FromPyObject`——由 codec 的
+/// 孤儿规则禁止跨 crate 实现 `FromPyObject`——由 codec 的
 /// `decode_request` 直接调用本函数替代 trait 实现。
 fn extract_serializationreq(ob: &Bound<'_, PyAny>) -> PyResult<SerializationReq> {
     let op: String = get_string(ob, "op")?;
@@ -484,7 +484,7 @@ fn extract_serializationreq(ob: &Bound<'_, PyAny>) -> PyResult<SerializationReq>
     }
 }
 
-/// F2a：孤儿规则禁止跨 crate 实现 `FromPyObject`——由 codec 的
+/// 孤儿规则禁止跨 crate 实现 `FromPyObject`——由 codec 的
 /// `decode_request` 直接调用本函数替代 trait 实现。
 fn extract_storereq(ob: &Bound<'_, PyAny>) -> PyResult<StoreReq> {
     let op: String = get_string(ob, "op")?;
@@ -851,7 +851,7 @@ macro_rules! capability_registry {
 
         /// 异步 perform 分发：返回 `asyncio.Future`，不阻塞 Python 主线程。
         ///
-        /// P1 优化：原 `dispatch_perform` 在 Python 主线程上
+        /// 与同步 `dispatch_perform` 的差异：同步实现于 Python 主线程上
         /// `py.detach(|| tokio.block_on(...))` 同步阻塞，无法在 asyncio
         /// 上下文中并发执行多个 perform。异步版本将 Rust Future 通过
         /// `future_into_py_iter` 转为 `asyncio.Future`，在 tokio runtime

@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 /// 为 ID 新类型生成统一访问器与 trait 实现。
 ///
-/// 内部字符串为 `pub`：F2a 拆分后 core 需直接读取（日志/格式化/测试断言），
+/// 内部字符串为 `pub`：core 需直接读取（日志/格式化/测试断言），
 /// 跨 crate 的 `pub(crate)` 不可见。构造仍走 `generate()`/`new()`/`From`。
 ///
 /// `#[serde(transparent)]` 与 rkyv derive 保持序列化二进制兼容（与 `pub String` 时期一致）。
@@ -546,7 +546,7 @@ pub struct ActorMessageResult {
     pub error: Option<ActorErrorEnvelope>,
 }
 
-/// 节点宿主平台信息，随心跳广播（节点可见性 N1）。
+/// 节点宿主平台信息，随心跳广播（节点可见性）。
 ///
 /// 核心自动填充 `os`/`arch`/`actant_version`；`host_runtime` 由绑定层补充
 /// （如 Python 层填 `platform.python_version()`），核心不感知任何语言语义。
@@ -586,7 +586,7 @@ pub fn node_labels_within_limit(labels: &std::collections::BTreeMap<String, Stri
     labels.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>() <= NODE_LABELS_MAX_BYTES
 }
 
-/// 混合逻辑时钟时间戳（F5 下移至 common：wire 协议依赖此类型）。
+/// 混合逻辑时钟时间戳（wire 协议依赖此类型）。
 #[derive(
     Debug,
     Clone,
@@ -813,7 +813,7 @@ mod hlc_merge_tests {
 
     #[test]
     fn merge_after_drift_cap_is_monotonic() {
-        // 复现报告 P0 场景：远端超出 drift 上限被 cap 后，
+        // 场景：远端超出 drift 上限被 cap 后，
         // 后续携带较旧时间戳的常态 merge 不得造成 (T, 0) 回退。
         let now = HybridLogicalClock::physical_now();
         let clock = HybridLogicalClock::with_max_drift_ms(500);

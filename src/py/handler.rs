@@ -9,7 +9,7 @@
 //! （后者经 `PyCapabilityRuntime` 暴露，需显式调用）。因此**双分发仍然存在**——
 //! Python handler 默认只在用户代码显式 `actant.ask/perform/emit` 时生效，
 //! 不参与 Rust 内部 dispatch。接线与否是一项独立决策，未接线前不要照本段
-//! 第一句的描述去推断运行时行为（审查 2026-09-18 修订）。
+//! 第一句的描述去推断运行时行为。
 
 use std::any::Any;
 use std::sync::Arc;

@@ -31,7 +31,7 @@ class TestCapabilityMetadata:
     def test_builtin_capabilities_excludes_python_only(self, cap_rt: _CapabilityRuntime) -> None:
         """Rust 不暴露 Routing/Scheduling/RetryPolicy——它们是纯 Python 策略。"""
         names = {name for name, _ in cap_rt.builtin_capabilities()}
-        # Rust 暴露的 5 个 capability（Execute 随 F4、Transport 随 0.3.6 减法删除）
+        # Rust 暴露的 5 个 capability
         expected = {
             "Serialization",
             "Store",

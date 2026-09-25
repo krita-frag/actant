@@ -103,7 +103,7 @@ def fetch_with_retry(repo: str, max_retries: int = 3) -> tuple[list[IssueRecord]
                 return [], last_err
             # 指数退避节奏（决策与节奏分离），上限 4s。
             # 注意：此为示例简化，生产环境应在独立线程池或异步任务中执行
-            # 阻塞 IO，避免阻塞 capability handler 调度线程（H6 说明）。
+            # 阻塞 IO，避免阻塞 capability handler 调度线程。
             time.sleep(min(0.5 * (2 ** (attempt - 1)), 4.0))
 
 
@@ -125,7 +125,7 @@ def run_pipeline(work_dir: Path, repos: list[str] | None = None) -> AnalysisRepo
     audit = AuditLogger(audit_path)
     store = FileResultStore(work_dir)
 
-    # 使用 try/finally 确保 AuditLogger 文件句柄在异常路径下也正确释放（H5 改进）。
+    # 使用 try/finally 确保 AuditLogger 文件句柄在异常路径下也正确释放。
     # AuditLogger 也实现了 __enter__/__exit__，可作为上下文管理器使用。
     try:
         with Runtime.with_defaults() as rt:

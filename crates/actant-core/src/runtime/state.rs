@@ -526,7 +526,7 @@ impl Drop for WriteBatcher {
 
         if !join.is_finished() {
             // 剩余丢失窗口：LMDB 写事务阻塞超过 drain 超时（磁盘慢/锁竞争）
-            // 时，Drop 不再等待。此处不 abort——丢弃 JoinHandle 仅解除
+            // 时，Drop 不等待。此处不 abort——丢弃 JoinHandle 仅解除
             // 关联，后台线程在通道已关闭的前提下仍会完成最终 flush；但若
             // 进程随 Drop 立即退出，缓冲中的残留条目将丢失。依赖"已返回
             // Ok 的写入在正常 Drop 路径不丢"的关键调用方应显式
@@ -737,7 +737,7 @@ impl Store {
     /// 异步优雅关闭 LMDB 环境。
     ///
     /// 返回 `Result` 以便调用方处理 `spawn_blocking` 任务 panic（如 LMDB 内部错误），
-    /// 而非直接 panic 整个进程（L4 改进）。
+    /// 而非直接 panic 整个进程。
     pub async fn prepare_close(&self) -> Result<heed::EnvClosingEvent> {
         let store = self.inner.clone();
         let event = tokio::task::spawn_blocking(move || store.prepare_close())

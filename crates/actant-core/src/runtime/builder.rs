@@ -159,7 +159,7 @@ fn load_or_create_identity(data_dir: &Path) -> Result<iroh::SecretKey, ActantErr
 
 /// 初始化 orchestrator，可选持久化。
 ///
-/// `event_log_override`（F4）非 `None` 时以注入实现替换默认 LMDB 事件日志
+/// `event_log_override` 非 `None` 时以注入实现替换默认 LMDB 事件日志
 ///（无 store 的纯内存场景注入值同样生效）。
 pub async fn init_orchestrator(
     data_dir: Option<&str>,
@@ -202,10 +202,10 @@ pub struct WorkerInitParams<'a> {
     pub node_id: &'a NodeId,
     pub network: &'a Arc<dyn Transport>,
     pub event_bus: EventBus,
-    /// 预构造调度器（F4 注入）。`Some` 时忽略 `scheduler_kind` 字符串——
+    /// 预构造调度器（注入）。`Some` 时忽略 `scheduler_kind` 字符串——
     /// 直接以该实现 spawn（包为 SchedulerActor）。
     pub scheduler: Option<Arc<dyn crate::runtime::workflow::Scheduler>>,
-    /// 本地编排回灌桥开关（X2），透传给 Worker。Python 绑定层保持 false。
+    /// 本地编排回灌桥开关，透传给 Worker。Python 绑定层保持 false。
     pub orchestrator_ingest: bool,
     pub scheduler_kind: &'a str,
     pub worker_config: &'a crate::common::WorkerConfig,
@@ -230,7 +230,7 @@ pub async fn init_worker(params: WorkerInitParams<'_>) -> Result<Worker, ActantE
     let scheduler_actor_id = ActorId::scheduler(params.node_id);
     // 注入 EventBus 到 SchedulerActor：Actor 在 enqueue 后触发
     // notify_task_enqueued()，Worker 通过 Notify 信号实现事件驱动唤醒。
-    // F4：注入的现成调度器优先；字符串 kind 仅选择内置实现。
+    // 注入的现成调度器优先；字符串 kind 仅选择内置实现。
     let scheduler_actor = if let Some(scheduler) = params.scheduler.clone() {
         SchedulerActor::with_event_bus(params.event_bus.clone()).with_scheduler(scheduler)?
     } else {
@@ -305,13 +305,13 @@ pub struct RuntimeBuilder {
     node_id: NodeId,
     config: ActantConfig,
     data_dir: Option<String>,
-    // ── F4 注入缝：缺省走内置实现，行为不变 ──
+    // ── 注入缝：缺省走内置实现，行为不变 ──
     scheduler: Option<Arc<dyn crate::runtime::workflow::Scheduler>>,
     task_dispatcher: Option<Arc<dyn TaskDispatcher>>,
     transport: Option<Arc<dyn Transport>>,
     discovery: Option<Arc<dyn crate::runtime::network::Discovery>>,
     event_log: Option<Arc<dyn crate::runtime::state::event_log::EventLog>>,
-    /// 本地编排回灌桥（X2）：Rust 原生 DAG 提交路径的依赖推进需要它。
+    /// 本地编排回灌桥：Rust 原生 DAG 提交路径的依赖推进需要它。
     /// **默认关闭**——Python 绑定层由事件泵承担同职责，双重回灌会产生
     /// 重试裁决竞态；仅 Rust 嵌入方（无事件泵）应显式开启。
     orchestrator_ingest: bool,
@@ -332,7 +332,7 @@ impl RuntimeBuilder {
         }
     }
 
-    /// 启用本地编排回灌桥（X2）。
+    /// 启用本地编排回灌桥。
     ///
     /// 供**纯 Rust 嵌入**使用：Rust 原生 DAG 提交（`submit` + `start`）没有
     /// Python 事件泵，任务完成后的依赖推进（后继入队）与重试裁决须由 core
@@ -343,10 +343,10 @@ impl RuntimeBuilder {
         self
     }
 
-    /// 注入自定义任务调度器（F4）。
+    /// 注入自定义任务调度器。
     ///
     /// 替换内置的 priority/fifo [`SchedulerActor`] 装配。注入时
-    /// `config.worker.scheduler_kind` 字符串不再生效。
+    /// `config.worker.scheduler_kind` 字符串被忽略。
     pub fn with_scheduler(
         mut self,
         scheduler: Arc<dyn crate::runtime::workflow::Scheduler>,
@@ -355,7 +355,7 @@ impl RuntimeBuilder {
         self
     }
 
-    /// 注入自定义任务分发器（F4）。
+    /// 注入自定义任务分发器。
     ///
     /// 替换内置进程池 `ProcessTaskDispatcher`——Rust 引擎实现
     /// [`TaskDispatcher`]（进程内/shell/任意语言 worker）即在此接入。
@@ -364,13 +364,13 @@ impl RuntimeBuilder {
         self
     }
 
-    /// 注入自定义传输层（F4）。替换内置 `NetworkManager` 构造。
+    /// 注入自定义传输层。替换内置 `NetworkManager` 构造。
     pub fn with_transport(mut self, transport: Arc<dyn Transport>) -> Self {
         self.transport = Some(transport);
         self
     }
 
-    /// 注入自定义节点发现策略（F4）。替换 `config.network.discovery_mode`
+    /// 注入自定义节点发现策略。替换 `config.network.discovery_mode`
     /// 字符串选择的内置实现。
     pub fn with_discovery(
         mut self,
@@ -380,7 +380,7 @@ impl RuntimeBuilder {
         self
     }
 
-    /// 注入自定义事件日志（F4）。替换按 store 有无选择的 LMDB/Memory 实现。
+    /// 注入自定义事件日志。替换按 store 有无选择的 LMDB/Memory 实现。
     pub fn with_event_log(
         mut self,
         event_log: Arc<dyn crate::runtime::state::event_log::EventLog>,
@@ -412,7 +412,7 @@ impl RuntimeBuilder {
         // payload 签名硬失败（require_payload_signing=true 且 key 为空时直接报错）。
         self.config.validate()?;
 
-        // SE2: 空 payload_signing_key 会禁用 payload 完整性验证，仅适用于开发/测试。
+        // 空 payload_signing_key 会禁用 payload 完整性验证，仅适用于开发/测试。
         // 生产环境必须配置非空密钥，否则恶意节点可投递伪造 cloudpickle payload。
         // require_payload_signing=true 时已由 validate 拒绝；此处仅对未强制签名的
         // 开发场景输出 warn，提醒用户此为不安全配置。
@@ -424,12 +424,12 @@ impl RuntimeBuilder {
             );
         }
 
-        // D2：将 payload 签名密钥同时作为 wire message 签名密钥。
+        // 将 payload 签名密钥同时作为 wire message 签名密钥。
         // 设计：单一密钥承担双重职责（payload + wire），简化运维配置。
         // 空密钥 = 禁用 wire 签名验证，向后兼容 0.2（无 mac 字段）。
         // 非空密钥 = 集群内所有节点必须共享同一密钥；任一节点密钥不匹配
         // 将导致其跨节点消息被对端丢弃，提供端到端集群身份认证。
-        // H6.2：按 node 注册——同进程多 Runtime 各自密钥互不覆盖，
+        // 按 node 注册——同进程多 Runtime 各自密钥互不覆盖，
         // 出站签名按消息来源节点选择（wire 模块的调用点在冻结的
         // workflow/ 子树中，密钥无法参数穿透，故保留进程级注册表）。
         crate::common::register_wire_signing_key(
@@ -451,7 +451,7 @@ impl RuntimeBuilder {
         let identity = load_or_create_identity(Path::new(&data_dir))?;
 
         let network: Arc<dyn Transport> = match self.transport.clone() {
-            // F4：使用方自带传输层（不再经 discovery preset 构造）。
+            // 使用方自带传输层（不经 discovery preset 构造）。
             Some(t) => {
                 tracing::info!("build: using injected transport");
                 t
@@ -487,13 +487,13 @@ impl RuntimeBuilder {
 
         let store_path = Path::new(&data_dir).join("store");
         // 主存储使用配置中的 StoreConfig（map_size / max_dbs / sync_mode），
-        // 不再隐式退回默认配置。open_with_config 内部创建目录。
+        // 不退回默认配置。open_with_config 内部创建目录。
         let lmdb_store = LmdbStore::open_with_config(&store_path, &self.config.store)
             .map_err(|e| ActantError::Storage(format!("failed to open store: {}", e)))?;
         let store = Store::new(lmdb_store.clone());
 
-        // F4：使用方自带分发器（进程内/shell/任意语言 worker）优先；
-        // 缺省走内置进程池。N3 任务日志边带出口须在构造时提供——
+        // 使用方自带分发器（进程内/shell/任意语言 worker）优先；
+        // 缺省走内置进程池。任务日志边带出口须在构造时提供——
         // 进程池在此刻拉起，后置注入会错过首批 worker 的 stderr 事件流。
         let task_dispatcher: Arc<dyn TaskDispatcher> = match self.task_dispatcher.clone() {
             Some(d) => d,
@@ -552,7 +552,7 @@ impl RuntimeBuilder {
                 ))
             }
         };
-        // B2：注入网络传输层，使工作流级硬超时监控可主动广播 CancelBroadcast。
+        // 注入网络传输层，使工作流级硬超时监控可主动广播 CancelBroadcast。
         let orchestrator = orchestrator.with_network(network.clone());
         // 句柄克隆留给 Runtime（供绑定层在 actor 之外做阻塞式等待点 park）。
         // `Orchestrator: Clone` 只复制共享句柄（state 为 Arc），语义上是同一个
@@ -569,7 +569,7 @@ impl RuntimeBuilder {
         // ── FailoverActor ──────────────────────────────────────────────
         // 接管心跳、故障检测、租约维护。start_background_loops 启动后台循环。
         tracing::info!("build: failover actor spawn enter");
-        // 节点元数据（N1/N2）：核心自动填充平台三要素，host_runtime 由绑定层经
+        // 节点元数据：核心自动填充平台三要素，host_runtime 由绑定层经
         // config 提供，labels 为用户自定义。
         let mut platform = crate::common::PlatformInfo::detect();
         platform.host_runtime = self.config.node_host_runtime.clone();

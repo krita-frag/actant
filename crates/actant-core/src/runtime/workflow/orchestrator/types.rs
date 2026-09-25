@@ -248,11 +248,10 @@ impl TerminalWaiterRegistry {
         }
     }
 
-    // **当前没有注册侧**：唯一的注册入口 `register_terminal_waiter` 已随审查
-    // （2026-09-18）删除——它零生产调用者，终态等待已被 Python 侧的
-    // `_wait_terminal_and_emit` 轮询取代（`fire` 因此总是 no-op）。
+    // **无注册入口**：没有任何路径向 `waiters` 插入等待者——终态等待由
+    // Python 侧的 `_wait_terminal_and_emit` 轮询承担，故 `fire` 总是 no-op。
     // 保留 `fire` 与其调用点是为了不牵动 `notify_terminal` 的既有结构；
-    // 若确认不再需要 oneshot 唤醒，应连同本结构体与 `fire_terminal_oneshot`
+    // 若确认不需要 oneshot 唤醒，可连同本结构体与 `fire_terminal_oneshot`
     // 一起删除（守则 3）。
 
     /// Fire the oneshot for a workflow that has reached terminal state.

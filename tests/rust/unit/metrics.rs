@@ -17,7 +17,7 @@ fn lock() -> std::sync::MutexGuard<'static, ()> {
 #[test]
 fn init_returns_ok() {
     let _g = lock();
-    // init() 必须返回 Ok，而非 panic（这是 P0 修复的核心契约）。
+    // init() 必须返回 Ok，而非 panic。
     let result = init();
     assert!(result.is_ok(), "init() should return Ok, got: {:?}", result);
 }

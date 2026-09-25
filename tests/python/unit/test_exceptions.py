@@ -229,7 +229,7 @@ def test_state_to_exception_map_covers_terminal_states() -> None:
 
 
 # ---------------------------------------------------------------------------
-# H7.3：emit 聚合错误 kind 保真（Rust 侧 format_error_kind 前缀）重建
+# emit 聚合错误 kind 保真（Rust 侧 format_error_kind 前缀）重建
 # ---------------------------------------------------------------------------
 
 

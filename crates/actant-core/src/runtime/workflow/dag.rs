@@ -504,10 +504,11 @@ impl WorkflowExecution {
     ///   作成功。
     /// - `Completed`：全部节点为 Completed/Skipped。
     ///
-    /// **回归修复**：此前判定为 `succeeded + skipped == total` 走 Completed、
-    /// 否则仅 `Continue` 策略才检查全终态。fail-fast（默认）下「全部节点被取消」
-    /// （succeeded=0）既不满足和式、又不进 continue 分支，工作流永久停在
-    /// `Running`——flow 的终态轮询（`_wait_terminal_and_emit`）因此永不返回。
+    /// 终态判定**不能只按 `succeeded + skipped == total` 走 Completed**：
+    /// fail-fast（默认）下「全部节点被取消」（succeeded=0）既不满足和式、又不进
+    /// `Continue` 分支，工作流会永久停在 `Running`——flow 的终态轮询
+    /// （`_wait_terminal_and_emit`）因此永不返回。故「无失败但存在被取消节点」
+    /// 显式判为 `Cancelled`。
     fn check_workflow_completion(&mut self) {
         // 终态工作流不可被改写：已终态（如 Cancelled / Failed）后到达的
         // 任务事件不得把状态翻转为 Completed。

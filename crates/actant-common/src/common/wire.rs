@@ -69,7 +69,7 @@ pub mod constants {
 /// - `flags`：2 hex 小写，bit 0 = sampled
 ///
 /// 本模块不依赖 OpenTelemetry SDK：保持 Rust 核心零外部依赖约束，
-/// 仅提供 trace 关联 ID 的生成与传播。若用户启用 OTLP exporter（C1），
+/// 仅提供 trace 关联 ID 的生成与传播。若用户启用 OTLP exporter，
 /// 接收方 `tracing::Span` 的 `wire.trace_id`/`wire.span_id` field 可被
 /// `opentelemetry-appender-tracing` 桥接到 OTLP span 属性，实现端到端关联。
 pub mod traceparent {
@@ -533,19 +533,19 @@ pub struct WireEnvelope {
     pub message: WireMessage,
     /// 跨节点 trace 上下文（W3C `traceparent` 字符串）。
     ///
-    /// C3：发送方在 [`WireEnvelope::wrap`] 时从当前 `tracing::Span` 提取
+    /// 发送方在 [`WireEnvelope::wrap`] 时从当前 `tracing::Span` 提取
     /// trace-id/span-id/flags，按 W3C Trace Context 格式序列化为字符串；
     /// 接收方在 [`WireEnvelope::decode`] 后解析该字符串，创建 `wire.recv`
     /// 子 span，使跨节点消息流在日志与 OTLP span 树中关联。
     ///
-    /// 与 D2 MAC 协同：MAC 覆盖本字段，确保 traceparent 不可被中间人篡改
+    /// 与 MAC 协同：MAC 覆盖本字段，确保 traceparent 不可被中间人篡改
     /// （否则攻击者可注入伪造 trace-id 干扰排查）。
     ///
     /// `None` 表示无 trace 上下文（如单元测试或调用方未启用 tracing），
     /// 接收方据此创建独立 root span。
     #[serde(default)]
     pub traceparent: Option<String>,
-    /// Wire message BLAKE3 keyed MAC（D2：节点身份认证 + 共享密钥签名）。
+    /// Wire message BLAKE3 keyed MAC（节点身份认证 + 共享密钥签名）。
     ///
     /// 由 [`WireEnvelope::wrap`] 在序列化 message 后计算并填入；
     /// [`WireEnvelope::decode`] 恒定时间校验，签名不匹配则丢弃消息。
@@ -602,7 +602,7 @@ static WIRE_SIGNING_KEYS: parking_lot::RwLock<WireSigningKeys> =
         primary: None,
     });
 
-// C3：当前线程的入站 trace 上下文。
+// 当前线程的入站 trace 上下文。
 //
 // 由 `current_trace_scope` 在 `wire.recv` span 进入时设置，在 span 退出时
 // 通过 guard 清除。当 wrap() 在该 span 内被调用（消息转发场景），会读取此
@@ -738,7 +738,7 @@ fn message_origin_node(msg: &WireMessage) -> Option<&NodeId> {
 /// `mac: None` 的 unsigned [`WireEnvelope`]」逐字节一致——MAC 覆盖的字节内容
 /// 与顺序保持不变（跨节点兼容红线）。借引用编码使 decode 校验路径无需为
 /// 验证 MAC 克隆整个 message。
-/// C2：MAC 覆盖字节的分段形态。段序 = `version 字节 | message |
+/// MAC 覆盖字节的分段形态。段序 = `version 字节 | message |
 /// traceparent | mac=None 字节`，与旧单缓冲 `mac_input_bytes` 逐字节一致
 /// （字节序不变红线）。消除了与消息等大的中间 `Vec` 组装；
 /// message 本体的 postcard 编码一次仍必要（postcard 无流式 API）。
@@ -761,7 +761,7 @@ fn mac_input_segments<'a>(
 impl WireEnvelope {
     /// 用当前协议版本封装 [`WireMessage`]，并注入跨节点 trace 上下文与 wire MAC。
     ///
-    /// C3：trace 上下文以 W3C `traceparent` 字符串形式注入。若当前线程有活跃
+    /// trace 上下文以 W3C `traceparent` 字符串形式注入。若当前线程有活跃
     /// `tracing::Span`（通过 `tracing::Span::current()`），从中提取 trace-id
     /// 与 flags，生成新的 span-id（child span），构造 `traceparent` 字符串。
     /// 若无活跃 span（如未启用 tracing subscriber 或顶层调用），则生成
@@ -776,7 +776,7 @@ impl WireEnvelope {
     /// `traceparent` 三字段序列化字节，不含 `mac` 字段自身（见
     /// [`mac_input_segments`]）。
     pub fn wrap(msg: WireMessage) -> Self {
-        // C3：生成 W3C traceparent。
+        // 生成 W3C traceparent。
         //
         // 多跳传播策略：检查当前线程的入站 trace 上下文（由 wire.recv span
         // 设置）。若存在，调用 `child()` 生成延续 trace-id 的新 span-id，
@@ -804,7 +804,7 @@ impl WireEnvelope {
         };
 
         // 计算可选 MAC：仅当按消息来源节点（或 primary 退化）找到已注册密钥时。
-        // C2：流式分段喂 hasher，不再组装与消息等大的覆盖字节 Vec。
+        // 流式分段喂 hasher，不再组装与消息等大的覆盖字节 Vec。
         let mac = signing_key_for(&unsigned.message).and_then(|key| {
             let message_bytes = match crate::common::encode_postcard(&unsigned.message) {
                 Ok(b) => b,
@@ -893,7 +893,7 @@ impl WireEnvelope {
                         return None;
                     }
                 };
-                // C2：流式分段验证（与发送侧同段序，字节序不变）。
+                // 流式分段验证（与发送侧同段序，字节序不变）。
                 candidates.iter().any(|key| {
                     let message_bytes = match crate::common::encode_postcard(&envelope.message) {
                         Ok(b) => b,
@@ -954,10 +954,10 @@ pub struct NodeHeartbeat {
     /// Iroh endpoint ID（公钥），用于直连。
     #[serde(default)]
     pub endpoint_addr: Option<String>,
-    /// 节点宿主平台信息（N1）。`None` = 旧版本节点未上报。
+    /// 节点宿主平台信息。`None` = 旧版本节点未上报。
     #[serde(default)]
     pub platform: Option<PlatformInfo>,
-    /// 用户自定义标签（N2）。发送侧校验 [`node_labels_within_limit`]，
+    /// 用户自定义标签。发送侧校验 [`node_labels_within_limit`]，
     /// 超限整体置空。
     #[serde(default)]
     pub labels: BTreeMap<String, String>,

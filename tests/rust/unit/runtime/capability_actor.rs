@@ -306,7 +306,7 @@ async fn emit_handler_error_calls_remaining_handlers_and_aggregates_error() {
     assert!(error.message.contains("1/2 handlers failed"));
 }
 
-// H7.3：emit 聚合错误 kind 保真——首个失败 handler 的 kind 编码进错误消息
+// emit 聚合错误 kind 保真——首个失败 handler 的 kind 编码进错误消息
 // 前缀（`[actant:storage] ...`），Python 侧 decode_error_kind 据此重建
 // 对应异常子类，而非统一退化为 internal/task。
 #[tokio::test]

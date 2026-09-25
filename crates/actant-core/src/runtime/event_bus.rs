@@ -48,7 +48,7 @@ pub enum Topic {
     TaskSkipped,
     /// 对端连接 / 断开。
     NetworkPeer,
-    /// 任务级日志流（N3 档 1）：worker 子进程经 stderr 边带上报的任务日志。
+    /// 任务级日志流：worker 子进程经 stderr 边带上报的任务日志。
     /// tap 语义（best-effort 可丢），不承载正确性语义。
     TaskLog,
     /// Actor 生命周期中的不可恢复错误（panic / 状态机非法转换等

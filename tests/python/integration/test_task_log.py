@@ -1,11 +1,11 @@
-"""N3 档 1 任务级日志流集成测试。
+"""任务级日志流集成测试。
 
 链路：worker 子进程（logging/print → stderr ``actant_log:`` 行协议）→
 Rust ``drain_stderr`` 解析 → ``BusEvent::TaskLog``（tap 语义）→ py
 ``on_task_log`` 回调。
 
-同时回归 N3 顺带修复的隐患：任务内 ``print`` 此前直写 fd 1 会损坏
-stdout 帧流——现在被捕获进日志边带，任务正常完成。
+任务内 ``print`` 被捕获进日志边带，不会直写 fd 1 损坏 stdout 帧流，
+任务正常完成。
 """
 
 from __future__ import annotations

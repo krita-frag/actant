@@ -1041,7 +1041,7 @@ async fn detect_and_claim_excludes_stale_nodes_from_election() {
     );
 }
 
-/// 检测前失联节点已被清出视图（P1：detect_and_claim_failed_nodes 先 expire_stale_peers）。
+/// 检测前失联节点已被清出视图（detect_and_claim_failed_nodes 先 expire_stale_peers）。
 #[tokio::test]
 async fn detect_and_claim_failed_nodes_expires_stale_peers_first() {
     let fm = make_fm_with_short_lease("node-A").await;

@@ -133,7 +133,7 @@ class TestFlowOrchestration:
                 assert not ts["error"]
 
     def test_flow_retry_re_runs_until_success(self) -> None:
-        """flow 级重试已移除：函数体中途异常直接传播、不重跑；任务级重试由
+        """flow 级不做整体重试：函数体中途异常直接传播、不重跑；任务级重试由
         ``@task(retries=...)`` 承载（与 flow 级重试无关）。"""
 
         attempts = {"n": 0}

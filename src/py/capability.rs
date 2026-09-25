@@ -195,8 +195,9 @@ impl PyCapabilityRuntime {
     /// （不调用 `tokio.block_on`），而是返回 `asyncio.Future`，
     /// 让 Python 侧 `await` 时真正让出控制权给 event loop。
     ///
-    /// P1 优化：原 `perform` 在 Python 主线程上 `py.detach(|| block_on(...))`
-    /// 同步阻塞，无法在 asyncio 上下文中并发执行多个 perform。
+    /// 与同步 `perform` 的差异：同步实现于 Python 主线程上
+    /// `py.detach(|| block_on(...))` 同步阻塞，无法在 asyncio 上下文中
+    /// 并发执行多个 perform。
     /// 异步版本通过 `future_into_py_iter` 将 Rust Future 转为
     /// `asyncio.Future`，在 tokio runtime 上异步执行 `inner.perform().await`，
     /// 结果通过 `GilThread::send_or_run` 回调到 asyncio loop。

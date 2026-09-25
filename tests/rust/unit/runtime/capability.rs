@@ -483,7 +483,7 @@ async fn ensure_layer_after_bind_does_not_spawn_actor() {
     let actor_system = Arc::new(crate::runtime::actor::ActorSystem::new());
     Arc::clone(&rt).bind_actor_system(actor_system).await;
 
-    // bind 后 ensure_layer 不再 spawn 新 CapabilityActor：
+    // bind 后 ensure_layer 不 spawn 新 CapabilityActor：
     // actor 表已 snapshot，新 layer 不会出现 actor 条目。
     rt.ensure_layer::<NodeLifecycle>(NodeLifecycle::meta());
     let type_id = std::any::TypeId::of::<NodeLifecycle>();
@@ -895,8 +895,9 @@ async fn bind_actor_system_spawns_actors_for_registered_codecs() {
     let actor_system = Arc::new(crate::runtime::actor::ActorSystem::new());
     Arc::clone(&rt).bind_actor_system(actor_system).await;
 
-    // 所有 9 个内置 capability 都注册了 codec + layer → 应有 9 个 actor_ids
-    // （Store 有 handler，其余 8 个空 layer）
+    // 5 个内置 capability（Serialization/Store/TaskLifecycle/WorkflowLifecycle/
+    // NodeLifecycle）均注册了 codec + layer → 应有 5 个 actor_ids
+    // （Store 有 handler，其余 4 个空 layer）
     let type_id_store = std::any::TypeId::of::<Store>();
     assert!(rt.actor_ids.get(&type_id_store).is_some());
     let type_id_lifecycle = std::any::TypeId::of::<NodeLifecycle>();

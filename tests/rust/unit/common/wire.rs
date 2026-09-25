@@ -253,9 +253,9 @@ fn test_decode_logs_warning_on_version_mismatch() {
     );
 }
 
-// --- C3：W3C Traceparent 跨节点传播 ---
+// --- W3C Traceparent 跨节点传播 ---
 
-/// C3 集成测试：`wrap()` 在无 thread-local scope 时生成 root traceparent，
+/// 集成测试：`wrap()` 在无 thread-local scope 时生成 root traceparent，
 /// 接收方 `decode()` 后能解析出该 traceparent。
 #[test]
 fn wire_envelope_wrap_injects_w3c_traceparent() {
@@ -281,7 +281,7 @@ fn wire_envelope_wrap_injects_w3c_traceparent() {
     assert_eq!(ctx.flags & 0x01, 0x01);
 }
 
-/// C3 集成测试：wrap → encode → decode 链路中 traceparent 保持不变
+/// 集成测试：wrap → encode → decode 链路中 traceparent 保持不变
 ///（端到端 wire 协议不丢失 trace 上下文）。
 #[test]
 fn wire_envelope_roundtrip_preserves_traceparent() {
@@ -306,7 +306,7 @@ fn wire_envelope_roundtrip_preserves_traceparent() {
     assert_eq!(decoded_tp.as_deref(), Some(original_tp.as_str()));
 }
 
-/// C3 集成测试：在 `current_trace_scope` 内调用 wrap() 时，生成的 traceparent
+/// 集成测试：在 `current_trace_scope` 内调用 wrap() 时，生成的 traceparent
 /// 必须是 child（trace-id 与父一致，span-id 不同）。
 #[test]
 fn wire_envelope_wrap_within_scope_produces_child_traceparent() {
@@ -336,7 +336,7 @@ fn wire_envelope_wrap_within_scope_produces_child_traceparent() {
     assert_ne!(child.span_id, parent.span_id);
 }
 
-/// C3 集成测试：scope 退出（guard drop）后，wrap() 退化为生成 root traceparent。
+/// 集成测试：scope 退出（guard drop）后，wrap() 退化为生成 root traceparent。
 #[test]
 fn wire_envelope_wrap_after_scope_drop_returns_to_root() {
     let parent = TraceContext::new_root(true);
@@ -380,11 +380,11 @@ fn wire_envelope_wrap_after_scope_drop_returns_to_root() {
     assert_ne!(root.trace_id, child.trace_id);
 }
 
-/// C3 集成测试：MAC 与 traceparent 协同——一旦设置签名密钥，
+/// 集成测试：MAC 与 traceparent 协同——一旦设置签名密钥，
 /// 篡改 traceparent 字段后 decode 必须失败。
 #[test]
 fn wire_mac_protects_traceparent_field() {
-    // 复用模块级 MAC_TEST_LOCK，与 D2 测试串行执行避免全局密钥污染。
+    // 复用模块级 MAC_TEST_LOCK，与 MAC 测试串行执行避免全局密钥污染。
     let _guard = MAC_TEST_LOCK.lock().unwrap();
 
     crate::common::set_wire_signing_key(b"test-key-c3".to_vec());
@@ -493,7 +493,7 @@ fn wire_task_outcome_as_str_returns_canonical_values() {
     assert_eq!(WireTaskOutcome::Skipped.as_str(), state_str::SKIPPED);
 }
 
-// --- WireEnvelope MAC（D2：节点身份认证 + 共享密钥签名） ---
+// --- WireEnvelope MAC（节点身份认证 + 共享密钥签名） ---
 
 /// 串行化 MAC 相关测试的全局锁。
 ///
@@ -536,7 +536,7 @@ fn envelope_roundtrip_without_signing() {
     }
 }
 
-/// D2 关键测试：启用签名后 wrap 自动计算 MAC，decode 通过校验。
+/// 关键测试：启用签名后 wrap 自动计算 MAC，decode 通过校验。
 #[test]
 fn envelope_wrap_with_key_produces_mac() {
     let _guard = MAC_TEST_LOCK.lock().unwrap();
@@ -561,7 +561,7 @@ fn envelope_wrap_with_key_produces_mac() {
     }
 }
 
-/// D2 关键测试：发送方与接收方密钥不匹配时，decode 必须丢弃消息。
+/// 关键测试：发送方与接收方密钥不匹配时，decode 必须丢弃消息。
 #[test]
 fn envelope_decode_rejects_mismatched_key() {
     let _guard = MAC_TEST_LOCK.lock().unwrap();
@@ -582,7 +582,7 @@ fn envelope_decode_rejects_mismatched_key() {
     );
 }
 
-/// D2 关键测试：启用签名后，未携带 MAC 的消息（如伪造者跳过签名）被丢弃。
+/// 关键测试：启用签名后，未携带 MAC 的消息（如伪造者跳过签名）被丢弃。
 #[test]
 fn envelope_decode_rejects_unsigned_message_when_key_set() {
     let _guard = MAC_TEST_LOCK.lock().unwrap();
@@ -604,7 +604,7 @@ fn envelope_decode_rejects_unsigned_message_when_key_set() {
     );
 }
 
-/// D2 关键测试：篡改序列化字节后 MAC 校验失败。
+/// 关键测试：篡改序列化字节后 MAC 校验失败。
 #[test]
 fn envelope_decode_rejects_tampered_bytes() {
     let _guard = MAC_TEST_LOCK.lock().unwrap();
@@ -626,7 +626,7 @@ fn envelope_decode_rejects_tampered_bytes() {
     );
 }
 
-/// C3 集成测试：嵌套 scope 退出后恢复**进入前的旧值**（LIFO），而非清空为无 trace。
+/// 集成测试：嵌套 scope 退出后恢复**进入前的旧值**（LIFO），而非清空为无 trace。
 ///
 /// 回归测试：TraceScopeGuard 历史上 drop 时无条件清空 thread-local，嵌套场景下
 /// 外层 scope 的 trace 上下文会被内层 guard 的退出误删。
@@ -692,7 +692,7 @@ fn mac_input_segments_match_unsigned_envelope_serialization() {
         traceparent: Some(TraceContext::new_root(true).to_header()),
         mac: None,
     };
-    // C2 等价性验证：分段拼接必须与 unsigned envelope 序列化逐字节一致
+    // 等价性验证：分段拼接必须与 unsigned envelope 序列化逐字节一致
     // （字节序不变红线）。
     let whole = crate::common::encode_postcard(&unsigned).unwrap();
     let message_bytes = crate::common::encode_postcard(&unsigned.message).unwrap();
@@ -737,7 +737,7 @@ fn mac_input_segments_match_unsigned_envelope_serialization() {
     assert_eq!(joined_no_tp, whole_no_tp);
 }
 
-/// H6.2：同进程两个不同密钥 Runtime 互不干扰。
+/// 同进程两个不同密钥 Runtime 互不干扰。
 ///
 /// `register_wire_signing_key` 按 node 隔离：rt-b 注册新密钥后，rt-a 的出站
 /// 消息仍以 key-a 签名（旧的全局单密钥行为会被覆盖）；接收侧尝试全部已注册

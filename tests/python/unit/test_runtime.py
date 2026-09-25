@@ -136,8 +136,8 @@ class TestPerformSemantics:
             actant.perform("CustomPerform", "x")
 
     def test_perform_without_any_handler_errors(self):
-        # SerializationHandler 直通实现已删（0.3.5 减法）：capability 注册面保留，
-        # 无 handler 时经 Rust 分发报错——用户链自己的 handler 即恢复语义。
+        # capability 注册面保留：无 handler 时经 Rust 分发报错——
+        # 用户链自己的 handler 即生效。
         rt = Runtime()
         with rt:
             req = SerializationReq(op="dump", data=b"payload")

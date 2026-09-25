@@ -479,7 +479,7 @@ impl NetworkManager {
     ///
     /// `Some(key)` 时 endpoint 以该 keypair 构造——endpoint id 由密钥决定，
     /// 跨重启稳定；`None`（默认）时由 iroh 生成临时密钥。
-    /// `discovery_override`（F4）非 `None` 时替换 `discovery_mode` 字符串
+    /// `discovery_override` 非 `None` 时替换 `discovery_mode` 字符串
     /// 选择的内置策略。
     pub async fn with_identity(
         node_id: NodeId,
@@ -519,7 +519,7 @@ impl NetworkManager {
             None => builder,
         };
         let builder = discovery.apply(builder);
-        // G-relay：自定义 relay 集群覆盖 preset 的 relay 配置（二者正交）。
+        // 自定义 relay 集群覆盖 preset 的 relay 配置（二者正交）。
         let builder = if config.relay_endpoints.is_empty() {
             builder
         } else {

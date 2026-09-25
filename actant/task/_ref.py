@@ -1,6 +1,6 @@
 """值引用（Ref）：内容寻址的大值句柄。
 
-大数据（> ``REF_INLINE_THRESHOLD``）不再内联进任务 payload，而是经
+大数据（> ``REF_INLINE_THRESHOLD``）不内联进任务 payload，而是经
 ``ValueStore`` capability 落本节点内容寻址 blob store，参数/边位置放
 ``Ref``（几十字节），消费侧按需拉取。
 
@@ -14,7 +14,7 @@ blob 内容有两种来源约定（由 ``unwrap_frame`` 标志区分，不外泄
 
 - 结果侧：父进程 ``_on_task_result`` 发现结果帧超阈值 → store →
   ``AsyncResult`` 内部持 ``Ref``；``result()`` 透明解析。
-- 参数侧（R3b）：``_collect_dep_ids`` 对大结果保留 ``Ref`` 不取值；
+- 参数侧：``_collect_dep_ids`` 对大结果保留 ``Ref`` 不取值；
   提交方 ``_submit`` 把 ``Ref`` 解析为 ``_RefArg``（帧内联字节）传给 worker；
   worker 在 ``_execute_with_retries`` 前解哨兵。
 """
@@ -112,7 +112,7 @@ def _materialize_refs(
     """把参数树中的 :class:`Ref` 解析为 :class:`_RefArg`（提交方父进程代取）。
 
     ``fetch`` 返回 blob 原始字节（结果帧约定，``unwrap_frame=True``）。
-    递归规则与 ``_resolve_value`` 一致（list / tuple / dict）。
+    按 list / tuple / dict 递归。
     """
     if isinstance(value, Ref):
         return _RefArg(fetch(value._ref_bytes), unwrap_frame=True)
@@ -129,11 +129,11 @@ def _degrade_large_values(
     value: Any,
     store: Callable[[bytes], bytes],
 ) -> Any:
-    """把参数树中超阈值的直传大值降级为 :class:`_RefArg`（R3b）。
+    """把参数树中超阈值的直传大值降级为 :class:`_RefArg`。
 
     每个候选值预序列化测量（定长标量跳过）；超 ``REF_INLINE_THRESHOLD`` 时
     字节落 blob（内容寻址去重）+ 参数位放哨兵——大值全程只序列化一次
-    （测量得到的 pickle 字节既落 blob 又随帧内联，不再重 pickle）。
+    （测量得到的 pickle 字节既落 blob 又随帧内联，不重复 pickle）。
     落 blob 失败不阻断提交：哨兵字节仍随帧内联交付，仅去重/引用语义缺失，
     经 exc_info 日志承载原因（与结果侧降级同一策略）。
     序列化失败的值原样保留，交由 ``_safe_serialize`` 输出定位诊断。

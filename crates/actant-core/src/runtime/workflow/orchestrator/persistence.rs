@@ -560,10 +560,10 @@ impl Orchestrator {
                 payload,
             } => {
                 // 一次取表到底，不写成"先判存在、再 get_mut().expect()"——
-                // 那两步之间有窗口，并发移除会让 expect panic（审查发现的 TOCTOU）。
+                // 那两步之间有窗口，并发移除会让 expect panic（先取后验，避免 TOCTOU）。
                 // 等待点不存在 ⇒ 信号先到：入缓冲，等后续 `WaitPointRegistered`
-                // 重放时消费。此前直接丢弃，等于"缓冲跨重启失效"
-                // （缓冲与等待点同批落盘，保证跨重启一致性的兜底路径）。
+                // 重放时消费；直接丢弃会让"缓冲跨重启失效"
+                // （缓冲与等待点同批落盘，是保证跨重启一致性的兜底路径）。
                 let Some(table) = self.state.waitpoints.get_mut(&workflow_id) else {
                     self.state
                         .pending_signals

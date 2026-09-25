@@ -235,7 +235,7 @@ class TestCrossNodeTaskExecution:
 
 
 class TestNodeVisibility:
-    """节点可见性（N1/N2）：peers() 返回对端 slots/labels。"""
+    """节点可见性：peers() 返回对端 slots/labels。"""
 
     @pytest.fixture
     def two_nodes_with_labels(self):

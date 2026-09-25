@@ -5,7 +5,7 @@
 //! - `enqueue_batch` — 批量入队
 //! - `dequeue_batch` — 批量出队
 //!
-//! P4 Actor 化重构后，调度状态由 SchedulerActor 持有，客户端通过 ActorSystem
+//! 调度状态由 SchedulerActor 持有，客户端通过 ActorSystem
 //! 消息协议转发请求。本基准测量端到端开销（含消息编解码与 actor 调度），
 //! 反映真实生产路径。
 //!

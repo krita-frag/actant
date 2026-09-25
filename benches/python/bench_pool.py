@@ -2,7 +2,7 @@
 
 进程级隔离的 worker 进程池在 dispatcher 构造时**预拉起** N 个 worker
 （见 `src/runtime/dispatcher.rs::ProcessTaskDispatcher::new`）。本基准量化
-三项特性，供 3.3「进程池冷启动与池化收益、超时强杀回收延迟」数据入档：
+三项特性，供「进程池冷启动与池化收益、超时强杀回收延迟」数据入档：
 
 - ``pool/start_ms_n`` — Runtime 启动耗时（含 N 个 worker 子进程 spawn）。
 - ``pool/first_dispatch_ms_n`` — 全新 Runtime 上**首个**任务端到端延迟

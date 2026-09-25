@@ -24,11 +24,11 @@
 //!
 //! 1. **孤儿编排**（既有）：peer 的 `active_workflows` 非空 ⇒ 它是那些 workflow
 //!    的编排者，按一致性哈希 `claim` 接管并 `reschedule_running_tasks`。
-//! 2. **在途转发**（新增）：peer 是**执行器**时 `active_workflows` 为空，
+//! 2. **在途转发**：peer 是**执行器**时 `active_workflows` 为空，
 //!    但它身上跑着**本节点转发过去**的任务。这些任务登记在
 //!    [`FailoverManager::outbound`]，失联时终结为 `TaskCompletion::Failed`
 //!    并经 event_bus 发布（与远端结果回灌同一条路），使提交方 `AsyncResult`
-//!    不再永久挂起。
+//!    不会永久挂起。
 //!
 //! 第 2 腿刻意**不重派发**：源节点没有"该任务未执行完"的持久凭据，盲目重跑
 //! 会静默重复副作用；重跑交由显式重试策略（重试裁决）或提交方重提。
@@ -97,7 +97,7 @@ pub struct OutboundTask {
     pub forwarded_at: Instant,
 }
 
-/// 对外暴露的 peer 视图（节点可见性 N2）。
+/// 对外暴露的 peer 视图（节点可见性）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerInfo {
     pub node_id: NodeId,
@@ -132,7 +132,7 @@ struct LeaseEntry {
     claimed_at_ms: u64,
     expires_at_ms: u64,
     /// 单调时钟租约到期时刻。``Some`` 时优先用于过期判定，避免 NTP 时钟跳变
-    /// 导致误判（M5-2 改进）。``None`` 表示租约从持久化恢复（无单调基线），
+    /// 导致误判。``None`` 表示租约从持久化恢复（无单调基线），
     /// 回退到墙钟 ``expires_at_ms`` 比较。
     deadline: Option<std::time::Instant>,
 }
@@ -219,9 +219,9 @@ pub struct FailoverManager {
     /// 本地事件总线：失联时把在途任务终结为 `TaskFailed` 发布出去，让提交方
     /// `AsyncResult` 得以终止。`None` 时（极简测试桩）该腿只清理登记表并告警。
     event_bus: Option<EventBus>,
-    /// 本节点平台信息（N1），随心跳广播。
+    /// 本节点平台信息，随心跳广播。
     platform: Option<PlatformInfo>,
-    /// 本节点用户自定义标签（N2），随心跳广播。
+    /// 本节点用户自定义标签，随心跳广播。
     labels: BTreeMap<String, String>,
     /// 节点身份密钥（endpoint keypair）。`Some` 时心跳以私钥签名。
     signing_key: Option<iroh::SecretKey>,
@@ -319,7 +319,7 @@ impl FailoverManager {
         postcard::to_allocvec(&unsigned).unwrap_or_default()
     }
 
-    /// 注入本节点元数据（平台信息 + 标签），随心跳广播（N1/N2）。
+    /// 注入本节点元数据（平台信息 + 标签），随心跳广播。
     pub fn with_node_metadata(
         mut self,
         platform: Option<PlatformInfo>,
@@ -533,7 +533,7 @@ impl FailoverManager {
     /// 失联处置第 2 腿：把目标为 `dead` 的在途任务终结为 `TaskFailed`。
     ///
     /// 发布走 event_bus（与 `network_router::publish_remote_completion` 同一条路）：
-    /// - 直提任务：Python 事件泵解析 `AsyncResult` 为异常，句柄不再永久挂起；
+    /// - 直提任务：Python 事件泵解析 `AsyncResult` 为异常，句柄不会永久挂起；
     /// - 编排任务：事件泵照常回灌 orchestrator，由重试裁决决定是否重派发。
     ///
     /// 返回终结的任务数，供调用方决定是否需要打日志。
@@ -653,7 +653,7 @@ impl FailoverManager {
             .collect()
     }
 
-    /// 返回当前在线的 peer 视图（节点可见性 N2）。
+    /// 返回当前在线的 peer 视图（节点可见性）。
     ///
     /// 在线判定复用心跳新鲜度语义：距上次心跳超过 `failure_timeout_ms` 或
     /// 从未收到心跳的节点不出现在结果中。返回值含节点元数据（slots/labels/
@@ -762,7 +762,7 @@ impl FailoverManager {
         // 在所有节点上一致，不受时钟偏差 / 网络
         // latency 影响。若使用接收方本地时间，
         // 会因网络传输时间而缩短租期。
-        // 单调 deadline 以本节点接收时刻为起点，避免 NTP 跳变误判（M5-2）。
+        // 单调 deadline 以本节点接收时刻为起点，避免 NTP 跳变误判。
         let lease = LeaseEntry::new_with_monotonic(
             claim.node_id.clone(),
             claim.timestamp_ms,

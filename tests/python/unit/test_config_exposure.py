@@ -1,4 +1,4 @@
-"""E5-E7 API 暴露面测试：_ActantConfig 高级字段透传 + delete_workflow。"""
+"""API 暴露面测试：_ActantConfig 高级字段透传 + delete_workflow。"""
 
 from __future__ import annotations
 
