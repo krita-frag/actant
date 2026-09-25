@@ -52,8 +52,8 @@
         print(parsed.result())
 
 - ``_context``：``TaskContext`` / ``get_task_context`` / ``_DispatchTaskContext`` / ``TaskState``
-- ``_helpers``：序列化、超时执行、重试执行、事件广播等纯函数辅助
-- ``_async_result``：``AsyncResult`` 与 ``_resolve_value``
+- ``_helpers``：序列化、执行、重试与取消检查、事件广播等纯函数辅助
+- ``_async_result``：``AsyncResult`` 与 ``_resolve_args_with_deps``
 - ``_worker``：worker 子进程循环（进程池后端的唯一执行入口）
 - ``_task_obj``：``Task`` 类与 ``@task`` 装饰器
 - ``_gather``：并行等待原语 ``gather``
@@ -61,7 +61,7 @@
 
 from __future__ import annotations
 
-from actant.task._async_result import AsyncResult, _resolve_value  # noqa: F401
+from actant.task._async_result import AsyncResult
 from actant.task._context import (  # noqa: F401
     TaskContext,
     TaskState,
@@ -72,9 +72,9 @@ from actant.task._context import (  # noqa: F401
 from actant.task._gather import gather, gather_async
 from actant.task._helpers import (  # noqa: F401
     _emit_task_event,
+    _execute_with_cancellation,
     _interruptible_sleep,
     _pickle_exception,
-    _run_with_timeout,
     _safe_serialize,
     _suppress_pickle_errors,
 )

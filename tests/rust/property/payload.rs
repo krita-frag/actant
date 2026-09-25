@@ -4,18 +4,10 @@
 //! 这些测试使用 `proptest` 验证 payload 编解码的不变量，
 //! 覆盖手写单元测试难以穷举的边界情况。
 
-use actant_core::common::{pack_group, pack_single, sign, unpack_payload, verify};
+use actant_core::common::{pack_group, sign, unpack_payload, verify};
 use proptest::prelude::*;
 
 proptest! {
-    /// `pack_single` 后 `unpack_payload` 应恢复原始字节。
-    #[test]
-    fn pack_single_unpack_roundtrip(data in prop::collection::vec(any::<u8>(), 0..256)) {
-        let packed = pack_single(data.clone());
-        let unpacked = unpack_payload(&packed).unwrap();
-        prop_assert_eq!(unpacked, vec![data]);
-    }
-
     /// `pack_group` 后 `unpack_payload` 应恢复原始字节列表。
     #[test]
     fn pack_group_unpack_roundtrip(

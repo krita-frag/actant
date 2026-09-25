@@ -17,7 +17,7 @@ from __future__ import annotations
 from typing import Any, Literal, NoReturn
 
 from actant._runtime import Runtime, get_current_runtime
-from actant.capabilities import CapabilityMeta
+from actant.capabilities import CapabilityMeta, EffectKind
 from actant.exceptions import InternalError, InvalidStateError
 
 
@@ -29,6 +29,19 @@ def _resolve_meta(name: str) -> tuple[Runtime, CapabilityMeta]:
             f"effect {name!r}: no active Runtime; wrap your code in `with actant.Runtime() as rt:`"
         )
     return runtime, runtime.capability_meta(name)
+
+
+def _resolve_by_kind(name: str, kind: EffectKind, effect_name: str) -> Runtime:
+    """解析 capability 元数据并校验 kind，返回其所属 Runtime。
+
+    校验失败抛 ``InvalidStateError``；成功则返回 Runtime 供随后的 effect 分发。
+    """
+    runtime, meta = _resolve_meta(name)
+    if meta.kind != kind:
+        raise InvalidStateError(
+            f"{effect_name}: capability {name!r} is {meta.kind!r}, not {kind!r}"
+        )
+    return runtime
 
 
 def ask(name: str, request: Any) -> Any | None:
@@ -45,11 +58,7 @@ def ask(name: str, request: Any) -> Any | None:
         InvalidStateError: 当前未在 Runtime 上下文中，或 capability kind 不匹配。
         KeyError: capability 未注册。
     """
-    runtime, meta = _resolve_meta(name)
-    if meta.kind != "ask":
-        raise InvalidStateError(
-            f"ask: capability {name!r} is {meta.kind!r}, not 'ask'"
-        )
+    runtime = _resolve_by_kind(name, "ask", "ask")
     return runtime._dispatch_ask(name, request)
 
 
@@ -67,11 +76,7 @@ def perform(name: str, request: Any) -> Any:
         InvalidStateError: 当前未在 Runtime 上下文中，或 capability kind 不匹配。
         KeyError: capability 未注册。
     """
-    runtime, meta = _resolve_meta(name)
-    if meta.kind != "perform":
-        raise InvalidStateError(
-            f"perform: capability {name!r} is {meta.kind!r}, not 'perform'"
-        )
+    runtime = _resolve_by_kind(name, "perform", "perform")
     return runtime._dispatch_perform(name, request)
 
 
@@ -100,11 +105,7 @@ def emit(
         raise ValueError(
             f"on_error must be 'log'/'raise'/'collect', got {on_error!r}"
         )
-    runtime, meta = _resolve_meta(name)
-    if meta.kind != "emit":
-        raise InvalidStateError(
-            f"emit: capability {name!r} is {meta.kind!r}, not 'emit'"
-        )
+    runtime = _resolve_by_kind(name, "emit", "emit")
     runtime._dispatch_emit(name, request, on_error=on_error)
 
 
@@ -175,11 +176,7 @@ def ask_async(name: str, request: Any) -> Any:
                 ask_async("Routing", ctx2),
             )
     """
-    runtime, meta = _resolve_meta(name)
-    if meta.kind != "ask":
-        raise InvalidStateError(
-            f"ask_async: capability {name!r} is {meta.kind!r}, not 'ask'"
-        )
+    runtime = _resolve_by_kind(name, "ask", "ask_async")
     return runtime._dispatch_ask_async(name, request)
 
 
@@ -207,11 +204,7 @@ def perform_async(name: str, request: Any) -> Any:
                 perform_async("Store", {"op": "put", "key": b"k3", "value": b"v3"}),
             )
     """
-    runtime, meta = _resolve_meta(name)
-    if meta.kind != "perform":
-        raise InvalidStateError(
-            f"perform_async: capability {name!r} is {meta.kind!r}, not 'perform'"
-        )
+    runtime = _resolve_by_kind(name, "perform", "perform_async")
     return runtime._dispatch_perform_async(name, request)
 
 

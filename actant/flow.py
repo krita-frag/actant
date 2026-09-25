@@ -26,7 +26,7 @@
 **重试单层化**：flow 任务的唯一重试执行者是 orchestrator（节点
 RetryPolicy，由 ``@task(retries=...)`` 映射）；派发给 worker 的 payload 头部
 retries 置 0，worker 层不重试。独立 ``@task`` 直调（非 flow）保持 worker 层
-重试不变。flow 级整体重试已删除——重放模型下函数体重试由续跑机制承载。
+重试不变。flow 级不做整体重试——重放模型下函数体重试由续跑机制承载。
 
 flow 生命周期通过 ``WorkflowLifecycle`` capability 广播：``submitted``/
 ``started`` 在工作流**真正建槽之后**才广播（工作流是惰性创建的，见下）；
@@ -371,10 +371,7 @@ def _raise_if_workflow_terminal(runtime: Any, workflow_id: str) -> None:
     state_name = state.get("state")
     if state_name == WORKFLOW_STATE_FAILED:
         if _deadline_failure(state):
-            raise ActantTimeoutError(
-                f"flow {workflow_id!r} exceeded its workflow deadline "
-                f"(error={_WORKFLOW_TIMEOUT_ERROR!r})"
-            )
+            raise _workflow_timeout_error(workflow_id)
         raise WorkflowFailedError(
             f"flow {workflow_id!r} failed while parked "
             f"(error={state.get('error')!r})"
@@ -783,10 +780,7 @@ def flow(
                 # 事实源是工作流超时，故归一为 ActantTimeoutError，保持该参数
                 # 既有错误类型契约。
                 if _workflow_deadline_expired(runtime, state):
-                    timeout_exc = ActantTimeoutError(
-                        f"flow {state.workflow_id!r} exceeded its workflow "
-                        f"deadline (error={_WORKFLOW_TIMEOUT_ERROR!r})"
-                    )
+                    timeout_exc = _workflow_timeout_error(state.workflow_id)
                     _settle_flow_failure(runtime, state, timeout_exc)
                     raise timeout_exc from exc
                 _settle_flow_failure(runtime, state, exc)
@@ -800,10 +794,7 @@ def flow(
             # 工作流以 deadline 到期收尾时，调用方必须看到超时——函数体自我
             # 完成（如纯 CPU 段跑完）不代表成功。`failed` 事件已由上面广播。
             if _deadline_failure(terminal):
-                raise ActantTimeoutError(
-                    f"flow {workflow_id!r} exceeded its workflow deadline "
-                    f"(error={_WORKFLOW_TIMEOUT_ERROR!r})"
-                )
+                raise _workflow_timeout_error(workflow_id)
             return result
 
         # 标记：使 `register_flow_recovery` 能识别"传进来的是包装器而非原函数"
@@ -832,6 +823,14 @@ def _deadline_failure(state: dict[str, Any] | None) -> bool:
         state
         and state.get("state") == WORKFLOW_STATE_FAILED
         and (state.get("error") or "") == _WORKFLOW_TIMEOUT_ERROR
+    )
+
+
+def _workflow_timeout_error(workflow_id: str) -> ActantTimeoutError:
+    """构造「flow 超过工作流 deadline」的异常（错误消息单点生成）。"""
+    return ActantTimeoutError(
+        f"flow {workflow_id!r} exceeded its workflow deadline "
+        f"(error={_WORKFLOW_TIMEOUT_ERROR!r})"
     )
 
 
@@ -885,12 +884,13 @@ def _settle_flow_failure(runtime: Any, state: _FlowState, exc: BaseException) ->
     try:
         if state.workflow_created:
             runtime.cancel_workflow(workflow_id)
-    except Exception:
-        # 工作流可能已终态（fail-fast 已触发）：取消是兜底动作，失败不应
-        # 掩盖原始异常。
+    except Exception as cancel_exc:
+        # 工作流可能已终态（fail-fast 已触发）：取消是兜底动作，失败不应掩盖
+        # 原始异常，且日志应记录真正的**取消失败**原因（cancel_exc），而不是误记
+        # 函数体原始异常（exc）。
         _logger.debug(
             "flow %s: cancel_workflow skipped (%s)",
-            workflow_id, type(exc).__name__,
+            workflow_id, type(cancel_exc).__name__,
         )
     _cancel_flow_tasks(workflow_id)
     _safe_emit(workflow_id, "failed", error=f"{type(exc).__name__}: {exc}")
@@ -974,10 +974,7 @@ def _replay_flow(
     except BaseException as exc:
         # 与 `@flow` 入口同构：deadline 强还原导致的失败对调用方呈现为超时。
         if _workflow_deadline_expired(runtime, state):
-            raise ActantTimeoutError(
-                f"flow {workflow_id!r} exceeded its workflow deadline "
-                f"(error={_WORKFLOW_TIMEOUT_ERROR!r})"
-            ) from exc
+            raise _workflow_timeout_error(workflow_id) from exc
         raise
     # 重放命中既存节点时工作流外壳已在历史中，无需创建；封口同样必须执行
     # （重放体的提交序列在函数体返回后才允许终态判定）。

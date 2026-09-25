@@ -1,8 +1,9 @@
 """``AsyncResult``：异步任务结果句柄与任务依赖解析。
 
 依赖 ``_context``（TaskContext / TaskState）与 ``_helpers``
-（``_suppress_pickle_errors``）。``_resolve_value`` 因紧耦合 ``AsyncResult``
-亦置于本模块，供 ``Task.submit`` / ``gather`` 使用。
+（``_suppress_pickle_errors``）。任务依赖解析（``_collect_dep_ids`` /
+``_resolve_args_with_deps``）因紧耦合 ``AsyncResult`` 亦置于本模块，
+供 ``Task.submit`` / ``submit_batch`` 使用。
 
 ## Intrusively-linked Futures 设计
 
@@ -548,8 +549,8 @@ def _set_aio_result(future: Any, value: Any, exc: Any) -> None:
 def _collect_dep_ids(value: Any, seen: set[str], ids: list[str]) -> Any:
     """单遍遍历 value：解析 ``AsyncResult`` 为其结果值，同时去重保序收集上游 task_id。
 
-    遍历规则与 ``_resolve_value`` 一致（list / tuple / dict 递归），但把"解析
-    结果"与"收集依赖 id"合并到一次遍历，避免两遍遍历的重复递归与规则漂移。
+    遍历规则：按 list / tuple / dict 递归，把"解析结果"与"收集依赖 id"
+    合并到单次遍历，避免两次独立递归导致规则漂移。
     ``seen``/``ids`` 由调用方持有，保证跨 ``args``/``kwargs`` 全局去重。
 
     大结果（内部为 ``Ref``）**不在此处取值**：``result()`` 会把大值反序列化到
@@ -587,8 +588,7 @@ def _resolve_args_with_deps(
     """单遍解析 ``submit`` 参数：解析上游 ``AsyncResult`` 并收集依赖 id。
 
     供 ``Task.submit`` / ``submit_batch`` 在构建编排依赖边时使用。
-    相比"先 ``_collect_async_result_ids`` 再 ``_resolve_value``"两遍遍历，
-    这里合并为一遍，同一规则不外泄、不漂移。
+    单遍把"解析参数"与"收集依赖 id"合并，同一递归规则不外泄、不漂移。
 
     Returns:
         ``(resolved_args, resolved_kwargs, upstream_ids)``：
@@ -603,20 +603,4 @@ def _resolve_args_with_deps(
     return resolved_args, resolved_kwargs, ids
 
 
-def _resolve_value(value: Any) -> Any:
-    """若 value 是 ``AsyncResult``，阻塞等待并返回其结果；否则原样返回。
-
-    递归处理 list / tuple / dict 容器内的 ``AsyncResult``，支持嵌套依赖。
-    """
-    if isinstance(value, AsyncResult):
-        return value.result()
-    if isinstance(value, list):
-        return [_resolve_value(v) for v in value]
-    if isinstance(value, tuple):
-        return tuple(_resolve_value(v) for v in value)
-    if isinstance(value, dict):
-        return {k: _resolve_value(v) for k, v in value.items()}
-    return value
-
-
-__all__ = ["AsyncResult", "_resolve_value"]
+__all__ = ["AsyncResult"]

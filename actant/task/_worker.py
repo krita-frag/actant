@@ -28,7 +28,7 @@ cloudpickle ``Pickler`` 绑定的 ``BytesIO`` 与读取用 ``BytesIO``，避免�
 汇入对应 OTel histogram；其余 stderr 行原样转发为日志。任务得/失败由 Rust
 在父进程依据 Result 帧与超时判定计入 counters，无需子进程上报。
 
-任务日志边带（N3 档 1）：任务执行期间，``logging`` 输出与 ``print``（stdout
+任务日志边带：任务执行期间，``logging`` 输出与 ``print``（stdout
 文本层）被捕获为 ``actant_log: <ts_ms> <level> <task_id> <message>`` 单行写入
 stderr，父进程 ``drain_stderr`` 发布为 ``TaskLog`` 事件（tap 语义，可丢）。
 **stdout 帧通道不可触碰**：捕获仅替换 ``sys.stdout`` 文本包装层——帧写入用的是
@@ -126,8 +126,9 @@ def _read_into(stream: Any, mv: memoryview) -> int:
 def _read_exact(stream: Any, n: int) -> bytes:
     """从流中读取精确 ``n`` 字节，用 ``bytearray`` + ``readinto`` 单次分配。
 
-    去掉了旧的 chunk list + `b''.join` 拼接（每 chunk 一个中间 bytes 分配 +
-    末尾一次 memcpy）。对于常见小载荷（< 4KB 任务元数据与结果）零额外分配。
+    单次 ``bytearray(n)`` 分配后循环 ``readinto``：避免按 chunk 逐个产生中间
+    bytes 再 ``b''.join``（每 chunk 一次分配 + 末尾一次 memcpy）。对常见小载荷
+    （< 4KB 任务元数据与结果）无额外分配。
     """
     buf = bytearray(n)
     mv = memoryview(buf)
@@ -427,7 +428,7 @@ class _TaskLogScope:
 
     进入时安装、退出时恢复。worker 单任务单线程，swap/restore 无并发风险；
     handler 级别取 WARNING——INFO 级框架内部日志量在任务粒度不可控，
-    用户任务自己的 logger 可显式调级（N3 是 tap 通道，不是全量日志导出）。
+    用户任务自己的 logger 可显式调级（tap 通道，不做全量日志导出）。
     """
 
     def __init__(self, task_id: str) -> None:
@@ -486,7 +487,7 @@ def _run_dispatch(payload: bytes, cancel_event: threading.Event) -> bytes:
         ))
         return _pack_result(False, safe)
 
-    # timeout_ms 为死参数（硬超时由 Rust 进程池强杀负责），固定传 0。
+    # 硬超时由 Rust 进程池对 worker 子进程强杀实施，此处不传 timeout。
     token = _WorkerCancelToken(cancel_event)
     ctx = _DispatchTaskContext(task_id, workflow_id, token)
     # 无 Runtime：事件（started/completed/failed...）由 Rust Worker 在父进程侧
@@ -494,7 +495,7 @@ def _run_dispatch(payload: bytes, cancel_event: threading.Event) -> bytes:
     with _task_context_scope(ctx), _TaskLogScope(task_id):
         t0 = time.monotonic()
         success, payload_obj = _execute_with_retries(
-            func, args, kwargs, 0, retries, retry_delay_ms,
+            func, args, kwargs, retries, retry_delay_ms,
             task_id, workflow_id, token, silent=True,
         )
     # 任务实际执行时段内（含重试的全部尝试）耗时上报到 stderr 边带，由父进程

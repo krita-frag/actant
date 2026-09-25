@@ -1,4 +1,4 @@
-"""内置默认 handler（C4 移动性拆分自 `_runtime.py`）。
+"""内置默认 handler。
 
 LocalRouter / FifoScheduler / DefaultRetryPolicy 是 ERH 的策略默认值；
 `_DefaultValueStoreHandler` 是 ValueStore 的 Python→Rust blob 桥。
@@ -8,9 +8,8 @@ LocalRouter / FifoScheduler / DefaultRetryPolicy 是 ERH 的策略默认值；
 
 from __future__ import annotations
 
-import threading  # noqa: F401
 import zlib
-from typing import TYPE_CHECKING, Any, cast  # noqa: F401
+from typing import TYPE_CHECKING, cast
 
 from actant.capabilities import (
     RetryCtx,

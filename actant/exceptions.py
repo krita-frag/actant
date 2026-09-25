@@ -12,130 +12,131 @@ class ActantError(RuntimeError):
         self.kind = kind
 
 
-class StorageError(ActantError):
+class _HintedActantError(ActantError):
+    """持有 `kind` 与可诊断 `hint` 的 ActantError 子类模板。
+
+    子类只需声明 `kind` 与 `hint` 两个类属性，构造时自动拼接 hint 后缀，
+    避免大量子类重复同一份 __init__ 样板。`hint` 为空则与普通 ActantError
+    一致（如 `FlowReplayError`）。
+    """
+
+    kind: str = "internal"
+    hint: str = ""
+
+    def __init__(self, message: str) -> None:
+        suffix = f" {self.hint}" if self.hint else ""
+        super().__init__(message + suffix, kind=self.kind)
+
+
+class StorageError(_HintedActantError):
     """存储层错误。"""
 
-    def __init__(self, message: str) -> None:
-        hint = (
-            " Check data_dir permissions, ensure only one process accesses the same LMDB path"
-            " (LMDB uses process-level locking — multiple processes on the same data_dir will fail),"
-            " and verify disk space."
-        )
-        super().__init__(message + hint, kind="storage")
+    kind = "storage"
+    hint = (
+        " Check data_dir permissions, ensure only one process accesses the same LMDB path"
+        " (LMDB uses process-level locking — multiple processes on the same data_dir will fail),"
+        " and verify disk space."
+    )
 
 
-class NetworkError(ActantError):
+class NetworkError(_HintedActantError):
     """网络层错误。"""
 
-    def __init__(self, message: str) -> None:
-        hint = (
-            " Ensure all nodes are reachable, ports are open, and bootstrap addresses are correct."
-        )
-        super().__init__(message + hint, kind="network")
+    kind = "network"
+    hint = (
+        " Ensure all nodes are reachable, ports are open, and bootstrap addresses are correct."
+    )
 
 
-class SerializationError(ActantError):
+class SerializationError(_HintedActantError):
     """序列化/反序列化错误。"""
 
-    def __init__(self, message: str) -> None:
-        hint = " Ensure task arguments and return values are picklable."
-        super().__init__(message + hint, kind="serialization")
+    kind = "serialization"
+    hint = " Ensure task arguments and return values are picklable."
 
 
-class ActorError(ActantError):
+class ActorError(_HintedActantError):
     """Actor 系统错误。"""
 
-    def __init__(self, message: str) -> None:
-        hint = " Check actor mailbox capacity, message serialization, and that the target actor is still alive."
-        super().__init__(message + hint, kind="actor")
+    kind = "actor"
+    hint = " Check actor mailbox capacity, message serialization, and that the target actor is still alive."
 
 
-class WorkflowError(ActantError):
+class WorkflowError(_HintedActantError):
     """Workflow 编排错误。"""
 
-    def __init__(self, message: str) -> None:
-        hint = " Verify DAG structure (no cycles, all task_ids referenced in edges exist), and that task payloads are valid."
-        super().__init__(message + hint, kind="workflow")
+    kind = "workflow"
+    hint = " Verify DAG structure (no cycles, all task_ids referenced in edges exist), and that task payloads are valid."
 
 
-class TaskError(ActantError):
+class TaskError(_HintedActantError):
     """任务执行错误。"""
 
-    def __init__(self, message: str) -> None:
-        hint = " Check task function implementation, argument types, and that all dependencies are importable in the worker process."
-        super().__init__(message + hint, kind="task")
+    kind = "task"
+    hint = " Check task function implementation, argument types, and that all dependencies are importable in the worker process."
 
 
-class WorkerError(ActantError):
+class WorkerError(_HintedActantError):
     """Worker 运行时错误。"""
 
-    def __init__(self, message: str) -> None:
-        hint = " Check worker logs, max_concurrent_tasks capacity, and that the Runtime is not in drain mode."
-        super().__init__(message + hint, kind="worker")
+    kind = "worker"
+    hint = " Check worker logs, max_concurrent_tasks capacity, and that the Runtime is not in drain mode."
 
 
-class ConfigError(ActantError):
+class ConfigError(_HintedActantError):
     """配置错误。"""
 
-    def __init__(self, message: str) -> None:
-        hint = " Review ActantConfig fields — failover params must satisfy heartbeat < failure_timeout < lease_duration, and data_dir must be writable."
-        super().__init__(message + hint, kind="config")
+    kind = "config"
+    hint = " Review ActantConfig fields — failover params must satisfy heartbeat < failure_timeout < lease_duration, and data_dir must be writable."
 
 
-class MetricsError(ActantError):
+class MetricsError(_HintedActantError):
     """指标管道错误（初始化或采集失败）。"""
 
-    def __init__(self, message: str) -> None:
-        hint = " Check that the metrics port is not already in use and prometheus_client is installed."
-        super().__init__(message + hint, kind="metrics")
+    kind = "metrics"
+    hint = " Check that the metrics port is not already in use and prometheus_client is installed."
 
 
-class NotFoundError(ActantError):
+class NotFoundError(_HintedActantError):
     """资源未找到。"""
 
-    def __init__(self, message: str) -> None:
-        hint = " Verify the resource ID and that it hasn't been garbage-collected."
-        super().__init__(message + hint, kind="not_found")
+    kind = "not_found"
+    hint = " Verify the resource ID and that it hasn't been garbage-collected."
 
 
-class AlreadyExistsError(ActantError):
+class AlreadyExistsError(_HintedActantError):
     """资源已存在。"""
 
-    def __init__(self, message: str) -> None:
-        hint = " Use a different name or ID."
-        super().__init__(message + hint, kind="already_exists")
+    kind = "already_exists"
+    hint = " Use a different name or ID."
 
 
-class ActantTimeoutError(ActantError):
+class ActantTimeoutError(_HintedActantError):
     """操作超时。"""
 
-    def __init__(self, message: str) -> None:
-        hint = " Consider increasing the timeout, checking worker availability, or verifying network connectivity."
-        super().__init__(message + hint, kind="timeout")
+    kind = "timeout"
+    hint = " Consider increasing the timeout, checking worker availability, or verifying network connectivity."
 
 
-class TaskCancelledError(ActantError):
+class TaskCancelledError(_HintedActantError):
     """操作被取消。"""
 
-    def __init__(self, message: str) -> None:
-        hint = " The task was cancelled via Runtime.cancel_task() or a parent flow was cancelled. Use AsyncResult.state to check cancellation status."
-        super().__init__(message + hint, kind="cancelled")
+    kind = "cancelled"
+    hint = " The task was cancelled via Runtime.cancel_task() or a parent flow was cancelled. Use AsyncResult.state to check cancellation status."
 
 
-class InvalidStateError(ActantError):
+class InvalidStateError(_HintedActantError):
     """无效状态操作（如在 drain 模式下提交任务）。"""
 
-    def __init__(self, message: str) -> None:
-        hint = " Ensure Runtime.start() has been called and the Runtime is not stopped/draining. Use 'with Runtime(...) as rt:' to manage lifecycle."
-        super().__init__(message + hint, kind="invalid_state")
+    kind = "invalid_state"
+    hint = " Ensure Runtime.start() has been called and the Runtime is not stopped/draining. Use 'with Runtime(...) as rt:' to manage lifecycle."
 
 
-class InternalError(ActantError):
+class InternalError(_HintedActantError):
     """内部错误。"""
 
-    def __init__(self, message: str) -> None:
-        hint = " This is likely a bug in Actant — please report it with the full stack trace and reproduction steps."
-        super().__init__(message + hint, kind="internal")
+    kind = "internal"
+    hint = " This is likely a bug in Actant — please report it with the full stack trace and reproduction steps."
 
 
 class PayloadTooLargeError(ActantError):
@@ -167,20 +168,19 @@ class WorkflowFailedError(ActantError):
         super().__init__(message + " " + hint, kind="workflow_failed")
 
 
-class WorkflowCancelledError(ActantError):
+class WorkflowCancelledError(_HintedActantError):
     """Workflow 被取消。"""
 
-    def __init__(self, message: str) -> None:
-        hint = (
-            " The workflow was cancelled — either via Runtime.cancel_workflow(), or as"
-            " part of a terminal transition (a parked flow body is released and"
-            " surfaces this error). This is terminal: the workflow will not resume;"
-            " start a new one if the work is still needed."
-        )
-        super().__init__(message + " " + hint, kind="workflow_cancelled")
+    kind = "workflow_cancelled"
+    hint = (
+        " The workflow was cancelled — either via Runtime.cancel_workflow(), or as"
+        " part of a terminal transition (a parked flow body is released and"
+        " surfaces this error). This is terminal: the workflow will not resume;"
+        " start a new one if the work is still needed."
+    )
 
 
-class FlowReplayError(ActantError):
+class FlowReplayError(_HintedActantError):
     """flow 重放冲突（提交序列指纹 fail-fast）。
 
     flow 体重放时第 n 次 ``task.submit()`` 与工作流历史中同序位节点的指纹
@@ -190,8 +190,8 @@ class FlowReplayError(ActantError):
     在本次重放中被违反，显式失败而非静默错位。
     """
 
-    def __init__(self, message: str) -> None:
-        super().__init__(message, kind="replay")
+    kind = "replay"
+    hint = ""
 
 
 # Rust ActantError variant → Python exception class

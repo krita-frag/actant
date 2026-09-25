@@ -61,8 +61,7 @@ pub use wire::{
 };
 // 请求-响应协议所需类型（公共 API）
 pub use payload::{
-    decode_blob_ref, encode_blob_ref, pack_group, pack_single, sign, unpack_payload, verify,
-    BlobRef,
+    decode_blob_ref, encode_blob_ref, pack_group, sign, unpack_payload, verify, BlobRef,
 };
 pub use serialization::MAX_DECODE_SIZE;
 pub use serialization::{decode_postcard, deserialize_rkyv_value, encode_postcard, serialize_rkyv};

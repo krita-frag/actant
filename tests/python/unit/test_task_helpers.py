@@ -11,9 +11,9 @@ from actant.exceptions import SerializationError, TaskCancelledError
 from actant.task._context import TaskContext, _task_context_scope
 from actant.task._helpers import (
     _emit_task_event,
+    _execute_with_cancellation,
     _interruptible_sleep,
     _pickle_exception,
-    _run_with_timeout,
     _safe_serialize,
     _suppress_pickle_errors,
 )
@@ -57,26 +57,26 @@ def test_interruptible_sleep_already_cancelled_returns_immediately() -> None:
     _interruptible_sleep(10.0, token)
 
 
-def test_run_with_timeout_returns_value() -> None:
+def test_execute_with_cancellation_returns_value() -> None:
     def add(a: int, b: int) -> int:
         return a + b
 
-    assert _run_with_timeout(add, (1, 2), {}, 1000) == 3
+    assert _execute_with_cancellation(add, (1, 2), {}) == 3
 
 
-def test_run_with_timeout_propagates_exception() -> None:
+def test_execute_with_cancellation_propagates_exception() -> None:
     def boom() -> None:
         raise ValueError("boom")
 
     with pytest.raises(ValueError, match="boom"):
-        _run_with_timeout(boom, (), {}, 1000)
+        _execute_with_cancellation(boom, (), {})
 
 
-def test_run_with_timeout_checks_cancel_before_start() -> None:
+def test_execute_with_cancellation_checks_cancel_before_start() -> None:
     ctx = TaskContext("t-cancel")
     ctx._cancel()
     with _task_context_scope(ctx), pytest.raises(TaskCancelledError):
-        _run_with_timeout(lambda: None, (), {}, 1000)
+        _execute_with_cancellation(lambda: None, (), {})
 
 
 def test_pickle_exception_round_trip() -> None:
@@ -271,7 +271,7 @@ def test_emit_task_event_on_error_collect_returns(monkeypatch: pytest.MonkeyPatc
     assert result is exc
 
 
-# ───────────────────────── EventBatcher.close() 显式 join 测试（H5）─────────────────────────
+# ───────────────────────── EventBatcher.close() 显式 join 测试 ─────────────────────────
 
 
 def test_event_batcher_close_joins_flush_thread() -> None:

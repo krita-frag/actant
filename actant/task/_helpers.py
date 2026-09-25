@@ -378,45 +378,26 @@ def _run_coroutine_on_worker_thread(coro: Any) -> Any:
         return result_box[0]
 
 
-def _run_with_timeout(
+def _execute_with_cancellation(
     func: Callable[..., Any],
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
-    timeout_ms: int,  # 保留以兼容调用方签名；超时由 Rust 侧强制执行。
 ) -> Any:
-    """在 worker 子进程主线程同步执行 ``func``，仅承担协作取消检查点。
+    """在 worker 子进程主线程同步执行 ``func``，仅承担协作取消检查。
 
-    执行模型：
-      - 本函数 **不** 在 Python 侧创建子线程或实施任何超时。``func`` 直接在当前
-        worker 子进程的主线程中同步执行。
-      - 硬超时由 Rust 进程池强制：``ProcessTaskDispatcher.dispatch(...,
-        effective_timeout)`` 以 ``effective_timeout`` 为硬上限，超时后立即
-        ``terminate()``/``kill()`` 对应的 worker 子进程并回收并发槽位，返回
-        ``Err(ActantError::Timeout)``。worker 侧不再套内层超时。
-      - Python 无法被强制中断，因此 ``func`` 内部应在长循环处调用
-        ``get_task_context().is_cancelled()`` 或使用 ``_interruptible_sleep``
-        实现协作式取消，以便在硬杀到来前干净退出。
+    硬超时由 Rust 进程池对 worker 子进程强杀实施（``effective_timeout``），
+    Python 侧不做任何超时。本函数职责是协作取消检查点：
+      1. 执行前检查取消标志，已取消则立即抛 ``TaskCancelledError``；
+      2. 执行后再次检查，若期间收到取消则丢弃结果并抛 ``TaskCancelledError``。
 
-    本函数的职责只是 **协作检查点**：
-      1. 执行前检查取消标志——若已取消（例如 dispatch 启动前上层已取消），
-         立即抛出 ``TaskCancelledError``，避免无效工作。
-      2. 执行后再次检查——若 ``func`` 期间收到取消，将结果丢弃并抛出
-         ``TaskCancelledError``，防止被取消任务返回"成功"结果。
-
-    **async def 支持**：若 ``func`` 是 coroutine function（``async def``），
-    在当前 worker 主线程上复用懒创建的进程级 event loop（
-    ``_get_worker_reuse_loop``）执行 coroutine。worker 主线程无运行中的
-    asyncio loop，因此 ``run_until_complete`` 可安全使用；loop 执行完毕后
-    **不关闭**（供后续任务复用），仅由 ``_cancel_pending_loop_tasks`` 清理
-    遗留的 pending 任务。本函数不做任何超时实施——硬超时统一由 Rust
-    进程池对 worker 子进程强杀完成。
+    ``async def`` 函数复用懒创建的进程级 event loop（``_get_worker_reuse_loop``）
+    在当前 worker 主线程执行；loop 不关闭，执行后由 ``_cancel_pending_loop_tasks``
+    清理遗留 pending 任务。
 
     Args:
         func: 待执行的业务函数（已反序列化）。可以是普通函数或 ``async def``。
         args: 位置参数。
         kwargs: 关键字参数。
-        timeout_ms: **未使用**。硬超时由进程池经 ``effective_timeout`` 强制执行。
-            此参数仅为保持调用方签名稳定而保留。
 
     Returns:
         ``func`` 的返回值（对于 ``async def``，是 coroutine 的 return 值，
@@ -474,7 +455,6 @@ def _execute_with_retries(
     func: Any,
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
-    timeout_ms: int,
     retries: int,
     retry_delay_ms: int,
     task_id: str,
@@ -485,7 +465,7 @@ def _execute_with_retries(
 ) -> tuple[bool, Any]:
     """执行任务函数并处理重试/取消/超时。
 
-    重试循环：每次尝试前检查取消，调用 ``_run_with_timeout`` 执行函数。
+    重试循环：每次尝试前检查取消，调用 ``_execute_with_cancellation`` 执行函数。
     失败时若仍有重试次数，则等待可中断的 ``retry_delay_ms`` 后重试；
     否则返回异常对象。成功时返回结果对象。
 
@@ -517,7 +497,7 @@ def _execute_with_retries(
             )
             return False, _ensure_picklable(cancel_exc)
         try:
-            result = _run_with_timeout(func, args, kwargs, timeout_ms)
+            result = _execute_with_cancellation(func, args, kwargs)
         except TaskCancelledError as exc:
             _logger.warning("task %s: cancelled", task_id)
             _emit_task_event(
@@ -844,12 +824,12 @@ __all__ = [
     "_EventBatcherScope",
     "_emit_task_event",
     "_ensure_picklable",
+    "_execute_with_cancellation",
     "_execute_with_retries",
     "_interruptible_sleep",
     "_invoke_callback",
     "_invoke_callbacks",
     "_pickle_exception",
-    "_run_with_timeout",
     "_safe_serialize",
     "_suppress_pickle_errors",
 ]

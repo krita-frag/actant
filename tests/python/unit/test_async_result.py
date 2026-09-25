@@ -7,7 +7,7 @@ import cloudpickle
 import pytest
 
 from actant.exceptions import ActantError, ActantTimeoutError
-from actant.task._async_result import AsyncResult, _resolve_value
+from actant.task._async_result import AsyncResult
 from actant.task._context import TaskContext
 
 _async_result_module = importlib.import_module("actant.task._async_result")
@@ -194,21 +194,6 @@ def test_wait_until_done() -> None:
     threading.Thread(target=_resolve_later, daemon=True).start()
     assert h.wait(timeout=1.0) is True
     assert h.result(timeout=0) == 42
-
-
-def test_resolve_value_asyncresult() -> None:
-    h = AsyncResult("t1")
-    h._set_result(42)
-    assert _resolve_value(h) == 42
-
-
-def test_resolve_value_nested_containers() -> None:
-    h1 = AsyncResult("t1")
-    h2 = AsyncResult("t2")
-    h1._set_result(1)
-    h2._set_result(2)
-    value = _resolve_value({"items": [h1, (h2,)]})
-    assert value == {"items": [1, (2,)]}
 
 
 def test_repr() -> None:

@@ -3,7 +3,7 @@
 //! ## 设计原则
 //!
 //! Rust 核心层**不感知** Python 的参数语义（args/kwargs/TaskRef 位置等）。
-//! 本模块提供基础打包：`pack_single` / `pack_group` — 由 Python 侧调用构建
+//! 本模块提供基础打包：`pack_group` — 由 Python 侧调用构建
 //! 任务 payload，Rust 视为不透明字节。
 //!
 //! ## Payload 格式
@@ -24,18 +24,6 @@ const TAG_SINGLE: u8 = 0x00;
 const TAG_GROUP: u8 = 0x01;
 /// 位置+关键字参数调用标签（仅用于 `unpack_payload` 内部校验）。
 const TAG_SINGLE_KW: u8 = 0x02;
-/// 将单个结果打包为 `[TAG_SINGLE, pickle_bytes...]`。
-///
-/// **当前无生产调用者**：原注释称"由 Python 侧调用构建 default_payload"，
-/// 该调用方已随 `actant/_serialization.py` 移除（仓库里只剩过期的 .pyc）。
-/// 保留是因为它是 [`pack_group`] 的对称原语、且属 `pub mod common` 的公开
-/// API（Rust 嵌入场景可用）；若确认不再需要，按守则 3 删除。
-pub fn pack_single(pickle_bytes: Vec<u8>) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(1 + pickle_bytes.len());
-    buf.push(TAG_SINGLE);
-    buf.extend_from_slice(&pickle_bytes);
-    buf
-}
 
 /// 将多个结果打包为 `[TAG_GROUP, count(u32 LE), len1(u32 LE), data1, ...]`。
 ///
@@ -67,7 +55,7 @@ pub fn pack_group(results: &[Vec<u8>]) -> crate::common::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// 解包由 `pack_single` 或 `pack_group` 打包的负载。
+/// 解包由 `pack_group`（含单值/关键字位置标签）打包的负载。
 ///
 /// 仅用于 Rust 侧测试和内部校验，Python 侧有自己的解包逻辑。
 pub fn unpack_payload(data: &[u8]) -> crate::common::Result<Vec<Vec<u8>>> {
@@ -208,7 +196,7 @@ pub fn verify(key: &[u8], data: &[u8]) -> Result<Vec<u8>, String> {
     let derived = derive_key(key);
     let expected = blake3::keyed_hash(&derived, payload);
 
-    // 恒定时间比较，避免时序侧信道泄露 MAC 字节前缀（SE1）。
+    // 恒定时间比较，避免时序侧信道泄露 MAC 字节前缀。
     // `ct_eq` 要求双方长度相等；mac_bytes 与 expected.as_bytes() 均为 MAC_LEN=32 字节。
     use subtle::ConstantTimeEq;
     if mac_bytes.ct_eq(expected.as_bytes()).into() {
@@ -223,7 +211,7 @@ pub const WIRE_MAC_LEN: usize = 32;
 
 /// 使用共享密钥为 wire message 字节计算 BLAKE3 keyed MAC。
 ///
-/// 流式计算 wire MAC（C2 增量化）：逐段 update，避免先组装与消息等大的
+/// 流式计算 wire MAC：逐段 update，避免先组装与消息等大的
 /// 覆盖字节 `Vec`（一次额外全量 memcpy）。段序与 [`wire_mac`] 的单缓冲
 /// 输入完全一致——`version 字节 | message | traceparent | mac=None 字节`，
 /// 字节序不变红线：两函数对同一 (version, message, traceparent) 必产出
