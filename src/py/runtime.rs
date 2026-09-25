@@ -706,8 +706,8 @@ impl PyRuntimeCore {
     ///
     /// ``origin_node`` 自动设为本节点 ID，使远程结果投递能找到本节点。
     ///
-    /// 性能路径：submit 不再 `block_on(scheduler.enqueue())` 跨 GIL 阻塞，
-    /// 而是把 `TaskDefinition` 推到后台 task 的 mpsc channel 立即返回。
+    /// 性能路径：submit 把 `TaskDefinition` 推到后台 task 的 mpsc channel
+    /// 后立即返回，避免 `block_on(scheduler.enqueue())` 跨 GIL 阻塞。
     /// `endpoint_addr` 在首次调用时 lazy 缓存（iroh endpoint 启动后不变）。
     #[tracing::instrument(name = "py.submit_task", level = "debug", skip(self, py, task), fields(task_id = %task.task_id))]
     fn submit_task(&self, py: Python<'_>, task: PyTask) -> PyResult<()> {
@@ -956,7 +956,7 @@ impl PyRuntimeCore {
         Ok(())
     }
 
-    /// 删除工作流（运维清理，E5）。
+    /// 删除工作流（运维清理）。
     ///
     /// 从内存与持久化存储中移除该工作流的全部状态（DAG/execution/pending/
     /// 结果/等待点/信号缓冲/事件水位）。与 `completed_retention_count` 的
@@ -1098,7 +1098,7 @@ impl PyRuntimeCore {
     ///
     /// 与其它工作流方法不同，本方法**不经 actor 消息循环**：actor 消息处理是
     /// 单线程顺序执行的，在 `handle_message` 内阻塞会让整个 WorkflowActor
-    /// （全部工作流）停摆。因此改为持有编排器只读句柄
+    /// （全部工作流）停摆。因此本方法持有编排器只读句柄
     /// （[`actant_core::runtime::context::Runtime::orchestrator_handle`]，与 actor 共享
     /// 同一个 `Arc<OrchestratorState>`）在 actor 之外阻塞。
     ///
@@ -1409,7 +1409,16 @@ impl PyRuntimeCore {
         Ok(ids.into_iter().map(|id| id.as_str().to_string()).collect())
     }
 
-    /// 枚举当前在线的 peer 节点（节点可见性 N2）。
+    /// 枚举**全部**（含已完成/历史）工作流 ID——存储遍历（``STORE_KEY_DAG`` 前缀）
+    /// 与内存活跃集合的并集。
+    #[tracing::instrument(name = "py.list_all_workflows", level = "debug", skip(self, py))]
+    fn list_all_workflows(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        let ids: Vec<WorkflowId> =
+            self.call_workflow_actor(py, workflow_methods::ALL_WORKFLOW_IDS, Vec::new())?;
+        Ok(ids.into_iter().map(|id| id.as_str().to_string()).collect())
+    }
+
+    /// 枚举当前在线的 peer 节点（节点可见性）。
     ///
     /// 返回 dict 列表，每项为 ``node_id`` / ``endpoint`` / ``available_slots`` /
     /// ``max_slots`` / ``active_workflows`` / ``labels`` / ``platform`` /
@@ -1537,7 +1546,7 @@ impl PyRuntimeCore {
         Ok(())
     }
 
-    /// 注册任务日志回调（N3 档 1）。
+    /// 注册任务日志回调。
     ///
     /// 订阅 event_bus 的 ``TaskLog`` 话题（worker 子进程经 stderr 边带上报的
     /// 任务日志，tap 语义 best-effort 可丢），收到事件时调用
@@ -1599,7 +1608,7 @@ impl PyRuntimeCore {
         Ok(())
     }
 
-    /// 注册 Worker 状态回调（X4）。
+    /// 注册 Worker 状态回调。
     ///
     /// 订阅 event_bus 的 ``WorkerLifecycle`` 话题（draining/drained/stopped），
     /// 收到事件时调用 ``callback(dict)``，dict 为 ``{state, node_id}``。
@@ -1691,9 +1700,9 @@ impl PyRuntimeCore {
 
         // 启动 submit_task 后台投递 task。
         //
-        // 关键优化：每次 submit_task 不再 `tokio.block_on(scheduler.enqueue())`
-        // 跨 GIL 同步阻塞（实测 ~12ms/op），而是把 TaskDefinition 推到
-        // unbounded mpsc channel 立即返回。后台 task 在 tokio runtime 上拉取
+        // 关键优化：submit_task 把 TaskDefinition 推到 unbounded mpsc channel
+        // 立即返回，避免 `tokio.block_on(scheduler.enqueue())` 跨 GIL 同步阻塞
+        // （实测 ~12ms/op）。后台 task 在 tokio runtime 上拉取
         // 并调用 `scheduler.enqueue().await`（actor 消息往返）。
         //
         // 错误处理：enqueue 失败（如 worker 已 shutdown）会 log error 并继续，
@@ -1937,7 +1946,7 @@ impl Drop for PyRuntimeCore {
 }
 
 /// Actor 返回错误时转换为对应的 `ActantError` 异常。
-/// F2a：`WorkflowEventPayload` 的观测访问器在 core 内按 `python` 特性门控
+/// `WorkflowEventPayload` 的观测访问器在 core 内按 `python` 特性门控
 /// （纯框架构建零 dead_code），绑定壳在此自行实现（enum 变体字段天然可见）。
 fn event_payload_task_id(ev: &WorkflowEventPayload) -> Option<&str> {
     match ev {

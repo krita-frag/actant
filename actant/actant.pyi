@@ -307,7 +307,7 @@ class _DagNode:
     """DAG 节点定义，由 Python 层构造后通过 `add_workflow_node` 提交。
 
     `task_id` 是节点在 DAG 中的唯一标识（对应 Orchestrator 侧 TaskId），
-    flow 路径下由提交序号确定性生成（S3 重放身份）；`name` 为人类可读名称。
+    flow 路径下由提交序号确定性生成（重放身份）；`name` 为人类可读名称。
     `priority` 为有符号整数；语义由 Python 层定义。
     `metadata` 为不透明 key-value 映射，Rust 透传不解释。
     """
@@ -441,21 +441,21 @@ class _RuntimeCore:
         failure_strategy: str | None = None,
         timeout_ms: int = 0,
     ) -> None:
-        """创建空持久化工作流外壳（S7 flow 提交路径第一步）。"""
+        """创建空持久化工作流外壳（flow 提交路径第一步）。"""
     def add_workflow_node(
         self,
         workflow_id: str,
         node: _DagNode,
         deps: list[str],
     ) -> dict[str, Any]:
-        """增量加入单个 DAG 节点（S7，先持久化再派发；重放命中时返回历史状态）。
+        """增量加入单个 DAG 节点（先持久化再派发；重放命中时返回历史状态）。
 
         返回 ``{"created": bool, "state": str | None, "result": bytes | None,
         "error": str | None}``。
         """
     def cancel_workflow(self, workflow_id: str) -> None: ...
     def seal_workflow(self, workflow_id: str) -> None:
-        """封口工作流节点集（S7：flow 函数体返回信号）。"""
+        """封口工作流节点集（flow 函数体返回信号）。"""
     def register_wait_point(
         self,
         workflow_id: str,
@@ -464,13 +464,13 @@ class _RuntimeCore:
         name: str | None = None,
         deadline_ms: int = 0,
     ) -> None:
-        """注册持久化等待点（S1/S2/S4）。
+        """注册持久化等待点。
 
         `kind` 为 ``"signal"`` / ``"timer"`` / ``"suspend"``；timer 须给绝对
         epoch 毫秒 `deadline_ms`（> 0）。同 `wait_key` 重复注册幂等。
         """
     def signal_wait_point(self, workflow_id: str, wait_key: str) -> bytes | None:
-        """递交信号唤醒等待点（信号缓冲：注册前抵达不再被丢弃）。
+        """递交信号唤醒等待点（信号缓冲：注册前抵达的信号进入缓冲，不丢弃）。
 
         返回唤醒的 payload；``None`` 表示**此刻没有等待点可被唤醒**，信号已入
         缓冲，将来注册同一 `wait_key` 时立即命中。**未知工作流**抛
@@ -478,7 +478,7 @@ class _RuntimeCore:
         终态，报错就等于"明明送到了却报错"）。
         """
     def resume_suspended(self, workflow_id: str) -> int:
-        """恢复挂起（S4）：唤醒该工作流所有等待中的 `suspend` 等待点。
+        """恢复挂起：唤醒该工作流所有等待中的 `suspend` 等待点。
 
         返回唤醒数量；``0`` 表示当前没有挂起中的挂起点（幂等）。只唤醒
         `suspend` 条件，不触碰 `signal` / `timer` 等待点。
@@ -495,14 +495,14 @@ class _RuntimeCore:
         result: bytes | None = None,
         error: str | None = None,
     ) -> dict[str, Any]:
-        """上报本地 flow 任务终态结果（S6/S7 桥）。
+        """上报本地 flow 任务终态结果。
 
         `state` 为 ``"Completed"`` / ``"Failed"`` / ``"Cancelled"``；
         返回 ``{"retry": bool, "delay_ms": int}``。
         """
     def get_workflow_state(self, workflow_id: str) -> dict[str, Any] | None: ...
     def get_dag(self, workflow_id: str) -> dict[str, Any] | None:
-        """查询工作流 DAG **结构**（E3）：节点 / 依赖边 / 重试策略。
+        """查询工作流 DAG **结构**：节点 / 依赖边 / 重试策略。
 
         与 `get_workflow_state`（**执行**状态）分工：本方法是**结构**。
         返回 ``None``（工作流不存在）或含 ``nodes`` / ``edges`` /
@@ -513,7 +513,7 @@ class _RuntimeCore:
     def get_workflow_history(
         self, workflow_id: str, *, after: tuple[int, int] | None = None
     ) -> list[dict[str, Any]]:
-        """读取工作流事件历史（E2 审计出口）。
+        """读取工作流事件历史（审计出口）。
 
         每项 ``{sequence, timestamp_ms, kind, task_id, error, payload}``；``kind``
         / ``task_id`` / ``error`` 供筛选，``payload`` 为不透明字节。`after` 是
@@ -521,13 +521,14 @@ class _RuntimeCore:
         """
 
     def list_workflows(self) -> list[str]: ...
+    def list_all_workflows(self) -> list[str]: ...
     def peers(self) -> list[dict[str, Any]]: ...
     def delete_workflow(self, workflow_id: str) -> None: ...
     def register_task_log_callback(self, callback: Callable[[dict[str, Any]], None]) -> None: ...
     def register_worker_state_callback(self, callback: Callable[[dict[str, Any]], None]) -> None: ...
     def register_task_result_callback(self, callback: Callable[[_TaskCompletion], None]) -> None: ...
     def value_store(self, data: bytes) -> bytes:
-        """将字节存入本节点内容寻址 blob 存储，返回 BlobRef wire 编码（0.3.2 R2）。"""
+        """将字节存入本节点内容寻址 blob 存储，返回 BlobRef wire 编码。"""
     def value_fetch(self, ref_bytes: bytes) -> bytes:
         """按 BlobRef wire 编码取回值字节：本地命中优先，未命中跨节点流式拉取。"""
     def value_ref_parts(self, ref_bytes: bytes) -> tuple[str, str]:

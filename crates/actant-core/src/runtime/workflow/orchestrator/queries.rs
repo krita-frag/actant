@@ -4,10 +4,10 @@
 
 use crate::common::payload::unpack_payload;
 use crate::common::serialization::serialize_rkyv;
-use crate::common::{RetryPolicy, TaskId, WorkflowId};
+use crate::common::{RetryPolicy, TaskId, WorkflowId, STORE_KEY_DAG};
 use crate::runtime::workflow::{Dag, Phase, WorkflowExecution};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::{keys::*, Orchestrator};
 
@@ -130,6 +130,37 @@ impl Orchestrator {
 
     pub fn active_workflow_ids(&self) -> Vec<WorkflowId> {
         self.state.active_workflow_ids()
+    }
+
+    /// 枚举**全部**工作流 ID：内存活跃 + 存储已持久化（含已完成/历史）。
+    ///
+    /// ``active_workflow_ids`` 只覆盖内存驻留的非终态工作流；已完成并淘汰的工作流
+    /// 仍以 ``STORE_KEY_DAG`` 为前缀的键留存于 Store，无遍历接口。本方法以该前缀
+    /// 扫描 Store 键集，并与内存活跃集合**取并集**（覆盖尚未落盘的刚提交工作流），
+    /// 去重排序后返回。存储枚举失败仅告警并退化为活跃集合——枚举是观测面，
+    /// 失败不应破坏控制面。
+    pub async fn all_workflow_ids(&self) -> Vec<WorkflowId> {
+        let mut ids: HashSet<WorkflowId> = self.active_workflow_ids().into_iter().collect();
+        if let Some(ref store) = self.store {
+            let prefix = STORE_KEY_DAG;
+            match store.scan_prefix(prefix).await {
+                Ok(pairs) => {
+                    for (key, _) in pairs {
+                        if let Some(id) = key.strip_prefix(prefix) {
+                            if !id.is_empty() {
+                                ids.insert(WorkflowId::new(id.to_string()));
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "all_workflow_ids: store scan_prefix failed");
+                }
+            }
+        }
+        let mut all: Vec<WorkflowId> = ids.into_iter().collect();
+        all.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        all
     }
 
     pub fn has_workflow(&self, workflow_id: &WorkflowId) -> bool {

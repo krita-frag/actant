@@ -105,6 +105,8 @@ pub mod workflow_methods {
     /// 事件历史读取（审计出口）。
     pub const GET_HISTORY: &str = "get_history";
     pub const ACTIVE_WORKFLOW_IDS: &str = "active_workflow_ids";
+    /// 枚举全部（含已完成/历史）工作流（存储遍历 + 活跃并集）。
+    pub const ALL_WORKFLOW_IDS: &str = "all_workflow_ids";
     pub const ADOPT_WORKFLOW: &str = "adopt_workflow";
     pub const DELETE_WORKFLOW: &str = "delete_workflow";
     pub const REMOVE_ACTIVE_WORKFLOW: &str = "remove_active_workflow";
@@ -425,6 +427,10 @@ impl Actor for WorkflowActor {
                 let ids = self.orchestrator.active_workflow_ids();
                 Ok(payload_result(msg_id, encode(&ids)?))
             }
+            workflow_methods::ALL_WORKFLOW_IDS => {
+                let ids = self.orchestrator.all_workflow_ids().await;
+                Ok(payload_result(msg_id, encode(&ids)?))
+            }
             workflow_methods::ADOPT_WORKFLOW => {
                 let workflow_id: WorkflowId = decode(&msg.payload)?;
                 self.orchestrator.adopt_workflow(&workflow_id).await?;
@@ -546,7 +552,7 @@ pub(crate) enum InnerScheduler {
         notify: Arc<tokio::sync::Notify>,
         closed: std::sync::atomic::AtomicBool,
     },
-    /// F4 注入缝：使用者提供的调度策略实现。所有操作转发给该实现——
+    /// 注入缝：使用者提供的调度策略实现。所有操作转发给该实现——
     /// fast-path enqueue（SharedInner 直调）与 Actor 消息路径行为一致。
     External(Arc<dyn crate::runtime::workflow::Scheduler>),
 }
@@ -871,7 +877,7 @@ impl SchedulerActor {
         }
     }
 
-    /// 用注入的调度策略实现构造（F4 注入缝）。
+    /// 用注入的调度策略实现构造（注入缝）。
     ///
     /// 内部队列状态被 [`InnerScheduler::External`] 包装——Actor 协议方法与
     /// fast-path enqueue 全部转发给该实现。策略（优先级/公平性/外部系统）

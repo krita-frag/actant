@@ -462,10 +462,9 @@ class Runtime:
                     "this Python handler will NOT be consulted by Rust-internal "
                     "dispatch paths (e.g. Worker task execution). It only takes "
                     "effect for Python-initiated actant.ask/perform/emit calls. "
-                    "For Routing/Scheduling/RetryPolicy this is fine (Python-only "
-                    "capabilities). For Execute/Store/Transport, "
-                    "register before start() or configure Rust-side handlers via "
-                    "RuntimeBuilder to override Rust-internal behavior.",
+                    "This is expected for Routing/Scheduling/RetryPolicy "
+                    "(Python-only capabilities). To override Rust-internal "
+                    "behavior, configure Rust-side handlers via RuntimeBuilder.",
                     name,
                 )
         return self
@@ -891,131 +890,134 @@ class Runtime:
         ``cloudpickle.dumps((success, payload_obj))``——payload_obj 是
         未序列化的 result 或 exc 对象（消除双层 dumps 优化）。
 
-        编排任务的终态在此解析后上报 orchestrator：payload 对 Rust 不
-        透明，本回调是唯一能区分「任务成功」与「任务业务失败」的一侧。上报返回
-        重试裁决且裁决为重试时，句柄保持等待（不发终态事件、移出注册表延后），
-        重试结果到达时经同一回调解析——与 worker 层重试的句柄语义一致。
+        各终态分派到私有方法解析：payload 对 Rust 不透明，本回调是唯一能区分
+        「任务成功」与「任务业务失败」的一侧。终态解析后上报 orchestrator；上报
+        返回重试裁决时句柄保持等待（不发终态事件、不移出注册表），重试结果到达
+        时经同一回调解析——与 worker 层重试的句柄语义一致。
         """
-        import cloudpickle as _cp
-
         task_id = completion.task_id
         with self._lock:
             handle = self._tasks.get(task_id)
         if handle is None:
             return
-        # 进程池后端：任务在 worker 子进程内执行，子进程以 silent=True 抑制
-        # TaskLifecycle 事件。started/completed/failed 事件改由本回调在父进程侧
-        # 依据 completion 状态发布，保持进程隔离前后可观测性契约一致。
         state = completion.state
         if state == TASK_STATE_RUNNING:
-            # Worker 已开始执行任务，更新状态为 running（非终态，不从注册表移除）。
+            # Worker 已开始执行任务，更新为 running（非终态，不从注册表移除）。
             handle._set_running()
             self._emit_batch("started", task_id, handle.workflow_id)
             return
         if state == TASK_STATE_COMPLETED:
-            # dispatch handler 返回 cloudpickle.dumps((success, payload_obj))
-            # payload_obj 是未序列化的 result/exc 对象。
-            raw = completion.result or b""
-            try:
-                success, payload_obj = _cp.loads(raw)
-            except (pickle.UnpicklingError, ValueError, TypeError) as e:
-                # 无法解码：当作失败处理（同样上报——否则编排节点会永久
-                # 停留在 Running，工作流无法封口收尾）。
-                msg = f"undecodable result for task {task_id!r}: {e}"
-                if self._report_task_result_to_orchestrator(handle, "Failed", error=msg):
-                    return
-                handle._set_error(msg)
-                self.unregister_task(task_id)
-                return
-            if success:
-                # 编排任务的完成必须回灌 orchestrator（DAG 状态机由
-                # orchestrator 推进，seal 前全部任务终态才允许工作流终态判定）。
-                # 非编排任务（workflow_id 空）为 no-op。
-                self._report_task_result_to_orchestrator(handle, "Completed", result=raw)
-                # 结果侧降级：结果帧超阈值时原样字节落 blob
-                # （0 次重序列化），句柄内部持 Ref。
-                # 落 blob 失败降级为内联对象并 warning——任务已成功完成，
-                # 值引用基建故障不翻转任务语义。
-                from actant.task._ref import REF_INLINE_THRESHOLD, _value_store
-
-                ref_bytes: bytes | None = None
-                if len(raw) > REF_INLINE_THRESHOLD:
-                    try:
-                        ref_bytes = _value_store(raw, runtime=self)
-                    except Exception:
-                        # 降级原因经 exc_info 日志承载，不静默。
-                        _logger.warning(
-                            "task %s: result (%d bytes) failed to store as blob ref; "
-                            "falling back to inline result",
-                            task_id,
-                            len(raw),
-                            exc_info=True,
-                        )
-                if ref_bytes is not None:
-                    handle._set_result_ref(ref_bytes)
-                else:
-                    # 内联对象路径：直接存对象避免 dumps/loads 往返；任务返回
-                    # bytes（如 echo(b"x")）也按对象存储，不会被误当作序列化结果。
-                    handle._set_result(payload_obj)
-                self._emit_batch("completed", task_id, handle.workflow_id)
-            else:
-                # 失败：payload_obj 是异常对象。
-                # 检查是否为 TaskCancelledError，是则设置 cancelled 状态。
-                from actant.exceptions import TaskCancelledError as _TCE
-
-                if isinstance(payload_obj, _TCE):
-                    # 取消同为编排终态：上报后 orchestrator 才能收尾该节点。
-                    self._report_task_result_to_orchestrator(handle, "Cancelled")
-                    handle._set_cancelled()
-                else:
-                    error_text = f"{type(payload_obj).__name__}: {payload_obj}"
-                    if self._report_task_result_to_orchestrator(
-                        handle, "Failed", error=error_text,
-                    ):
-                        # orchestrator 裁决为重试：句柄保持等待、不发失败事件、
-                        # 不移出注册表——重试结果到达时经同一回调解析。与 worker
-                        # 层重试的句柄语义一致（重试耗尽前提交方见不到失败）。
-                        _logger.info(
-                            "task %s: orchestrator scheduled retry; handle stays pending",
-                            task_id,
-                        )
-                        return
-                    # _set_error 接受 BaseException，内部 dumps 存入 _error_payload。
-                    handle._set_error(payload_obj)
-                    self._emit_batch(
-                        "failed",
-                        task_id,
-                        handle.workflow_id,
-                        error=error_text,
-                    )
+            keep = self._on_task_state_completed(handle, task_id, completion.result or b"")
         elif state == TASK_STATE_FAILED:
-            # error 字段是 Rust 端生成的字符串。通过 reconstruct_error 解析
-            # kind 前缀（``[actant:KIND] message``）重建对应 Python 异常子类，
-            # 保留错误类型（如 timeout → ActantTimeoutError）。
-            error_text = completion.error or "unknown error"
-            # Rust 侧失败（超时/崩溃耗尽/panic）同样是编排终态，须经
-            # orchestrator 裁决重试或终局。
-            if self._report_task_result_to_orchestrator(handle, "Failed", error=error_text):
-                _logger.info(
-                    "task %s: orchestrator scheduled retry; handle stays pending",
-                    task_id,
-                )
-                return
-            handle._set_error(reconstruct_error(error_text))
-            self._emit_batch(
-                "failed",
-                task_id,
-                handle.workflow_id,
-                error=error_text,
-            )
+            # error 字段是 Rust 端生成的字符串，经 reconstruct_error 重建异常
+            # 子类，保留错误类型（如 timeout → ActantTimeoutError）。
+            keep = self._on_task_state_failed(handle, task_id, completion.error or "unknown error")
         elif state == TASK_STATE_CANCELLED:
             # 取消同为编排终态：上报后 orchestrator 才能收尾该节点。
             self._report_task_result_to_orchestrator(handle, "Cancelled")
             handle._set_cancelled()
+            keep = False
         elif state == TASK_STATE_SKIPPED:
             handle._set_error("task skipped")
-        # 任务终态后从注册表移除（本地孤儿回收）。
-        self.unregister_task(task_id)
+            keep = False
+        else:
+            return
+        if not keep:
+            # 终态后从注册表移除（本地孤儿回收）；编排裁决为重试时保持等待。
+            self.unregister_task(task_id)
+
+    def _on_task_state_completed(self, handle: Any, task_id: str, raw: bytes) -> bool:
+        """解析 COMPLETED 结果帧，返回「编排是否裁决重试（句柄保持等待）」。
+
+        进程池后端任务在 worker 内以 silent=True 抑制 TaskLifecycle 事件；
+        started/completed/failed 事件改由父进程侧依据 completion 状态发布，
+        保持进程隔离前后可观测性契约一致。
+        """
+        import cloudpickle as _cp
+
+        try:
+            success, payload_obj = _cp.loads(raw)
+        except (pickle.UnpicklingError, ValueError, TypeError) as e:
+            # 无法解码：当作失败处理（同样上报——否则编排节点会永久停留在
+            # Running，工作流无法封口收尾）。emit=False 与原有语义一致。
+            msg = f"undecodable result for task {task_id!r}: {e}"
+            return self._finalize_failed(handle, task_id, msg, msg, emit=False)
+        if not success:
+            # 失败：payload_obj 是异常对象，先识别取消。
+            from actant.exceptions import TaskCancelledError as _TCE
+
+            if isinstance(payload_obj, _TCE):
+                # 取消同为编排终态：上报后 orchestrator 才能收尾该节点。
+                self._report_task_result_to_orchestrator(handle, "Cancelled")
+                handle._set_cancelled()
+                return False
+            error_text = f"{type(payload_obj).__name__}: {payload_obj}"
+            return self._finalize_failed(handle, task_id, payload_obj, error_text)
+        # 编排任务的完成必须回灌 orchestrator（DAG 状态机由 orchestrator 推进，
+        # seal 前全部任务终态才允许工作流终态判定）；非编排任务（workflow_id 空）
+        # 为 no-op。
+        self._report_task_result_to_orchestrator(handle, "Completed", result=raw)
+        # 结果侧降级：结果帧超阈值时原样字节落 blob（0 次重序列化），句柄内部
+        # 持 Ref。落 blob 失败降级为内联对象并 warning——任务已成功完成，值引用
+        # 基建故障不翻转任务语义。
+        from actant.task._ref import REF_INLINE_THRESHOLD, _value_store
+
+        ref_bytes: bytes | None = None
+        if len(raw) > REF_INLINE_THRESHOLD:
+            try:
+                ref_bytes = _value_store(raw, runtime=self)
+            except Exception:
+                # 降级原因经 exc_info 日志承载，不静默。
+                _logger.warning(
+                    "task %s: result (%d bytes) failed to store as blob ref; "
+                    "falling back to inline result",
+                    task_id,
+                    len(raw),
+                    exc_info=True,
+                )
+        if ref_bytes is not None:
+            handle._set_result_ref(ref_bytes)
+        else:
+            # 内联对象路径：直接存对象避免 dumps/loads 往返；任务返回 bytes
+            # （如 echo(b"x")）也按对象存储，不会被误当作序列化结果。
+            handle._set_result(payload_obj)
+        self._emit_batch("completed", task_id, handle.workflow_id)
+        return False
+
+    def _on_task_state_failed(self, handle: Any, task_id: str, error_text: str) -> bool:
+        """处理 Rust 侧 FAILED（超时/崩溃耗尽/panic）终态。
+
+        error 是 Rust 端字符串，经 ``reconstruct_error`` 解析 kind 前缀
+        （``[actant:KIND] message``）重建对应 Python 异常子类。
+        """
+        return self._finalize_failed(handle, task_id, reconstruct_error(error_text), error_text)
+
+    def _finalize_failed(
+        self,
+        handle: Any,
+        task_id: str,
+        error_payload: Any,
+        error_text: str,
+        emit: bool = True,
+    ) -> bool:
+        """失败终态统一出口：先经 orchestrator 裁决，返回「是否保持句柄等待」。
+
+        裁决为重试时句柄保持 pending、不发失败事件、不移出注册表——重试结果
+        到达时经同一回调解析，与 worker 层重试语义一致（重试耗尽前提交方见不到
+        失败）。
+        """
+        if self._report_task_result_to_orchestrator(handle, "Failed", error=error_text):
+            _logger.info(
+                "task %s: orchestrator scheduled retry; handle stays pending",
+                task_id,
+            )
+            return True
+        # _set_error 接受 BaseException（含 reconstruct 后的异常对象），内部
+        # dumps 存入 _error_payload。
+        handle._set_error(error_payload)
+        if emit:
+            self._emit_batch("failed", task_id, handle.workflow_id, error=error_text)
+        return False
 
     def stop(self, timeout: float | None = None) -> None:
         """停止 Runtime，关闭 Rust tokio runtime 并清除线程上下文。
@@ -1652,8 +1654,23 @@ class Runtime:
             raise InvalidStateError("Runtime not started: rust_core is None")
         return list(core.list_workflows())
 
+    def list_all_workflows(self) -> list[str]:
+        """列出**全部** workflow id——存储遍历（``STORE_KEY_DAG`` 前缀扫描）与
+        内存活跃集合的并集，含已完成/历史工作流。
+
+        相比 ``list_workflows``（仅内存驻留的活跃非终态工作流），已完成并淘汰的
+        工作流仍以 dag 键留存于 Store，本方法一并枚举，适合面板展示历史记录。
+
+        Raises:
+            InvalidStateError: Runtime 未启动。
+        """
+        core = self._rust_core
+        if core is None:
+            raise InvalidStateError("Runtime not started: rust_core is None")
+        return list(core.list_all_workflows())
+
     def on_task_log(self, callback: Callable[[dict[str, Any]], None]) -> None:
-        """订阅任务日志流（N3 档 1）。
+        """订阅任务日志流。
 
         任务在 worker 子进程执行期间，``logging``（WARNING 及以上）与
         ``print`` 输出经 stderr 边带回传，每个事件调用
@@ -1674,7 +1691,7 @@ class Runtime:
         core.register_task_log_callback(callback)
 
     def on_worker_state(self, callback: Callable[[dict[str, Any]], None]) -> None:
-        """订阅 Worker 生命周期事件（X4）。
+        """订阅 Worker 生命周期事件。
 
         节点进入排空/完成排空/停止时调用
         ``callback({state, node_id})``（state ∈ ``draining``/``drained``/``stopped``）。
