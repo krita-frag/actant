@@ -85,6 +85,8 @@ OPS_PER_CALL: dict[str, int] = {
     "gather/gather_10": 10,
     "gather/gather_100": 100,
     "gather/serial_result_100": 100,
+    "batch/batch_10": 10,
+    "batch/batch_100": 100,
     "concurrency/concurrent_1000": 1000,
     "concurrency/silent_1000": 1000,
     "events/normal_100": 100,
@@ -164,7 +166,7 @@ def _bench_definitions(quick: bool = False) -> list[tuple[str, str, Callable, in
     flows = _make_flows()
 
     # 默认采样配置
-    # 注意：actant submit 同步阻塞 ~7-12ms/op，单次采样 number=50 即 ~500ms
+    # 注意：actant submit 同步阻塞 ~242µs/op（详见报告），单次采样 number=100 即 ~24ms
     if quick:
         nr_normal = (20, 3)  # (number, repeat)
         nr_slow = (5, 3)
@@ -268,6 +270,21 @@ def _bench_definitions(quick: bool = False) -> list[tuple[str, str, Callable, in
             make_payload.submit(s).result(timeout=10)
 
         defs.append((f"payload/output_{size}_bytes", "payload", _make_output, *nr_slow))
+
+    # === batch（推荐吞吐路径：submit_batch 单次 PyO3 投递 + gather 并行等待）===
+    # 与 gather/* 对照：gather_* 用循环 submit()（每次独立 PyO3 边界），本组走
+    # submit_batch → enqueue_batch 单次投递，测量批量投递的边际收益。
+    def _batch_10():
+        handles = echo.submit_batch([b""] * 10)
+        actant.gather(*handles, timeout=10)
+
+    defs.append(("batch/batch_10", "batch", _batch_10, *nr_normal))
+
+    def _batch_100():
+        handles = echo.submit_batch([b""] * 100)
+        actant.gather(*handles, timeout=30)
+
+    defs.append(("batch/batch_100", "batch", _batch_100, *nr_slow))
 
     # === flow ===
     fanout_imperative = flows["fanout_imperative"]

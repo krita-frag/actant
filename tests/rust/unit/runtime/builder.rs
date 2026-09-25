@@ -90,7 +90,7 @@ fn symlink_to_system_dir_rejected() {
 
 #[test]
 fn subdir_of_system_dir_rejected() {
-    // H6.3：黑名单祖先判断——系统目录的子路径同样拒绝，即使目录尚不存在
+    // 黑名单祖先判断——系统目录的子路径同样拒绝，即使目录尚不存在
     // （canonicalize 失败，走逐级向上找已存在祖先的归一化路径）。
     let result = validate_data_dir("/etc/actant-nonexistent-xyz-123");
     assert!(
@@ -477,7 +477,7 @@ async fn build_creates_expected_subdirectories() {
         .await
         .expect("build should succeed");
 
-    // build 应创建 orchestrator、store 子目录；actor 系统不再落盘。
+    // build 应创建 orchestrator、store 子目录；actor 系统不落盘。
     assert!(
         dir.path().join("orchestrator").exists(),
         "orchestrator dir should exist"
@@ -710,6 +710,144 @@ async fn build_redispatches_recovered_pending_tasks_only() {
     assert!(
         worker.scheduler().try_dequeue().await.is_none(),
         "no other task may be redispatched: t1 is Completed (no re-run), t3 has unfinished dependencies"
+    );
+
+    runtime.shutdown().await.expect("shutdown ok");
+}
+
+// ───────────────────────── 注入缝「真实接入」验证 ─────────────────────────
+// 6 个 `RuntimeBuilder::with_*` 缝中，`with_event_log`/`with_task_dispatcher`/
+// `with_orchestrator_ingest` 已被既有测试与 `examples/rust_embed.rs` 接入验证；
+// 以下为 `with_transport`/`with_scheduler`/`with_discovery` 三个注入缝的端到端
+// 接入测试：每个都注入自定义实现，并断言其**真实接管**而非回退到内置实现。
+
+/// 始终报告 `len() == 7`、`is_empty() == false` 的哨兵调度器。
+///
+/// 默认 FIFO/priority 在空队列下 `len()` 为 0。注入后若能通过
+/// `worker.scheduler().len()` 读到哨兵值，即证明注入策略被 `SchedulerActor`
+/// 包装并权威接管（而非回退到 config 选的内置策略）。
+struct SentinelScheduler;
+
+#[async_trait::async_trait]
+impl crate::runtime::workflow::Scheduler for SentinelScheduler {
+    async fn enqueue(
+        &self,
+        _task: crate::common::TaskDefinition,
+    ) -> std::result::Result<(), crate::common::ActantError> {
+        Ok(())
+    }
+    async fn enqueue_batch(
+        &self,
+        _tasks: Vec<crate::common::TaskDefinition>,
+    ) -> std::result::Result<(), crate::common::ActantError> {
+        Ok(())
+    }
+    async fn dequeue(&self) -> Option<crate::common::TaskDefinition> {
+        None
+    }
+    async fn try_dequeue(&self) -> Option<crate::common::TaskDefinition> {
+        None
+    }
+    async fn dequeue_batch(&self, _limit: usize) -> Vec<crate::common::TaskDefinition> {
+        Vec::new()
+    }
+    async fn drain_unrouted(&self) -> Vec<crate::common::TaskDefinition> {
+        Vec::new()
+    }
+    async fn is_empty(&self) -> bool {
+        false
+    }
+    async fn len(&self) -> usize {
+        7
+    }
+}
+
+/// 记录 `apply` 是否被调用的发现策略桩。
+///
+/// `Discovery::apply` 在 `NetworkManager` 构造（build 期间）同步调用一次；
+/// 注入后若标志被置位，即证明注入发现策略被应用（而非使用 config 的
+/// `discovery_mode` preset）。
+#[derive(Debug)]
+struct SeamDiscovery {
+    applied: std::sync::atomic::AtomicBool,
+}
+
+impl crate::runtime::network::Discovery for SeamDiscovery {
+    fn apply(&self, builder: iroh::endpoint::Builder) -> iroh::endpoint::Builder {
+        self.applied
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        builder
+    }
+    fn name(&self) -> &'static str {
+        "seam-test"
+    }
+}
+
+#[tokio::test]
+async fn build_with_injected_transport_uses_it_as_live_network() {
+    let dir = tempdir().unwrap();
+    let node_id = make_node("node-transport-seam");
+    // 记录订阅的注入传输层；与传入 builder 的是同一底层实例（Arc 克隆）。
+    let mock = MockTransport::new("node-transport-seam");
+    let transport: Arc<dyn crate::runtime::network::Transport> = Arc::new(mock.clone());
+
+    let runtime = RuntimeBuilder::new(node_id, make_test_config())
+        .with_data_dir(dir.path().to_str().unwrap().to_string())
+        .with_transport(transport)
+        .build()
+        .await
+        .expect("build with injected transport should succeed");
+
+    // build 会对能力 gossip topic 订阅（builder 装配必经路径）。注入传输层若
+    // 真是 live network，该订阅会被记录；内置 NetworkManager 则不会写入此桩。
+    assert!(
+        mock.subscribed_to(crate::common::wire::constants::TOPIC_CAPABILITY_GOSSIP),
+        "injected transport must be the live network and receive build-time subscriptions"
+    );
+
+    runtime.shutdown().await.expect("shutdown ok");
+}
+
+#[tokio::test]
+async fn build_with_injected_scheduler_is_authoritative() {
+    let dir = tempdir().unwrap();
+    let node_id = make_node("node-scheduler-seam");
+
+    let runtime = RuntimeBuilder::new(node_id, make_test_config())
+        .with_data_dir(dir.path().to_str().unwrap().to_string())
+        .with_scheduler(Arc::new(SentinelScheduler))
+        .build()
+        .await
+        .expect("build with injected scheduler should succeed");
+
+    let worker = runtime.worker().expect("worker injected");
+    assert_eq!(
+        worker.scheduler().len().await,
+        7,
+        "injected scheduler must govern len(), not fall back to built-in FIFO/priority"
+    );
+
+    runtime.shutdown().await.expect("shutdown ok");
+}
+
+#[tokio::test]
+async fn build_applies_injected_discovery() {
+    let dir = tempdir().unwrap();
+    let node_id = make_node("node-discovery-seam");
+    let discovery = Arc::new(SeamDiscovery {
+        applied: std::sync::atomic::AtomicBool::new(false),
+    });
+
+    let runtime = RuntimeBuilder::new(node_id, make_test_config())
+        .with_data_dir(dir.path().to_str().unwrap().to_string())
+        .with_discovery(discovery.clone())
+        .build()
+        .await
+        .expect("build with injected discovery should succeed");
+
+    assert!(
+        discovery.applied.load(std::sync::atomic::Ordering::Relaxed),
+        "injected discovery must be applied to the built network, not the config preset"
     );
 
     runtime.shutdown().await.expect("shutdown ok");

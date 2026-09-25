@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib
 import time
+from typing import Any
 
 import pytest
 
@@ -241,5 +242,37 @@ def test_flow_body_error_propagates_without_retry() -> None:
     with Runtime.with_defaults(), pytest.raises(RuntimeError, match="not yet"):
         my_flow()
     assert calls["count"] == 1
+
+
+def test_list_all_workflows_includes_completed() -> None:
+    """已完成工作流离开活跃列表，但存储遍历接口仍能枚举到它（历史记录）。
+
+    ``list_workflows`` 仅返回内存活跃非终态工作流；``list_all_workflows``
+    以 ``STORE_KEY_DAG`` 前缀扫描 Store 并与活跃集合取并集，故已完成工作流
+    仍可枚举，供面板展示历史。
+    """
+    from actant.flow import current_workflow_id
+
+    with Runtime.with_defaults() as rt:
+        holder: dict[str, Any] = {}
+
+        @flow(name="unit_hist_wf")  # type: ignore[untyped-decorator]
+        def my_flow() -> int:
+            holder["workflow_id"] = current_workflow_id()
+            return _add_one.submit(1).result()  # type: ignore[no-any-return]
+
+        assert my_flow() == 2
+        workflow_id = str(holder["workflow_id"])
+        # 终态工作流离开"活跃"列表。
+        assert workflow_id not in rt.list_workflows()
+        # 存储遍历接口仍能枚举到它。
+        assert workflow_id in rt.list_all_workflows()
+
+
+def test_list_all_workflows_unstarted_raises() -> None:
+    """未启动的 Runtime 调用 ``list_all_workflows`` 抛 ``InvalidStateError``。"""
+    rt = Runtime()
+    with pytest.raises(InvalidStateError):
+        rt.list_all_workflows()
 
 

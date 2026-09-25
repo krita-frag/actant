@@ -406,7 +406,7 @@ async fn submit_with_timeout_sets_deadline() {
     assert!(state.deadline_ms().is_some());
 }
 
-// --- B2: 工作流级硬超时主动取消 ---
+// --- 工作流级硬超时主动取消 ---
 
 /// 捕获所有 broadcast 调用的 mock transport，用于断言超时监控发出了取消广播。
 struct BroadcastCaptureTransport {
@@ -496,7 +496,7 @@ impl Transport for BroadcastCaptureTransport {
     }
 }
 
-/// B2 关键测试：注入网络后，工作流超时触发 CancelBroadcast 广播。
+/// 关键测试：注入网络后，工作流超时触发 CancelBroadcast 广播。
 #[tokio::test]
 async fn workflow_timeout_broadcasts_cancel_when_network_set() {
     use crate::common::wire::{CancelBroadcast, TOPIC_CANCEL};
@@ -613,7 +613,7 @@ async fn workflow_timeout_self_delivers_cancel_locally() {
     assert_eq!(decoded.task_id, roots[0].id);
 }
 
-/// B2 回归测试：未注入网络时，超时监控仍标记工作流失败但不广播取消。
+/// 回归测试：未注入网络时，超时监控仍标记工作流失败但不广播取消。
 #[tokio::test]
 async fn workflow_timeout_without_network_marks_failed_without_broadcast() {
     let mut config = ActantConfig::default();
@@ -1058,7 +1058,7 @@ async fn late_completion_after_failure_does_not_revive_workflow() {
     assert!(t1.result.is_none());
 }
 
-// ---- P1：submit_with_timeout 的 deadline 持久化 ----
+// ---- submit_with_timeout 的 deadline 持久化 ----
 
 /// 设置 deadline 后经 flush 落盘，重启 recover 后 deadline 仍在。
 #[tokio::test]
@@ -1089,7 +1089,7 @@ async fn submit_with_timeout_persists_deadline_across_recover() {
     );
 }
 
-// ---- P1：条件边求值失败不得丢弃 ready 后继 ----
+// ---- 条件边求值失败不得丢弃 ready 后继 ----
 
 /// 求值器返回 Err 时：`on_task_completed` 不应整体失败，已就绪的普通后继
 /// 照常返回，求值失败的条件边原样交还调用方外部处理（重试同一完成消息
@@ -1152,7 +1152,7 @@ async fn condition_evaluator_error_defers_edge_and_keeps_ready() {
     assert_eq!(state.tasks[&TaskId::from("t2")].state, Phase::Pending);
 }
 
-// ---- P1：超时失败的工作流写入 Failed 事件 ----
+// ---- 超时失败的工作流写入 Failed 事件 ----
 
 /// 工作流级硬超时触发后，除状态翻转外还应向 `workflow:{id}` topic 写入
 /// `WorkflowEventPayload::Failed` 事件（对齐 fail_task 路径）。
@@ -2021,10 +2021,10 @@ async fn timeout_watcher_fires_expired_timer_wait_point_without_explicit_poll() 
 // 终态释放 park 等待者 / suspend 恢复
 // ---------------------------------------------------------------------------
 
-/// 核心修复：工作流进入终态时必须释放**等待点 park** 的等待者。
+/// 核心不变量：工作流进入终态时必须释放**等待点 park** 的等待者。
 ///
-/// 等待点 park 是独立于 `AsyncResult` 的第二条阻塞原语，此前唯一的释放点是
-/// 运行时关停（`release_all_wait_point_waiters`）。缺了这一步，cancel / fail /
+/// 等待点 park 是独立于 `AsyncResult` 的第二条阻塞原语，仅靠运行时关停
+/// （`release_all_wait_point_waiters`）释放不够。缺了这一步，cancel / fail /
 /// deadline 都到不了 park 中的 flow 体——工作流已终态而函数体永久挂起
 ///（实测：8s 观察窗内纹丝不动）。
 #[tokio::test]
@@ -2416,4 +2416,50 @@ async fn history_trim_only_touches_events_absorbed_by_watermark() {
         total_after <= total_before,
         "裁剪只应减少总量：before={total_before} after={total_after}"
     );
+}
+
+/// `all_workflow_ids` 返回内存活跃集合与存储 dag 前缀扫描（已完成/历史）的并集，
+/// 去重排序；直接写 dag 键模拟"淘汰后仅剩 dag 键"的历史工作流。
+#[tokio::test]
+async fn all_workflow_ids_unions_active_and_store() {
+    let dir = tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let orch = Orchestrator::new()
+        .with_signing_key(TEST_SIGNING_KEY.to_vec())
+        .with_store(store.clone());
+
+    // 内存活跃工作流（submit 时也会落盘 dag 键，但纳入的是内存驻留集合）。
+    let active = WorkflowId::from("wf-active");
+    orch.submit(active.clone(), make_linear_dag())
+        .await
+        .unwrap();
+
+    // 两个"已完成/历史"工作流：直接以 dag 前缀写 Store。
+    let done_a = WorkflowId::from("wf-done-a");
+    let done_b = WorkflowId::from("wf-done-b");
+    for wf_id in [&done_a, &done_b] {
+        let key = format!("{}{}", crate::common::STORE_KEY_DAG, wf_id.as_str());
+        store.put(&key, b"dag-bytes").await.unwrap();
+    }
+
+    let ids = orch.all_workflow_ids().await;
+    assert_eq!(ids.len(), 3, "active + done_a + done_b");
+    assert!(ids.contains(&active));
+    assert!(ids.contains(&done_a));
+    assert!(ids.contains(&done_b));
+    // 结果稳定排序（确定性，便于断言与展示）。
+    let mut sorted = ids.clone();
+    sorted.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    assert_eq!(ids, sorted);
+}
+
+/// 无 store 的 Orchestrator：枚举退化为内存活跃集合，不报错。
+#[tokio::test]
+async fn all_workflow_ids_without_store_falls_back_to_active() {
+    let orch = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
+    let wf = WorkflowId::from("wf-only-active");
+    orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
+
+    let ids = orch.all_workflow_ids().await;
+    assert_eq!(ids, vec![wf]);
 }
