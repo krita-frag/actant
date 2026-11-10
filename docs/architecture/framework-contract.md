@@ -21,54 +21,66 @@ Actant 的身份定义见[架构总览](overview.md)。框架化不改变身份�
 
 ## 二、扩展缝（全部是编译期 trait，见"不插件化"）
 
-扩展点的**唯一事实源**是 `actant/extension_points.json`；由它生成的
-[扩展点清单](../reference/extension-points.md) 列出每一层的入口、装配位置、
-解析时机、热路径标记、跨节点安全性与验收测试，`actant extensions` 输出同一份数据。
-`tests/python/unit/test_extension_contract.py` 把清单与
-`RuntimeBuilder::with_*`、`BUILTIN_CAPABILITIES` 双向比对：新增缝不登记、
-登记了却删缝、或验收路径失效，CI 都会变红。该门禁还静态扫描热路径白名单文件，
-禁止 capability 动态分派调用与 GIL 附加进入每任务 / 每消息路径。
+Actant 没有插件注册表，也没有描述扩展点的清单文件：缝就是 trait（Rust）与
+handler 链（Python），注入就是调用一次 builder 方法或 `chain`，其余由用户自己在
+Rust / Python 侧拼装。因此「有哪些缝」直接看 `RuntimeBuilder::with_*` 与
+`rt.layer(...)`，不存在第二份需要同步的登记表。
 
-清单里的 `production_call_site` 记的是**装配 / 绑定位置**（多数是
-`RuntimeBuilder` 的 `build` / `init_*`），不是运行期调用频率；是否热路径由
-`hot_path` 单独标注，静态扫描目标由门禁内的白名单给出。
+| 缝 | 注入点 | 跨节点可用 | 运行期可替换 |
+| --- | --- | --- | --- |
+| `Scheduler` | `RuntimeBuilder::with_scheduler` | 是 | 否 |
+| `RoutePolicy` | `RuntimeBuilder::with_route_policy`（或 `Runtime(route_policy=...)`） | 是 | 否 |
+| `TaskDispatcher` | `RuntimeBuilder::with_task_dispatcher` | 是 | 否 |
+| `Transport` | `RuntimeBuilder::with_transport` | 是 | 否 |
+| `Discovery` | `RuntimeBuilder::with_discovery` | 是 | 否 |
+| `EventLog` | `RuntimeBuilder::with_event_log` | 是 | 否 |
+| `SubmitBackend` | `Task.submit` 的后端协议（Python 侧） | 否 | 是 |
+| 内置 capability handler | `rt.layer(name).chain(handler)` | 否 | 是 |
 
-分层语义（「统一」落在契约与验收，不落在分发路径）：
+「跨节点可用」只对 Rust 缝成立：实现随引擎部署，workflow failover 后仍在本节点
+可用；Python handler 与 `SubmitBackend` 是进程内对象，不随工作流迁移。
 
-- **rust**：6 条编译期 trait 缝，经 `RuntimeBuilder::with_*` 注入。实现随引擎
-  部署，failover 后仍在本节点可用；这是唯一能改变 Rust 内部行为的一层。
-- **bridge**：Python 代码接入 Rust 热路径的桥（`PyRoutePolicy`）与 Python 侧
-  提交接缝（`SubmitBackend`）。实现是进程内对象，**不随工作流迁移**。
-- **python**：4 个内置 capability 的 handler 链，经 `rt.layer(name).chain(...)`。
-  只作用于 Python 侧发起的 effect，同样不跨节点。
+**统一的是词汇，不是调用路径**。所有扩展共用 capability / handler / effect 词汇，
+但按解析时机分两个执行域：
 
-**统一落在契约，不落在调用路径**：所有条目共用 capability / handler / effect
-词汇、同一份清单与验收分级，但按 `resolution` 分成两个执行域。
+- **构造期定稿**：`Arc<dyn Trait>` 句柄在 `Runtime::new` / `RuntimeBuilder::build`
+  二选一并冻结，运行期只有一次 vtable 调用、不查注册表、没有 setter。6 条 Rust 缝
+  属于此域；`route_policy` 的实现可以是 Python callable，但仍由
+  `resolve_route_policy` 在构造期决定并注入，运行期不存在「是否安装」的分支。
+- **运行期解析**：`rt.layer(...).chain(...)` 可增删覆盖，用于数据面与观测面。
+  `CapabilityRuntime` 的 `ask` / `perform` / `emit` 需经注册表查表、编解码与 Actor
+  邮箱往返，只服务 Python 侧发起的 effect，不进入每任务 / 每消息路径。
 
-- `build_time`：构造期二选一并冻结为 `Arc<dyn Trait>` 句柄，运行期只有一次
-  vtable 调用。6 条 rust 缝与 `py_route_policy` 属于此域；Python 侧能在
-  `actant extensions` 查到它们，但没有 setter，不能在运行期替换。
-  `py_route_policy` 的实现是 Python callable，仍由 `resolve_route_policy`
-  在 `Runtime::new` 构造期决定并注入，运行期不存在「是否安装」的分支。
-- `runtime`：`rt.layer(...).chain(...)` 动态解析，可增删覆盖；用于数据面与
-  观测面。`CapabilityRuntime` 的 `ask` / `perform` / `emit` 需经注册表查表、
-  编解码与 Actor 邮箱往返，不进入 `hot_path=true` 的路径。
+Rust 侧自行拼装：
 
-`hot_path=true` 的点必须 `resolution=build_time`；该约束与热路径文件的静态
-扫描一起替代性能阈值断言，理由见 `.github/workflows/bench.yml` 的裁决。
+```rust
+let runtime = RuntimeBuilder::new(node_id, config)
+    .with_data_dir(data_dir)
+    .with_scheduler(Arc::new(MyScheduler::default()))
+    .with_task_dispatcher(Arc::new(MyDispatcher::default()))
+    .build()
+    .await?;
+```
 
-**性能保证靠结构，不靠数值阈值**：`build_time` 域在 `Runtime::new` /
-`RuntimeBuilder::build` 二选一并冻结，运行期不存在「是否安装了 Python handler」
-的判断，也不查注册表；热路径白名单文件由 `test_extension_contract.py` 静态禁止
-capability 三动词调用与 GIL 附加。`.github/workflows/bench.yml` 只产出 criterion
-artifact 供人工跨 run 对比，明确不做阈值断言（共享 runner 的 CPU 噪声大于真实
-回归幅度），因此它不是门禁。冻结是单向的：构造期定稿后运行期不可替换、不可热
-更新，换实现必须重建 Runtime；这与
-`crates/actant-core/src/runtime/capability.rs::bind_actor_system` 在 spawn 时
-快照 handler、绑定后禁止 `chain` 的语义一致。
+Python 侧自行拼装：
 
-放置类策略（路由 / 调度 / 重试）不是 capability：它们由 rust 层的
-`RoutePolicy` / `Scheduler` 承担，避免进程内闭包在 failover 后失效。
+```python
+rt = Runtime(route_policy=my_callable)   # 构造期注入，运行期不可换
+rt.layer("Store").chain(my_store_handler)  # 运行期可增删覆盖
+```
+
+冻结是单向的：构造期定稿后运行期不可替换、不可热更新，换实现必须重建 Runtime；
+这与 `crates/actant-core/src/runtime/capability.rs::bind_actor_system` 在 spawn 时
+快照 handler、绑定后禁止 `chain` 的语义一致。放置类策略（路由 / 调度 / 重试）不是
+capability：它们由 Rust 层的 `RoutePolicy` / `Scheduler` 承担，避免进程内闭包在
+failover 后失效。
+
+**性能边界用结构守，不用数值阈值**：`tests/python/unit/test_hot_path_guard.py`
+静态扫描热路径白名单文件（路由、调度、任务分发、传输广播、事件日志落盘、上下文），
+禁止 `CapabilityRuntime` 三动词调用与 `Python::attach` / `with_gil` 出现在每任务 /
+每消息路径。只禁调用形态，不禁类型名与 postcard 序列化——`context.rs` 合法持有
+`CapabilityRuntime`。`.github/workflows/bench.yml` 只产出 criterion artifact 供人工
+跨 run 对比，不做阈值断言：共享 runner 的 CPU 噪声大于真实回归幅度，不能当门禁。
 
 ### Rust 嵌入最小清单
 
@@ -108,8 +120,7 @@ Python 层有两条扩展路径，均经 `rt.layer(...)` 登记 handler，**只�
   workflow failover 后失效。
 
 要覆盖 **Rust 内部行为**（任务执行、存储、传输等），只能用 rust 层的
-`RuntimeBuilder` 注入缝（见[扩展点清单](../reference/extension-points.md)），
-不能靠 `layer().chain()`。
+`RuntimeBuilder` 注入缝（见本节表格），不能靠 `layer().chain()`。
 
 `rt.layer("Store").chain(handler)` 是公开的数据面扩展点，边界由
 `tests/python/integration/test_store_capability_override.py` 锁定：**Python 侧

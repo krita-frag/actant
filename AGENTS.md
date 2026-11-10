@@ -12,7 +12,7 @@
 - ERH 扩展模型：[docs/architecture/erh.md](docs/architecture/erh.md)
 - Worker 与进程隔离：[docs/architecture/worker-model.md](docs/architecture/worker-model.md)
 - 框架契约与 Rust 注入缝：[docs/architecture/framework-contract.md](docs/architecture/framework-contract.md)
-- 全部扩展点、执行域与验收：[docs/reference/extension-points.md](docs/reference/extension-points.md)；维护流程：[docs/contributing/extensions.md](docs/contributing/extensions.md)
+- 扩展缝与执行域边界：[docs/architecture/framework-contract.md](docs/architecture/framework-contract.md)
 - 任务 / 工作流 / 能力扩展：[docs/guide/](docs/guide/)
 - 代码约定全文：[docs/contributing/code-style.md](docs/contributing/code-style.md)
 - 文档该写在哪：[docs/contributing/doc-map.md](docs/contributing/doc-map.md)
@@ -64,7 +64,7 @@
 - 测试必须确定性；外部依赖需 mock。
 - 端到端测试用 `threading.Event` 做就绪信号。
 - 接线类改动不看「单测全绿」：必须有真实驱动生产路径的 e2e，且不直接调用被接线函数。
-- 新增或保留扩展点必须登记 `actant/extension_points.json`（含 `resolution` / `hot_path`），并交齐「清单登记 + 能证伪的门禁 + 验收测试」。热路径点必须 `build_time`，热路径白名单文件不得出现 capability 动态分派调用或 GIL 附加；只禁调用形态，不禁类型名与网络帧序列化。门禁见 `tests/python/unit/test_extension_contract.py`，流程见 [扩展点维护](docs/contributing/extensions.md)。
+- 新增扩展缝只需两件事：注入入口（`RuntimeBuilder::with_*` 或 `rt.layer(...).chain(...)`）+ 一条真实驱动生产路径的接线测试；边界写进 [框架契约](docs/architecture/framework-contract.md)，不另设登记清单或查询命令。热路径文件不得出现 capability 动态分派调用或 GIL 附加；只禁调用形态，不禁类型名与网络帧序列化，静态扫描见 `tests/python/unit/test_hot_path_guard.py`。
 - 全量命令见 [docs/contributing/testing.md](docs/contributing/testing.md)。
 
 ## 常用命令

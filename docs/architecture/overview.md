@@ -4,7 +4,7 @@
 
 Actant 的身份 = **P2P 无中心 fabric + ERH 能力分发 + 进程级隔离 + 持久化状态机**。
 这里的「能力分发」指 `runtime` 域的用户态扩展；Rust 引擎内部的可替换策略另由
-`RuntimeBuilder` 的编译期 trait 缝承担，两者同登一份[扩展点清单](../reference/extension-points.md)。
+`RuntimeBuilder` 的编译期 trait 缝承担，两者见[框架契约](framework-contract.md)的扩展缝一节。
 
 | 盒 | 内容 |
 | --- | --- |
@@ -26,7 +26,7 @@ Actant 的身份 = **P2P 无中心 fabric + ERH 能力分发 + 进程级隔离 +
 
 ## 扩展面全景
 
-所有扩展点同登[扩展点清单](../reference/extension-points.md)，共用 capability / handler / effect 词汇与一套验收门禁；统一的是契约，不是调用路径。按解析时机分两个执行域：
+全部扩展共用 capability / handler / effect 词汇；统一的是词汇与边界，不是调用路径。按解析时机分两个执行域，细节见[框架契约](framework-contract.md)：
 
 | 执行域 | 解析时机 | 典型扩展面 | 运行期成本 |
 | --- | --- | --- | --- |
@@ -106,10 +106,9 @@ Rust：tokio、iroh、iroh-blobs、heed/LMDB、rkyv、postcard、PyO3。Python�
 ## 下一步
 
 - [ERH 扩展模型](erh.md)
-- [扩展点清单](../reference/extension-points.md)
+- [框架契约](framework-contract.md)：扩展缝、执行域与性能边界
 - [Worker 运行模型](worker-model.md)
 - [调度器](scheduler.md)
 - [故障转移](failover.md)
 - [恢复语义](recovery.md)
-- [框架契约](framework-contract.md)
 - [服务层](service-layer.md)

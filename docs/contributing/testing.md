@@ -53,13 +53,13 @@ cargo test -p actant-core -p actant-common --no-default-features
 uv run python scripts/gen_api_reference.py --check           # 参考页是否最新
 uv run python scripts/api_surface.py --check                 # 公共 API 表面快照
 uv run pytest tests/python/unit/test_docs_contract.py -q     # 公共 API docstring 契约
-uv run pytest tests/python/unit/test_extension_contract.py -q # 扩展点清单、执行域与热路径静态扫描
 uv run mkdocs build --strict                                 # 死链与构建错误
 ```
 
-改动 `actant/extension_points.json` 后，除重新生成参考页外还必须跑
-`test_extension_contract.py`：它会双向比对清单与 Rust trait 缝 / 内置 capability，
-并静态扫描热路径白名单文件。流程见[扩展点维护](extensions.md)。
+改动 Rust 热路径（路由、调度、任务分发、传输、事件日志、上下文）后跑
+`tests/python/unit/test_hot_path_guard.py`：它静态扫描这些文件，禁止出现
+capability 三动词调用与 GIL 附加。新增热路径文件要同步登记该测试的
+`_HOT_PATH_FILES`。
 
 改动 `actant/actant.pyi`、配置类字段或 CLI 后，先重新生成参考页：
 

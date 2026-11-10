@@ -41,7 +41,6 @@ nav:
       - 配置项: reference/configuration.md
       - CLI: reference/cli.md
       - Rust API: reference/rust-api.md
-      - 扩展点清单: reference/extension-points.md
   - 架构:
       - 总览: architecture/overview.md
       - 执行模型: architecture/execution-model.md
@@ -60,7 +59,6 @@ nav:
       - 测试: contributing/testing.md
       - 代码约定: contributing/code-style.md
       - 文档地图: contributing/doc-map.md
-      - 扩展点维护: contributing/extensions.md
 
 plugins:
   - search

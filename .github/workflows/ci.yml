@@ -54,8 +54,7 @@ jobs:
         run: cargo test -p actant-core -p actant-common --no-default-features
 
       # TaskDispatcher 注入缝的行为验收：ClosureDispatcher 真实跑通
-      # 提交 → DAG → 执行 → 聚合，而不只是被编译过。对应扩展点清单
-      # 中 task_dispatcher 的 acceptance_test，门禁会校验本步骤存在。
+      # 提交 → DAG → 执行 → 聚合，而不只是被编译过。
       - name: Rust 嵌入示例（TaskDispatcher 注入缝行为验收）
         run: cargo run --no-default-features --example rust_embed
 

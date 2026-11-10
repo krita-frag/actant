@@ -7,15 +7,14 @@
 ## `actant`
 
 ```text
-usage: actant [-h] {worker,status,extensions,version,metrics} ...
+usage: actant [-h] {worker,status,version,metrics} ...
 
 Actant CLI — P2P 分布式任务编排引擎
 
 positional arguments:
-  {worker,status,extensions,version,metrics}
+  {worker,status,version,metrics}
     worker              启动一个 Worker 节点（后台常驻，P2P 自动发现对端）
     status              查询本地 Runtime 状态（版本、capability、持久化节点信息）
-    extensions          列出构建期登记的可用扩展点（不查询运行中的 Runtime）
     version             显示版本号
     metrics             启动独立的 Prometheus HTTP exporter（/metrics 端点）
 
@@ -83,18 +82,6 @@ usage: actant status [-h] [--data-dir DATA_DIR]
 options:
   -h, --help           show this help message and exit
   --data-dir DATA_DIR  持久化数据目录（读取 node_meta.json 获取节点信息）
-```
-
-## `actant extensions`
-
-```text
-usage: actant extensions [-h] [--layer {rust,bridge,python}] [--json]
-
-options:
-  -h, --help            show this help message and exit
-  --layer {rust,bridge,python}
-                        只显示指定层的扩展点
-  --json                以 JSON 输出清单与未覆盖方向
 ```
 
 ## `actant version`

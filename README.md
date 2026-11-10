@@ -88,7 +88,7 @@ uv run python -m examples.github_analyzer       # 大型示例：真实 GitHub �
 | 安装与快速开始 | [docs/start/quickstart.md](docs/start/quickstart.md) |
 | 任务、工作流、能力扩展 | [docs/guide/](docs/guide/tasks.md) |
 | Python / Rust API | [docs/reference/](docs/reference/python-api.md) |
-| 扩展点清单与维护 | [docs/reference/extension-points.md](docs/reference/extension-points.md) · [docs/contributing/extensions.md](docs/contributing/extensions.md) |
+| 扩展缝与执行域边界 | [docs/architecture/framework-contract.md](docs/architecture/framework-contract.md) |
 | 分层、ERH、Worker、框架契约 | [docs/architecture/](docs/architecture/overview.md) |
 | SLA、排障 | [docs/operations/](docs/operations/sla-baseline.md) |
 | 开发、测试、代码约定 | [docs/contributing/](docs/contributing/dev-setup.md) |

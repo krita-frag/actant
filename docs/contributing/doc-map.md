@@ -10,7 +10,6 @@
 | Rust 公共 API | `///` 注释 | rustdoc（见 [Rust API](../reference/rust-api.md)） | 在 Markdown 复写 trait 签名 |
 | 配置项与默认值 | `_ActantConfig` / `_NetworkConfig` 签名 | [配置项](../reference/configuration.md)（生成） | 多处维护参数表 |
 | CLI 参数 | `actant/cli.py` 的 argparse | [CLI](../reference/cli.md)（生成） | 口头描述 |
-| 扩展点条目、解析时机、热路径标记、验收等级 | `actant/extension_points.json` | [扩展点清单](../reference/extension-points.md)（生成）· [扩展点维护](extensions.md) | 在架构页 / 指南页复写扩展点表格或字段取值 |
 | 架构决策与边界 | `docs/architecture/*.md` | 本站架构章节 | README / AGENTS 复述 |
 | 行为承诺 | 测试断言 | [SLA 基线](../operations/sla-baseline.md) | 只写数字不写来源 |
 | 协议版本 | wire 常量 + `CHANGELOG.md` | [框架契约](../architecture/framework-contract.md) | 分散在注释里 |
@@ -22,7 +21,6 @@
 - **使用方式、最佳实践** → `docs/guide/`
 - **由代码生成的内容** → `docs/reference/`，只放生成指令，不放手写签名
 - **分层、协议、持久化、扩展缝** → `docs/architecture/`；执行域边界与性能裁决只写[框架契约](../architecture/framework-contract.md)
-- **扩展点条目本身** → 只改 `actant/extension_points.json`，字段含义、生成链与验收流程见[扩展点维护](extensions.md)
 - **SLA、混沌、排障** → `docs/operations/`
 - **开发流程、测试、风格** → `docs/contributing/`
 - **内部计划、一次性分析** → 留在 `plans/` 或 `.trae/`，不进入站点
@@ -32,7 +30,7 @@
 1. 这个事实是否已经在别处出现？如果是，改成链接。
 2. 改的是 API 吗？如果是，改 docstring / `.pyi`，不要改参考页。
 3. 改的是架构决策吗？如果是，只改一个架构页，并检查其他页面是否引用了旧结论。
-4. 改的是扩展点吗？如果是，走[扩展点维护](extensions.md)的四步流程，确认生成页、`actant extensions` 与门禁同步，且没有在别处复写清单表格。
+4. 改的是扩展缝吗？如果是，只改[框架契约](../architecture/framework-contract.md)一处，并在 `tests/rust/unit/runtime/builder.rs` 补一条接线测试；不要在指南页复写缝表格。
 5. 链接是否可达？`mkdocs build --strict` 会拦截死链。
 
 ## Rust 文档覆盖现状

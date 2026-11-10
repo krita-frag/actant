@@ -19,7 +19,6 @@ import os
 import signal
 import sys
 import threading
-from pathlib import Path
 from typing import Any
 
 import actant
@@ -352,7 +351,6 @@ def cmd_status(args: argparse.Namespace) -> int:
     data_dir = getattr(args, "data_dir", None)
     if data_dir:
         print(f"data_dir: {data_dir}")
-        import json
         import os
 
         meta_path = os.path.join(data_dir, "node_meta.json")
@@ -371,53 +369,6 @@ def cmd_status(args: argparse.Namespace) -> int:
             )
     else:
         print("data_dir: (none specified; use --data-dir to inspect a persisted node)")
-    return 0
-
-
-def _load_extension_points() -> dict[str, Any]:
-    """读取与包一起发布的构建期扩展点清单。"""
-    path = Path(actant.__file__).with_name("extension_points.json")
-    data: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
-    return data
-
-
-def cmd_extensions(args: argparse.Namespace) -> int:
-    """列出构建期登记的可用扩展点。
-
-    只回答「有哪些扩展点」，不回答「当前 Runtime 注入了哪个实现」：Rust
-    编译期注入的 trait 实现不会暴露给 Python，运行时也无从查询。每项同时
-    标出解析时机与是否位于热路径，二者共同决定运行期能否替换实现。
-    """
-    data = _load_extension_points()
-    points: list[dict[str, Any]] = data["points"]
-    layer = getattr(args, "layer", None)
-    if layer is not None:
-        points = [point for point in points if point["layer"] == layer]
-    if getattr(args, "json", False):
-        print(
-            json.dumps(
-                {"points": points, "uncovered_intents": data["uncovered_intents"]},
-                ensure_ascii=False,
-                indent=2,
-            )
-        )
-        return 0
-    print("可用扩展点（构建期登记；不表示当前实例已注入某个实现）")
-    for point in points:
-        safe = "yes" if point["cross_node_safe"] else "no"
-        hot = "yes" if point["hot_path"] else "no"
-        print(f"  [{point['layer']}] {point['id']}: {point['summary']}")
-        print(f"    entry={point['entrypoint']}")
-        print(
-            f"    call_site={point['production_call_site']}  cross_node_safe={safe}"
-            f"  resolution={point['resolution']}  hot_path={hot}"
-            f"  acceptance_level={point['acceptance_level']}"
-        )
-        print(f"    acceptance={point['acceptance_test']}")
-    print(
-        f"共 {len(points)} 项；差距/未覆盖方向 {len(data['uncovered_intents'])} "
-        "项不在此列表中，见 docs/reference/extension-points.md"
-    )
     return 0
 
 
@@ -559,23 +510,6 @@ def main(argv: list[str] | None = None) -> int:
         help="持久化数据目录（读取 node_meta.json 获取节点信息）",
     )
     p_status.set_defaults(func=cmd_status)
-
-    p_extensions = sub.add_parser(
-        "extensions",
-        help="列出构建期登记的可用扩展点（不查询运行中的 Runtime）",
-    )
-    p_extensions.add_argument(
-        "--layer",
-        choices=["rust", "bridge", "python"],
-        default=None,
-        help="只显示指定层的扩展点",
-    )
-    p_extensions.add_argument(
-        "--json",
-        action="store_true",
-        help="以 JSON 输出清单与未覆盖方向",
-    )
-    p_extensions.set_defaults(func=cmd_extensions)
 
     p_version = sub.add_parser("version", help="显示版本号")
     p_version.set_defaults(func=cmd_version)

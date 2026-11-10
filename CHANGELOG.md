@@ -10,6 +10,13 @@
 
 ### 破坏性变更
 
+- **删除 `actant extensions` 与扩展点清单**：不插件化的框架不需要第二份登记表——
+  缝就是 `RuntimeBuilder::with_*`（Rust）与 `rt.layer(...).chain(...)`（Python），
+  用户在两侧自行拼装。随之删除 `actant/extension_points.json`、生成页
+  `docs/reference/extension-points.md`、维护流程页与清单门禁；「有哪些缝、能否跨
+  节点、运行期可否替换」统一写在[框架契约](docs/architecture/framework-contract.md)。
+  原清单门禁承担的热路径静态扫描保留为 `tests/python/unit/test_hot_path_guard.py`
+  （禁止 capability 三动词调用与 GIL 附加进入每任务 / 每消息路径）。
 - **删除工作流级 `namespace` / `idempotency_key`（伪能力）**：
   `Runtime.submit_workflow`（及 PyO3 同名方法）不再接受这两个参数，
   `WorkflowInvocation` 与 `get_workflow_invocation()` 的返回 dict 同步移除对应键。

@@ -40,4 +40,4 @@ Worker 主循环不 sleep 轮询：`SchedulerActor` 在 `enqueue` 后触发 `not
 
 ## 扩展点
 
-`Scheduler` 是 Rust 核心的公共扩展点：外部实现只需满足 `Send + Sync`，可替换为公平调度、加权轮询、截止时间优先等策略；实现须保证 `close()` 后拒绝新任务并唤醒等待中的消费者。该点在[扩展点清单](../reference/extension-points.md)中登记为 `hot_path=true` / `resolution=build_time`：只能在构造期经 `RuntimeBuilder` 注入，运行期没有 setter、不可替换。装配入口见 [框架契约](framework-contract.md)。
+`Scheduler` 是 Rust 核心的公共扩展点：外部实现只需满足 `Send + Sync`，可替换为公平调度、加权轮询、截止时间优先等策略；实现须保证 `close()` 后拒绝新任务并唤醒等待中的消费者。它位于 Rust 热路径：只能在构造期经 `RuntimeBuilder::with_scheduler` 注入，运行期没有 setter、不可替换。装配入口见 [框架契约](framework-contract.md)。

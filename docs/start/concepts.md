@@ -23,7 +23,7 @@ with Runtime(name="node-a", data_dir="./data") as rt:
 
 ## Capability / Handler / Layer / Effect
 
-Actant 的全部扩展面登记在同一份[扩展点清单](../reference/extension-points.md)：Rust 编译期 trait 缝、Python→Rust 桥与用户态 capability。**统一的是契约**（清单、词汇、门禁与验收），不是调用路径；按解析时机分为构造期定稿的 `build_time` 域与运行期动态解析的 `runtime` 域。
+Actant 的扩展面只有两类：Rust 编译期 trait 缝（经 `RuntimeBuilder` 注入）与用户态 capability handler（经 `rt.layer(...).chain(...)` 登记）。**统一的是词汇**，不是调用路径；按解析时机分为构造期定稿的 `build_time` 域与运行期动态解析的 `runtime` 域，边界见[框架契约](../architecture/framework-contract.md)。
 
 ERH 描述 `runtime` 域的扩展词汇：
 
@@ -32,7 +32,7 @@ ERH 描述 `runtime` 域的扩展词汇：
 - **Layer**：同一 capability 的 handler 链。
 - **Effect**：请求能力，分 `ask`（决策）/ `perform`（副作用）/ `emit`（广播）。
 
-内置 4 个 capability，全部有引擎发射点或默认 handler：`Store` 回退到 Rust `StoreHandler`（可用 `rt.layer("Store").chain(...)` 覆盖），`ValueStore` 由 Python 层提供默认 handler；`TaskLifecycle` / `WorkflowLifecycle` 由引擎在任务与工作流生命周期节点发射，用户以 handler 订阅。用户自建的 capability 通过 `rt.layer(name, kind).chain(...)` 登记，由用户代码自行 `ask` / `perform` / `emit` 驱动，引擎不会自动调用。放置类策略（路由/调度/重试）不是 capability，由 Rust `RoutePolicy` / `Scheduler` 或第 3 层外部调度器承担；哪些点能从 Python 覆盖、哪些只能在 Rust 装配期注入，见[扩展点清单](../reference/extension-points.md)。
+内置 4 个 capability，全部有引擎发射点或默认 handler：`Store` 回退到 Rust `StoreHandler`（可用 `rt.layer("Store").chain(...)` 覆盖），`ValueStore` 由 Python 层提供默认 handler；`TaskLifecycle` / `WorkflowLifecycle` 由引擎在任务与工作流生命周期节点发射，用户以 handler 订阅。用户自建的 capability 通过 `rt.layer(name, kind).chain(...)` 登记，由用户代码自行 `ask` / `perform` / `emit` 驱动，引擎不会自动调用。放置类策略（路由/调度/重试）不是 capability，由 Rust `RoutePolicy` / `Scheduler` 或第 3 层外部调度器承担；哪些点能从 Python 覆盖、哪些只能在 Rust 装配期注入，见[框架契约](../architecture/framework-contract.md)。
 
 ## Worker 与节点
 
@@ -47,5 +47,5 @@ ERH 描述 `runtime` 域的扩展词汇：
 - [任务](../guide/tasks.md)
 - [工作流](../guide/flows.md)
 - [能力扩展](../guide/capabilities.md)
-- [扩展点清单](../reference/extension-points.md)：哪些点能扩展、从哪一侧扩展
+- [框架契约](../architecture/framework-contract.md)：哪些缝能扩展、从哪一侧扩展
 - [架构总览](../architecture/overview.md)

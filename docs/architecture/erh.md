@@ -2,8 +2,8 @@
 
 ERH 描述 `resolution=runtime` 的执行域：数据面与观测面由 Python 侧发起，经 handler 链解析。
 Rust 引擎的每任务 / 每消息路径不使用 ERH——它们在构造期定稿为 trait 句柄
-（`resolution=build_time`）。统一的是清单、词汇与验收契约，不是分发机制；
-全量条目与执行域见[扩展点清单](../reference/extension-points.md)。
+（`resolution=build_time`）。统一的是词汇与边界，不是分发机制；
+Rust 侧的注入缝见[框架契约](framework-contract.md)。
 
 数据面与观测面的扩展点统一建模为：
 
@@ -47,6 +47,4 @@ Rust 引擎的每任务 / 每消息路径不使用 ERH——它们在构造期�
 ## 相关页面
 
 - [能力扩展指南](../guide/capabilities.md)
-- [扩展点清单](../reference/extension-points.md)：全部扩展点与执行域
-- [框架契约](framework-contract.md)
-- [扩展点维护](../contributing/extensions.md)：新增或修改条目的流程
+- [框架契约](framework-contract.md)：Rust 注入缝与两个执行域

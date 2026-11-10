@@ -3,8 +3,8 @@
 ## ERH 模型
 
 ERH 只覆盖 `resolution=runtime` 的扩展域。Rust 热路径上的路由、调度、分发、
-传输与事件日志在构造期定稿为 trait 句柄，不走 handler 链；全部扩展点及其
-解析时机见[扩展点清单](../reference/extension-points.md)。
+传输与事件日志在构造期定稿为 trait 句柄，不走 handler 链；两层边界见
+[框架契约](../architecture/framework-contract.md)。
 
 | Effect | 语义 | 调用方式 | 返回值 |
 | --- | --- | --- | --- |
@@ -83,6 +83,5 @@ with Runtime() as rt:
 
 ## 下一步
 
-- [扩展点清单](../reference/extension-points.md)：全部扩展点、解析时机与验收强度。
-- [框架契约](../architecture/framework-contract.md)：Rust 注入缝与双分发边界。
+- [框架契约](../architecture/framework-contract.md)：Rust 注入缝、双分发边界与两个执行域。
 - [架构总览](../architecture/overview.md)：ERH 在整体分层中的位置。

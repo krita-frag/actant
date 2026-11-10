@@ -55,8 +55,6 @@ actant = "actant.cli:main"
 manifest-path = "Cargo.toml"
 python-source = "."
 module-name = "actant.actant"
-# CLI 的 `actant extensions` 在运行时读取这份清单，必须随 wheel 一同发布。
-include = ["actant/extension_points.json"]
 
 [tool.ruff]
 line-length = 100
