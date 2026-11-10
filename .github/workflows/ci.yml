@@ -96,8 +96,10 @@ jobs:
       - name: 文档构建（严格模式）
         run: uv run mkdocs build --strict
 
-      - name: pytest（并行，全量含 e2e）
-        run: uv run pytest tests/python/ -n 4
+      # 覆盖率阈值只定义在 pyproject.toml 的 [tool.coverage.report] fail_under，
+      # pytest-cov 会读取它，CI 不重复写数字，避免两处漂移。
+      - name: pytest（并行，全量含 e2e，覆盖率门禁）
+        run: uv run pytest tests/python/ -n 4 --cov=actant --cov-report=term-missing
 
       - name: pytest（act-ext-testkit dogfooding）
         run: uv run pytest extensions/act-ext-testkit/tests
