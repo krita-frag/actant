@@ -1,16 +1,22 @@
 """L2 服务层：跨进程提交、定义寻址与协议传输。
 
-服务层只把现有 Runtime 原语映射为稳定的进程边界，不新增执行语义。当前包含：
+服务层把现有 Runtime 原语映射为稳定的进程边界，不新增执行语义。它是**可选的
+传输扩展**，不属于 ``actant`` 核心包：核心包只提供引擎与进程内 SDK，HTTP/JSON
+入口由本扩展按需安装。包含：
 
-- :mod:`actant.service.definitions`：``DefinitionRef`` 与定义校验；
-- :mod:`actant.service.protocol`：HTTP/JSON + SSE 协议 v1。
+- :mod:`act_ext_service.definitions`：``DefinitionRef`` 与定义校验；
+- :mod:`act_ext_service.protocol`：HTTP/JSON + SSE 协议 v1。
 
 pull worker 与读模型尚未实现；它们依赖的租约语义已在核心侧就绪。
+
+.. warning::
+   协议 v1 **没有鉴权**，且会 ``cloudpickle.loads`` 客户端提交的载荷。只允许在
+   可信网络内暴露。
 """
 
 from __future__ import annotations
 
-from actant.service.definitions import (
+from act_ext_service.definitions import (
     DefinitionError,
     DefinitionHashMismatchError,
     DefinitionNotFoundError,
@@ -19,7 +25,7 @@ from actant.service.definitions import (
     DefinitionVersionMismatchError,
     definition_hash,
 )
-from actant.service.protocol import PROTOCOL_VERSION, ServiceClient, ServiceServer
+from act_ext_service.protocol import PROTOCOL_VERSION, ServiceClient, ServiceServer
 
 __all__ = [
     "PROTOCOL_VERSION",

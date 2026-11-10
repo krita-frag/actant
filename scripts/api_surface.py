@@ -47,20 +47,16 @@ NAMESPACE_MODULES: dict[str, Path] = {
     "actant.effects": ROOT / "actant" / "effects.py",
     "actant.capabilities": ROOT / "actant" / "capabilities.py",
     "actant.exceptions": ROOT / "actant" / "exceptions.py",
-    "actant.observability": ROOT / "actant" / "observability.py",
-    "actant.service": ROOT / "actant" / "service" / "__init__.py",
     "actant.testkit": ROOT / "actant" / "testkit.py",
 }
 
 NAMESPACE_BUDGETS: dict[str, int] = {
     "actant.tasks": 11,
-    "actant.workflow": 14,
+    "actant.workflow": 15,
     "actant.aio": 7,
     "actant.effects": 4,
     "actant.capabilities": 19,
     "actant.exceptions": 23,
-    "actant.observability": 1,
-    "actant.service": 10,
     "actant.testkit": 5,
 }
 

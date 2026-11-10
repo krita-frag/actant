@@ -92,7 +92,7 @@ actant/
 │   └── actant-core/        # 框架主体：actor / workflow / state / network / capability
 ├── src/                    # PyO3 绑定壳（module-name = actant.actant）
 ├── actant/                 # Python 公共 API 与 ERH 扩展模型
-│   └── service/            # L2 服务层：定义寻址与 HTTP/JSON + SSE 协议
+├── extensions/             # 可选扩展包（act-service：L2 服务层；act-ext-testkit：测试台）
 ├── examples/               # 可运行示例
 ├── benches/                # Python 与 Rust 基准测试
 ├── tests/python/           # Python 测试（unit / integration / e2e）

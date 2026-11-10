@@ -2,7 +2,7 @@
 
 提交方只需持有 ``DefinitionRef = name + version + hash``，无需在本进程导入
 flow 代码；宿主进程用 :class:`DefinitionResolver` 把引用解析回
-:class:`~actant._internal.flow.FlowDefinition`，并在版本或内容不一致时返回
+:class:`~actant.workflow.FlowDefinition`，并在版本或内容不一致时返回
 稳定错误码（``kind``），由服务协议原样透传给客户端。
 
 指纹口径：函数字节码 + 嵌套代码 + 常量 + 装饰时声明的执行参数。``co_filename``
@@ -20,8 +20,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from actant._internal.flow import FLOW_REGISTRY, FlowDefinition, FlowRegistry
 from actant.exceptions import ActantError
+from actant.workflow import FLOW_REGISTRY, FlowDefinition, FlowRegistry
 
 __all__ = [
     "DefinitionError",

@@ -11,9 +11,7 @@ import threading
 from pathlib import Path
 
 import pytest
-
-from actant import Runtime, flow, task, use_runtime
-from actant.service import (
+from act_ext_service import (
     DefinitionHashMismatchError,
     DefinitionNotFoundError,
     DefinitionRef,
@@ -22,6 +20,8 @@ from actant.service import (
     ServiceClient,
     ServiceServer,
 )
+
+from actant import Runtime, flow, task, use_runtime
 from actant.workflow import wait_signal
 
 _PARKED = threading.Event()

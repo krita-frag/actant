@@ -38,6 +38,14 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import cloudpickle
 
+from act_ext_service.definitions import (
+    DefinitionError,
+    DefinitionHashMismatchError,
+    DefinitionNotFoundError,
+    DefinitionRef,
+    DefinitionResolver,
+    DefinitionVersionMismatchError,
+)
 from actant.exceptions import (
     ActantTimeoutError,
     AlreadyExistsError,
@@ -48,21 +56,13 @@ from actant.exceptions import (
     SerializationError,
     raise_for_kind,
 )
-from actant.service.definitions import (
-    DefinitionError,
-    DefinitionHashMismatchError,
-    DefinitionNotFoundError,
-    DefinitionRef,
-    DefinitionResolver,
-    DefinitionVersionMismatchError,
-)
 
 if TYPE_CHECKING:
-    from actant._internal.runtime import Runtime
+    from actant import Runtime
 
 __all__ = ["PROTOCOL_VERSION", "ServiceClient", "ServiceServer"]
 
-_logger = logging.getLogger("actant.service")
+_logger = logging.getLogger("act_ext_service")
 
 PROTOCOL_VERSION = "v1"
 

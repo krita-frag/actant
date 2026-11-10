@@ -130,6 +130,7 @@
     "gather",
     "get_current_runtime",
     "host_flows",
+    "metrics_text",
     "perform",
     "start_flow",
     "task",
@@ -193,21 +194,6 @@
       "raise_for_kind",
       "raise_for_state"
     ],
-    "actant.observability": [
-      "metrics_text"
-    ],
-    "actant.service": [
-      "DefinitionError",
-      "DefinitionHashMismatchError",
-      "DefinitionNotFoundError",
-      "DefinitionRef",
-      "DefinitionResolver",
-      "DefinitionVersionMismatchError",
-      "PROTOCOL_VERSION",
-      "ServiceClient",
-      "ServiceServer",
-      "definition_hash"
-    ],
     "actant.tasks": [
       "AsyncResult",
       "BatchProgress",
@@ -231,6 +217,7 @@
       "FLOW_REGISTRY",
       "FlowDefinition",
       "FlowHandle",
+      "FlowRegistry",
       "continue_as_new",
       "current_workflow_id",
       "flow",

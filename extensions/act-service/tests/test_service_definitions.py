@@ -6,9 +6,7 @@ from collections.abc import Callable
 from typing import Any
 
 import pytest
-
-from actant._internal.flow import FlowDefinition, FlowRegistry
-from actant.service import (
+from act_ext_service import (
     DefinitionHashMismatchError,
     DefinitionNotFoundError,
     DefinitionRef,
@@ -16,6 +14,8 @@ from actant.service import (
     DefinitionVersionMismatchError,
     definition_hash,
 )
+
+from actant.workflow import FlowDefinition, FlowRegistry
 
 
 def _sample(value: int) -> int:

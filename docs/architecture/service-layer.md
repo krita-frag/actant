@@ -9,10 +9,16 @@
 
 ## 包布局
 
+服务层是可选的**传输扩展**，不随 `actant` 核心包发布：核心包只提供引擎与进程内
+SDK，HTTP/JSON 入口按需安装 `extensions/act-service`。
+
 | 文件 | 职责 |
 | --- | --- |
-| `actant/service/definitions.py` | `DefinitionRef`、内容指纹、宿主侧定义解析与稳定错误码 |
-| `actant/service/protocol.py` | HTTP/JSON + SSE 协议 v1，以及无第三方依赖的客户端 |
+| `extensions/act-service/act_ext_service/definitions.py` | `DefinitionRef`、内容指纹、宿主侧定义解析与稳定错误码 |
+| `extensions/act-service/act_ext_service/protocol.py` | HTTP/JSON + SSE 协议 v1，以及无第三方依赖的客户端 |
+
+扩展只依赖 `actant` 的公开面（`actant`、`actant.workflow`、`actant.exceptions`），
+不引用 `actant._internal`——核心换内部结构时这里不会跟着碎。
 
 `worker_client.py`（pull worker）与 `readmodel.py`（跨节点读模型）尚未落地：
 它们依赖任务租约语义，须待租约机制稳定后再实现。当前不创建占位实现。
@@ -22,7 +28,7 @@
 提交方只需要一个引用：
 
 ```python
-from actant.service import DefinitionRef, DefinitionResolver
+from act_ext_service import DefinitionRef, DefinitionResolver
 
 ref = DefinitionResolver().reference("etl-daily")   # 本进程已导入定义时
 # 或由部署清单提供：
@@ -55,7 +61,7 @@ Python 主/次版本升级可能改变字节码，跨版本部署同样应提升
 
 ```python
 from actant import Runtime
-from actant.service import ServiceServer
+from act_ext_service import ServiceServer
 
 with Runtime() as rt:
     with ServiceServer(rt) as server:
@@ -66,7 +72,7 @@ with Runtime() as rt:
 客户端只依赖标准库：
 
 ```python
-from actant.service import DefinitionRef, ServiceClient
+from act_ext_service import DefinitionRef, ServiceClient
 
 client = ServiceClient("http://127.0.0.1:8000")
 workflow_id = client.submit(ref, 41)       # 参数经 cloudpickle 传输

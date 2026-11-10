@@ -76,7 +76,7 @@ jobs:
           echo "OK: runtime/common 无 crate::py 引用"
 
       - name: ruff
-        run: uv run ruff check actant tests/python benches/ extensions/act-ext-testkit
+        run: uv run ruff check actant tests/python benches/ extensions/act-ext-testkit extensions/act-service
 
       - name: mypy
         run: uv run mypy actant
@@ -103,6 +103,11 @@ jobs:
 
       - name: pytest（act-ext-testkit dogfooding）
         run: uv run pytest extensions/act-ext-testkit/tests
+
+      # 服务层是可选扩展，不属于 actant 核心包，因此单独跑；它不参与核心的
+      # 覆盖率口径（覆盖率只统计 ``actant``）。
+      - name: pytest（act-service 扩展）
+        run: uv run pytest extensions/act-service/tests
 
   windows:
     name: Windows 编译 + pipe 路径冒烟

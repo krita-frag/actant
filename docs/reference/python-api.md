@@ -6,7 +6,7 @@
 
 ## 顶层与子命名空间
 
-`actant.__all__` 只保留 17 个最常用入口，其余 API 按职责放在子命名空间：
+`actant.__all__` 只保留 18 个最常用入口，其余 API 按职责放在子命名空间：
 
 | 用途 | 导入路径 | 名字 |
 | --- | --- | --- |
@@ -18,7 +18,7 @@
 | 能力与事件 | `actant.capabilities` | `EffectKind` `StoreReq` `ValueStoreReq` `TaskEvent` `WorkflowEvent` `RetryCtx` `RouteCtx` `ScheduleCtx` 及对应 Handler 协议 |
 | 顶层异常与版本 | `actant` | `ActantError` `__version__` |
 | 异常 | `actant.exceptions` | 全部具名异常与 `raise_for_kind` / `raise_for_state` |
-| 观测 | `actant.observability` | `metrics_text` |
+| 观测 | `actant` | `metrics_text`（Prometheus exposition 文本） |
 | 测试台 | `actant.testkit` | `close_peer` `reopen_peer` `delay_heartbeat` `inject_hlc_drift` `kill_node` |
 
 同步面只保留默认名；异步动词集中在 `actant.aio`，与同步面同名（`aio.flow` /
@@ -36,7 +36,7 @@ from actant.effects import ask
 from actant.workflow import patched, wait_signal
 ```
 
-`from actant import *` 只导入 `actant.__all__` 里的 17 个名字（含 `__version__`：虽以下划线开头，但显式列入 `__all__` 因而同样被导出）；旧路径（如 `from actant import Task`）已移除，不再提供兼容垫片。
+`from actant import *` 只导入 `actant.__all__` 里的 18 个名字（含 `__version__`：虽以下划线开头，但显式列入 `__all__` 因而同样被导出）；旧路径（如 `from actant import Task`）已移除，不再提供兼容垫片。
 
 ::: actant
     options:
@@ -57,8 +57,11 @@ from actant.workflow import patched, wait_signal
 
 ::: actant.effects
 
-::: actant.observability
-
 ## 测试台
 
 ::: actant.testkit
+
+## 可选扩展包
+
+进程边界（HTTP/JSON + SSE 服务协议）不在核心包内，见 `extensions/act-service`
+（模块名 `act_ext_service`）与[服务层](../architecture/service-layer.md)。

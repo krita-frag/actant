@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "act-ext-service"
+version = "0.2.0"
+description = "Actant L2 服务层：定义寻址与 HTTP/JSON + SSE 协议（可选传输扩展）"
+requires-python = ">=3.10"
+dependencies = ["cloudpickle>=3.1.2"]
+
+[project.optional-dependencies]
+actant = ["actant>=0.3.0"]
+dev = ["pytest>=8"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["act_ext_service"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+mypy_path = "."

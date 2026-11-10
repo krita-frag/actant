@@ -27,16 +27,17 @@
 - ``actant.aio``：异步面（与同步面同名，如 ``aio.flow`` / ``aio.ask`` / ``aio.gather``）；
 - ``actant.effects``：同步 effect 动词；
 - ``actant.capabilities``：能力类型、事件与 handler 协议；
-- ``actant.exceptions``：异常层级；
-- ``actant.observability``：指标导出。
+- ``actant.exceptions``：异常层级。
+
+进程边界（HTTP/JSON + SSE 服务协议）不随核心包发布，见 ``extensions/act-service``。
 """
 
 from __future__ import annotations
 
-from actant import aio, observability, service, testkit, workflow  # noqa: F401  注册子命名空间属性
+from actant import aio, testkit, workflow  # noqa: F401  注册子命名空间属性
 from actant._internal.flow import FlowHandle, flow, host_flows, start_flow
 from actant._internal.runtime import Layer, Runtime, get_current_runtime, use_runtime
-from actant.actant import get_version
+from actant.actant import get_version, metrics_text
 from actant.effects import ask, emit, perform
 from actant.exceptions import ActantError
 from actant.tasks import AsyncResult, Ref, gather, task
@@ -57,6 +58,7 @@ __all__ = [
     "gather",
     "get_current_runtime",
     "host_flows",
+    "metrics_text",
     "perform",
     "start_flow",
     "task",

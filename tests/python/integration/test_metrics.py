@@ -2,7 +2,7 @@
 
 验证：
 - ``Runtime.metrics_text()`` 返回 Prometheus exposition format 文本。
-- ``actant.observability.metrics_text()`` 顶层便捷函数。
+- ``actant.metrics_text()`` 顶层便捷函数。
 
 HTTP 托管（``/metrics`` 端点）已从核心层外置：不提供自动化测试，
 托管样例见 ``examples/metrics_server.py`` 与 ``actant worker --metrics-port``。
@@ -13,7 +13,7 @@ from __future__ import annotations
 import pytest
 
 import actant
-from actant.observability import metrics_text
+from actant import metrics_text
 
 
 @pytest.mark.integration

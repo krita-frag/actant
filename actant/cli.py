@@ -23,8 +23,8 @@ from pathlib import Path
 from typing import Any
 
 import actant
+from actant.actant import metrics_text
 from actant.capabilities import BUILTIN_CAPABILITIES, TaskEvent
-from actant.observability import metrics_text
 from actant.workflow import FLOW_REGISTRY
 
 _logger = logging.getLogger("actant.cli")
