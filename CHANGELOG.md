@@ -218,6 +218,14 @@
 - **`actant.observability` 删除，`metrics_text` 升为顶层入口**：`from actant import
   metrics_text`；`actant.__all__` 17 → 18，`actant.workflow.__all__` 增加 `FlowRegistry`
   （14 → 15）。
+- **死配置与零调用构造器清理**：`_ActantConfig` 删除 `workflow_default_timeout_ms`
+  （`WorkflowConfig::default_timeout_ms` 从未被核心读取，暴露给用户的开关实际无效；
+  工作流级超时由 `submit_workflow(..., timeout_ms=...)` 显式指定）。Rust 侧删除
+  零调用构造函数 `failover_actor` / `dag_gossip_actor` / `fifo_scheduler_actor` /
+  `priority_scheduler_actor`（调度器改用 `SchedulerActor::fifo()` /
+  `SchedulerActor::priority()`）；`init_actor_system` 摘掉未使用的 `data_dir` / `config`
+  形参，`build_task_payload` 摘掉未使用的 `dag` / `execution` / `task_id` 形参；
+  删除只在 `drop` 时打一条 debug 日志的 `impl Drop for Orchestrator`。
 
 ### 新增（服务层与直提任务租约）
 

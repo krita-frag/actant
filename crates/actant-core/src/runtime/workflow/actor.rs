@@ -19,12 +19,11 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::common::{
-    ActantError, ActorMessage, ActorMessageResult, FailoverConfig, GossipConfig, NodeId,
-    OrchestratorClaim, Result, TaskDefinition, TaskId, WorkflowId, WorkflowInvocation,
+    ActantError, ActorMessage, ActorMessageResult, NodeId, OrchestratorClaim, Result,
+    TaskDefinition, TaskId, WorkflowId, WorkflowInvocation,
 };
 use crate::runtime::actor::Actor;
 use crate::runtime::event_bus::{BusEvent, EventBus};
-use crate::runtime::network::Transport;
 use crate::runtime::workflow::messaging::{decode, encode, ok_result, payload_result};
 use crate::runtime::workflow::{
     Dag, DagGossip, DagNode, FailoverManager, FailureScope, Orchestrator, WaitCondition,
@@ -1053,16 +1052,6 @@ impl Actor for SchedulerActor {
     }
 }
 
-/// 创建默认的 FIFO SchedulerActor。
-pub fn fifo_scheduler_actor() -> SchedulerActor {
-    SchedulerActor::fifo()
-}
-
-/// 创建按优先级调度的 SchedulerActor。
-pub fn priority_scheduler_actor() -> SchedulerActor {
-    SchedulerActor::priority()
-}
-
 pub const FAILOVER_ACTOR_TYPE: &str = "FailoverActor";
 
 /// FailoverActor 支持的方法名。
@@ -1287,43 +1276,6 @@ impl Actor for DagGossipActor {
             ))),
         }
     }
-}
-
-/// 用给定网络、ActorSystem、WorkflowActor ID 和配置构造 `DagGossipActor`。
-pub fn dag_gossip_actor(
-    network: Arc<dyn Transport>,
-    actor_system: Arc<crate::runtime::actor::ActorSystem>,
-    workflow_actor_id: crate::common::ActorId,
-    config: GossipConfig,
-) -> DagGossipActor {
-    DagGossipActor::new(DagGossip::new(
-        network,
-        actor_system,
-        workflow_actor_id,
-        config,
-    ))
-}
-
-/// 用给定依赖构造 `FailoverActor`。
-pub async fn failover_actor(
-    node_id: NodeId,
-    network: Arc<dyn Transport>,
-    actor_system: Arc<crate::runtime::actor::ActorSystem>,
-    workflow_actor_id: crate::common::ActorId,
-    config: Option<FailoverConfig>,
-) -> FailoverActor {
-    let manager = match config {
-        Some(cfg) => FailoverManager::with_config(
-            node_id,
-            network,
-            actor_system,
-            workflow_actor_id,
-            cfg,
-            None,
-        ),
-        None => FailoverManager::new(node_id, network, actor_system, workflow_actor_id),
-    };
-    FailoverActor::new(Arc::new(manager))
 }
 
 #[cfg(test)]

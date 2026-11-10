@@ -12,8 +12,7 @@ Worker 相关默认值（均取自 Rust 侧默认值）：
 - ``max_concurrent_tasks`` 默认 ``num_cpus``；
 - ``num_worker_processes`` 默认跟随 ``max_concurrent_tasks``（保持并发
   信号量与进程池容量一致）；
-- ``crash_failover_max_attempts`` 默认 3；
-- ``workflow_default_timeout_ms`` 默认 3_600_000（``WorkflowConfig``）。
+- ``crash_failover_max_attempts`` 默认 3。
 
 | 参数 | 类型 | 默认值 |
 | --- | --- | --- |
@@ -29,7 +28,6 @@ Worker 相关默认值（均取自 Rust 侧默认值）：
 | `require_payload_signing` | `bool` | `False` |
 | `num_worker_processes` | `int \| None` | `None` |
 | `crash_failover_max_attempts` | `int \| None` | `None` |
-| `workflow_default_timeout_ms` | `int \| None` | `None` |
 | `node_labels` | `dict[str, str] \| None` | `None` |
 | `store` | `_StoreConfig \| None` | `None` |
 | `prefetch_min` | `int \| None` | `None` |

@@ -16,9 +16,8 @@ pub mod runtime;
 pub mod scheduler;
 
 pub use actor::{
-    dag_gossip_actor, failover_actor, failover_methods, fifo_scheduler_actor, gossip_methods,
-    priority_scheduler_actor, scheduler_methods, workflow_methods, DagGossipActor, FailoverActor,
-    SchedulerActor, TaskCompletionResponse, WorkflowActor, DAG_GOSSIP_ACTOR_TYPE,
+    failover_methods, gossip_methods, scheduler_methods, workflow_methods, DagGossipActor,
+    FailoverActor, SchedulerActor, TaskCompletionResponse, WorkflowActor, DAG_GOSSIP_ACTOR_TYPE,
     FAILOVER_ACTOR_TYPE, SCHEDULER_ACTOR_TYPE, WORKFLOW_ACTOR_TYPE,
 };
 pub use dag::WorkflowExecution;

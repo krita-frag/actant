@@ -18,9 +18,7 @@ use actant_core::common::{
 };
 use actant_core::runtime::actor::ActorSystem;
 use actant_core::runtime::state::Store;
-use actant_core::runtime::workflow::{
-    fifo_scheduler_actor, priority_scheduler_actor, ActorScheduler, Dag, DagNode, Scheduler,
-};
+use actant_core::runtime::workflow::{ActorScheduler, Dag, DagNode, Scheduler, SchedulerActor};
 
 // dhat 全局分配器 — 仅在此 bench 二进制中注册，启用 dhat-heap feature 时生效。
 #[global_allocator]
@@ -77,7 +75,7 @@ fn priority_client(
     actor_system: &Arc<ActorSystem>,
 ) -> Arc<dyn Scheduler> {
     let actor_id = ActorId::new("mem-profile-priority".to_string());
-    rt.block_on(actor_system.spawn(actor_id.clone(), priority_scheduler_actor()))
+    rt.block_on(actor_system.spawn(actor_id.clone(), SchedulerActor::priority()))
         .unwrap();
     Arc::new(ActorScheduler::new(actor_id, actor_system.clone()))
 }
@@ -88,7 +86,7 @@ fn fifo_client(
     actor_system: &Arc<ActorSystem>,
 ) -> Arc<dyn Scheduler> {
     let actor_id = ActorId::new("mem-profile-fifo".to_string());
-    rt.block_on(actor_system.spawn(actor_id.clone(), fifo_scheduler_actor()))
+    rt.block_on(actor_system.spawn(actor_id.clone(), SchedulerActor::fifo()))
         .unwrap();
     Arc::new(ActorScheduler::new(actor_id, actor_system.clone()))
 }

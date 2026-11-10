@@ -76,29 +76,18 @@ fn failover_validate_rejects_zero_check_interval() {
 //
 // 判据：`ActantConfig` 序列化后出现的每个字段名，必须在生产代码里以
 // `.字段名` 的形式被读取至少一次。只声明、`validate()` 通过、核心从不读取的
-// 字段会让本用例变红。
-//
-// 历史案例：`WorkflowConfig::default_timeout_ms` 能被 Python 设置、能通过
-// 校验，但核心没有任何读取点——暴露给用户的开关实际无效。
+// 字段会让本用例变红——这类字段等于给用户一个永远不生效的开关。
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// 豁免表：每条都必须写明「为什么它没有核心读取点却是有效的」。
 ///
 /// 这张表不是挡箭牌。新增条目等于承认该字段当前无效或需要特殊论证；
 /// 新出现的无效字段不在表内，照样让门禁变红。
-const READER_EXEMPT: &[(&str, &str)] = &[
-    (
-        "require_payload_signing",
-        // RuntimeBuilder::build 在装配前调用 validate，这里是唯一且真实的消费点。
-        "只在 ActantConfig::validate 中读取；validate 由 builder 在 build 前强制调用",
-    ),
-    (
-        "default_timeout_ms",
-        // 暴露给 Python（workflow_default_timeout_ms）但核心从不读：S2c 要么接线为
-        // 工作流默认超时，要么连同 PyO3 暴露面一起删除。
-        "TODO(S2c)：当前无生产读取点，待接线或删除",
-    ),
-];
+const READER_EXEMPT: &[(&str, &str)] = &[(
+    "require_payload_signing",
+    // RuntimeBuilder::build 在装配前调用 validate，这里是唯一且真实的消费点。
+    "只在 ActantConfig::validate 中读取；validate 由 builder 在 build 前强制调用",
+)];
 
 /// 递归收集配置的字段路径（如 `failover.lease_duration_ms`）。
 fn collect_config_paths(value: &serde_json::Value, prefix: &str, out: &mut Vec<String>) {

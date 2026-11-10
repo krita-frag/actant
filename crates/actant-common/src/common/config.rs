@@ -536,7 +536,6 @@ impl Default for NetworkConfig {
 pub struct WorkflowConfig {
     pub state_poll_interval_ms: u64,
     pub completed_retention_count: usize,
-    pub default_timeout_ms: u64,
     /// 后台持久化刷新间隔（毫秒）。
     /// 脏工作流执行状态按此间隔批量写入存储，而非每次状态变更都写，减少写放大。
     /// 终态总是立即持久化。
@@ -555,7 +554,6 @@ impl Default for WorkflowConfig {
         Self {
             state_poll_interval_ms: 500,
             completed_retention_count: 1000,
-            default_timeout_ms: 3_600_000,
             persist_flush_interval_ms: 200,
             event_log_max_events_per_workflow: 0,
         }

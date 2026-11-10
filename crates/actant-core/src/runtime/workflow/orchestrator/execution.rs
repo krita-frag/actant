@@ -690,13 +690,7 @@ impl Orchestrator {
                 ))
             })?;
 
-            let payload = build_task_payload(
-                &slot.dag,
-                &slot.execution,
-                succ_id,
-                &node.payload,
-                &self.config.payload_signing_key,
-            )?;
+            let payload = build_task_payload(&node.payload, &self.config.payload_signing_key)?;
 
             let attempt = slot
                 .execution
@@ -751,13 +745,7 @@ impl Orchestrator {
             .map(|t| t.attempt())
             .unwrap_or(0);
 
-        let payload = build_task_payload(
-            &slot.dag,
-            &slot.execution,
-            task_id,
-            &node.payload,
-            &self.config.payload_signing_key,
-        )?;
+        let payload = build_task_payload(&node.payload, &self.config.payload_signing_key)?;
         Ok(Some(self.task_definition(
             &slot.dag,
             node,

@@ -1,8 +1,8 @@
 //! Orchestrator 的 `state` 职责子模块。
 //!
-//! 负责持有 `Orchestrator` 结构体定义、构造器、克隆/drop 实现以及
-//! 字段访问器。所有业务方法分布在 `persistence` / `execution` / `queries`
-//! 三个子模块中，通过 `pub(crate)` 字段共享内部状态。
+//! 负责持有 `Orchestrator` 结构体定义、构造器、克隆实现以及字段访问器。
+//! 所有业务方法分布在 `persistence` / `execution` / `queries` 三个子模块中，
+//! 通过 `pub(crate)` 字段共享内部状态。
 
 use std::sync::Arc;
 
@@ -41,15 +41,6 @@ impl Orchestrator {
     /// 故障注入：给编排器 HLC 施加时钟偏移（毫秒，可正可负），0 恢复正常。
     pub fn inject_hlc_drift_ms(&self, ms: i64) {
         self.hlc.inject_drift_ms(ms);
-    }
-}
-
-impl Drop for Orchestrator {
-    fn drop(&mut self) {
-        tracing::debug!(
-            "Orchestrator::drop — store is_some = {}",
-            self.store.is_some()
-        );
     }
 }
 

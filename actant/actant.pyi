@@ -194,8 +194,7 @@ class _ActantConfig:
     - ``max_concurrent_tasks`` 默认 ``num_cpus``；
     - ``num_worker_processes`` 默认跟随 ``max_concurrent_tasks``（保持并发
       信号量与进程池容量一致）；
-    - ``crash_failover_max_attempts`` 默认 3；
-    - ``workflow_default_timeout_ms`` 默认 3_600_000（``WorkflowConfig``）。
+    - ``crash_failover_max_attempts`` 默认 3。
     """
 
     def __new__(
@@ -212,7 +211,6 @@ class _ActantConfig:
         require_payload_signing: bool = False,
         num_worker_processes: int | None = None,
         crash_failover_max_attempts: int | None = None,
-        workflow_default_timeout_ms: int | None = None,
         node_labels: dict[str, str] | None = None,
         *,
         store: _StoreConfig | None = None,
@@ -246,9 +244,6 @@ class _ActantConfig:
     @property
     def crash_failover_max_attempts(self) -> int:
         """worker 崩溃后任务重路由的最大执行次数（含首次）。"""
-    @property
-    def workflow_default_timeout_ms(self) -> int:
-        """工作流默认超时（毫秒）。"""
     @property
     def default_task_timeout_ms(self) -> int: ...
     @property

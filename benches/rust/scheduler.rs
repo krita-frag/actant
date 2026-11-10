@@ -19,8 +19,7 @@ use tokio::runtime::Runtime;
 use actant_core::common::{ActorId, RetryPolicy, TaskDefinition, TaskId, WorkflowId};
 use actant_core::runtime::actor::ActorSystem;
 use actant_core::runtime::workflow::{
-    fifo_scheduler_actor, priority_scheduler_actor, spawn_fast_path_scheduler, ActorScheduler,
-    Scheduler,
+    spawn_fast_path_scheduler, ActorScheduler, Scheduler, SchedulerActor,
 };
 
 fn make_task(idx: usize, priority: i32) -> TaskDefinition {
@@ -49,7 +48,7 @@ fn make_task(idx: usize, priority: i32) -> TaskDefinition {
 fn priority_client(rt: &Runtime) -> Arc<dyn Scheduler> {
     let actor_system = Arc::new(ActorSystem::new());
     let actor_id = ActorId::new("sched-priority-bench".to_string());
-    rt.block_on(actor_system.spawn(actor_id.clone(), priority_scheduler_actor()))
+    rt.block_on(actor_system.spawn(actor_id.clone(), SchedulerActor::priority()))
         .unwrap();
     Arc::new(ActorScheduler::new(actor_id, actor_system))
 }
@@ -58,7 +57,7 @@ fn priority_client(rt: &Runtime) -> Arc<dyn Scheduler> {
 fn fifo_client(rt: &Runtime) -> Arc<dyn Scheduler> {
     let actor_system = Arc::new(ActorSystem::new());
     let actor_id = ActorId::new("sched-fifo-bench".to_string());
-    rt.block_on(actor_system.spawn(actor_id.clone(), fifo_scheduler_actor()))
+    rt.block_on(actor_system.spawn(actor_id.clone(), SchedulerActor::fifo()))
         .unwrap();
     Arc::new(ActorScheduler::new(actor_id, actor_system))
 }
@@ -207,7 +206,7 @@ fn priority_client_fast(rt: &Runtime) -> Arc<dyn Scheduler> {
         .block_on(spawn_fast_path_scheduler(
             actor_id,
             actor_system,
-            priority_scheduler_actor(),
+            SchedulerActor::priority(),
         ))
         .unwrap();
     Arc::new(sched)

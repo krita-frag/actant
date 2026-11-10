@@ -135,32 +135,14 @@ fn make_node(id: &str) -> NodeId {
 }
 
 #[test]
-fn init_actor_system_without_data_dir_returns_in_memory_system() {
+fn init_actor_system_binds_node_id_without_persistence() {
+    // actor 系统为系统 actor 专用本地运行时：只绑定 node_id 与事件总线，
+    // 不接 data_dir——mailbox 与 actor 状态是进程内存活对象，跨重启不保留
+    //（工作流恢复由 orchestrator 的统一历史承载）。
     let node_id = make_node("node-A");
     let event_bus = EventBus::new();
-    let config = crate::common::ActantConfig::default();
-    let system = init_actor_system(None, &node_id, &event_bus, &config).unwrap();
-    assert!(Arc::strong_count(&system) >= 1);
-}
-
-#[test]
-fn init_actor_system_with_data_dir_is_stateless() {
-    let dir = tempdir().unwrap();
-    let node_id = make_node("node-B");
-    let event_bus = EventBus::new();
-    let config = crate::common::ActantConfig::default();
-    let system = init_actor_system(
-        Some(dir.path().to_str().unwrap()),
-        &node_id,
-        &event_bus,
-        &config,
-    )
-    .unwrap();
-    // actor 系统为系统 actor 专用本地运行时：不落任何持久化文件
-    //（工作流恢复由 orchestrator 的统一历史承载）。
-    assert!(!dir.path().join("actor").exists());
-    assert!(!dir.path().join("actor.wal").exists());
-    drop(system);
+    let system = init_actor_system(&node_id, &event_bus).unwrap();
+    assert_eq!(system.node_id(), Some(&node_id));
 }
 
 // ───────────────────────── 节点身份（identity.key）测试 ─────────────────────────

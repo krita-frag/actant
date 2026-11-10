@@ -100,10 +100,8 @@ pub fn validate_data_dir(data_dir: &str) -> Result<(), ActantError> {
 /// 工作流恢复由 orchestrator 的统一工作流历史承载；mailbox 与 actor 状态
 /// 均为进程内存活对象，跨重启不保留。
 pub fn init_actor_system(
-    _data_dir: Option<&str>,
     node_id: &NodeId,
     event_bus: &EventBus,
-    _config: &crate::common::ActantConfig,
 ) -> Result<Arc<ActorSystem>, ActantError> {
     let system = Arc::new(
         ActorSystem::new()
@@ -539,12 +537,7 @@ impl RuntimeBuilder {
         let event_bus = EventBus::new();
 
         tracing::info!("build: init_actor_system enter");
-        let actor_system = init_actor_system(
-            self.data_dir.as_deref(),
-            &self.node_id,
-            &event_bus,
-            &self.config,
-        )?;
+        let actor_system = init_actor_system(&self.node_id, &event_bus)?;
         tracing::info!("build: init_actor_system done");
 
         let store_path = Path::new(&data_dir).join("store");

@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use super::*;
 use crate::common::{ActorId, RetryPolicy};
 use crate::runtime::actor::ActorSystem;
+use crate::runtime::network::Transport;
 use crate::runtime::workflow::DagNode;
 use crate::test_support::MockTransport;
 
@@ -62,7 +63,7 @@ async fn scheduler_actor_enqueue_and_dequeue() {
     let system = ActorSystem::new();
     let actor_id = ActorId::from("sched-actor-1");
     system
-        .spawn(actor_id.clone(), fifo_scheduler_actor())
+        .spawn(actor_id.clone(), SchedulerActor::fifo())
         .await
         .unwrap();
 
@@ -117,7 +118,8 @@ async fn failover_actor_update_capacity_and_get_peers() {
     let node_id = NodeId::from("node-1");
     let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-1"));
     let wf_actor_id = ActorId::workflow(&node_id);
-    let actor = failover_actor(node_id.clone(), network, system.clone(), wf_actor_id, None).await;
+    let manager = FailoverManager::new(node_id.clone(), network, system.clone(), wf_actor_id);
+    let actor = FailoverActor::new(Arc::new(manager));
     let actor_id = ActorId::failover(&node_id);
     system.spawn(actor_id.clone(), actor).await.unwrap();
 
@@ -148,7 +150,7 @@ async fn scheduler_actor_close_and_is_empty() {
     let system = ActorSystem::new();
     let actor_id = ActorId::from("sched-actor-2");
     system
-        .spawn(actor_id.clone(), priority_scheduler_actor())
+        .spawn(actor_id.clone(), SchedulerActor::priority())
         .await
         .unwrap();
 
@@ -206,7 +208,8 @@ async fn failover_actor_unknown_method_returns_error() {
     let node_id = NodeId::from("node-3");
     let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-3"));
     let wf_actor_id = ActorId::workflow(&node_id);
-    let actor = failover_actor(node_id.clone(), network, system.clone(), wf_actor_id, None).await;
+    let manager = FailoverManager::new(node_id.clone(), network, system.clone(), wf_actor_id);
+    let actor = FailoverActor::new(Arc::new(manager));
     let actor_id = ActorId::failover(&node_id);
     system.spawn(actor_id.clone(), actor).await.unwrap();
 

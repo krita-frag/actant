@@ -181,13 +181,12 @@ Worker 相关默认值（均取自 Rust 侧默认值）：
 - ``max_concurrent_tasks`` 默认 ``num_cpus``；
 - ``num_worker_processes`` 默认跟随 ``max_concurrent_tasks``（保持并发
   信号量与进程池容量一致）；
-- ``crash_failover_max_attempts`` 默认 3；
-- ``workflow_default_timeout_ms`` 默认 3_600_000（``WorkflowConfig``）。
+- ``crash_failover_max_attempts`` 默认 3。
 
 **构造**
 
 ```python
-_ActantConfig(payload_signing_key: str, network: _NetworkConfig | None = None, failover: _FailoverConfig | None = None, gossip: _GossipConfig | None = None, max_concurrent_tasks: int | None = None, default_task_timeout_ms: int | None = None, drain_timeout_secs: int | None = None, remote_fallback_delay_ms: int | None = None, scheduler: str | None = None, require_payload_signing: bool = False, num_worker_processes: int | None = None, crash_failover_max_attempts: int | None = None, workflow_default_timeout_ms: int | None = None, node_labels: dict[str, str] | None = None, *, store: _StoreConfig | None = None, prefetch_min: int | None = None, prefetch_max: int | None = None, worker_cancel_grace_ms: int | None = None, pending_result_channel_capacity: int | None = None, completed_retention_count: int | None = None, max_history_events: int | None = None, persist_flush_interval_ms: int | None = None, state_poll_interval_ms: int | None = None, starvation_timeout_ms: int | None = None, node_quotas: dict[str, int] | None = None, role: str | None = None)
+_ActantConfig(payload_signing_key: str, network: _NetworkConfig | None = None, failover: _FailoverConfig | None = None, gossip: _GossipConfig | None = None, max_concurrent_tasks: int | None = None, default_task_timeout_ms: int | None = None, drain_timeout_secs: int | None = None, remote_fallback_delay_ms: int | None = None, scheduler: str | None = None, require_payload_signing: bool = False, num_worker_processes: int | None = None, crash_failover_max_attempts: int | None = None, node_labels: dict[str, str] | None = None, *, store: _StoreConfig | None = None, prefetch_min: int | None = None, prefetch_max: int | None = None, worker_cancel_grace_ms: int | None = None, pending_result_channel_capacity: int | None = None, completed_retention_count: int | None = None, max_history_events: int | None = None, persist_flush_interval_ms: int | None = None, state_poll_interval_ms: int | None = None, starvation_timeout_ms: int | None = None, node_quotas: dict[str, int] | None = None, role: str | None = None)
 ```
 
 **属性**
@@ -202,7 +201,6 @@ _ActantConfig(payload_signing_key: str, network: _NetworkConfig | None = None, f
 | `max_concurrent_tasks` | `int` |  |
 | `num_worker_processes` | `int` | worker 子进程数（进程池大小）；``None`` 构造时跟随 ``max_concurrent_tasks``。 |
 | `crash_failover_max_attempts` | `int` | worker 崩溃后任务重路由的最大执行次数（含首次）。 |
-| `workflow_default_timeout_ms` | `int` | 工作流默认超时（毫秒）。 |
 | `default_task_timeout_ms` | `int` |  |
 | `drain_timeout_secs` | `int` |  |
 | `remote_fallback_delay_ms` | `int` |  |

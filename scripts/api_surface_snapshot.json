@@ -279,8 +279,7 @@
       "starvation_timeout_ms",
       "state_poll_interval_ms",
       "store",
-      "worker_cancel_grace_ms",
-      "workflow_default_timeout_ms"
+      "worker_cancel_grace_ms"
     ],
     "_CapabilityRuntime": [
       "ask",

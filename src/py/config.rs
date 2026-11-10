@@ -546,10 +546,6 @@ pub struct PyActantConfig {
     /// `WorkerConfig::default`（3）。
     #[pyo3(get)]
     pub crash_failover_max_attempts: u32,
-    /// 工作流默认超时（毫秒），透传 `WorkflowConfig::default_timeout_ms`。
-    /// 未指定时取 Rust `WorkflowConfig::default`（3_600_000）。
-    #[pyo3(get)]
-    pub workflow_default_timeout_ms: u64,
     /// 用户自定义节点标签，随心跳广播给集群。超 4KB 整体丢弃。
     #[pyo3(get)]
     pub node_labels: BTreeMap<String, String>,
@@ -600,12 +596,10 @@ impl PyActantConfig {
     ///   进程池容量一致；显式指定时二者解耦，需自行保证语义一致。
     /// - `crash_failover_max_attempts`：worker 崩溃后任务重路由的最大执行次数
     ///   （含首次）。`None`（默认）= Rust `WorkerConfig::default` 的 3。
-    /// - `workflow_default_timeout_ms`：工作流默认超时（毫秒）。`None`（默认）
-    ///   = Rust `WorkflowConfig::default` 的 3_600_000。
     /// - `store`：本地持久化配置（目录 / mmap 上限 / 同步策略）。`None`（默认）
     ///   = Rust `StoreConfig::default`。
     #[new]
-    #[pyo3(signature = (payload_signing_key, network=None, failover=None, gossip=None, max_concurrent_tasks=None, default_task_timeout_ms=None, drain_timeout_secs=None, remote_fallback_delay_ms=None, scheduler=None, require_payload_signing=false, num_worker_processes=None, crash_failover_max_attempts=None, workflow_default_timeout_ms=None, node_labels=None, *, store=None, prefetch_min=None, prefetch_max=None, worker_cancel_grace_ms=None, pending_result_channel_capacity=None, completed_retention_count=None, max_history_events=None, persist_flush_interval_ms=None, state_poll_interval_ms=None, starvation_timeout_ms=None, node_quotas=None, role=None))]
+    #[pyo3(signature = (payload_signing_key, network=None, failover=None, gossip=None, max_concurrent_tasks=None, default_task_timeout_ms=None, drain_timeout_secs=None, remote_fallback_delay_ms=None, scheduler=None, require_payload_signing=false, num_worker_processes=None, crash_failover_max_attempts=None, node_labels=None, *, store=None, prefetch_min=None, prefetch_max=None, worker_cancel_grace_ms=None, pending_result_channel_capacity=None, completed_retention_count=None, max_history_events=None, persist_flush_interval_ms=None, state_poll_interval_ms=None, starvation_timeout_ms=None, node_quotas=None, role=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         payload_signing_key: String,
@@ -620,7 +614,6 @@ impl PyActantConfig {
         require_payload_signing: bool,
         num_worker_processes: Option<usize>,
         crash_failover_max_attempts: Option<u32>,
-        workflow_default_timeout_ms: Option<u64>,
         node_labels: Option<BTreeMap<String, String>>,
         store: Option<PyStoreConfig>,
         prefetch_min: Option<usize>,
@@ -662,8 +655,6 @@ impl PyActantConfig {
                 .unwrap_or(max_concurrent),
             crash_failover_max_attempts: crash_failover_max_attempts
                 .unwrap_or(default_worker.crash_failover_max_attempts),
-            workflow_default_timeout_ms: workflow_default_timeout_ms
-                .unwrap_or(actant_core::common::WorkflowConfig::default().default_timeout_ms),
             node_labels: node_labels.unwrap_or_default(),
             role: role.unwrap_or_else(|| NodeRole::default().as_str().to_string()),
             node_quotas: node_quotas.unwrap_or_default(),
@@ -731,8 +722,6 @@ impl Default for PyActantConfig {
             require_payload_signing: false,
             num_worker_processes: max_concurrent,
             crash_failover_max_attempts: default_worker.crash_failover_max_attempts,
-            workflow_default_timeout_ms: actant_core::common::WorkflowConfig::default()
-                .default_timeout_ms,
             node_labels: BTreeMap::new(),
             role: NodeRole::default().as_str().to_string(),
             node_quotas: BTreeMap::new(),
@@ -789,7 +778,6 @@ impl TryFrom<&PyActantConfig> for ActantConfig {
             },
             store: c.store.to_rust()?,
             workflow: actant_core::common::WorkflowConfig {
-                default_timeout_ms: c.workflow_default_timeout_ms,
                 completed_retention_count: c.completed_retention_count,
                 event_log_max_events_per_workflow: c.max_history_events,
                 persist_flush_interval_ms: c.persist_flush_interval_ms,
