@@ -11,6 +11,7 @@ dial 父节点后把 ``node_id``/``peer_id``/``endpoint_addr`` 写入 JSON 信�
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 
@@ -31,8 +32,12 @@ def main() -> int:
         "peer_id": rt.peer_id,
         "endpoint_addr": rt.listen_addresses()["endpoint_addr"],
     }
-    with open(info_path, "w", encoding="utf-8") as f:
+    # 父进程按「文件存在」判定就绪，因此必须原子发布：直接写 info_path 会让
+    # 轮询方读到刚创建、尚未写入内容的 0 字节文件（json.load 报 Expecting value）。
+    staging = f"{info_path}.tmp"
+    with open(staging, "w", encoding="utf-8") as f:
         json.dump(info, f)
+    os.replace(staging, info_path)
     rt.serve()
     while True:
         time.sleep(1.0)
