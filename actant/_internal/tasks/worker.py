@@ -424,6 +424,11 @@ class _TaskLogScope:
         return self
 
     def __exit__(self, *exc: Any) -> None:
+        # 先 flush 再换回真实 stdout：任务末尾没有换行的输出（``print(end="")``）
+        # 还留在代理缓冲里，直接恢复引用会让这段输出静默丢失。
+        current = sys.stdout
+        if isinstance(current, _StdoutLogProxy):
+            current.flush()
         sys.stdout = self._real_stdout
         if self._handler is not None:
             logging.getLogger().removeHandler(self._handler)

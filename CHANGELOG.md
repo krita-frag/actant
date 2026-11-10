@@ -266,6 +266,9 @@
   （取 `&mut self`，而 `Worker` 构造后立即被移入 `Arc`，生产上不可达）与
   `WireTaskState::from_python_str`（状态字符串只做 Rust→Python 单向映射，
   Python 侧状态经结果上报回传，不经过该解析）。
+- **worker 任务末尾的无换行输出不再丢失**：`_TaskLogScope.__exit__` 此前直接
+  把 `sys.stdout` 换回真实流，代理缓冲里尚未遇到换行的片段（`print(x, end="")`）
+  随之被丢弃且不留任何痕迹。现在退出前先 flush 代理，再恢复引用。
 
 ### 修复（异步面健壮性）
 

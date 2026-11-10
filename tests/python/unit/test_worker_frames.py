@@ -148,6 +148,25 @@ def test_read_frame_accepts_length_under_limit() -> None:
         parent_side.close()
 
 
+@_windows_skip
+def test_read_frame_reports_truncated_body() -> None:
+    """正文短于帧头声明长度：抛 EOFError 而非返回残缺帧。"""
+    p_r, p_w = os.pipe()
+    child_side = io.FileIO(p_r, "rb")
+    parent_side = io.FileIO(p_w, "wb")
+    try:
+        parent_side.write(_FRAME_HEADER.pack(1 + 8, 0x01))
+        parent_side.write(b"abc")
+        parent_side.flush()
+        parent_side.close()  # 关掉写端 → 读端提前 EOF
+        with pytest.raises(EOFError, match="unexpected EOF"):
+            _read_frame(child_side)
+    finally:
+        child_side.close()
+        if not parent_side.closed:
+            parent_side.close()
+
+
 # ───────────────────────── dispatch 载荷截断严格检查 ─────────────────────────
 
 
@@ -215,6 +234,37 @@ def test_write_frame_falls_back_when_nothing_written(
     finally:
         child_out.close()
         parent_in.close()
+
+
+@_windows_skip
+def test_write_frame_falls_back_without_writev(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """平台无 ``os.writev``：回退拼接写，帧仍完整。"""
+    monkeypatch.delattr(os, "writev")
+    p_r, p_w = os.pipe()
+    child_out = io.FileIO(p_w, "wb")
+    parent_in = io.FileIO(p_r, "rb")
+    try:
+        body = b"no-writev"
+        _write_frame(child_out, 0x02, body)
+        hdr = _readn(parent_in, _FRAME_HEADER.size)
+        length, msg_type = _FRAME_HEADER.unpack(hdr)
+        assert msg_type == 0x02
+        assert _readn(parent_in, length - 1) == body
+    finally:
+        child_out.close()
+        parent_in.close()
+
+
+@_windows_skip
+def test_writev_all_rejects_zero_progress(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``writev`` 返回 0（对端已关的退化情形）必须上抛，不得原地死循环。"""
+    monkeypatch.setattr(os, "writev", lambda fileno, bufs: 0)
+    with pytest.raises(_WriteVError) as excinfo:
+        _writev_all(1, b"abc")
+    assert excinfo.value.written == 0
+    assert "returned 0 bytes" in str(excinfo.value)
 
 
 @_windows_skip
