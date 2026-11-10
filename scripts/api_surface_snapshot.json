@@ -1,0 +1,479 @@
+{
+  "pyo3_classes": {
+    "PyActantConfig": [
+      "new"
+    ],
+    "PyAsyncAwaitable": [
+      "__await__",
+      "__iter__",
+      "__next__"
+    ],
+    "PyCancelToken": [
+      "__bool__",
+      "__repr__",
+      "cancelled",
+      "is_cancelled"
+    ],
+    "PyCapabilityRuntime": [
+      "ask",
+      "ask_async",
+      "builtin_capabilities",
+      "capability_count",
+      "emit",
+      "new",
+      "perform",
+      "perform_async",
+      "perform_batch_async",
+      "registered_capabilities"
+    ],
+    "PyFailoverConfig": [
+      "new"
+    ],
+    "PyGossipConfig": [
+      "new"
+    ],
+    "PyNetworkConfig": [
+      "new"
+    ],
+    "PyNode": [
+      "__repr__",
+      "new"
+    ],
+    "PyRetryPolicy": [
+      "default",
+      "new",
+      "to_bytes"
+    ],
+    "PyRuntimeCore": [
+      "add_gossip_peer",
+      "add_workflow_node",
+      "backup_to",
+      "batch_progress",
+      "broadcast_cancel",
+      "cancel_task",
+      "cancel_workflow",
+      "capability_runtime",
+      "close_peer",
+      "delay_heartbeat",
+      "delete_workflow",
+      "dial",
+      "discover_peers",
+      "get_context_value",
+      "get_dag",
+      "get_workflow_history",
+      "get_workflow_invocation",
+      "get_workflow_journal",
+      "get_workflow_state",
+      "inject_hlc_drift",
+      "list_all_workflows",
+      "list_workflows",
+      "listen_addresses",
+      "max_concurrent_tasks",
+      "new",
+      "node_id",
+      "peer_id",
+      "peers",
+      "record_batch_terminal",
+      "register_batch",
+      "register_task_log_callback",
+      "register_task_result_callback",
+      "register_wait_point",
+      "register_worker_state_callback",
+      "remove_batch",
+      "reopen_peer",
+      "report_task_result",
+      "resolve_context_value",
+      "resume_suspended",
+      "seal_workflow",
+      "serve",
+      "set_max_concurrent_tasks",
+      "shutdown",
+      "signal_wait_point",
+      "storage_stats",
+      "submit_task",
+      "submit_tasks_batch",
+      "submit_workflow",
+      "update_node_state",
+      "value_fetch",
+      "value_ref_parts",
+      "value_store",
+      "wait_wait_point",
+      "wait_wait_point_async"
+    ],
+    "PyStoreConfig": [
+      "__repr__",
+      "new"
+    ],
+    "PyStoreStats": [
+      "__repr__",
+      "utilization_ratio"
+    ],
+    "PyTask": [
+      "__repr__",
+      "new"
+    ],
+    "PyWorkflowState": [
+      "__repr__"
+    ]
+  },
+  "python_all": [
+    "ActantError",
+    "AsyncResult",
+    "FlowHandle",
+    "Layer",
+    "Ref",
+    "Runtime",
+    "__version__",
+    "ask",
+    "emit",
+    "flow",
+    "gather",
+    "get_current_runtime",
+    "host_flows",
+    "perform",
+    "start_flow",
+    "task",
+    "use_runtime"
+  ],
+  "python_namespaces": {
+    "actant.aio": [
+      "AsyncDriver",
+      "AsyncFlowContext",
+      "ask",
+      "flow",
+      "gather",
+      "perform",
+      "perform_batch"
+    ],
+    "actant.capabilities": [
+      "EffectKind",
+      "RetryCtx",
+      "RetryPolicyHandler",
+      "RouteCtx",
+      "RoutingHandler",
+      "ScheduleCtx",
+      "SchedulingHandler",
+      "StoreHandler",
+      "StoreReq",
+      "TaskEvent",
+      "TaskLifecycleHandler",
+      "ValueStoreHandler",
+      "ValueStoreReq",
+      "WorkflowEvent",
+      "WorkflowLifecycleHandler"
+    ],
+    "actant.effects": [
+      "ask",
+      "emit",
+      "impossible",
+      "perform"
+    ],
+    "actant.exceptions": [
+      "ActantError",
+      "ActantTimeoutError",
+      "ActorError",
+      "AlreadyExistsError",
+      "BlockingInEventLoopError",
+      "ConfigError",
+      "FlowReplayError",
+      "InternalError",
+      "InvalidStateError",
+      "MetricsError",
+      "NetworkError",
+      "NotFoundError",
+      "PayloadTooLargeError",
+      "SerializationError",
+      "StorageError",
+      "TaskCancelledError",
+      "TaskError",
+      "WorkerError",
+      "WorkflowCancelledError",
+      "WorkflowError",
+      "WorkflowFailedError",
+      "raise_for_kind",
+      "raise_for_state"
+    ],
+    "actant.observability": [
+      "metrics_text"
+    ],
+    "actant.service": [
+      "DefinitionError",
+      "DefinitionHashMismatchError",
+      "DefinitionNotFoundError",
+      "DefinitionRef",
+      "DefinitionResolver",
+      "DefinitionVersionMismatchError",
+      "PROTOCOL_VERSION",
+      "ServiceClient",
+      "ServiceServer",
+      "definition_hash"
+    ],
+    "actant.tasks": [
+      "AsyncResult",
+      "BatchProgress",
+      "REF_INLINE_THRESHOLD",
+      "Ref",
+      "Task",
+      "TaskContext",
+      "TaskState",
+      "gather",
+      "get_task_context",
+      "task"
+    ],
+    "actant.testkit": [
+      "close_peer",
+      "delay_heartbeat",
+      "inject_hlc_drift",
+      "kill_node",
+      "reopen_peer"
+    ],
+    "actant.workflow": [
+      "FLOW_REGISTRY",
+      "FlowDefinition",
+      "FlowHandle",
+      "continue_as_new",
+      "current_workflow_id",
+      "flow",
+      "flow_ctx",
+      "host_flows",
+      "patched",
+      "sleep_until",
+      "start_flow",
+      "suspend",
+      "wait_signal"
+    ]
+  },
+  "stub_classes": {
+    "ActantError": [
+      "kind"
+    ],
+    "ActantTimeoutError": [],
+    "ActorError": [],
+    "AlreadyExistsError": [],
+    "CancelToken": [
+      "cancelled",
+      "is_cancelled"
+    ],
+    "ConfigError": [],
+    "FlowReplayError": [],
+    "InternalError": [],
+    "InvalidStateError": [],
+    "MetricsError": [],
+    "NetworkError": [],
+    "NotFoundError": [],
+    "PayloadTooLargeError": [
+      "actual",
+      "limit"
+    ],
+    "PyAsyncAwaitable": [],
+    "SerializationError": [],
+    "StorageError": [],
+    "TaskCancelledError": [],
+    "TaskError": [],
+    "WorkerError": [],
+    "WorkflowCancelledError": [],
+    "WorkflowError": [],
+    "WorkflowFailedError": [
+      "task_error",
+      "task_name"
+    ],
+    "_ActantConfig": [
+      "completed_retention_count",
+      "crash_failover_max_attempts",
+      "default_task_timeout_ms",
+      "drain_timeout_secs",
+      "failover",
+      "gossip",
+      "max_concurrent_tasks",
+      "max_history_events",
+      "network",
+      "node_labels",
+      "node_quotas",
+      "num_worker_processes",
+      "payload_signing_key",
+      "pending_result_channel_capacity",
+      "persist_flush_interval_ms",
+      "prefetch_max",
+      "prefetch_min",
+      "remote_fallback_delay_ms",
+      "require_payload_signing",
+      "role",
+      "scheduler",
+      "starvation_timeout_ms",
+      "state_poll_interval_ms",
+      "store",
+      "worker_cancel_grace_ms",
+      "workflow_default_timeout_ms"
+    ],
+    "_CapabilityRuntime": [
+      "ask",
+      "ask_async",
+      "builtin_capabilities",
+      "capability_count",
+      "emit",
+      "perform",
+      "perform_async",
+      "perform_batch_async",
+      "registered_capabilities"
+    ],
+    "_DagNode": [
+      "metadata",
+      "name",
+      "payload",
+      "priority",
+      "quota",
+      "retry",
+      "tags",
+      "task_id",
+      "timeout_ms"
+    ],
+    "_Event": [
+      "completion",
+      "kind"
+    ],
+    "_FailoverConfig": [
+      "failure_timeout_ms",
+      "heartbeat_interval_ms",
+      "lease_duration_ms",
+      "lease_expiry_check_interval_secs"
+    ],
+    "_GossipConfig": [
+      "dedup_ttl_secs",
+      "dedup_window_size",
+      "heads_broadcast_interval_ms",
+      "retry_attempts",
+      "retry_base_delay_ms"
+    ],
+    "_ListenAddresses": [
+      "direct_addrs",
+      "endpoint_addr",
+      "endpoint_id",
+      "relay_url"
+    ],
+    "_NetworkConfig": [
+      "allowed_peer_ids",
+      "bootstrap_nodes",
+      "direct_request_timeout_ms",
+      "dns_origin_domain",
+      "event_channel_capacity",
+      "gossip_bootstrap_peers",
+      "hlc_max_drift_ms",
+      "listen_ip",
+      "listen_port",
+      "max_message_size",
+      "max_pending_direct_requests",
+      "preset",
+      "relay_endpoints",
+      "require_signed_records",
+      "require_signed_records"
+    ],
+    "_RetryPolicy": [
+      "backoff_multiplier",
+      "default",
+      "delay_ms",
+      "max_delay_ms",
+      "max_retries",
+      "to_bytes"
+    ],
+    "_RuntimeCore": [
+      "add_gossip_peer",
+      "add_workflow_node",
+      "backup_to",
+      "batch_progress",
+      "broadcast_cancel",
+      "cancel_task",
+      "cancel_workflow",
+      "capability_runtime",
+      "close_peer",
+      "delay_heartbeat",
+      "delete_workflow",
+      "dial",
+      "discover_peers",
+      "get_context_value",
+      "get_dag",
+      "get_workflow_history",
+      "get_workflow_invocation",
+      "get_workflow_journal",
+      "get_workflow_state",
+      "inject_hlc_drift",
+      "list_all_workflows",
+      "list_workflows",
+      "listen_addresses",
+      "max_concurrent_tasks",
+      "node_id",
+      "peer_id",
+      "peers",
+      "record_batch_terminal",
+      "register_batch",
+      "register_task_log_callback",
+      "register_task_result_callback",
+      "register_wait_point",
+      "register_worker_state_callback",
+      "remove_batch",
+      "reopen_peer",
+      "report_task_result",
+      "resolve_context_value",
+      "resume_suspended",
+      "seal_workflow",
+      "serve",
+      "set_max_concurrent_tasks",
+      "shutdown",
+      "signal_wait_point",
+      "storage_stats",
+      "submit_task",
+      "submit_tasks_batch",
+      "submit_workflow",
+      "update_node_state",
+      "value_fetch",
+      "value_ref_parts",
+      "value_store",
+      "wait_wait_point",
+      "wait_wait_point_async"
+    ],
+    "_StoreConfig": [
+      "data_dir",
+      "flush_interval_ms",
+      "map_size",
+      "max_dbs",
+      "sync_mode"
+    ],
+    "_StoreStats": [
+      "entries",
+      "file_bytes",
+      "map_size",
+      "max_readers",
+      "readers",
+      "used_bytes",
+      "utilization_ratio"
+    ],
+    "_TaskCompletion": [
+      "error",
+      "result",
+      "state",
+      "target_node",
+      "task_id",
+      "task_name",
+      "workflow_id"
+    ],
+    "_TaskDef": [
+      "name",
+      "payload",
+      "pinned_target",
+      "priority",
+      "quota",
+      "tags",
+      "target_endpoint_addr",
+      "target_node",
+      "task_id",
+      "timeout_ms",
+      "workflow_id"
+    ],
+    "_WorkflowState": [
+      "CANCELLED",
+      "COMPLETED",
+      "FAILED",
+      "PENDING",
+      "RUNNING"
+    ]
+  }
+}

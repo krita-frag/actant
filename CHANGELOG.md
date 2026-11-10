@@ -3,10 +3,101 @@
 本项目遵循 [Semantic Versioning](https://semver.org/)，但 1.0.0 前不保证向后兼容。
 每次发布记录破坏性变更、新增功能与缺陷修复。
 
+> 历史条目中引用的源码与文档路径按当时的工作树书写，重构后可能已不存在；
+> 请以当前代码为准，不要把这些路径当作现有结构索引。
+
 ## [Unreleased](https://github.com/actant/actant/compare/v0.3.0...HEAD)
 
 ### 破坏性变更
 
+- **删除工作流级 `namespace` / `idempotency_key`（伪能力）**：
+  `Runtime.submit_workflow`（及 PyO3 同名方法）不再接受这两个参数，
+  `WorkflowInvocation` 与 `get_workflow_invocation()` 的返回 dict 同步移除对应键。
+  二者此前只随 `Submitted` 事件落盘、没有任何隔离或去重消费者；任务级
+  `idempotency_key`（`Task.submit`）保持不变。需要隔离时用独立 `data_dir`，
+  需要工作流幂等时由调用方复用同一个 `workflow_id`。
+- **删除 `Runtime.with_defaults()`**：与 `Runtime(...)` 完全等价，统一为构造器；
+  同时删除 PyO3 内部接缝 `_CapabilityRuntime.chain_python_handler` /
+  `dispatch_ask` / `dispatch_perform` / `dispatch_emit`（Python handler 只走
+  Python 侧分发链）。
+- **任务重试遵循退避策略**：`RetryPolicy.backoff_multiplier` / `max_delay_ms`
+  现在参与计算（`delay_ms * multiplier^retry`，上限 `max_delay_ms`）；此前固定
+  使用 `delay_ms`。
+- **顶层 API 收敛（79→17，无兼容垫片）**：`actant.__all__` 只保留 17 个入口，
+  其余按下述路径下沉；旧写法（如 `from actant import Task`）直接 `ImportError`：
+  - `actant.workflow`：`sleep_until` / `wait_signal` / `suspend` / `continue_as_new` /
+    `patched` / `current_workflow_id` / `flow_ctx` / `FlowDefinition` /
+    `FLOW_REGISTRY`；
+  - `actant.tasks`：`Task` / `TaskContext` / `TaskState` / `BatchProgress` /
+    `get_task_context`；
+  - `actant.aio`：`AsyncDriver` / `AsyncFlowContext` / `flow` / `ask` /
+    `perform` / `perform_batch` / `gather`；
+  - `actant.effects`：`ask` / `impossible` / `perform`；
+  - `actant.capabilities`：`EffectKind`、请求 / 事件 dataclass 与 handler 协议；
+  - `actant.exceptions`：全部具名异常（含 `ActantError`）与 `raise_for_kind` /
+    `raise_for_state`；
+  - `actant.observability`：`metrics_text`。
+
+  **异步面独立命名空间**：删除 `async_flow` / `gather_async` / `ask_async` /
+  `perform_async` / `perform_batch_async` 五个后缀名，统一为 `actant.aio` 下的
+  同名动词（`aio.flow` / `aio.gather` / `aio.ask` / `aio.perform` /
+  `aio.perform_batch`）；`AsyncFlowContext` 移到 `actant.aio`。同步面只保留默认名，
+  import 路径即可区分等待语义。`AsyncResult` 仍是唯一跨边界对象：同步
+  `result()`、异步 `await`；在 event loop 上调用阻塞读立即抛
+  `BlockingInEventLoopError`（`InvalidStateError` 子类，用于与运行时生命周期
+  错误区分），不再静默冻结循环。
+
+  顶层 `effect()` 通用分发器删除，改用 `ask` / `perform` / `emit`；顶层现在导出
+  `ask` 而非 `effect`，与三动词对称。`require_runtime` 删除（用
+  `get_current_runtime`）。`actant/flow.py` / `actant/flow_async.py` 改为私有模块
+  `actant/_internal/flow.py` / `actant/_internal/flow_async.py`，`actant.flow` 恒为装饰器；
+  `actant/task/` 重命名为 `actant/tasks/`，`actant.task` 恒为装饰器、`actant.tasks`
+  为模块命名空间，消除同名遮蔽。PyO3 的 `prometheus_text` 更名为 `metrics_text`，
+  Python 侧不再出现两套指标命名。`scripts/api_surface.py` 对顶层与每个公开子命名
+  空间分别设硬预算门禁。
+- **持久化配置收敛为 `_StoreConfig`**：`_ActantConfig` 移除 `data_dir` 与四个
+  `store_*` 扁平参数，改为关键字参数 `store=_StoreConfig(...)`
+  （`data_dir` / `map_size` / `max_dbs` / `sync_mode` / `flush_interval_ms`）。
+  `data_dir` 的解析优先级为：`Runtime(data_dir=...)` > `config.store.data_dir` >
+  临时目录。新增 `Runtime.storage_stats()`（返回 `_StoreStats`）与
+  `Runtime.backup_to(path)` 在线热备份。
+- **`actant.aio` 三个 effect 改为协程函数**：`aio.ask` / `aio.perform` /
+  `aio.perform_batch` 由普通函数改为 `async def`，必须 `await`；不 `await` 的调用
+  不再同步抛错。`aio.gather` 在超时或外部取消时取消未完成的桥接 future。
+  `aio.AsyncDriver` 从 `actant.driver` 重导出，异步 flow 可用
+  `actant.host_flows(driver=actant.aio.AsyncDriver())` 驱动；若异步 flow 定义被
+  默认 `BlockingDriver` 承载，`host_flows` 现在记录 warning。
+- **私有实现收进 `actant/_internal/`**：`_runtime.py` / `_runtime_base.py` /
+  `_flow.py` / `_flow_async.py` / `_persistence.py` 移入该包并去掉文件名前导下划线，
+  顶层目录只保留公开模块（`aio` / `workflow` / `tasks` / `effects` / `capabilities` /
+  `exceptions` / `observability` / `testkit` / `driver` / `cli`）。私有路径导入
+  （如 `from actant._runtime import Runtime`）需改为
+  `from actant._internal.runtime import Runtime`；公开 API 与语义不变。
+- **`flow()` 移除 `retries` / `retry_delay_ms` 参数**：二者一直是 no-op
+  （flow 级不做整体重试，任务级重试由 `@task(retries=...)` 映射为节点
+  `RetryPolicy`，函数体续跑由重放机制承载）。`@flow(retries=...)` 现在直接抛
+  `TypeError`。同时删除未使用的 `exceptions.encode_error_kind`（错误前缀由 Rust
+  端直接格式化）。
+- **`actant task` 子命令删除**：该命令只能读取进程内 Runtime 注册表，跨进程
+  必然返回空列表或“未找到”，且 `cancel` 会拉起完整 Runtime。任务状态请在提交
+  进程内通过 `Runtime.list_tasks()` / `get_task()` / `cancel_task()` 查询。
+- **公开面收敛（0.3.x 减法）**：删除 `actant.resume_flows`（改用 `host_flows()`）；
+  `Runtime.forget_task` / `forget_workflow_result` / `forget_idempotency_key` 合并为
+  `Runtime.forget(kind, key)`；删除 `Task.delay` / `Task.map` / `Task.starmap`
+  （改用 `submit()` / `submit_batch()`）；删除 `Runtime.handler_count`（用
+  `len(rt.handlers(name))`）；`Runtime.list_all_workflows()` 合并为
+  `list_workflows(include_archived=True)`；网络 `dial_async` /
+  `add_gossip_peer_async` / `discover_peers_async` 删除；顶层 `actant` 不再导出
+  `PYTHON_ONLY_CAPABILITIES` / `RUST_BACKED_CAPABILITIES` / `WIRED_CAPABILITIES` /
+  `REF_INLINE_THRESHOLD`（改从 `actant.capabilities` / `actant.tasks` 导入）。
+- **Wire 协议 v2（滚动升级不兼容）**：`TaskDefinition` 新增 `tags` / `quota` /
+  `pinned_target`，`NodeHeartbeat` 新增 `available_quotas`，DAG 节点新增
+  `tags` / `quota`，postcard 与 rkyv 布局均变化，`WIRE_PROTOCOL_VERSION` 1→2。
+  **整集群需同步升级**；旧节点无法解码新帧。本地 LMDB 中由旧版本写入的
+  workflow DAG/execution 存档同样需要重建（删除 `data_dir` 下的 LMDB 文件）。
+- **`_DagNode` 绑定构造器收窄**：新增 `tags` / `quota` 关键字参数；`retry`
+  改为构造后属性赋值，`metadata` 移出构造器（Python 侧从未传入）。直接构造
+  `_DagNode(retry=..., metadata=...)` 的调用方需调整。
 - **Transport capability 删除 + Serialization 直通 handler 删除（0.3.6 减法，capability 10→9）**：
   引用计数审计确认二者零生产消费者——Rust 网络通信全走 `NetworkManager` 直接方法调用
   （Transport capability 是 SHM ring 时代的接口形状），Python 序列化走 cloudpickle 不经
@@ -114,6 +205,105 @@
 - **CRDT 模块移除（0.3.1 剪裁 T2）**：`src/runtime/state/crdt.rs`（ORSet/GCounter/LWWRegister）为死码，全仓零引用，整文件删除。DAG gossip 状态合并使用 HLC 比较语义，不受影响。
 
 - **Python-facing Actor API 移除（0.3.1 剪裁 T3/T4/T5/T6，capability 13 → 10）**：`_ActorCore`（`spawn_actor`/`call_method` 等全部方法，全仓零调用方）、`PythonActor`、`ActorMessaging`/`ActorSupervision`/`ActorLifecycle` 三个 capability 及其 ctx dataclass 与 Handler Protocol、`_Event.orchestration()`/`_Event.supervision()`（无构造路径）、`_RuntimeCore.retry_policy`/`set_retry_policy`（零调用）、`register_python_dispatch_handler`（no-op）全部删除；`_NetworkConfig.actor_router_strategy`/`actor_registry_gossip_interval_ms` 同步摘除。内置 capability 收敛为 10 个（策略型 Routing/Scheduling/RetryPolicy + Rust-backed Serialization/Transport/Store/Execute/TaskLifecycle/WorkflowLifecycle/NodeLifecycle）。本地 `ActorSystem`（spawn/mailbox/at-least-once/取消/持久化）保留，仍是四类系统 actor 的生产底座；`ActorError` 异常保留（本地 ActorSystem 仍产生 `actor` kind）。另删除 `observability::shutdown()` no-op 与未实现的 relay map 配置字段。
+
+### 新增（服务层与直提任务租约）
+
+- **`actant.service`**：定义寻址（`DefinitionRef = name + version + hash`）、
+  HTTP/JSON + SSE 协议 v1（`ServiceServer` / `ServiceClient`）、
+  `DefinitionResolver` 与稳定错误码（`definition_not_found` /
+  `definition_version_mismatch` / `definition_hash_mismatch`）。协议不内置鉴权，
+  见 `docs/architecture/service-layer.md`。
+- **直提任务租约**：`TaskDefinition` 新增 `lease_deadline_ms`；转发到远端的独立
+  任务在 origin 登记租约，执行节点失联或租约到期后递增 `attempt` 重投，
+  远端结果按 attempt fencing 丢弃迟到结果。工作流任务不使用该字段。
+- **Python `RoutePolicy` callable**：`Runtime(route_policy=fn)` 接受
+  `fn(ctx: dict, candidates: list[dict]) -> 决策`，决策可为 `"local"` / `"defer"` /
+  `("remote", node_id)` / `("defer", reason)`。返回 `None`、抛异常、返回非法值或
+  目标节点暂无 endpoint 地址时，本次决策降级到内置 `DefaultRoutePolicy`，不影响
+  后续任务。回调在 routing 线程同步执行，**不得**在其中等待任务结果或做阻塞调用
+  （如 `AsyncResult.result()`），否则会与该线程负责的结果回泵互相等待。
+
+### 修复（审计止血）
+
+- **API surface 门禁恢复**：`scripts/api_surface.py` 的 `actant.tasks` 路径
+  指向扁平化后的 `actant/tasks.py`，`--check` 不再因 `FileNotFoundError` 失败；
+  文档契约测试新增快照校验，确保脚本本身可运行。
+- **构建新鲜度自检**：pytest session 启动时比较原生扩展与 Rust 构建输入的
+  mtime，过期 `.so` 直接失败并提示 `uv run maturin develop`，避免测试跑在旧
+  实现上（可用 `ACTANT_SKIP_BUILD_CHECK=1` 跳过）。
+- **直提任务结果 fencing 只拒绝更旧的 attempt**：执行节点本地崩溃转移会自行把
+  `attempt` 推进一位并在同节点重投，而 origin 的在途登记仍停在转发时的值。
+  此前要求 attempt 精确相等，自愈后的合法结果被判为陈旧：结果投递重试 3 次后
+  发布一个假的 `TaskFailed` 补偿事件，origin 随后又按租约重投一次，同一任务被
+  执行三次。现改为「登记 attempt ≤ 结果 attempt」即接受，仍拒绝严格更旧的结果。
+- **租约「无有效租约」语义收口**：`TaskDefinition::lease_deadline_ms == 0` 此前
+  在文档与注释里同时被描述为「无租约」「立即到期」「待重投」三种含义。现统一为
+  一种：**无有效租约**（从未租出或已放弃），对检查点等效于立即到期。读写收敛到
+  `TaskDefinition::NO_LEASE` / `relinquish_lease()` / `lease_expired_at(now_ms)`，
+  不再各自比较字面量——原判定里 `deadline == 0 ||` 这一支本身就是冗余的。
+- **删除两处无生产调用者的 `pub` 项**：`Worker::clear_capacity_callback`
+  （取 `&mut self`，而 `Worker` 构造后立即被移入 `Arc`，生产上不可达）与
+  `WireTaskState::from_python_str`（状态字符串只做 Rust→Python 单向映射，
+  Python 侧状态经结果上报回传，不经过该解析）。
+
+### 修复（异步面健壮性）
+
+- **`aio.perform_batch` 使用 Rust 批量路径**：全部条目都由 Rust 内置 handler
+  处理时委托 `_rust_runtime.perform_batch_async`（单次边界穿越 + `join_all`
+  并发），与文档承诺一致；含 Python handler 的条目仍逐条在 executor 并发。
+  空批次直接返回 `[]`，不再要求活跃 Runtime；调度前快照输入列表，避免调用方
+  在等待期间修改原列表影响结果。
+- **`aio.gather` 校验 handle 类型**：非 `AsyncResult` 参数抛带下标的
+  `TypeError`，不再以 `AttributeError` 形式泄漏内部细节。
+- **缺少 event loop 的错误提示**：`_get_asyncio_loop` 抛 `InvalidStateError`
+  时覆写 hint，提示改用 `async def` / `asyncio.run(...)`，不再误导用户去
+  `Runtime.start()`。`_HintedActantError` 支持按实例覆盖 hint。
+- **`AsyncDriver.close()` 异常安全**：`join()` 重抛重放失败时仍停止 loop 并
+  关闭同步执行器，避免线程与线程池泄漏。
+
+### 破坏性变更（通用化 M1：放置契约）
+
+- **路由三态 + 任务/心跳 schema 扩展**：`RoutePolicy::select_target` 返回
+  `RouteDecision`（`Local` / `Remote` / `Defer`），`None` 不再表示"本地执行"；
+  `RouteCandidate` 增 `labels`，`RouteContext` 增 `required` 与配额视图。
+  `TaskDefinition` 增 `tags: Vec<String>`、`quota: Option<String>`（rkyv + serde
+  尾部字段，旧存档/旧节点需重建或同步升级）；`NodeHeartbeat` 增
+  `available_quotas`；`WorkerConfig` 增 `node_quotas`。自定义 `RoutePolicy`
+  实现必须迁移到三态。PyO3 `_TaskDef` 增 `tags`/`quota`，`_ActantConfig` 增
+  `node_quotas`，`register_task_log_callback` 增可选 `task_id`。
+
+### 新增（通用化 M1–M4：自动放置 / 控制面 / batch / 配额）
+
+- **标签感知自动放置（M1）**：`@task(tags=...)` 从 Python 直达 Rust；
+  `LabelAffinityRoutePolicy`（`"label_affinity"`）按 `tags ⊆ node_labels` 放置并
+  优先剩余槽位；本地执行前强制 fit 校验；无匹配走 `Defer` 退避重入队，超过
+  `starvation_timeout_ms` 失败；新增 metric `actant.tasks.deferred`。
+- **节点控制面与故障注入（M2）**：`_RuntimeCore.close_peer` / `reopen_peer` /
+  `delay_heartbeat` / `inject_hlc_drift`，与 `peers()`、lifecycle 事件订阅组合
+  支撑分布式测试台。
+- **`act-ext-testkit`（M3）**：`extensions/act-ext-testkit` 提供集群编排、故障
+  注入、事件断言与命名空间 / `data_dir` / 端口隔离契约；CI 以 3 节点收敛场景
+  dogfooding（5 用例）。
+- **batch/array job 逐项进度（M4）**：`submit_batch(..., batch_id=...)` 提交前
+  注册 `BatchTracker`；`Runtime.batch_progress(batch_id)` 返回
+  `total/completed/failed/cancelled/skipped/pending/finished`；终态由 Python
+  结果泵解析业务载荷后上报（Rust 侧业务失败仍以 `Completed` 到达），重复结算
+  幂等；flow 路径不接受 `batch_id`（显式报错）。
+- **分布式命名配额（M4）**：`@task(quota="gpu")` + `_ActantConfig(node_quotas={...})`；
+  执行节点本地原子扣减（`QuotaGuard` RAII 归还），剩余容量随心跳广播，路由跳过
+  已满/未声明节点；耗尽时 `Defer`，starvation 超时失败。
+- **逐任务结构化日志流（M4）**：`EventBus::subscribe_task_logs(task_id)` 与
+  `Runtime.on_task_log(callback, task_id=...)`；保留全局 `TaskLog` 话题，逐任务
+  通道同样为 tap 语义、满即丢。
+
+### 修复（跨节点 workflow 结果回灌）
+
+- **workflow 任务缺少 origin endpoint addr**：Orchestrator 派发的
+  `TaskDefinition` 只带逻辑 `origin_node`（Python 嵌入下等于 `Runtime.name`），
+  远端执行完成后无法把它解析成网络地址，直连结果投递失败并使 flow 函数体
+  永久挂起。现在 `task_definition` 从注入的 `Transport::listen_addresses()`
+  填充 `origin_endpoint_addr`，远端 completion 可直连回编排节点；无网络时保持
+  `None`（本地路径不受影响）。
 
 ### 新增（0.3.5：日志流 + 框架化 + 收尾）
 

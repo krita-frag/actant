@@ -17,8 +17,8 @@
 | 平台 | macOS 14.7.8（Darwin 23.6.0），arm64（Apple Silicon） |
 | Python | CPython 3.11.14 |
 | CPU | 10 核 |
-| 执行后端 | 进程池（worker 子进程，`python -m actant.task._worker`），线程后端已移除 |
-| 版本 | 0.3.5 工作树（含 0.3.4 身份与信任 / Actor 精简 / F3 与 0.3.5 前五批；manifest 版本号仍为 0.3.0，与里程碑标签解耦） |
+| 执行后端 | 进程池（worker 子进程，`python -m actant._internal.tasks.worker`），线程后端已移除 |
+| 版本 | 当前工作树（manifest 版本号 0.3.0） |
 | 发现模式 | `ACTANT_DISCOVERY=none`（测试离线约定，无 DNS/relay 干扰） |
 
 ## 2. 方法学
@@ -88,7 +88,7 @@
   1.55 / 1.56 / 1.56 / 1.55s——**与基线一致**。排队 20 个任务的边际等待 ≈ 0.05s，
   即排队成本主要为等待慢任务释放槽位（1 个排队批次深度 ≈ 慢任务时长），调度本身无显著开销。
 
-### 3.4 worker 崩溃恢复（引用 H1 可靠性矩阵 + 探针观测）
+### 3.4 worker 崩溃恢复
 
 - **SLA 契约**：
   1. worker 子进程崩溃属基础设施级失败，任务清空 `target_node` 重新入队重路由
@@ -100,13 +100,13 @@
   - 恢复后节点吞吐：50 个快速任务 0.02s 收敛（~2400 ops/s），节点无降级。
   - 持续崩溃任务在有界尝试内到达终态失败，批次内其他任务不受影响
     （可执行断言见 `test_multi_node_reliability.py::TestWorkerKillIsolation`）。
-- **0.3.3 复跑**：H1 可靠性矩阵（`tests/python/e2e/test_multi_node_reliability.py`）
+- **复跑记录**：可靠性矩阵（`tests/python/e2e/test_multi_node_reliability.py`）
   在本机以 `--basetemp` 绕开 `tmp_path` 沙箱限制后**真实执行**——
   `TestNodeKill` / `TestNodeRestartResume` / `TestWorkerKillIsolation` /
   `TestOutOfOrderResults` 全部通过。其中
   `test_node_kill_inflight_task_terminal_state` 仍为 **xfail**（见 §4 已知边界）。
 
-### 3.5 取消结算与传播（0.3.3 S6/S7 收尾）
+### 3.5 取消结算与传播
 
 - **SLA 契约**：
   1. **取消必须结算 DAG**——工作流内节点被取消后，工作流本身必须进入终态
@@ -118,18 +118,16 @@
   4. **取消不得静默丢失**——任务尚在调度器队列（未开始执行）时提交的取消
      请求必须被登记，并在派发时被采纳；
   5. 工作流以取消收尾时计入 `actant.workflows.cancelled` 指标，并发独立的
-     `WorkflowEventPayload::Cancelled` 终态事件（不复用 `Failed`）。
+     `JournalEvent::Cancelled` 终态事件（不复用 `Failed`）。
 - **配置**：`@flow` 体内提交 2 个长任务，`a.cancel(propagate=True,
   force_after=0.5)` 取消整个工作流。
 - **可执行断言**：
   `tests/python/unit/test_task.py::TestCancellation::test_propagate_cancels_same_workflow_tasks`
   （契约的唯一执行载体）；失败行为回归见 `tests/rust/unit/runtime/workflow/`
-  的 5 个新增用例（全取消 fail-fast 终态、部分取消不误报 Completed、
+  的 5 个用例（全取消 fail-fast 终态、部分取消不误报 Completed、
   seal 前取消不终态、取消派发结果映射、派发前取消登记）。
 - **观测**（本机 macOS arm64，连跑 5 次）：**0.52–1.59s** 全部返回，工作流终态
-  `Cancelled`。**修复前**同一用例连跑 3 次：2 次挂起至 60s 超时、1 次耗时
-  **10.74s**（两个任务各跑满 10s——取消实际未生效，靠任务自然结束兜底）。
-  量级差异（~10.7s / 挂起 → ~0.5s）是本批次最显著的基线变化。
+  `Cancelled`。
 
 ## 4. 已知边界
 
@@ -143,14 +141,13 @@
 - **分区语义（诚实声明）**：网络分区下故障转移依赖租约 + gossip 最终一致；旧主与新主存在
   有限的双执行窗口（结果接受侧 attempt fencing 丢弃过期代际的结果，但副作用可能已发生）——
   与所有无中心系统一样，任务函数需要幂等。完整信任边界文档随 0.3.4（身份与信任）落地。
-- **在途直提任务无重认领路径（xfail 记录）**：执行节点被强杀后，**存活编排器**上
-  已派往该节点的**直提任务**（`submit_to`，非工作流节点）无重认领路径——failover 的
-  claim 重调度只覆盖"死亡编排器的孤儿 workflow"。该任务的 `AsyncResult` 保持挂起，
-  30s 内不达终态。可执行记录：
-  `test_multi_node_reliability.py::TestNodeKill::test_node_kill_inflight_task_terminal_state`
-  （`xfail(strict=False)`）。同源缺口：`actant/flow.py` 的 `_replay_flow`（S3 续跑入口，
-  按既有 `workflow_id` 重放 flow 体）**全仓零调用方**、不在 `__all__`——即"节点重启
-  自动续跑"尚无公开接线，重启只能恢复状态、不能自动重放未完成的 flow 体。
+- **在途直提任务按租约重投**：执行节点被强杀后，存活 origin 上的直提任务
+  （`submit_to`，非工作流节点）登记条目立即到期，Worker 递增 `attempt` 后重投到
+  存活节点；旧执行的迟到结果按 attempt fencing 丢弃。语义为 at-least-once
+  （重投会重新执行任务体，副作用可能发生两次），重投预算复用
+  `crash_failover_max_attempts`（默认 3），耗尽后以 `WorkerError` 终结。可执行记录：
+  `test_multi_node_reliability.py::TestNodeKill::test_node_kill_inflight_task_terminal_state`。
+  节点重启续跑由 `Runtime.host_flows()` 扫描未完成 flow 并重放（`_replay_flow`）。
 - **单机基线**：所有数字来自单节点 + 本地进程池；多节点 P2P（跨机网络、gossip 收敛、
   远端 failover）的吞吐/恢复时间数据待补，预计受网络 RTT 主导，不可由本文档外推。
 - **Windows 未验证**：本基线在 macOS arm64 观测；worker IPC 已统一为 stdio pipe

@@ -24,6 +24,9 @@ Thumbs.db
 .env
 .env.*
 
+# Documentation site
+site/
+
 # Coverage
 htmlcov/
 .coverage
@@ -50,6 +53,7 @@ benches/python/results/
 
 # IDE local files
 .trae/
+.trae-html-share-packages/
 
 # Development working documents (local only)
 plans/

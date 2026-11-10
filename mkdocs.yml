@@ -1,0 +1,94 @@
+site_name: Actant
+site_description: 基于 Actor 模型的跨平台通用分布式任务编排引擎
+docs_dir: docs
+site_dir: site
+
+theme:
+  name: material
+  language: zh
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - search.suggest
+    - search.highlight
+  palette:
+    - scheme: default
+      primary: deep purple
+      toggle:
+        icon: material/weather-night
+        name: 切换到深色模式
+    - scheme: slate
+      primary: deep purple
+      toggle:
+        icon: material/weather-sunny
+        name: 切换到浅色模式
+
+nav:
+  - 首页: index.md
+  - 入门:
+      - 安装: start/install.md
+      - 快速开始: start/quickstart.md
+      - 核心概念: start/concepts.md
+  - 使用指南:
+      - 任务: guide/tasks.md
+      - 工作流: guide/flows.md
+      - 能力扩展: guide/capabilities.md
+      - 部署与发现: guide/deployment.md
+  - API 参考:
+      - Python API: reference/python-api.md
+      - PyO3 绑定 API: reference/pyo3-api.md
+      - 配置项: reference/configuration.md
+      - CLI: reference/cli.md
+      - Rust API: reference/rust-api.md
+      - 扩展点清单: reference/extension-points.md
+  - 架构:
+      - 总览: architecture/overview.md
+      - 执行模型: architecture/execution-model.md
+      - ERH 扩展模型: architecture/erh.md
+      - Worker 运行模型: architecture/worker-model.md
+      - 调度器: architecture/scheduler.md
+      - 故障转移: architecture/failover.md
+      - 恢复语义: architecture/recovery.md
+      - 框架契约: architecture/framework-contract.md
+      - 服务层: architecture/service-layer.md
+  - 运维:
+      - SLA 基线: operations/sla-baseline.md
+      - 排障: operations/troubleshooting.md
+  - 贡献:
+      - 开发环境: contributing/dev-setup.md
+      - 测试: contributing/testing.md
+      - 代码约定: contributing/code-style.md
+      - 文档地图: contributing/doc-map.md
+      - 扩展点维护: contributing/extensions.md
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            docstring_style: google
+            show_source: false
+            show_signature_annotations: true
+            separate_signature: true
+            members_order: source
+            filters: ["!^_"]
+
+extra:
+  version:
+    provider: mike
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences

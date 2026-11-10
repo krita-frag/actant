@@ -33,7 +33,8 @@
 - [ ] `cargo test`
 - [ ] `cargo test --no-default-features`
 - [ ] `uv run pytest tests/python/ -n 4`
-- [ ] `uv run ruff check actant tests/python benches/`
+- [ ] `uv run pytest extensions/act-ext-testkit/tests`
+- [ ] `uv run ruff check actant tests/python benches/ extensions/act-ext-testkit`
 - [ ] `uv run mypy actant`
 - [ ] 涉及核心增量时：PR 内显式拆分"核心原语 + 外围能力"并附删除清单
 

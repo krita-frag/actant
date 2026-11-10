@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "act-ext-testkit"
+version = "0.2.0"
+description = "Actant 分布式/P2P 测试台：隔离、混沌故障注入、弱网、追踪断言、NAT/对抗场景"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+actant = ["actant>=0.3.0"]
+dev = ["pytest>=8", "pytest-timeout>=2"]
+
+[project.entry-points.pytest11]
+act_ext_testkit = "act_ext_testkit.pytest_plugin"
+
+[project.entry-points."act_ext_testkit.backends"]
+actant = "act_ext_testkit.backends.actant:ActantBackend"
+
+[tool.hatch.build.targets.wheel]
+packages = ["act_ext_testkit"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+mypy_path = "."
+# actant 的 @task 是动态装饰器（返回 Any），无法在装饰点保留函数签名；
+# 测试里大量使用该装饰器，关闭此项避免噪声。
+disable_error_code = ["untyped-decorator"]
+
