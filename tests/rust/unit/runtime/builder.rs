@@ -670,6 +670,90 @@ async fn build_can_be_called_multiple_times_with_different_dirs() {
     rt2.shutdown().await.expect("shutdown rt2 ok");
 }
 
+// ───────────────────────── 租约持久化接线测试 ─────────────────────────
+
+/// 租约键的 store key 布局（与 `persist_lease` / `recover_leases_from_store` 一致）。
+fn lease_key(workflow_id: &crate::common::WorkflowId) -> String {
+    format!("{}{}", crate::common::STORE_KEY_LEASE, workflow_id.0)
+}
+
+/// 端到端验证「租约写盘 → 重启恢复 → 过期清理」在生产装配下真的通电。
+///
+/// 这三条路径都以 `FailoverManager::with_config(.., Some(store))` 为前提。
+/// 若 `RuntimeBuilder::build` 退回 `FailoverManager::new()`（`store: None`），
+/// 它们会全部静默变成 no-op：重启后租约表清零（控制面可能重复接管同一
+/// 工作流）、过期键永不清理。断言因此只走 builder，不手工构造 manager。
+#[tokio::test]
+async fn leases_persist_and_expire_across_runtime_restart() {
+    let dir = tempdir().unwrap();
+    let data_dir = dir.path().to_str().unwrap().to_string();
+    let node_id = make_node("node-lease-restart");
+    let live = crate::common::WorkflowId::from("wf-lease-live");
+    let stale = crate::common::WorkflowId::from("wf-lease-stale");
+
+    // 第一轮：正常 claim 一条租约，再写入一条「落盘时即已过期」的租约。
+    // 默认租期 16s，回拨 60s 保证过期判定与机器速度无关。
+    {
+        let rt = RuntimeBuilder::new(node_id.clone(), make_test_config())
+            .with_data_dir(data_dir.clone())
+            .build()
+            .await
+            .expect("first build should succeed");
+        let fm = rt
+            .failover_manager()
+            .expect("worker 必须注入 failover manager");
+
+        fm.claim_workflow(&live)
+            .await
+            .expect("claim should succeed");
+        fm.handle_claim(&crate::common::OrchestratorClaim {
+            node_id: node_id.clone(),
+            workflow_id: stale.clone(),
+            timestamp_ms: crate::common::epoch_millis().saturating_sub(60_000),
+        })
+        .await;
+
+        assert_eq!(fm.active_leases().len(), 2, "两条租约都应先生效");
+        // 落盘证据：两条 key 都在 store 里，与内存视图相互独立。
+        assert!(
+            rt.store().get(&lease_key(&live)).await.unwrap().is_some(),
+            "claim 必须把租约写进 store"
+        );
+        assert!(
+            rt.store().get(&lease_key(&stale)).await.unwrap().is_some(),
+            "过期租约同样先落盘，由恢复路径清理"
+        );
+
+        rt.shutdown().await.expect("shutdown should succeed");
+    }
+
+    // 第二轮：同一 data_dir 重新 build ≡ 进程重启。
+    {
+        let rt = RuntimeBuilder::new(node_id, make_test_config())
+            .with_data_dir(data_dir)
+            .build()
+            .await
+            .expect("second build should succeed");
+        let fm = rt
+            .failover_manager()
+            .expect("worker 必须注入 failover manager");
+
+        let leases = fm.active_leases();
+        assert_eq!(
+            leases.len(),
+            1,
+            "重启后只应恢复未过期租约，实际: {leases:?}"
+        );
+        assert_eq!(leases[0].0, live.0);
+        assert!(
+            rt.store().get(&lease_key(&stale)).await.unwrap().is_none(),
+            "过期租约键必须在恢复时删除，而不是留到下次启动再判一次"
+        );
+
+        rt.shutdown().await.expect("shutdown should succeed");
+    }
+}
+
 // ───────────────────────── 恢复重派发接线测试 ─────────────────────────
 
 use crate::runtime::workflow::{Dag, DagNode, Orchestrator};

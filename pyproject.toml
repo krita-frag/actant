@@ -106,7 +106,7 @@ markers = [
 # ---------------------------------------------------------------------------
 # 设计原则：
 #   - Rust 核心（src/）由 cargo-tarpaulin/llvm-cov 覆盖，目标 90%+
-#   - Python 目标 85%；当前基线 78.24%，门禁先卡 78 防回退，随 e2e 补强逐步抬升
+#   - Python 目标 85%；当前基线 82.74%（worker 运行时补齐后），门禁卡 82 防回退
 # CI 的 pytest 步骤带 `--cov`，pytest-cov 直接读取本文件的 `fail_under` 作为阈值，
 # 因此阈值只有这一处定义。本地未安装 pytest-cov 时跳过收集，测试仍可运行。
 
@@ -129,9 +129,9 @@ source = [
 ]
 
 [tool.coverage.report]
-# 整体门禁：所有模块平均。当前基线 78.24%，卡 78 防回退；目标 85。
+# 整体门禁：所有模块平均。当前基线 82.74%，卡 82 防回退；目标 85。
 # 分模块阈值（公共 API / 关键路径）需要独立脚本才能表达，暂不引入。
-fail_under = 78
+fail_under = 82
 show_missing = true
 skip_covered = false
 skip_empty = true

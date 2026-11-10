@@ -58,6 +58,19 @@ pub struct LogEntry {
 /// 实现必须是线程安全且支持并发的。
 pub trait EventLog: Send + Sync {
     /// 追加一条事件到指定 topic，返回全局唯一事件 ID。
+    ///
+    /// **同步是刻意的，不要改成 `async fn`**，两条理由：
+    ///
+    /// 1. 返回的 [`EventId`] 会被调用方立刻记为持久化水位
+    ///    （`Orchestrator::log_event` → `record_event_seq`，随后用于
+    ///    `trim_absorbed` 与重放上界）。把落盘推迟到后台线程就等于让水位越过
+    ///    尚未持久化的事件，崩溃恢复后重放会缺一段历史。
+    /// 2. 调用方里存在**无法 await 的同步路径**：`signal_wait_point` 由绑定层
+    ///    以 `#[pymethods] fn`（非 async）调用，再向下走到 `log_event`。改成
+    ///    async 只能靠 `block_on` 兜底，在 tokio 上下文内调用会直接 panic。
+    ///
+    /// 因此阻塞成本（默认 `SyncMode::Sync` 下每次 append 一次 fsync）不走
+    /// `spawn_blocking`，而是由 `StoreConfig::sync_mode` 这个既有旋钮调节。
     fn append(&self, topic: &str, payload: &[u8]) -> Result<EventId>;
 
     /// 读取指定 topic 在 `after` 之后的所有事件。
