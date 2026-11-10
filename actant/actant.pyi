@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any, final
 
 def get_version() -> str: ...
 def refresh_logger() -> None: ...
-def prometheus_text() -> str: ...
+def metrics_text() -> str: ...
 
 # Rust-exposed exceptions (register_exceptions in src/py/error.rs)
 # 从 actant.exceptions 导入的 Python 端异常类，与 Rust ActantError 一一对应。
@@ -33,6 +33,7 @@ class WorkflowFailedError(ActantError):
     task_name: str | None
     task_error: str | None
 class WorkflowCancelledError(ActantError): ...
+class FlowReplayError(ActantError): ...
 
 @final
 class CancelToken:
@@ -48,7 +49,6 @@ class _WorkflowState:
     COMPLETED: _WorkflowState
     FAILED: _WorkflowState
     CANCELLED: _WorkflowState
-    SKIPPED: _WorkflowState
 
 @final
 class _RetryPolicy:
@@ -67,6 +67,8 @@ class _RetryPolicy:
     def backoff_multiplier(self) -> float: ...
     @property
     def max_delay_ms(self) -> int: ...
+    @classmethod
+    def default(cls) -> _RetryPolicy: ...
     def to_bytes(self) -> bytes: ...
 
 @final
@@ -83,8 +85,7 @@ class _NetworkConfig:
         direct_request_timeout_ms: int = 30000,
         listen_port: int = 0,
         listen_ip: str = "",
-        capability_gossip_interval_ms: int = 5000,
-        event_channel_capacity: int = 256,
+        event_channel_capacity: int = 1024,
         dns_origin_domain: str = "",
         relay_endpoints: list[str] | None = None,
         require_signed_records: bool = False,
@@ -109,8 +110,6 @@ class _NetworkConfig:
     def listen_port(self) -> int: ...
     @property
     def listen_ip(self) -> str: ...
-    @property
-    def capability_gossip_interval_ms(self) -> int: ...
     @property
     def event_channel_capacity(self) -> int: ...
     @property
@@ -167,6 +166,34 @@ class _GossipConfig:
     def heads_broadcast_interval_ms(self) -> int: ...
 
 @final
+class _StoreConfig:
+    """本地持久化配置（LMDB）。
+
+    ``map_size`` 是 mmap 虚拟地址上限，不预分配磁盘；``sync_mode`` 取
+    ``"sync"`` / ``"group_commit"`` / ``"no_sync"``，``flush_interval_ms``
+    仅在 ``"group_commit"`` 下生效。
+    """
+
+    def __new__(
+        cls,
+        data_dir: str | None = None,
+        map_size: int | None = None,
+        max_dbs: int | None = None,
+        sync_mode: str | None = None,
+        flush_interval_ms: int | None = None,
+    ) -> _StoreConfig: ...
+    @property
+    def data_dir(self) -> str | None: ...
+    @property
+    def map_size(self) -> int: ...
+    @property
+    def max_dbs(self) -> int: ...
+    @property
+    def sync_mode(self) -> str: ...
+    @property
+    def flush_interval_ms(self) -> int: ...
+
+@final
 class _ActantConfig:
     """Rust ``ActantConfig`` 的 PyO3 桥。
 
@@ -186,7 +213,6 @@ class _ActantConfig:
         gossip: _GossipConfig | None = None,
         max_concurrent_tasks: int | None = None,
         default_task_timeout_ms: int | None = None,
-        data_dir: str | None = None,
         drain_timeout_secs: int | None = None,
         remote_fallback_delay_ms: int | None = None,
         scheduler: str | None = None,
@@ -196,17 +222,18 @@ class _ActantConfig:
         workflow_default_timeout_ms: int | None = None,
         node_labels: dict[str, str] | None = None,
         *,
-        store_map_size: int | None = None,
-        store_max_dbs: int | None = None,
-        store_sync_mode: str | None = None,
-        store_flush_interval_ms: int | None = None,
+        store: _StoreConfig | None = None,
         prefetch_min: int | None = None,
         prefetch_max: int | None = None,
         worker_cancel_grace_ms: int | None = None,
         pending_result_channel_capacity: int | None = None,
         completed_retention_count: int | None = None,
+        max_history_events: int | None = None,
         persist_flush_interval_ms: int | None = None,
         state_poll_interval_ms: int | None = None,
+        starvation_timeout_ms: int | None = None,
+        node_quotas: dict[str, int] | None = None,
+        role: str | None = None,
     ) -> _ActantConfig: ...
     @property
     def payload_signing_key(self) -> str: ...
@@ -236,18 +263,22 @@ class _ActantConfig:
     @property
     def remote_fallback_delay_ms(self) -> int: ...
     @property
+    def starvation_timeout_ms(self) -> int:
+        """任务无匹配节点（Defer）时最长等待毫秒数，超时转 Failed；0 表示不设上限。"""
+    @property
     def scheduler(self) -> str: ...
     @property
     def node_labels(self) -> dict[str, str]:
         """用户自定义节点标签，随心跳广播给集群。"""
     @property
-    def store_map_size(self) -> int: ...
+    def role(self) -> str:
+        """节点拓扑角色：``"both"``（默认）/ ``"orchestrator"`` / ``"worker"``。"""
     @property
-    def store_max_dbs(self) -> int: ...
+    def node_quotas(self) -> dict[str, int]:
+        """本节点命名配额容量（如 ``{"gpu": 2}``），随心跳广播剩余容量。"""
     @property
-    def store_sync_mode(self) -> str: ...
-    @property
-    def store_flush_interval_ms(self) -> int: ...
+    def store(self) -> _StoreConfig:
+        """本地持久化配置（目录 / mmap 上限 / 同步策略）。"""
     @property
     def prefetch_min(self) -> int: ...
     @property
@@ -258,6 +289,8 @@ class _ActantConfig:
     def pending_result_channel_capacity(self) -> int: ...
     @property
     def completed_retention_count(self) -> int: ...
+    @property
+    def max_history_events(self) -> int: ...
     @property
     def persist_flush_interval_ms(self) -> int: ...
     @property
@@ -310,6 +343,7 @@ class _DagNode:
     flow 路径下由提交序号确定性生成（重放身份）；`name` 为人类可读名称。
     `priority` 为有符号整数；语义由 Python 层定义。
     `metadata` 为不透明 key-value 映射，Rust 透传不解释。
+    `tags`/`quota` 为放置诉求，随节点派发为 `TaskDefinition` 的对应字段。
     """
     task_id: str
     name: str
@@ -318,16 +352,18 @@ class _DagNode:
     timeout_ms: int | None
     priority: int | None
     metadata: dict[str, str] | None
+    tags: list[str]
+    quota: str | None
 
     def __new__(
         cls,
         task_id: str,
         name: str,
         payload: bytes,
-        retry: _RetryPolicy | None = None,
         timeout_ms: int | None = None,
         priority: int | None = None,
-        metadata: dict[str, str] | None = None,
+        tags: list[str] | None = None,
+        quota: str | None = None,
     ) -> _DagNode: ...
 
 @final
@@ -348,6 +384,12 @@ class _TaskDef:
     target_node: str | None
     target_endpoint_addr: str | None
     timeout_ms: int | None
+    tags: list[str]
+    quota: str | None
+    priority: int
+    # `pinned_target` 由 Rust 侧按构造时的 `target_node` 推断：Python 传入
+    # 非空 target_node 即视为 `submit_to` 的持久指定，路由层不会覆盖。
+    pinned_target: bool
     # 注意：Rust 侧 `_TaskDef.retry_policy` 没有 `#[pyo3(get)]`（与 `timeout_ms`
     # 不同），故此处**不声明**该属性——按存根访问会 AttributeError。
     # 需要读节点重试策略请用 `Runtime.get_dag()` 的 `nodes[*].retry_policy`。
@@ -361,6 +403,9 @@ class _TaskDef:
         target_node: str | None = None,
         target_endpoint_addr: str | None = None,
         timeout_ms: int | None = None,
+        tags: list[str] | None = None,
+        quota: str | None = None,
+        priority: int | None = None,
         retry_policy: _RetryPolicy | None = None,
     ) -> _TaskDef: ...
 
@@ -377,8 +422,6 @@ class _CapabilityRuntime:
     @property
     def capability_count(self) -> int: ...
     def registered_capabilities(self) -> list[str]: ...
-    def handler_count(self, name: str) -> int: ...
-    def chain_python_handler(self, name: str, handler: Callable[..., Any]) -> None: ...
     def ask(self, name: str, request: Any) -> Any | None: ...
     def perform(self, name: str, request: Any) -> Any: ...
     def emit(self, name: str, request: Any) -> None: ...
@@ -400,6 +443,30 @@ class _ListenAddresses:
     def endpoint_addr(self) -> str: ...
 
 @final
+class _StoreStats:
+    """本地存储容量快照（``_RuntimeCore.storage_stats()`` 的返回值）。
+
+    ``file_bytes / map_size`` 是 LMDB 写满判断口径；``used_bytes`` 是不含
+    空闲页的实际数据占用。
+    """
+
+    @property
+    def map_size(self) -> int: ...
+    @property
+    def used_bytes(self) -> int: ...
+    @property
+    def file_bytes(self) -> int: ...
+    @property
+    def entries(self) -> int: ...
+    @property
+    def readers(self) -> int: ...
+    @property
+    def max_readers(self) -> int: ...
+    @property
+    def utilization_ratio(self) -> float:
+        """数据文件高水位占 mmap 上限的比例（``file_bytes / map_size``）。"""
+
+@final
 class _RuntimeCore:
     """Rust 统一运行时核心的 PyO3 包装。
 
@@ -412,6 +479,9 @@ class _RuntimeCore:
         name: str | None = None,
         data_dir: str | None = None,
         config: _ActantConfig | None = None,
+        route_policy: (
+            str | Callable[[dict[str, Any], list[dict[str, Any]]], Any] | None
+        ) = None,
     ) -> _RuntimeCore: ...
     def capability_runtime(self) -> _CapabilityRuntime: ...
     def serve(self) -> None: ...
@@ -419,13 +489,25 @@ class _RuntimeCore:
     def node_id(self) -> str: ...
     def peer_id(self) -> str: ...
     def listen_addresses(self) -> _ListenAddresses: ...
+    def storage_stats(self) -> _StoreStats:
+        """返回本地存储容量与使用情况快照；启动时已同步上报一次 ``actant.store.*`` 指标。"""
+    def backup_to(self, path: str) -> int:
+        """在线热备份本地存储到 ``path``，返回备份文件字节数。"""
     def dial(self, addr: str) -> None: ...
-    def dial_async(self, addr: str) -> Any: ...
     def add_gossip_peer(self, peer_id: str) -> None: ...
-    def add_gossip_peer_async(self, peer_id: str) -> Any: ...
     def discover_peers(self) -> list[str]: ...
-    def discover_peers_async(self) -> Any: ...
+    def close_peer(self, target: str) -> None: ...
+    def reopen_peer(self, target: str) -> None: ...
+    def delay_heartbeat(self, ms: int) -> None: ...
+    def inject_hlc_drift(self, ms: int) -> None: ...
     def cancel_task(self, task_id: str) -> bool: ...
+    def update_node_state(
+        self,
+        labels: dict[str, str] | None = None,
+        quotas: dict[str, int] | None = None,
+        draining: bool | None = None,
+    ) -> None:
+        """运行时更新节点状态（标签 / 配额容量 / draining）。"""
     def set_max_concurrent_tasks(self, new_max: int) -> None: ...
     def max_concurrent_tasks(self) -> int: ...
     def broadcast_cancel(self, task_id: str, workflow_id: str) -> None: ...
@@ -435,13 +517,29 @@ class _RuntimeCore:
 
         仅在批量场景使用（如 ``gather``）；要求已调用 ``serve()``。
         """
+    def register_batch(self, batch_id: str, task_ids: list[str]) -> dict[str, Any]:
+        """注册 batch/array job，返回初始进度快照。"""
+    def batch_progress(self, batch_id: str) -> dict[str, Any] | None:
+        """查询 batch 进度；未注册返回 ``None``。"""
+    def record_batch_terminal(self, task_id: str, state: str) -> dict[str, Any] | None:
+        """记录 batch 成员终态（completed/failed/cancelled）。"""
+    def remove_batch(self, batch_id: str) -> bool:
+        """移除 batch 注册与成员索引。"""
     def submit_workflow(
         self,
         workflow_id: str,
         failure_strategy: str | None = None,
         timeout_ms: int = 0,
+        name: str | None = None,
+        version: int = 0,
+        args: bytes | None = None,
     ) -> None:
-        """创建空持久化工作流外壳（flow 提交路径第一步）。"""
+        """创建空持久化工作流外壳（flow 提交路径第一步）。
+
+        ``name`` 非空时把提交描述（flow 名、版本、入参字节）
+        作为 ``WorkflowInvocation`` 写入 journal 的 ``Submitted`` 事件；其余提交
+        路径不伪造调用描述。
+        """
     def add_workflow_node(
         self,
         workflow_id: str,
@@ -455,7 +553,10 @@ class _RuntimeCore:
         """
     def cancel_workflow(self, workflow_id: str) -> None: ...
     def seal_workflow(self, workflow_id: str) -> None:
-        """封口工作流节点集（flow 函数体返回信号）。"""
+        """封口工作流节点集（flow 函数体返回信号）。
+
+        封口后 orchestrator 才允许工作流终态判定；全部任务已终态时立即收尾。
+        """
     def register_wait_point(
         self,
         workflow_id: str,
@@ -464,14 +565,25 @@ class _RuntimeCore:
         name: str | None = None,
         deadline_ms: int = 0,
     ) -> None:
-        """注册持久化等待点。
+        """注册持久化等待点（先注册、后 `wait_wait_point`）。
 
-        `kind` 为 ``"signal"`` / ``"timer"`` / ``"suspend"``；timer 须给绝对
-        epoch 毫秒 `deadline_ms`（> 0）。同 `wait_key` 重复注册幂等。
+        `kind` 为 ``"signal"`` / ``"timer"`` / ``"suspend"``：signal 等具名业务
+        事件，timer 须给绝对 epoch 毫秒 `deadline_ms`（> 0），suspend 等
+        `resume_suspended`。同 `wait_key` 重复注册为 no-op（不改写条件、不重复
+        追加事件），这是重放体幂等的前提。
+
+        抛 ``ValueError``（kind 非法或 timer 的 deadline_ms 为 0）与
+        ``NotFoundError``（工作流不存在）。
         """
-    def signal_wait_point(self, workflow_id: str, wait_key: str) -> bytes | None:
+    def signal_wait_point(
+        self,
+        workflow_id: str,
+        wait_key: str,
+        payload: bytes = b"",
+    ) -> bytes | None:
         """递交信号唤醒等待点（信号缓冲：注册前抵达的信号进入缓冲，不丢弃）。
 
+        ``payload`` 原样随信号进入工作流历史，``wait_wait_point`` 返回同一份字节；
         返回唤醒的 payload；``None`` 表示**此刻没有等待点可被唤醒**，信号已入
         缓冲，将来注册同一 `wait_key` 时立即命中。**未知工作流**抛
         ``NotFoundError``；**工作流已终态不报错**（递交方重试时会撞上刚跑完的
@@ -479,14 +591,49 @@ class _RuntimeCore:
         """
     def resume_suspended(self, workflow_id: str) -> int:
         """恢复挂起：唤醒该工作流所有等待中的 `suspend` 等待点。
-
         返回唤醒数量；``0`` 表示当前没有挂起中的挂起点（幂等）。只唤醒
         `suspend` 条件，不触碰 `signal` / `timer` 等待点。
         """
+
+    def resolve_context_value(
+        self,
+        workflow_id: str,
+        key: str,
+        kind: str,
+        candidate: bytes,
+    ) -> bytes:
+        """解析（首次记录 / 重放命中）确定性上下文值。
+
+        首次执行返回 ``candidate`` 并写入历史；重放返回历史记录值。同 ``key``
+        的历史记录是另一种 ``kind`` 时抛 ``FlowReplayError``。
+        """
+
+    def get_context_value(
+        self,
+        workflow_id: str,
+        key: str,
+    ) -> bytes | None:
+        """只读查询已记录的上下文值；未记录返回 ``None``（不写历史）。"""
+
     def wait_wait_point(
         self, workflow_id: str, wait_key: str, timeout_ms: int = 0
     ) -> bytes | None:
-        """阻塞等待等待点条件满足；``timeout_ms=0`` 表示无限等待。"""
+        """阻塞等待等待点条件满足（flow 体 park 原语）。
+
+        调用方必须先 `register_wait_point`；本方法只负责 park，且不在 actor
+        消息循环内阻塞（不会拖停其他工作流）。``timeout_ms=0`` 表示无限等待。
+
+        返回条件满足时的 payload；``None`` 表示超时，或等待期间工作流被移除 /
+        编排器未注入。
+        """
+    def wait_wait_point_async(
+        self, workflow_id: str, wait_key: str, timeout_ms: int = 0
+    ) -> Awaitable[bytes | None]:
+        """非阻塞等待等待点条件满足（asyncio 版本）。
+
+        语义与 ``wait_wait_point`` 一致，但返回 awaitable，等待期间不占用线程、
+        不阻塞 event loop。
+        """
     def report_task_result(
         self,
         workflow_id: str,
@@ -495,10 +642,12 @@ class _RuntimeCore:
         result: bytes | None = None,
         error: str | None = None,
     ) -> dict[str, Any]:
-        """上报本地 flow 任务终态结果。
+        """上报本地 flow 任务终态结果（Python 事件泵调用）。
 
-        `state` 为 ``"Completed"`` / ``"Failed"`` / ``"Cancelled"``；
-        返回 ``{"retry": bool, "delay_ms": int}``。
+        `workflow_id` 为空串表示独立 ``@task``（非编排任务），直接返回空裁决。
+        `state` 为 ``"Completed"`` / ``"Failed"`` / ``"Cancelled"``；返回
+        ``{"retry": bool, "delay_ms": int}``——``retry`` 为真表示 orchestrator
+        已排定重试并按延迟重新入队，提交方句柄应继续等待；为假表示终局。
         """
     def get_workflow_state(self, workflow_id: str) -> dict[str, Any] | None: ...
     def get_dag(self, workflow_id: str) -> dict[str, Any] | None:
@@ -520,11 +669,36 @@ class _RuntimeCore:
         ``(sequence, timestamp_ms)`` 游标，``None`` 从头读取。
         """
 
+    def get_workflow_journal(self, workflow_id: str) -> list[dict[str, Any]]:
+        """读取工作流的稳定 journal（跨语言消费面）。
+
+        每项固定含 ``seq`` / ``timestamp_ms`` / ``kind`` / ``workflow_id`` /
+        ``task_id`` / ``wait_key`` / ``error`` / ``payload``，并按事件类型附带
+        ``condition``（等待点标签）与 ``invocation``（提交描述 dict / ``None``）。
+        ``kind`` 为小写稳定事件名；``payload`` 是该事件的业务字节。
+        """
+
+    def get_workflow_invocation(self, workflow_id: str) -> dict[str, Any] | None:
+        """读取 ``Submitted`` 事件中的提交描述。
+
+        返回 ``{workflow_id, name, version, args}``；
+        旧记录或非 flow 提交路径返回 ``None``。``args`` 是上层序列化字节。
+        """
+
     def list_workflows(self) -> list[str]: ...
     def list_all_workflows(self) -> list[str]: ...
     def peers(self) -> list[dict[str, Any]]: ...
-    def delete_workflow(self, workflow_id: str) -> None: ...
-    def register_task_log_callback(self, callback: Callable[[dict[str, Any]], None]) -> None: ...
+    def delete_workflow(self, workflow_id: str) -> None:
+        """删除工作流及其持久化状态；不存在时为 no-op。
+
+        与自动淘汰互补，供手动清理已完成 / 孤儿工作流。运行中的工作流删除后
+        其任务结果将不可恢复。
+        """
+    def register_task_log_callback(
+        self,
+        callback: Callable[[dict[str, Any]], None],
+        task_id: str | None = None,
+    ) -> None: ...
     def register_worker_state_callback(self, callback: Callable[[dict[str, Any]], None]) -> None: ...
     def register_task_result_callback(self, callback: Callable[[_TaskCompletion], None]) -> None: ...
     def value_store(self, data: bytes) -> bytes:

@@ -8,9 +8,10 @@ import pytest
 
 import actant
 from actant import Runtime
-from actant._runtime import get_current_runtime, use_runtime
+from actant._internal.runtime import get_current_runtime, use_runtime
 from actant.actant import _NetworkConfig
-from actant.capabilities import RouteCtx, SerializationReq, TaskEvent
+from actant.capabilities import TaskEvent
+from actant.effects import ask
 
 
 class TestRuntimeLifecycle:
@@ -73,12 +74,12 @@ class TestRuntimeLifecycle:
 class TestLayerRegistration:
     def test_builtin_layer_empty_by_default(self):
         rt = Runtime()
-        assert rt.handler_count("Routing") == 0
+        assert len(rt.handlers("Store")) == 0
 
     def test_chain_appends_handler(self):
         rt = Runtime()
-        rt.layer("Routing").chain(lambda ctx: "node-a")
-        assert rt.handler_count("Routing") == 1
+        rt.layer("MyRouter", kind="ask").chain(lambda ctx: "node-a")
+        assert len(rt.handlers("MyRouter")) == 1
 
     def test_custom_capability_requires_kind(self):
         rt = Runtime()
@@ -95,54 +96,44 @@ class TestLayerRegistration:
 class TestAskSemantics:
     def test_ask_returns_first_non_none_in_reverse_order(self):
         rt = Runtime()
-        rt.layer("Routing").chain(lambda ctx: None)
-        rt.layer("Routing").chain(lambda ctx: "low-priority")
-        rt.layer("Routing").chain(lambda ctx: "high-priority")
+        rt.layer("MyRouter", "ask").chain(lambda ctx: None)
+        rt.layer("MyRouter").chain(lambda ctx: "low-priority")
+        rt.layer("MyRouter").chain(lambda ctx: "high-priority")
         with rt:
-            result = actant.ask("Routing", RouteCtx(task_name="t", local_node="local"))
+            result = ask("MyRouter", {"task_name": "t", "local_node": "local"})
             assert result == "high-priority"
 
     def test_ask_returns_none_when_all_abstain_on_custom_capability(self):
         rt = Runtime()
         rt.layer("CustomAsk", "ask").chain(lambda ctx: None)
         with rt:
-            assert actant.ask("CustomAsk", "input") is None
+            assert ask("CustomAsk", "input") is None
 
     def test_ask_returns_none_when_python_only_capability_abstains(self):
-        """Routing 是纯 Python 策略，无 Rust fallback，handler 全弃权时返回 None。"""
+        """自定义 ask capability 无 Rust fallback，handler 全弃权时返回 None。"""
         rt = Runtime()
-        rt.layer("Routing").chain(lambda ctx: None)
+        rt.layer("MyRouter", "ask").chain(lambda ctx: None)
         with rt:
-            assert actant.ask("Routing", RouteCtx(task_name="t", local_node="fallback")) is None
+            assert ask("MyRouter", {"task_name": "t", "local_node": "fallback"}) is None
 
-    def test_builtin_routing_default_local_node(self):
-        rt = Runtime.with_defaults()
-        with rt:
-            assert actant.ask("Routing", RouteCtx(task_name="t", local_node="me")) == "me"
+    def test_default_constructor_does_not_register_policy_handlers(self):
+        rt = Runtime()
+        assert "Routing" not in rt.capabilities
 
 
 class TestPerformSemantics:
     def test_perform_calls_last_handler(self):
         rt = Runtime()
-        rt.layer("Serialization").chain(lambda req: b"first")
-        rt.layer("Serialization").chain(lambda req: b"last")
+        rt.layer("Codec", "perform").chain(lambda req: b"first")
+        rt.chain("Codec", lambda req: b"last")
         with rt:
-            assert actant.perform("Serialization", SerializationReq(op="dump", data=b"x")) == b"last"
+            assert actant.perform("Codec", {"op": "dump"}) == b"last"
 
     def test_perform_raises_when_no_handlers_on_custom_capability(self):
         rt = Runtime()
         rt.layer("CustomPerform", "perform")  # 注册 capability，但不附加 handler
         with pytest.raises(RuntimeError, match="has no handlers"), rt:
             actant.perform("CustomPerform", "x")
-
-    def test_perform_without_any_handler_errors(self):
-        # capability 注册面保留：无 handler 时经 Rust 分发报错——
-        # 用户链自己的 handler 即生效。
-        rt = Runtime()
-        with rt:
-            req = SerializationReq(op="dump", data=b"payload")
-            with pytest.raises(Exception, match="no handler"):
-                actant.perform("Serialization", req)
 
 
 class TestEmitSemantics:
@@ -170,7 +161,7 @@ class TestEffectKindValidation:
         rt = Runtime()
         rt.layer("CustomPerform", "perform").chain(lambda x: x)
         with pytest.raises(RuntimeError, match="not 'ask'"), rt:
-            actant.ask("CustomPerform", "x")
+            ask("CustomPerform", "x")
 
     def test_perform_rejects_non_perform_capability(self):
         rt = Runtime()

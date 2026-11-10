@@ -45,7 +45,7 @@ import actant
 
 # 压制 actant 日志输出，仅保留 bench 自己的进度信息，避免干扰测量与输出整洁。
 logging.getLogger("actant").setLevel(logging.ERROR)
-logging.getLogger("actant.task").setLevel(logging.ERROR)
+logging.getLogger("actant.tasks").setLevel(logging.ERROR)
 logging.getLogger("actant.flow").setLevel(logging.ERROR)
 logging.getLogger("actant.runtime").setLevel(logging.ERROR)
 
@@ -323,7 +323,7 @@ def run_benchmarks(
     print(f"filter: {name_filter or '(none)'}", flush=True)
     print(flush=True)
 
-    with actant.Runtime.with_defaults():
+    with actant.Runtime():
         # 触发一次预热：让 iroh endpoint / tokio runtime 完成初始化
         _warmup_in_runtime()
 

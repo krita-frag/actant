@@ -2,7 +2,7 @@
 
 验证：
 - ``Runtime.metrics_text()`` 返回 Prometheus exposition format 文本。
-- ``actant.metrics_text()`` 顶层便捷函数。
+- ``actant.observability.metrics_text()`` 顶层便捷函数。
 
 HTTP 托管（``/metrics`` 端点）已从核心层外置：不提供自动化测试，
 托管样例见 ``examples/metrics_server.py`` 与 ``actant worker --metrics-port``。
@@ -13,6 +13,7 @@ from __future__ import annotations
 import pytest
 
 import actant
+from actant.observability import metrics_text
 
 
 @pytest.mark.integration
@@ -20,7 +21,7 @@ class TestMetricsText:
     """``metrics_text()`` 返回 Prometheus 文本。"""
 
     def test_runtime_metrics_text(self) -> None:
-        with actant.Runtime.with_defaults() as rt:
+        with actant.Runtime() as rt:
             text = rt.metrics_text()
             assert isinstance(text, str)
             # metrics::init() 已在 _RuntimeCore::new() 中调用，
@@ -28,8 +29,8 @@ class TestMetricsText:
             assert "actant_" in text or text == ""
 
     def test_top_level_metrics_text(self) -> None:
-        with actant.Runtime.with_defaults():
-            text = actant.metrics_text()
+        with actant.Runtime():
+            text = metrics_text()
             assert isinstance(text, str)
 
     def test_metrics_text_after_task(self) -> None:
@@ -39,7 +40,7 @@ class TestMetricsText:
         def add(a: int, b: int) -> int:
             return a + b
 
-        with actant.Runtime.with_defaults() as rt:
+        with actant.Runtime() as rt:
             h = add.submit(1, 2)
             h.result(timeout=10)
             text = rt.metrics_text()

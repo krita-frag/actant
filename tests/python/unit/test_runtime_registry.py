@@ -1,51 +1,52 @@
-"""``actant._runtime`` 注册表与 Layer 单元测试（不启动 Rust）。"""
+"""``actant._internal.runtime`` 注册表与 Layer 单元测试（不启动 Rust）。"""
 from __future__ import annotations
 
 import pytest
 
 import actant
 from actant import Runtime
-from actant.task import AsyncResult
+from actant.tasks import AsyncResult
 
 
 def test_runtime_registers_builtin_capabilities() -> None:
     rt = Runtime()
     names = rt.capabilities
-    assert "Routing" in names
+    assert "Store" in names
+    assert "Routing" not in names
 
 
 def test_layer_chain_and_handlers() -> None:
     rt = Runtime()
-    layer = rt.layer("Routing", kind="ask")
+    layer = rt.layer("MyRouter", kind="ask")
     def h(x: object) -> object:
         return x
     layer.chain(h)
-    assert rt.handler_count("Routing") == 1
-    assert rt.handlers("Routing") == [h]
+    assert len(rt.handlers("MyRouter")) == 1
+    assert rt.handlers("MyRouter") == [h]
 
 
 def test_layer_remove() -> None:
     rt = Runtime()
     def h(x: object) -> object:
         return x
-    rt.chain("Routing", h)
-    assert rt.layer("Routing").remove(h) is True
-    assert rt.layer("Routing").remove(h) is False
+    rt.layer("MyRouter", kind="ask").chain(h)
+    assert rt.layer("MyRouter").remove(h) is True
+    assert rt.layer("MyRouter").remove(h) is False
 
 
 def test_layer_clear() -> None:
     rt = Runtime()
-    rt.chain("Routing", lambda x: x)
-    rt.chain("Routing", lambda x: x)
-    assert rt.layer("Routing").clear() == 2
-    assert rt.handler_count("Routing") == 0
+    rt.layer("MyRouter", kind="ask").chain(lambda x: x)
+    rt.chain("MyRouter", lambda x: x)
+    assert rt.layer("MyRouter").clear() == 2
+    assert len(rt.handlers("MyRouter")) == 0
 
 
 def test_replace_handler() -> None:
     rt = Runtime()
-    rt.chain("Routing", lambda x: x)
-    rt.replace_handler("Routing", lambda x: "new")
-    assert rt.handler_count("Routing") == 1
+    rt.layer("MyRouter", kind="ask").chain(lambda x: x)
+    rt.replace_handler("MyRouter", lambda x: "new")
+    assert len(rt.handlers("MyRouter")) == 1
 
 
 def test_replace_handler_unknown_capability() -> None:
@@ -63,14 +64,14 @@ def test_custom_capability_requires_kind() -> None:
 def test_builtin_capability_kind_mismatch() -> None:
     rt = Runtime()
     with pytest.raises(ValueError, match="kind"):
-        rt.layer("Routing", kind="perform")
+        rt.layer("Store", kind="ask")
 
 
 def test_capability_meta() -> None:
     rt = Runtime()
-    meta = rt.capability_meta("Routing")
-    assert meta.name == "Routing"
-    assert meta.kind == "ask"
+    meta = rt.capability_meta("Store")
+    assert meta.name == "Store"
+    assert meta.kind == "perform"
 
 
 def test_capability_meta_unknown() -> None:

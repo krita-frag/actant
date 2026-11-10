@@ -2,11 +2,15 @@
 
 本示例演示统一扩展语法：
 
-- ``Runtime`` / ``Runtime.with_defaults()``：运行时入口
-- ``rt.layer(name).chain(handler)``：向 capability 注册 handler
+- ``Runtime`` / ``Runtime()``：运行时入口
+- ``rt.layer(name, kind).chain(handler)``：向自定义 capability 注册 handler
 - ``ask`` / ``perform`` / ``emit``：三种 effect 原语
 - handler 覆盖优先级（后注册 = 高优先级）
 - ``Runtime`` 作为 context manager 的生命周期
+
+放置类策略（路由/调度/重试）由 Rust ``RoutePolicy`` / ``Scheduler`` 或
+第 3 层外部调度器承担，不在 Python 层预装 handler。这里用自定义 capability
+演示 ERH 语法。
 
 运行::
 
@@ -15,46 +19,42 @@
 
 from __future__ import annotations
 
-import actant
-from actant import (
-    RetryCtx,
-    RouteCtx,
-    Runtime,
-    ScheduleCtx,
-    ask,
-    emit,
-    impossible,
-)
+from actant import Runtime, emit
+from actant.capabilities import RetryCtx, RouteCtx, ScheduleCtx
+from actant.effects import ask, impossible
+from actant.exceptions import InternalError, InvalidStateError
 
 
 def main() -> None:
-    # ``with_defaults()`` 预装 Python 策略层默认 handler（LocalRouter /
-    # FifoScheduler / DefaultRetryPolicy）。也可用 ``Runtime()`` 从零开始。
-    with Runtime.with_defaults() as rt:
-        print("=== ask 决策型 ===")
+    # ``Runtime()`` 直接构造：Rust 侧已内置数据面默认策略，
+    # Python 层不再注册路由/调度/重试 handler。
+    with Runtime() as rt:
+        print("=== ask 决策型（用户自定义 capability）===")
 
-        # Routing：无 peer 时路由到本地；有 peer 时按 task_name 稳定哈希。
-        route = ask(
-            "Routing",
-            RouteCtx(task_name="etl-1", peers=["node-a", "node-b"], local_node="me"),
+        # 自定义路由 capability：后注册的 handler 在 ask 中优先决策。
+        rt.layer("MyRouter", "ask").chain(
+            lambda ctx: "dedicated-node" if "gpu" in ctx.tags else None
         )
-        print(f"  routing(etl-1, peers=[a,b]) -> {route}")
+        route = ask("MyRouter", RouteCtx(task_name="train", peers=["a", "b"], tags=["gpu"]))
+        print(f"  routing(tag=gpu)            -> {route}")
 
-        # 追加自定义 router：后注册的 handler 在 ask 中优先决策，覆盖默认。
-        rt.layer("Routing").chain(lambda ctx: "dedicated-node" if "gpu" in ctx.tags else None)
-        route = ask("Routing", RouteCtx(task_name="train", peers=["a", "b"], tags=["gpu"]))
-        print(f"  routing(tag=gpu, override)  -> {route}")
-        # 标签不匹配时自定义 router 弃权（返回 None），回退到默认 LocalRouter。
-        route = ask("Routing", RouteCtx(task_name="etl-2", peers=["a", "b"]))
-        print(f"  routing(no gpu, fallback)   -> {route}")
+        # 自定义 handler 弃权（None）时继续向前查找；无 handler 则返回 None。
+        route = ask("MyRouter", RouteCtx(task_name="etl", peers=["a", "b"]))
+        print(f"  routing(no gpu)             -> {route}")
 
-        # Scheduling：默认 FIFO，返回 pending 队首。
-        nxt = ask("Scheduling", ScheduleCtx(workflow_id="wf-1", pending=["t1", "t2", "t3"]))
+        # 自定义调度 capability。
+        rt.layer("MyScheduler", "ask").chain(
+            lambda ctx: ctx.pending[0] if ctx.pending else None
+        )
+        nxt = ask("MyScheduler", ScheduleCtx(workflow_id="wf-1", pending=["t1", "t2", "t3"]))
         print(f"  scheduling(FIFO)            -> {nxt}")
 
-        # RetryPolicy：attempt < max_retries 返回 True，否则弃权返回 None。
-        print(f"  retry(attempt=0, max=3)     -> {ask('RetryPolicy', RetryCtx('t', 0, 'boom', 3))}")
-        print(f"  retry(attempt=3, max=3)     -> {ask('RetryPolicy', RetryCtx('t', 3, 'boom', 3))}")
+        # 自定义重试 capability。
+        rt.layer("MyRetry", "ask").chain(
+            lambda ctx: True if ctx.attempt < ctx.max_retries else None
+        )
+        print(f"  retry(attempt=0, max=3)     -> {ask('MyRetry', RetryCtx('t', 0, 'boom', 3))}")
+        print(f"  retry(attempt=3, max=3)     -> {ask('MyRetry', RetryCtx('t', 3, 'boom', 3))}")
 
         print("\n=== emit 反应型（自定义 capability）===")
         # 内置 lifecycle capability（TaskLifecycle 等）由 Rust 事件总线提供，
@@ -67,27 +67,27 @@ def main() -> None:
         for line in audit:
             print(f"  {line}")
 
-        print("\n=== 通用 effect 入口 ===")
-        # ``actant.effect`` 按 kind 字符串分发到 ask/perform/emit。
-        result = actant.effect("Routing", "ask", RouteCtx(task_name="x", tags=["gpu"]))
-        print(f"  effect(Routing, ask)        -> {result}")
+        print("\n=== 决策型 effect ===")
+        # ``ask`` 逆序询问 handler 链，首个非 None 的结果生效。
+        result = ask("MyRouter", RouteCtx(task_name="x", tags=["gpu"]))
+        print(f"  ask(MyRouter)               -> {result}")
 
         print("\n=== 运行时查询 ===")
         print(f"  capabilities: {sorted(rt.capabilities)}")
-        print(f"  Routing handlers: {rt.handler_count('Routing')}")
-        print(f"  Audit handlers:   {rt.handler_count('Audit')}")
+        print(f"  MyRouter handlers: {len(rt.handlers('MyRouter'))}")
+        print(f"  Audit handlers:    {len(rt.handlers('Audit'))}")
 
-    # 退出 with 块后 Runtime 已 stop，此时调用 effect 会得到明确错误。
+    # 退出 with 块后 Runtime 已 stop，此时调用 ask 会得到明确错误。
     print("\n=== 退出后的错误路径 ===")
     try:
-        ask("Routing", RouteCtx(task_name="x"))
-    except actant.InvalidStateError as exc:
+        ask("MyRouter", RouteCtx(task_name="x"))
+    except InvalidStateError as exc:
         print(f"  预期错误 (InvalidStateError): {exc}")
 
     # impossible() 用于标记"此 effect 必须有 handler 处理"的不可达分支。
     try:
         impossible("此处不应到达")
-    except actant.InternalError as exc:
+    except InternalError as exc:
         print(f"  impossible() (InternalError): {exc}")
 
 

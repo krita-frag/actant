@@ -17,15 +17,8 @@ import threading
 import time
 from pathlib import Path
 
-from actant import (
-    Runtime,
-    flow,
-    register_flow_recovery,
-    resume_flows,
-    task,
-    use_runtime,
-    wait_signal,
-)
+from actant import Runtime, flow, host_flows, task, use_runtime
+from actant.workflow import wait_signal
 
 
 @task(name="rs_touch")
@@ -105,7 +98,7 @@ class TestFlowResume:
 
         # ---- 阶段 A：跑一半后强制停掉（模拟节点死亡）----
         events = _Events()
-        rt_a = Runtime.with_defaults(name="resume-node", data_dir=data_dir)
+        rt_a = Runtime(name="resume-node", data_dir=data_dir)
         rt_a.start()
         leftovers: list[BaseException] = []
 
@@ -142,7 +135,7 @@ class TestFlowResume:
         assert leftovers, "被强停的残留执行体应已中止（否则测试前提不成立）"
 
         # ---- 阶段 B：同 data_dir 重启 → 续跑 ----
-        rt_b = Runtime.with_defaults(name="resume-node", data_dir=data_dir)
+        rt_b = Runtime(name="resume-node", data_dir=data_dir)
         rt_b.start()
         try:
             assert wf_id in rt_b.list_workflows(), "非终态工作流必须存活于 store"
@@ -152,13 +145,12 @@ class TestFlowResume:
             assert state["tasks"][node1]["state"] == "Completed", state
             assert state["state"] != "Completed"
 
-            register_flow_recovery("resume-flow", _pipeline, args=(marker,))
             resumed: list[str] = []
             failures: list[BaseException] = []
 
             def _resume() -> None:
                 try:
-                    resumed.extend(resume_flows(runtime=rt_b))
+                    resumed.extend(host_flows(runtime=rt_b, once=True))
                 except BaseException as exc:
                     failures.append(exc)
 
@@ -168,7 +160,7 @@ class TestFlowResume:
             assert _signal_until_registered(rt_b, wf_id, "go") is not None
             driver.join(timeout=30)
             assert not driver.is_alive(), (
-                f"resume_flows 未收敛; state={rt_b.get_workflow_state(wf_id)} "
+                f"host_flows 未收敛; state={rt_b.get_workflow_state(wf_id)} "
                 f"resumed={resumed} failures={failures}"
             )
             assert failures == []

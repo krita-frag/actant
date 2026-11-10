@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 import actant
-from actant import TaskEvent
+from actant.capabilities import TaskEvent
 from actant.cli import (
     _build_config,
     _configure_logging,
@@ -29,6 +29,7 @@ def _make_args(**kwargs: object) -> argparse.Namespace:
         "drain_timeout_secs": None,
         "remote_fallback_delay_ms": None,
         "scheduler": None,
+        "role": None,
         "bootstrap_nodes": None,
         "listen_port": None,
         "heartbeat_interval_ms": None,
@@ -161,9 +162,3 @@ def test_main_status_with_data_dir_reads_meta(
     assert main(["status", "--data-dir", str(data_dir)]) == 0
     captured = capsys.readouterr()
     assert "node-x" in captured.out
-
-
-def test_main_task_cancel_requires_id(capsys: pytest.CaptureFixture[str]) -> None:
-    assert main(["task", "cancel"]) == 1
-    captured = capsys.readouterr()
-    assert "requires" in captured.err

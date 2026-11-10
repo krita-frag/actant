@@ -5,7 +5,7 @@
 - 临时 data_dir 自动创建与清理。
 - 任务提交与执行正常工作。
 - 较短的 drain 超时加速 teardown。
-- 与 ``with_defaults`` 行为兼容（默认 handler 已注册）。
+- 与 ``Runtime()`` 行为兼容（默认 handler 已注册）。
 """
 
 from __future__ import annotations
@@ -112,12 +112,11 @@ class TestRuntimeTestMode:
             result = h.result(timeout=10)
             assert result == 7
 
-    def test_test_mode_registers_default_handlers(self) -> None:
+    def test_test_mode_registers_no_python_policy_handlers(self) -> None:
         with Runtime.test() as rt:
-            # 默认 handler 已注册（Routing、Scheduling 等）
-            assert "Routing" in rt._layers
-            assert "Scheduling" in rt._layers
-            assert len(rt._layers["Routing"]) >= 1
+            # 放置类策略由 Rust 侧 RoutePolicy/Scheduler 承担
+            assert "Routing" not in rt._layers
+            assert "Scheduling" not in rt._layers
 
     def test_test_mode_context_manager(self) -> None:
         with Runtime.test() as rt:
@@ -125,7 +124,7 @@ class TestRuntimeTestMode:
         assert not rt._started
 
     def test_test_mode_fast_start(self) -> None:
-        """test 模式启动应比 with_defaults 更快（无网络初始化）。"""
+        """test 模式启动应比默认构造更快（无网络初始化）。"""
         start = time.monotonic()
         with Runtime.test():
             pass

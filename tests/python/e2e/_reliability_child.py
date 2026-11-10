@@ -23,7 +23,7 @@ def main() -> int:
     data_dir = sys.argv[3]
     name = sys.argv[4] if len(sys.argv) > 4 else "child-node"
 
-    rt = actant.Runtime.with_defaults(name=name, data_dir=data_dir)
+    rt = actant.Runtime(name=name, data_dir=data_dir)
     rt.start()
     rt.dial(parent_addr)
     info = {

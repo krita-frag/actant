@@ -4,25 +4,34 @@
 `actant worker` 启动的节点无需连接中心服务器，通过 iroh 自动发现对端节点。
 每个节点同时是编排器与执行器。
 
-CLI 保持极简：只负责 worker 启动与状态查询（节点、任务、集群），不直接执行或
-提交任务。任务提交应通过用户代码调用 `task.submit()` / `flow()` 完成。
+CLI 保持极简：只负责 worker 启动、状态查询与指标导出，不直接执行或提交任务。
+任务提交应通过用户代码调用 `task.submit()` / `flow()` 完成；任务状态由进程内
+`Runtime` 管理，不跨进程暴露。
 """
 
 from __future__ import annotations
 
 import argparse
 import http.server
+import json
 import logging
 import os
 import signal
 import sys
 import threading
+from pathlib import Path
 from typing import Any
 
 import actant
-from actant import TaskEvent
+from actant.capabilities import BUILTIN_CAPABILITIES, TaskEvent
+from actant.observability import metrics_text
+from actant.workflow import FLOW_REGISTRY
 
 _logger = logging.getLogger("actant.cli")
+
+# flow host 后台线程重新扫描未完成工作流的间隔；与 ``flow._HOST_IDLE_POLL_INTERVAL_S``
+# 同量级，避免空转扫描成为 CPU 热点。
+_FLOW_HOST_POLL_INTERVAL_S = 0.5
 
 
 class _MetricsHandler(http.server.BaseHTTPRequestHandler):
@@ -37,7 +46,7 @@ class _MetricsHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
             return
-        body = actant.metrics_text().encode("utf-8")
+        body = metrics_text().encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -108,6 +117,9 @@ def _build_config(args: argparse.Namespace) -> Any:
             "scheduler",
             "bootstrap_nodes",
             "listen_port",
+            "role",
+            "heartbeat_interval_ms",
+            "failure_timeout_ms",
         )
     )
     if not has_custom:
@@ -146,6 +158,7 @@ def _build_config(args: argparse.Namespace) -> Any:
         drain_timeout_secs=args.drain_timeout_secs,
         remote_fallback_delay_ms=args.remote_fallback_delay_ms,
         scheduler=args.scheduler,
+        role=args.role,
     )
 
 
@@ -169,9 +182,10 @@ def cmd_metrics(args: argparse.Namespace) -> int:
 
     # 必须创建一个 _RuntimeCore 以触发 metrics::init()——否则全局 registry 为空，
     # /metrics 返回空字符串。轻量：不订阅任务 topic，不参与 P2P 发现。
-    rt = actant.Runtime.with_defaults(name=f"metrics-{os.getpid()}")
+    rt = actant.Runtime(name=f"metrics-{os.getpid()}")
     rt.start()
-    # 不调用 rt.serve()——不参与 worker 调度循环。
+    # start() 会一并拉起 Worker 守护循环；本命令不注册 flow、不投递任务，
+    # 循环保持空转即可，进程随后由 stop_event 控制退出。
 
     server, actual_port = _start_metrics_server(args.port)
     print(
@@ -197,6 +211,28 @@ def cmd_metrics(args: argparse.Namespace) -> int:
     return 0
 
 
+def _start_flow_host(rt: actant.Runtime, stop_event: threading.Event) -> threading.Thread:
+    """在后台线程持续驱动未完成 flow，直到 ``stop_event`` 置位。
+
+    ``host_flows(once=True)`` 只扫描一轮；这里以固定间隔重复调用，构成常驻
+    host 服务。单轮异常记录日志后退出线程，不静默重试——否则故障会被
+    总线级别的日志噪声掩盖。
+    """
+
+    def _loop() -> None:
+        while not stop_event.is_set():
+            try:
+                rt.host_flows(once=True)
+            except Exception:
+                _logger.exception("flow host loop failed; stopping")
+                return
+            stop_event.wait(_FLOW_HOST_POLL_INTERVAL_S)
+
+    thread = threading.Thread(target=_loop, name="actant-flow-host", daemon=True)
+    thread.start()
+    return thread
+
+
 def cmd_worker(args: argparse.Namespace) -> int:
     """启动一个 Worker 节点作为后台常驻进程。
 
@@ -206,19 +242,42 @@ def cmd_worker(args: argparse.Namespace) -> int:
     若指定 ``--metrics-port``，会在该端口启动一个 HTTP 服务器暴露
     Prometheus exposition format（``/metrics`` 端点），供 Prometheus 抓取。
     服务器在独立线程中运行，不阻塞 worker 主循环。
+
+    若指定 ``--host-flows``，另起后台线程持续重放本 ``data_dir`` 中未完成的
+    工作流（含其他进程提交的），使节点成为常驻 flow host。
     """
     _configure_logging(args.log_level)
 
+    if args.resume and args.host_flows:
+        print(
+            "error: --resume and --host-flows are mutually exclusive "
+            "(--host-flows already covers startup recovery)",
+            file=sys.stderr,
+        )
+        return 1
+    if (args.role or "both") == "worker" and (args.resume or args.host_flows):
+        print(
+            "error: --role worker does not host flows; remove --resume/--host-flows "
+            "or use --role orchestrator",
+            file=sys.stderr,
+        )
+        return 1
+
     config = _build_config(args)
-    rt = actant.Runtime.with_defaults(
+    rt = actant.Runtime(
         name=args.name,
         data_dir=args.data_dir,
         config=config,
     )
     # 默认订阅 TaskLifecycle，将任务事件打印到 stderr。
     rt.layer("TaskLifecycle").chain(_print_task_event)
-    rt.start()
-    rt.serve()  # 非阻塞：worker.run() 在 tokio 后台 spawn
+    # start() 内部已调用 serve() 拉起 Worker 守护循环，此处不要再调一次。
+    rt.start(auto_resume=args.resume)
+
+    stop_event = threading.Event()
+    flow_host: threading.Thread | None = None
+    if args.host_flows:
+        flow_host = _start_flow_host(rt, stop_event)
 
     # 可选：启动 Prometheus HTTP exporter（CLI 自有托管，见 _start_metrics_server）。
     metrics_server: http.server.ThreadingHTTPServer | None = None
@@ -235,6 +294,11 @@ def cmd_worker(args: argparse.Namespace) -> int:
             f"metrics: http://0.0.0.0:{metrics_port}/metrics",
             file=sys.stderr,
         )
+    if args.host_flows:
+        definitions = FLOW_REGISTRY.names()
+        print(f"flow host: {len(definitions)} flow definition(s)", file=sys.stderr)
+        for flow_name in definitions:
+            print(f"  {flow_name}", file=sys.stderr)
     if args.data_dir:
         print(
             "P2P auto-discovery active (no central server needed)",
@@ -249,8 +313,6 @@ def cmd_worker(args: argparse.Namespace) -> int:
         )
     print("press Ctrl+C to drain in-flight tasks and shutdown", file=sys.stderr)
 
-    stop_event = threading.Event()
-
     def _handle_signal(_signum: int, _frame: object) -> None:
         stop_event.set()
 
@@ -260,6 +322,13 @@ def cmd_worker(args: argparse.Namespace) -> int:
     stop_event.wait()
 
     print("draining in-flight tasks and shutting down...", file=sys.stderr)
+    if flow_host is not None:
+        flow_host.join(timeout=5.0)
+        if flow_host.is_alive():
+            _logger.warning(
+                "flow host thread did not stop within 5s; "
+                "an in-flight flow replay will be aborted by shutdown"
+            )
     rt.stop()
     if metrics_server is not None:
         metrics_server.shutdown()
@@ -276,9 +345,9 @@ def cmd_status(args: argparse.Namespace) -> int:
     若提供了 ``--data-dir``，尝试从持久化存储中读取节点信息。
     """
     print(f"actant version: {actant.__version__}")
-    print(f"capabilities: {len(actant.BUILTIN_CAPABILITIES)}")
-    for name in sorted(actant.BUILTIN_CAPABILITIES):
-        meta = actant.BUILTIN_CAPABILITIES[name]
+    print(f"capabilities: {len(BUILTIN_CAPABILITIES)}")
+    for name in sorted(BUILTIN_CAPABILITIES):
+        meta = BUILTIN_CAPABILITIES[name]
         print(f"  {name}: kind={meta.kind}")
     data_dir = getattr(args, "data_dir", None)
     if data_dir:
@@ -305,44 +374,50 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_task(args: argparse.Namespace, *, runtime: actant.Runtime | None = None) -> int:
-    """本地任务状态查询/取消（极简，不涉及跨节点调度）。
+def _load_extension_points() -> dict[str, Any]:
+    """读取与包一起发布的构建期扩展点清单。"""
+    path = Path(actant.__file__).with_name("extension_points.json")
+    data: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
+    return data
 
-    ``list`` 读取的本地任务注册表是**进程内内存态**：仅在注入活跃 ``runtime``
-    时有意义。无 ``runtime`` 注入时直接提示并返回 1，而不是新建空 Runtime
-    制造"永远 no tasks"的假象。``cancel`` 同样依赖内存注册表，保持既有行为。
+
+def cmd_extensions(args: argparse.Namespace) -> int:
+    """列出构建期登记的可用扩展点。
+
+    只回答「有哪些扩展点」，不回答「当前 Runtime 注入了哪个实现」：Rust
+    编译期注入的 trait 实现不会暴露给 Python，运行时也无从查询。每项同时
+    标出解析时机与是否位于热路径，二者共同决定运行期能否替换实现。
     """
-    if args.action == "list" and runtime is None:
+    data = _load_extension_points()
+    points: list[dict[str, Any]] = data["points"]
+    layer = getattr(args, "layer", None)
+    if layer is not None:
+        points = [point for point in points if point["layer"] == layer]
+    if getattr(args, "json", False):
         print(
-            "task registry is in-memory and requires a running runtime; "
-            "start a runtime or use `actant status`",
-            file=sys.stderr,
+            json.dumps(
+                {"points": points, "uncovered_intents": data["uncovered_intents"]},
+                ensure_ascii=False,
+                indent=2,
+            )
         )
-        return 1
-    rt = runtime if runtime is not None else actant.Runtime.with_defaults().start()
-    owns_runtime = runtime is None
-    try:
-        if args.action == "list":
-            task_ids = rt.list_tasks()
-            if not task_ids:
-                print("no tasks")
-                return 0
-            for tid in task_ids:
-                handle = rt.get_task(tid)
-                print(f"{tid} state={handle.state if handle else 'unknown'}")
-        elif args.action == "cancel":
-            cancelled = rt.cancel_task(args.task_id)
-            if cancelled:
-                print(f"cancelled: {args.task_id}")
-            else:
-                print(f"task not found or already done: {args.task_id}")
-                return 1
-        else:
-            print(f"unknown action: {args.action}", file=sys.stderr)
-            return 1
-    finally:
-        if owns_runtime:
-            rt.stop()
+        return 0
+    print("可用扩展点（构建期登记；不表示当前实例已注入某个实现）")
+    for point in points:
+        safe = "yes" if point["cross_node_safe"] else "no"
+        hot = "yes" if point["hot_path"] else "no"
+        print(f"  [{point['layer']}] {point['id']}: {point['summary']}")
+        print(f"    entry={point['entrypoint']}")
+        print(
+            f"    call_site={point['production_call_site']}  cross_node_safe={safe}"
+            f"  resolution={point['resolution']}  hot_path={hot}"
+            f"  acceptance_level={point['acceptance_level']}"
+        )
+        print(f"    acceptance={point['acceptance_test']}")
+    print(
+        f"共 {len(points)} 项；差距/未覆盖方向 {len(data['uncovered_intents'])} "
+        "项不在此列表中，见 docs/reference/extension-points.md"
+    )
     return 0
 
 
@@ -400,6 +475,15 @@ def _add_worker_args(p: argparse.ArgumentParser) -> None:
         help="调度器类型（默认 priority）",
     )
     p.add_argument(
+        "--role",
+        default=None,
+        choices=["both", "orchestrator", "worker"],
+        help=(
+            "节点拓扑角色（默认 both）。orchestrator 只编排不执行本地任务；"
+            "worker 只执行任务、不 claim workflow、不驱动 flow host"
+        ),
+    )
+    p.add_argument(
         "--payload-signing-key",
         default=None,
         help="P2P payload 签名密钥（也可用 ACTANT_PAYLOAD_KEY 环境变量）",
@@ -433,6 +517,22 @@ def _add_worker_args(p: argparse.ArgumentParser) -> None:
         default=None,
         help="若指定，在该端口启动 Prometheus HTTP exporter（/metrics 端点）",
     )
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "启动后在后台重放本节点未终态工作流（崩溃恢复闭环）。"
+            "会执行已注册的 flow 代码并重新派发任务，默认关闭。"
+        ),
+    )
+    p.add_argument(
+        "--host-flows",
+        action="store_true",
+        help=(
+            "常驻 flow host：持续扫描 data_dir 中未完成工作流并从 journal 重放，"
+            "包括其他进程 start_flow 提交的工作流。与 --resume 互斥。"
+        ),
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -460,22 +560,22 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_status.set_defaults(func=cmd_status)
 
-    p_task = sub.add_parser(
-        "task",
-        help="本地任务查询/取消（list / cancel <task-id>）",
+    p_extensions = sub.add_parser(
+        "extensions",
+        help="列出构建期登记的可用扩展点（不查询运行中的 Runtime）",
     )
-    p_task.add_argument(
-        "action",
-        choices=["list", "cancel"],
-        help="操作类型",
-    )
-    p_task.add_argument(
-        "task_id",
-        nargs="?",
+    p_extensions.add_argument(
+        "--layer",
+        choices=["rust", "bridge", "python"],
         default=None,
-        help="任务 ID（cancel 时必需）",
+        help="只显示指定层的扩展点",
     )
-    p_task.set_defaults(func=cmd_task)
+    p_extensions.add_argument(
+        "--json",
+        action="store_true",
+        help="以 JSON 输出清单与未覆盖方向",
+    )
+    p_extensions.set_defaults(func=cmd_extensions)
 
     p_version = sub.add_parser("version", help="显示版本号")
     p_version.set_defaults(func=cmd_version)
@@ -501,9 +601,6 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if not hasattr(args, "func"):
         parser.print_help()
-        return 1
-    if args.command == "task" and args.action == "cancel" and not args.task_id:
-        print("error: task cancel requires <task-id>", file=sys.stderr)
         return 1
     return int(args.func(args))
 

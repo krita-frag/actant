@@ -30,15 +30,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from actant import (
-    RetryCtx,
-    RouteCtx,
-    Runtime,
-    ScheduleCtx,
-    ask,
-    emit,
-    perform,
-)
+from actant import Runtime, emit, perform
+from actant.capabilities import RetryCtx, RouteCtx, ScheduleCtx
+from actant.effects import ask
 
 from .handlers import (
     AnalyzeReq,
@@ -90,7 +84,7 @@ def fetch_with_retry(repo: str, max_retries: int = 3) -> tuple[list[IssueRecord]
         except (urllib.error.HTTPError, urllib.error.URLError, OSError, ValueError) as e:
             last_err = f"{type(e).__name__}: {e}"
             should_retry = ask(
-                "RetryPolicy",
+                "AnalyzerRetry",
                 RetryCtx(
                     task_id=f"fetch:{repo}",
                     attempt=attempt,
@@ -128,11 +122,11 @@ def run_pipeline(work_dir: Path, repos: list[str] | None = None) -> AnalysisRepo
     # 使用 try/finally 确保 AuditLogger 文件句柄在异常路径下也正确释放。
     # AuditLogger 也实现了 __enter__/__exit__，可作为上下文管理器使用。
     try:
-        with Runtime.with_defaults() as rt:
-            # 覆盖默认策略 handler（后注册=高优先级），并注册自定义 capability
-            rt.layer("Routing").chain(OwnerRouter(NODES))
-            rt.layer("Scheduling").chain(PrFirstScheduler())
-            rt.layer("RetryPolicy").chain(ExponentialBackoffRetry(max_retries=3))
+        with Runtime() as rt:
+            # 注册用户自定义 ask capability（引擎不会自动调用）
+            rt.layer("AnalyzerRouting", "ask").chain(OwnerRouter(NODES))
+            rt.layer("AnalyzerScheduling", "ask").chain(PrFirstScheduler())
+            rt.layer("AnalyzerRetry", "ask").chain(ExponentialBackoffRetry(max_retries=3))
             rt.layer("Throttle", "ask").chain(TokenBucket(capacity=30, refill=0.5))
             rt.layer("Fetch", "perform").chain(GithubFetcher())
             rt.layer("Analyze", "perform").chain(analyzer)
@@ -170,7 +164,7 @@ def run_pipeline(work_dir: Path, repos: list[str] | None = None) -> AnalysisRepo
                 # 内容路由：按 owner 哈希到分析节点
                 for rec in records:
                     target = ask(
-                        "Routing",
+                        "AnalyzerRouting",
                         RouteCtx(
                             task_name=repo,  # owner/repo
                             peers=NODES,
@@ -192,7 +186,7 @@ def run_pipeline(work_dir: Path, repos: list[str] | None = None) -> AnalysisRepo
 
             processed = 0
             while pending:
-                next_id = ask("Scheduling", ScheduleCtx(workflow_id="wf-gh", pending=pending))
+                next_id = ask("AnalyzerScheduling", ScheduleCtx(workflow_id="wf-gh", pending=pending))
                 if next_id is None:
                     break
                 pending.remove(next_id)

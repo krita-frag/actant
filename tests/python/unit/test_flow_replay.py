@@ -1,4 +1,4 @@
-"""续跑驱动单元测试：flow 名恢复、恢复登记、``_replay_node_outcome`` 四分支。
+"""续跑驱动单元测试：flow 定义登记、``host_flows`` 入口、``_replay_node_outcome``。
 
 这些是"纯映射逻辑"的测试，与真实重放解耦：真实重放（已完成节点不重跑、
 缺口节点补执行）由 ``tests/python/integration/test_flow_resume.py`` 覆盖。
@@ -12,13 +12,12 @@ from typing import Any
 
 import pytest
 
-from actant import Runtime, flow, register_flow_recovery, resume_flows
+from actant import Runtime, flow, host_flows
+from actant._internal.flow import _replay_node_outcome
 from actant.exceptions import InvalidStateError
-from actant.flow import _FLOW_RECOVERY, _flow_name_from_id, _replay_node_outcome
+from actant.workflow import FLOW_REGISTRY
 
-#: ``actant.flow`` 这个**属性**在包命名空间里被同名的 ``flow`` 装饰器遮蔽，
-#: 故必须经 ``sys.modules`` 拿模块对象（否则 ``import actant.flow as m`` 会绑到函数）。
-_FLOW_MODULE = sys.modules["actant.flow"]
+_FLOW_MODULE = sys.modules["actant._internal.flow"]
 
 
 class _FakeRuntime:
@@ -42,84 +41,47 @@ class _FakeHandle:
         self.error = message
 
 
-class TestFlowNameFromId:
-    """``{flow_name}-{uuid8}`` → flow 名。"""
+class TestFlowRegistry:
+    """``@flow`` 导入登记定义；调用参数不在登记里（由 invocation 持久化）。"""
 
-    @pytest.mark.parametrize(
-        ("workflow_id", "expected"),
-        [
-            ("etl-1a2b3c4d", "etl"),
-            ("my-flow-1a2b3c4d", "my-flow"),
-            ("a-00000000", "a"),
-        ],
-    )
-    def test_recovers_flow_name(self, workflow_id: str, expected: str) -> None:
-        assert _flow_name_from_id(workflow_id) == expected
-
-    @pytest.mark.parametrize(
-        "workflow_id",
-        [
-            "wp-restart-wf",  # 尾段非 8 位
-            "no-uuid-zzzzzzzz",  # 尾段非十六进制
-            "nodash",
-            "--",
-        ],
-    )
-    def test_unrecognized_returns_none(self, workflow_id: str) -> None:
-        assert _flow_name_from_id(workflow_id) is None
-
-
-class TestRecoveryRegistry:
-    """``@flow`` 导入登记 + 显式参数登记。"""
-
-    def test_flow_registers_its_body(self) -> None:
-        @flow(name="unit-registered")
-        def pipeline() -> None: ...
-
-        entry = _FLOW_RECOVERY["unit-registered"]
-        assert entry.args == ()
-        assert entry.kwargs == {}
-
-    def test_register_flow_recovery_supplies_args(self) -> None:
-        @flow(name="unit-with-args")
+    def test_flow_registers_definition(self) -> None:
+        @flow(name="unit-registered", version=2, timeout_ms=1234)
         def pipeline(src: str) -> None: ...
 
-        register_flow_recovery("unit-with-args", pipeline, args=("data.txt",))
-        entry = _FLOW_RECOVERY["unit-with-args"]
-        assert entry.func.__name__ == "pipeline"
-        assert entry.args == ("data.txt",)
+        definition = FLOW_REGISTRY.get("unit-registered")
+        assert definition is not None
+        assert definition.func.__name__ == "pipeline"
+        assert definition.version == 2
+        assert definition.timeout_ms == 1234
+        # 装饰器暴露标记，供工具反查（与注册表一致）。
+        assert getattr(pipeline, "__actant_flow_name__", None) == "unit-registered"
+        assert getattr(pipeline, "__actant_flow_version__", None) == 2
 
-    def test_register_flow_recovery_unwraps_decorated_flow(self) -> None:
-        """传 ``@flow`` 后的对象必须被解包到原函数。
+    def test_definition_func_is_raw_function_not_wrapper(self) -> None:
+        """登记的函数体必须是原函数。
 
-        若不解包，重放会再次进入包装器并生成**新的 workflow_id**——"重放"静默
-        退化成"新建工作流从头跑"，已完成节点全部重跑。这是真实踩过的坑。
+        若登记的是 ``@flow`` 包装器，重放会再次进入包装器并生成**新的
+        workflow_id**——"重放"静默退化成"新建工作流从头跑"，已完成节点全部重跑。
         """
 
-        @flow(name="unit-unwrap")
+        @flow(name="unit-raw-func")
         def pipeline() -> None: ...
 
-        # 装饰后的对象带标记；原函数不带。
-        assert getattr(pipeline, "__actant_flow_name__", None) == "unit-unwrap"
+        definition = FLOW_REGISTRY.get("unit-raw-func")
+        assert definition is not None
+        assert getattr(definition.func, "__actant_flow_name__", None) is None
+        assert definition.func.__name__ == "pipeline"
 
-        register_flow_recovery("unit-unwrap", pipeline)
-        entry = _FLOW_RECOVERY["unit-unwrap"]
-        assert getattr(entry.func, "__actant_flow_name__", None) is None, (
-            "恢复登记里的函数体必须是原函数，不能是 @flow 包装器"
-        )
-        assert entry.func.__name__ == "pipeline"
-
-    def test_resume_flows_requires_runtime(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_host_flows_requires_runtime(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(_FLOW_MODULE, "get_current_runtime", lambda: None)
         with pytest.raises(InvalidStateError):
-            resume_flows()
+            host_flows()
 
-    def test_resume_flows_skips_unregistered(self) -> None:
-        """无恢复登记的非终态工作流：跳过 + 不抛错（warning 记录在日志）。"""
-        with Runtime.with_defaults() as rt:
-            # 尾段 8 位十六进制 → 可解析出 flow 名 "orphan"，但无登记。
+    def test_host_flows_skips_workflow_without_invocation(self) -> None:
+        """非 flow 提交路径创建的工作流没有 invocation：跳过 + 不抛错。"""
+        with Runtime() as rt:
             rt.submit_workflow("orphan-abcdef12")
-            assert resume_flows(runtime=rt) == []
+            assert host_flows(runtime=rt) == []
 
 
 class TestReplayNodeOutcome:
@@ -152,13 +114,6 @@ class TestReplayNodeOutcome:
         handle = _FakeHandle("t-3")
         _replay_node_outcome(rt, handle, {"state": "Cancelled"})
         assert rt.results[0].state == "Cancelled"
-
-    def test_skipped_sets_handle_error_only(self) -> None:
-        rt = _FakeRuntime()
-        handle = _FakeHandle("t-4")
-        _replay_node_outcome(rt, handle, {"state": "Skipped"})
-        assert rt.results == [], "Skipped 不经结果回灌路径"
-        assert handle.error == "task skipped"
 
     @pytest.mark.parametrize("state", ["Pending", "Running"])
     def test_in_flight_leaves_handle_waiting(self, state: str) -> None:

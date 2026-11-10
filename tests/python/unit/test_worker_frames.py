@@ -1,4 +1,4 @@
-"""``actant.task._worker`` stdio 帧协议单元测试（不依赖 Runtime/子进程）。
+"""``actant._internal.tasks.worker`` stdio 帧协议单元测试（不依赖 Runtime/子进程）。
 
 覆盖：pipe 帧读写往返、帧长上限防线（协议损坏判定）、v2 dispatch 载荷截断
 严格检查、writev 部分写失败回退语义。跨进程路径由 Python 集成测试与 e2e 派发
@@ -12,7 +12,7 @@ import sys
 
 import pytest
 
-from actant.task._worker import (
+from actant._internal.tasks.worker import (
     _FRAME_HEADER,
     _PAYLOAD_VERSION,
     _V2_HEADER_STRUCT,

@@ -1,10 +1,10 @@
-"""``actant.task._task_obj`` 单元测试（不启动 Runtime）。"""
+"""``actant._internal.tasks.task`` 单元测试（不启动 Runtime）。"""
 from __future__ import annotations
 
 import pytest
 
 from actant.exceptions import InvalidStateError
-from actant.task import AsyncResult, Task, task
+from actant.tasks import AsyncResult, Task, task
 
 
 class _CapturingCore:
@@ -72,42 +72,6 @@ def test_task_repr() -> None:
     assert "sample" in repr(sample)
 
 
-def test_task_map_calls_submit(monkeypatch: pytest.MonkeyPatch) -> None:
-    @task
-    def double(x: int) -> int:
-        return x * 2
-
-    submitted: list[int] = []
-
-    def _submit_batch(items, **kwargs):
-        for x in items:
-            submitted.append(x)
-        return [AsyncResult(f"h-{x}") for x in items]
-
-    monkeypatch.setattr(double, "submit_batch", _submit_batch)
-    handles = double.map([1, 2, 3])
-    assert submitted == [1, 2, 3]
-    assert len(handles) == 3
-
-
-def test_task_starmap_calls_submit(monkeypatch: pytest.MonkeyPatch) -> None:
-    @task
-    def add(a: int, b: int) -> int:
-        return a + b
-
-    submitted: list[tuple[int, int]] = []
-
-    def _submit_batch(items, *, unpack=False, **kwargs):
-        for item in items:
-            submitted.append(tuple(item))
-        return [AsyncResult(f"h-{a}-{b}") for a, b in items]
-
-    monkeypatch.setattr(add, "submit_batch", _submit_batch)
-    handles = add.starmap([(1, 2), (3, 4)])
-    assert submitted == [(1, 2), (3, 4)]
-    assert len(handles) == 2
-
-
 def test_task_submit_requires_runtime() -> None:
     @task
     def sample() -> None:
@@ -117,22 +81,13 @@ def test_task_submit_requires_runtime() -> None:
         sample.submit()
 
 
-def test_task_delay_requires_runtime() -> None:
-    @task
-    def sample() -> None:
-        return None
-
-    with pytest.raises(InvalidStateError):
-        sample.delay()
-
-
 def test_task_submit_to_sets_remote_target(monkeypatch: pytest.MonkeyPatch) -> None:
     import importlib
 
-    task_obj = importlib.import_module("actant.task._task_obj")
+    backend = importlib.import_module("actant._internal.tasks.backend")
 
     fake_runtime = _FakeRuntime()
-    monkeypatch.setattr(task_obj, "get_current_runtime", lambda: fake_runtime)
+    monkeypatch.setattr(backend, "get_current_runtime", lambda: fake_runtime)
 
     @task
     def add(a: int, b: int) -> int:
@@ -145,6 +100,42 @@ def test_task_submit_to_sets_remote_target(monkeypatch: pytest.MonkeyPatch) -> N
     assert submitted is not None
     assert submitted.target_node == "worker-node"
     assert submitted.target_endpoint_addr == "peer-id"
+
+
+def test_task_submit_uses_registered_backend() -> None:
+    """提交接缝可替换：``Task.submit`` 只依赖 ``SubmitBackend``。"""
+    import importlib
+
+    backend_mod = importlib.import_module("actant._internal.tasks.backend")
+
+    class _RecordingBackend:
+        def __init__(self) -> None:
+            self.calls: list[tuple[tuple[object, ...], dict[str, object], str | None]] = []
+
+        def submit_task(
+            self,
+            task: object,
+            args: tuple[object, ...],
+            kwargs: dict[str, object],
+            *,
+            target_node: str | None,
+            target_endpoint_addr: str | None,
+            idempotency_key: str | None,
+        ) -> AsyncResult:
+            self.calls.append((args, kwargs, idempotency_key))
+            return AsyncResult("remote-task")
+
+    @task
+    def add(a: int, b: int) -> int:
+        return a + b
+
+    recorder = _RecordingBackend()
+    with backend_mod.use_submit_backend(recorder):
+        handle = add.submit(1, 2, idempotency_key="k1")
+
+    assert isinstance(handle, AsyncResult)
+    assert handle.task_id == "remote-task"
+    assert recorder.calls == [((1, 2), {}, "k1")]
 
 
 def test_task_options_preserved() -> None:

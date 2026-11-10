@@ -24,8 +24,9 @@ from typing import Any
 
 import pytest
 
-from actant import AsyncResult, Runtime, flow, get_task_context, task
+from actant import AsyncResult, Runtime, flow, task
 from actant.exceptions import ActantError, InvalidStateError, TaskCancelledError
+from actant.tasks import get_task_context
 
 # ============================================================================
 # 模块级函数 + Task 对象
@@ -299,16 +300,6 @@ class TestTaskDefinition:
 
         assert heavy.name == "param-task"
 
-    def test_delay_is_alias_of_submit(self):
-        @task
-        def echo(x: int) -> int:
-            return x
-
-        with Runtime.with_defaults():
-            handle = echo.delay(42)
-            assert isinstance(handle, AsyncResult)
-            assert handle.result(timeout=30) == 42
-
 
 # ============================================================================
 # submit / AsyncResult
@@ -317,7 +308,7 @@ class TestTaskDefinition:
 
 class TestSubmit:
     def test_submit_returns_async_result(self):
-        with Runtime.with_defaults():
+        with Runtime():
             handle = _echo.submit(42)
             assert isinstance(handle, AsyncResult)
             assert handle.result(timeout=30) == 42
@@ -331,19 +322,19 @@ class TestSubmit:
             f.submit()
 
     def test_result_blocks_until_done(self):
-        with Runtime.with_defaults():
+        with Runtime():
             handle = _echo.submit(99)
             assert handle.result(timeout=30) == 99
             assert handle.done()
 
     def test_done_property(self):
-        with Runtime.with_defaults():
+        with Runtime():
             handle = _echo.submit(1)
             handle.result(timeout=30)
             assert handle.done()
 
     def test_repr_includes_state(self):
-        with Runtime.with_defaults():
+        with Runtime():
             handle = _echo.submit(1)
             handle.result(timeout=30)
             repr_str = repr(handle)
@@ -355,20 +346,20 @@ class TestTaskState:
     """TaskState 字面量类型与 AsyncResult.state 行为。"""
 
     def test_state_completed_on_success(self):
-        with Runtime.with_defaults():
+        with Runtime():
             handle = _echo.submit(1)
             handle.result(timeout=30)
             assert handle.state == "completed"
 
     def test_state_failed_on_exception(self):
-        with Runtime.with_defaults():
+        with Runtime():
             handle = _fail_value_error.submit()
             with pytest.raises(ValueError, match="task failed"):
                 handle.result(timeout=30)
             assert handle.state == "failed"
 
     def test_state_running_while_in_flight(self):
-        with Runtime.with_defaults():
+        with Runtime():
             handle = _short_sleep.submit()
             # 分布式模型：Worker 需轮询拉取任务后才会进入 running 状态，
             # 短暂轮询等待 TaskStarted 事件到达（0.3s 睡眠窗口内应观察到 running）。
@@ -386,20 +377,20 @@ class TestTaskState:
 
 class TestFailurePropagation:
     def test_task_exception_re_raised_by_result(self):
-        with Runtime.with_defaults():
+        with Runtime():
             handle = _fail_value_error.submit()
             with pytest.raises(ValueError, match="task failed"):
                 handle.result(timeout=30)
 
     def test_exception_method_returns_exception(self):
-        with Runtime.with_defaults():
+        with Runtime():
             handle = _fail_runtime_error.submit()
             exc = handle.exception(timeout=30)
             assert isinstance(exc, RuntimeError)
             assert "kaboom" in str(exc)
 
     def test_exception_method_returns_none_on_success(self):
-        with Runtime.with_defaults():
+        with Runtime():
             handle = _echo.submit(1)
             handle.result(timeout=30)
             assert handle.exception(timeout=30) is None
@@ -408,7 +399,7 @@ class TestFailurePropagation:
         """exception() 取消语义对齐 - 取消时抛 TaskCancelledError。"""
         # 使用 max_concurrent_tasks=1：blocker 占用唯一 worker，第二个任务排队，
         # 取消排队任务后状态转为 cancelled，exception() 应抛 TaskCancelledError。
-        with Runtime.with_defaults(max_concurrent_tasks=1) as rt:
+        with Runtime(max_concurrent_tasks=1) as rt:
             blocker = _blocker.submit()  # 占用唯一 worker
             _wait_for_state(blocker, "running")
             handle = _echo.submit(42)    # 排队，尚未开始
@@ -420,7 +411,7 @@ class TestFailurePropagation:
             blocker.result(timeout=30)
 
     def test_custom_exception_type_preserved(self):
-        with Runtime.with_defaults():
+        with Runtime():
             handle = _fail_custom.submit()
             with pytest.raises(_MyError):
                 handle.result(timeout=30)
@@ -433,27 +424,27 @@ class TestFailurePropagation:
 
 class TestDependencyResolution:
     def test_async_result_resolved_as_argument(self):
-        with Runtime.with_defaults():
+        with Runtime():
             a = _increment.submit(10)       # 11
             b = _double.submit(a)           # 自动等待 a，传入 11，得 22
             assert b.result(timeout=30) == 22
 
     def test_dependency_in_list(self):
-        with Runtime.with_defaults():
+        with Runtime():
             a = _echo.submit(1)
             b = _echo.submit(2)
             result = _make_pair.submit([a, b])
             assert result.result(timeout=30) == (1, 2)
 
     def test_dependency_in_dict(self):
-        with Runtime.with_defaults():
+        with Runtime():
             a = _echo.submit(10)
             b = _echo.submit(20)
             result = _sum_dict.submit({"a": a, "b": b})
             assert result.result(timeout=30) == 30
 
     def test_chained_dependencies(self):
-        with Runtime.with_defaults():
+        with Runtime():
             h = _increment.submit(0)    # 0 → 1
             for _ in range(4):           # 1→2→3→4→5
                 h = _increment.submit(h)
@@ -469,14 +460,14 @@ class TestRetry:
     def test_retry_succeeds_after_failures(self, tmp_path):
         _retry_counter["count"] = 0
         marker = tmp_path / "retry_attempts.txt"
-        with Runtime.with_defaults():
+        with Runtime():
             handle = _flaky.submit(str(marker))
             assert handle.result(timeout=30) == "ok"
         # worker 子进程在重试期间把每次尝试写入标记文件；父进程据此断言尝试次数。
         assert _read_markers(str(marker)).count("attempt") == 3
 
     def test_retry_exhausted_returns_failure(self):
-        with Runtime.with_defaults():
+        with Runtime():
             handle = _always_fail.submit()
             with pytest.raises(ValueError, match="always"):
                 handle.result(timeout=30)
@@ -484,7 +475,7 @@ class TestRetry:
     def test_no_retry_by_default(self, tmp_path):
         _no_retry_counter["count"] = 0
         marker = tmp_path / "no_retry_attempts.txt"
-        with Runtime.with_defaults():
+        with Runtime():
             handle = _fail_once.submit(str(marker))
             with pytest.raises(RuntimeError, match=r"^fail$"):
                 handle.result(timeout=30)
@@ -498,7 +489,7 @@ class TestRetry:
 
 class TestTimeout:
     def test_timeout_aborts_task(self):
-        with Runtime.with_defaults():
+        with Runtime():
             handle = _slow_timeout.submit()
             # 分布式模型：超时由 Rust Worker tokio 调度器强制取消，
             # 结果为 ActantError（"task timed out after Xms"）。
@@ -506,7 +497,7 @@ class TestTimeout:
                 handle.result(timeout=30)
 
     def test_no_timeout_allows_long_task(self):
-        with Runtime.with_defaults():
+        with Runtime():
             handle = _quick_no_timeout.submit()
             assert handle.result(timeout=30) == 42
 
@@ -518,7 +509,7 @@ class TestTimeout:
 
 class TestTaskRegistry:
     def test_list_tasks_after_submit(self):
-        with Runtime.with_defaults() as rt:
+        with Runtime() as rt:
             handle = _echo.submit(1)
             # 任务完成前应在注册表中；完成后会移除（孤儿回收）
             task_ids = rt.list_tasks()
@@ -526,18 +517,18 @@ class TestTaskRegistry:
             handle.result(timeout=30)
 
     def test_get_task_returns_handle(self):
-        with Runtime.with_defaults() as rt:
+        with Runtime() as rt:
             handle = _echo.submit(1)
             assert rt.get_task(handle.task_id) is handle
 
     def test_get_task_returns_none_for_unknown(self):
-        with Runtime.with_defaults() as rt:
+        with Runtime() as rt:
             assert rt.get_task("nonexistent") is None
 
     def test_cancel_queued_task(self):
         # 使用 max_concurrent_tasks=1：blocker 占用唯一 worker，第二个任务排队等待，
         # Future.cancel() 对排队任务返回 True。
-        with Runtime.with_defaults(max_concurrent_tasks=1) as rt:
+        with Runtime(max_concurrent_tasks=1) as rt:
             blocker = _blocker.submit()      # 占用唯一 worker
             _wait_for_state(blocker, "running")
             handle = _echo.submit(42)        # 排队，尚未开始
@@ -562,12 +553,12 @@ class TestTaskRegistry:
             assert rt.is_cancelled(handle.task_id) is False
 
     def test_cancel_unknown_task_returns_false(self):
-        with Runtime.with_defaults() as rt:
+        with Runtime() as rt:
             assert rt.cancel_task("unknown") is False
 
     def test_cancel_completed_task_returns_false(self):
         """已完成的任务不可取消，cancel_task 应返回 False。"""
-        with Runtime.with_defaults() as rt:
+        with Runtime() as rt:
             handle = _echo.submit(42)
             result = handle.result(timeout=30)
             assert result == 42
@@ -576,7 +567,7 @@ class TestTaskRegistry:
 
     def test_cancel_failed_task_returns_false(self):
         """已失败的任务不可取消，cancel_task 应返回 False。"""
-        with Runtime.with_defaults() as rt:
+        with Runtime() as rt:
             handle = _fail_value_error.submit()
             with pytest.raises(ValueError):
                 handle.result(timeout=30)
@@ -585,7 +576,7 @@ class TestTaskRegistry:
 
     def test_cancel_already_cancelled_is_idempotent(self):
         """对已取消任务再次调用 cancel 应返回 True（幂等语义）。"""
-        with Runtime.with_defaults(max_concurrent_tasks=1) as rt:
+        with Runtime(max_concurrent_tasks=1) as rt:
             blocker = _blocker.submit()
             _wait_for_state(blocker, "running")
             handle = _echo.submit(42)
@@ -595,7 +586,7 @@ class TestTaskRegistry:
             blocker.result(timeout=30)
 
     def test_submit_failure_cleans_up_registration(self):
-        with Runtime.with_defaults() as rt:
+        with Runtime() as rt:
             baseline = set(rt.list_tasks())
             original_core = rt._rust_core
             rt._rust_core = _FailingSubmitCore()
@@ -617,7 +608,7 @@ class TestCancellation:
         assert get_task_context() is None
 
     def test_cooperative_cancellation_checkpoint(self):
-        with Runtime.with_defaults(max_concurrent_tasks=1) as rt:
+        with Runtime(max_concurrent_tasks=1) as rt:
             blocker = _blocker.submit()
             _wait_for_state(blocker, "running")
             handle = _cancel_check.submit()  # 排队
@@ -630,7 +621,7 @@ class TestCancellation:
     def test_cancel_emits_task_lifecycle_event(self):
         events: list[str] = []
 
-        with Runtime.with_defaults(max_concurrent_tasks=1) as rt:
+        with Runtime(max_concurrent_tasks=1) as rt:
             rt.layer("TaskLifecycle").chain(lambda e: events.append(e.kind))
             blocker = _blocker.submit()
             _wait_for_state(blocker, "running")
@@ -654,7 +645,7 @@ class TestCancellation:
         """
         events: list[tuple[str, str]] = []  # (kind, task_id)
 
-        with Runtime.with_defaults() as rt:
+        with Runtime() as rt:
             rt.layer("TaskLifecycle").chain(
                 lambda e: events.append((e.kind, e.task_id))
             )
@@ -669,7 +660,7 @@ class TestCancellation:
         """任务失败时 dispatch handler 应广播 ``failed`` 事件（回归同上）。"""
         events: list[tuple[str, str]] = []
 
-        with Runtime.with_defaults() as rt:
+        with Runtime() as rt:
             rt.layer("TaskLifecycle").chain(
                 lambda e: events.append((e.kind, e.task_id))
             )
@@ -685,7 +676,7 @@ class TestCancellation:
         marker = tmp_path / "cancel_hook.txt"
         # 使用 max_concurrent_tasks=2 让 _cancel_hook 立即开始执行并注册钩子；
         # 通过 marker 文件中的 ``registered`` 确认钩子已注册，然后 cancel。
-        with Runtime.with_defaults(max_concurrent_tasks=2) as rt:
+        with Runtime(max_concurrent_tasks=2) as rt:
             handle = _cancel_hook.submit(str(marker))
             _wait_for_marker(str(marker), "registered", timeout=5)
             rt.cancel_task(handle.task_id)
@@ -696,7 +687,7 @@ class TestCancellation:
 
     def test_force_after_invokes_cleanup(self, tmp_path):
         marker = tmp_path / "force_cleanup.txt"
-        with Runtime.with_defaults(max_concurrent_tasks=2):
+        with Runtime(max_concurrent_tasks=2):
             handle = _cancel_hook.submit(str(marker))
             _wait_for_marker(str(marker), "registered", timeout=5)
             handle.cancel(force_after=0.1)
@@ -718,14 +709,14 @@ class TestCancellation:
             assert b.state == "cancelled" or b.state == "running"
 
         pipeline = flow(_pipeline)
-        with Runtime.with_defaults(max_concurrent_tasks=2) as rt:
+        with Runtime(max_concurrent_tasks=2) as rt:
             rt.layer("TaskLifecycle").chain(lambda e: events.append(e.kind))
             pipeline()
 
         assert events.count("cancelled") >= 1
 
     def test_task_unregistered_after_completion(self):
-        with Runtime.with_defaults() as rt:
+        with Runtime() as rt:
             handle = _echo.submit(1)
             handle.result(timeout=30)
             # result() 返回时 state=completed，但 unregister_task 在同一回调中
@@ -769,7 +760,7 @@ _flow_fail = flow(_flow_fail_fn)
 
 class TestFlow:
     def test_flow_executes_body(self):
-        with Runtime.with_defaults():
+        with Runtime():
             assert _simple_pipeline(2, 3) == 5
 
     def test_flow_requires_runtime(self):
@@ -779,7 +770,7 @@ class TestFlow:
     def test_flow_emits_lifecycle_events(self):
         events: list[str] = []
 
-        with Runtime.with_defaults() as rt:
+        with Runtime() as rt:
             rt.layer("WorkflowLifecycle").chain(
                 lambda e: events.append(e.kind)
             )
@@ -790,7 +781,7 @@ class TestFlow:
     def test_flow_emits_failed_on_exception(self):
         events: list[str] = []
 
-        with Runtime.with_defaults() as rt:
+        with Runtime() as rt:
             rt.layer("WorkflowLifecycle").chain(
                 lambda e: events.append(e.kind)
             )
@@ -801,5 +792,5 @@ class TestFlow:
         assert "completed" not in events
 
     def test_flow_with_task_dependencies(self):
-        with Runtime.with_defaults():
+        with Runtime():
             assert _etl_pipeline(10) == 21  # (10 * 2) + 1

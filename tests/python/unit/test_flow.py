@@ -1,13 +1,13 @@
-"""``actant.flow`` 私有辅助函数单元测试（不依赖 Runtime）。"""
+"""``actant._internal.flow`` 私有辅助函数单元测试（不依赖 Runtime）。"""
 from __future__ import annotations
 
 import importlib
 
 import pytest
 
-from actant.flow import _safe_emit
+from actant._internal.flow import _safe_emit
 
-_flow_module = importlib.import_module("actant.flow")
+_flow_module = importlib.import_module("actant._internal.flow")
 
 
 class _EmitFaker:
@@ -68,7 +68,7 @@ def test_cancel_flow_tasks_continues_on_single_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """单个任务取消失败不应阻止同 workflow 其他任务被取消。"""
-    import actant._runtime
+    import actant._internal.runtime
 
     handles = {
         "t1": _FakeHandle("wf1"),
@@ -77,7 +77,7 @@ def test_cancel_flow_tasks_continues_on_single_failure(
         "t4": _FakeHandle("wf2"),
     }
     monkeypatch.setattr(
-        actant._runtime, "get_current_runtime", lambda: _FakeRuntime(handles)
+        actant._internal.runtime, "get_current_runtime", lambda: _FakeRuntime(handles)
     )
 
     _flow_module._cancel_flow_tasks("wf1")
@@ -90,11 +90,11 @@ def test_cancel_flow_tasks_continues_on_single_failure(
 
 def test_cancel_flow_tasks_no_runtime_returns() -> None:
     """无活跃 Runtime 时直接返回。"""
-    import actant._runtime
+    import actant._internal.runtime
 
     monkeypatch = pytest.MonkeyPatch()
     with monkeypatch.context() as m:
-        m.setattr(actant._runtime, "get_current_runtime", lambda: None)
+        m.setattr(actant._internal.runtime, "get_current_runtime", lambda: None)
         _flow_module._cancel_flow_tasks("wf1")
 
 

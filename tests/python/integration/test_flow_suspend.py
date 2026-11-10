@@ -23,8 +23,9 @@ import time
 
 import pytest
 
-from actant import Runtime, flow, suspend, use_runtime, wait_signal
+from actant import Runtime, flow, use_runtime
 from actant.exceptions import ActantTimeoutError
+from actant.workflow import suspend, wait_signal
 
 
 class _Events:
@@ -95,7 +96,7 @@ class TestSuspendResume:
             return "done"
 
         events = _Events()
-        with Runtime.with_defaults() as rt:
+        with Runtime() as rt:
             rt.layer("WorkflowLifecycle", "emit").chain(events)
 
             thread = _run_flow(rt, pipeline, outcome)
@@ -122,7 +123,7 @@ class TestSuspendResume:
             return "done"
 
         events = _Events()
-        with Runtime.with_defaults() as rt:
+        with Runtime() as rt:
             rt.layer("WorkflowLifecycle", "emit").chain(events)
 
             thread = _run_flow(rt, pipeline, outcome)
@@ -147,7 +148,7 @@ class TestSuspendResume:
             return "done"
 
         events = _Events()
-        with Runtime.with_defaults() as rt:
+        with Runtime() as rt:
             rt.layer("WorkflowLifecycle", "emit").chain(events)
 
             thread = _run_flow(rt, pipeline, outcome)
@@ -187,7 +188,7 @@ class TestSuspendResume:
             return "done"
 
         events = _Events()
-        with Runtime.with_defaults() as rt:
+        with Runtime() as rt:
             rt.layer("WorkflowLifecycle", "emit").chain(events)
 
             thread = _run_flow(rt, pipeline, outcome)
@@ -213,7 +214,7 @@ class TestSuspendResume:
             suspend(timeout_ms=300)
             return "done"
 
-        with Runtime.with_defaults():
+        with Runtime():
             started = time.monotonic()
             with pytest.raises(ActantTimeoutError) as excinfo:
                 pipeline()
@@ -242,7 +243,7 @@ class TestAbortParkedFlow:
             return "done"
 
         events = _Events()
-        with Runtime.with_defaults() as rt:
+        with Runtime() as rt:
             rt.layer("WorkflowLifecycle", "emit").chain(events)
 
             thread = _run_flow(rt, pipeline, outcome)
@@ -272,7 +273,7 @@ class TestAbortParkedFlow:
             return "done"
 
         events = _Events()
-        with Runtime.with_defaults() as rt:
+        with Runtime() as rt:
             rt.layer("WorkflowLifecycle", "emit").chain(events)
 
             thread = _run_flow(rt, pipeline, outcome)
@@ -293,13 +294,13 @@ class TestAbortParkedFlow:
 
         @flow(name="wf-abort-timer")
         def pipeline() -> str:
-            from actant import sleep_until
+            from actant.workflow import sleep_until
 
             sleep_until(int(time.time() * 1000) + 30_000)   # 30s 后到期
             return "done"
 
         events = _Events()
-        with Runtime.with_defaults() as rt:
+        with Runtime() as rt:
             rt.layer("WorkflowLifecycle", "emit").chain(events)
 
             thread = _run_flow(rt, pipeline, outcome)
@@ -324,7 +325,7 @@ class TestSuspendDurability:
         data_dir = str(tmp_path / "data")
         wf_id = "wf-suspend-restart"
 
-        rt_a = Runtime.with_defaults(name="suspend-node", data_dir=data_dir)
+        rt_a = Runtime(name="suspend-node", data_dir=data_dir)
         rt_a.start()
         try:
             rt_a.submit_workflow(wf_id)
@@ -335,14 +336,14 @@ class TestSuspendDurability:
             rt_a.stop()
 
         # 另起一个挂起点（模拟"挂起中崩溃"），重启后应能被恢复。
-        rt_b = Runtime.with_defaults(name="suspend-node", data_dir=data_dir)
+        rt_b = Runtime(name="suspend-node", data_dir=data_dir)
         rt_b.start()
         try:
             rt_b.register_wait_point(wf_id, "suspend-2", kind="suspend")
         finally:
             rt_b.stop()
 
-        rt_c = Runtime.with_defaults(name="suspend-node", data_dir=data_dir)
+        rt_c = Runtime(name="suspend-node", data_dir=data_dir)
         rt_c.start()
         try:
             # 挂起点随快照恢复 → 重启后仍可被恢复（幂等返回 1）。

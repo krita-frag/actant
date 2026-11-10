@@ -27,7 +27,7 @@
    溃，两节点存活。
 
 RSS 为 ru_maxrss 峰值水位观测值（参考 test_chaos_baseline），打印供
-docs/SLA_BASELINE.md 记录，不设阈值断言。
+docs/operations/sla-baseline.md 记录，不设阈值断言。
 """
 
 from __future__ import annotations
@@ -45,9 +45,9 @@ import pytest
 
 import actant
 from actant import Runtime
+from actant._internal.tasks.ref import Ref
 from actant.exceptions import NotFoundError
-from actant.task import task
-from actant.task._ref import Ref
+from actant.tasks import task
 from tests.python._helpers import connect_peers
 from tests.python._helpers import ref_tasks as rt
 
@@ -99,8 +99,8 @@ def two_nodes() -> Iterator[tuple[Runtime, Runtime]]:
     """两个真实 iroh 进程内节点，双向发现收敛后交付，测试后回收。"""
     dir_a = tempfile.mkdtemp(prefix="actant-ref-a-")
     dir_b = tempfile.mkdtemp(prefix="actant-ref-b-")
-    rt_a = Runtime.with_defaults(name="ref-a", data_dir=dir_a)
-    rt_b = Runtime.with_defaults(name="ref-b", data_dir=dir_b)
+    rt_a = Runtime(name="ref-a", data_dir=dir_a)
+    rt_b = Runtime(name="ref-b", data_dir=dir_b)
     rt_a.start()
     rt_b.start()
     try:

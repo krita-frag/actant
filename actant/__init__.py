@@ -1,200 +1,64 @@
 """Actant - 基于 Actor 模型的跨平台通用分布式任务编排引擎。
 
-采用 Effect-Resource-Handler 统一扩展架构：所有扩展点（Routing、Scheduling、
-Store、Lifecycle）统一为 `Capability`（能力声明）+ `Handler`
-（能力实现）+ `Layer`（handler 组合）+ `Effect`（请求能力）。
+采用 Effect-Resource-Handler 统一扩展架构：数据面与观测面扩展点
+（Store、ValueStore、TaskLifecycle、WorkflowLifecycle）统一为 `Capability`
+（能力声明）+ `Handler`（能力实现）+ `Layer`（handler 组合）+
+`Effect`（请求能力）。
+
+路由、调度、重试等放置类策略不属于 ERH 数据面：它们由 Rust
+`RoutePolicy` / `Scheduler` 或第 3 层外部调度器承担，避免进程内 Python
+闭包在 workflow failover 后失效。
 
 典型用法::
 
     import actant
 
     rt = actant.Runtime()
-    rt.layer("Routing").chain(my_router)
     rt.layer("TaskLifecycle").chain(lambda e: print(f"task {e.kind}: {e.task_id}"))
     rt.start()
 
     # 在 handler 中请求 capability：
-    target = actant.ask("Routing", ctx)
     actant.emit("TaskLifecycle", task_event)
 
+顶层只保留最常用的入口。其余 API 按职责放在子命名空间：
+
+- ``actant.tasks``：任务对象、上下文与状态；
+- ``actant.workflow``：等待点、续代、版本控制与流程定义注册表；
+- ``actant.aio``：异步面（与同步面同名，如 ``aio.flow`` / ``aio.ask`` / ``aio.gather``）；
+- ``actant.effects``：同步 effect 动词；
+- ``actant.capabilities``：能力类型、事件与 handler 协议；
+- ``actant.exceptions``：异常层级；
+- ``actant.observability``：指标导出。
 """
 
 from __future__ import annotations
 
-from actant._effects import (
-    ask,
-    ask_async,
-    effect,
-    emit,
-    impossible,
-    perform,
-    perform_async,
-    perform_batch_async,
-)
-from actant._runtime import Layer, Runtime, get_current_runtime, require_runtime, use_runtime
+from actant import aio, observability, service, testkit, workflow  # noqa: F401  注册子命名空间属性
+from actant._internal.flow import FlowHandle, flow, host_flows, start_flow
+from actant._internal.runtime import Layer, Runtime, get_current_runtime, use_runtime
 from actant.actant import get_version
-from actant.actant import prometheus_text as metrics_text
-from actant.capabilities import (
-    BUILTIN_CAPABILITIES,
-    NODE_LIFECYCLE,
-    PYTHON_ONLY_CAPABILITIES,
-    RETRY_POLICY,
-    ROUTING,
-    RUST_BACKED_CAPABILITIES,
-    SCHEDULING,
-    SERIALIZATION,
-    STORE,
-    TASK_LIFECYCLE,
-    VALUE_STORE,
-    WORKFLOW_LIFECYCLE,
-    CapabilityMeta,
-    EffectKind,
-    NodeEvent,
-    NodeLifecycleHandler,
-    RetryCtx,
-    RetryPolicyHandler,
-    RouteCtx,
-    RoutingHandler,
-    ScheduleCtx,
-    SchedulingHandler,
-    StoreHandler,
-    StoreReq,
-    TaskEvent,
-    TaskLifecycleHandler,
-    ValueStoreHandler,
-    ValueStoreReq,
-    WorkflowEvent,
-    WorkflowLifecycleHandler,
-    get_builtin_capability_meta,
-)
-from actant.exceptions import (
-    ActantError,
-    ActantTimeoutError,
-    ActorError,
-    AlreadyExistsError,
-    ConfigError,
-    FlowReplayError,
-    InternalError,
-    InvalidStateError,
-    MetricsError,
-    NetworkError,
-    NotFoundError,
-    PayloadTooLargeError,
-    SerializationError,
-    StorageError,
-    TaskCancelledError,
-    TaskError,
-    WorkerError,
-    WorkflowCancelledError,
-    WorkflowError,
-    WorkflowFailedError,
-)
-from actant.flow import (
-    current_workflow_id,
-    flow,
-    register_flow_recovery,
-    resume_flows,
-    sleep_until,
-    suspend,
-    wait_signal,
-)
-from actant.task import (
-    REF_INLINE_THRESHOLD,
-    AsyncResult,
-    Ref,
-    Task,
-    TaskContext,
-    TaskState,
-    gather,
-    gather_async,
-    get_task_context,
-    task,
-)
+from actant.effects import ask, emit, perform
+from actant.exceptions import ActantError
+from actant.tasks import AsyncResult, Ref, gather, task
 
 __version__ = get_version()
 
 __all__ = [
-    "BUILTIN_CAPABILITIES",
-    "NODE_LIFECYCLE",
-    "PYTHON_ONLY_CAPABILITIES",
-    "REF_INLINE_THRESHOLD",
-    "RETRY_POLICY",
-    "ROUTING",
-    "RUST_BACKED_CAPABILITIES",
-    "SCHEDULING",
-    "SERIALIZATION",
-    "STORE",
-    "TASK_LIFECYCLE",
-    "VALUE_STORE",
-    "WORKFLOW_LIFECYCLE",
     "ActantError",
-    "ActantTimeoutError",
-    "ActorError",
-    "AlreadyExistsError",
     "AsyncResult",
-    "CapabilityMeta",
-    "ConfigError",
-    "EffectKind",
-    "FlowReplayError",
-    "InternalError",
-    "InvalidStateError",
+    "FlowHandle",
     "Layer",
-    "MetricsError",
-    "NetworkError",
-    "NodeEvent",
-    "NodeLifecycleHandler",
-    "NotFoundError",
-    "PayloadTooLargeError",
     "Ref",
-    "RetryCtx",
-    "RetryPolicyHandler",
-    "RouteCtx",
-    "RoutingHandler",
     "Runtime",
-    "ScheduleCtx",
-    "SchedulingHandler",
-    "SerializationError",
-    "StorageError",
-    "StoreHandler",
-    "StoreReq",
-    "Task",
-    "TaskCancelledError",
-    "TaskContext",
-    "TaskError",
-    "TaskEvent",
-    "TaskLifecycleHandler",
-    "TaskState",
-    "ValueStoreHandler",
-    "ValueStoreReq",
-    "WorkerError",
-    "WorkflowCancelledError",
-    "WorkflowError",
-    "WorkflowEvent",
-    "WorkflowFailedError",
-    "WorkflowLifecycleHandler",
     "__version__",
     "ask",
-    "ask_async",
-    "current_workflow_id",
-    "effect",
     "emit",
     "flow",
     "gather",
-    "gather_async",
-    "get_builtin_capability_meta",
     "get_current_runtime",
-    "get_task_context",
-    "impossible",
-    "metrics_text",
+    "host_flows",
     "perform",
-    "perform_async",
-    "perform_batch_async",
-    "register_flow_recovery",
-    "require_runtime",
-    "resume_flows",
-    "sleep_until",
-    "suspend",
+    "start_flow",
     "task",
     "use_runtime",
-    "wait_signal",
 ]

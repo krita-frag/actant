@@ -6,10 +6,11 @@
 1. ``test_node_kill_mid_workflow``：强杀执行节点，幸存节点降级存活且后续
    任务正常收敛（SLA：集群不因单节点死亡而失联）。
 2. ``test_node_kill_inflight_task_terminal_state``：执行节点死亡后在途任务
-   最终到达终态。失败转移新增"在途转发"处置腿：
-   心跳视图可见的失联 peer 直接终结其上的在途任务；连心跳都来不及被观测到
-   的目标（节点在首个心跳间隔前失联）则由主动直连探测判定。任务以
-   `WorkerError` 终结（fail-fast，不自动重跑）。
+   最终到达终态。直提任务（``submit_to``）转发时由 origin 登记租约；执行
+   节点失联后租约立即到期，Worker 递增 ``attempt`` 重新入队并重投到存活
+   节点，旧执行的迟到结果按 attempt fencing 丢弃。语义为 at-least-once：
+   重投成功则返回结果，重投预算（``crash_failover_max_attempts``）耗尽
+   则以 ``WorkerError`` 终结。
 3. ``test_node_restart_resume``：节点重启（store recover）后工作流状态恢复：
    工作流与节点状态跨重启保持 Completed，已完成任务不重跑（副作用计数不变）。
 4. ``test_out_of_order_results``：并发提交、乱序完成，结果按句柄正确聚合。
@@ -33,14 +34,14 @@ from typing import TYPE_CHECKING
 import pytest
 
 import actant
-from actant.task import gather, task
+from actant.tasks import gather, task
 from tests.python._helpers import reliability_tasks as rt_tasks
 from tests.python._helpers import wait_until
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-    from actant._runtime import Runtime
+    from actant._internal.runtime import Runtime
 
 # 用例总时长上限（秒）：含节点启动、故障注入与收敛等待。
 CASE_BUDGET_S = 60.0
@@ -137,7 +138,7 @@ def _marker_count(path: str, token: str) -> int:
 def node_kill_env(tmp_path) -> Iterator[tuple[Runtime, ChildNode]]:
     """幸存节点（进程内）+ 可强杀子进程节点，测试后保证子进程被回收。"""
     workdir = str(tmp_path)
-    rt = actant.Runtime.with_defaults(
+    rt = actant.Runtime(
         name="survivor",
         data_dir=os.path.join(workdir, "data-survivor"),
         max_concurrent_tasks=4,
@@ -206,21 +207,20 @@ class TestNodeKill:
                 "survivor node must keep completing tasks after peer death"
             )
 
-            # 在途任务由 failover 的在途转发腿终结为 WorkerError（见下一用例），
+            # 在途直提任务由租约重投到存活节点（见下一用例），
             # 但幸存节点不得被其拖垮：本用例只断言集群降级存活。
             assert time.monotonic() - started < CASE_BUDGET_S
 
     def test_node_kill_inflight_task_terminal_state(self, node_kill_env) -> None:
         """执行节点死亡后在途任务最终到达终态（SLA：任务不永久挂起）。
 
-        failover 的失联扫描新增"在途转发"处置腿——本节点转发出去、
-        结果未回的任务登记在 `FailoverManager::outbound`；peer 被判失联时这些
-        任务以 `TaskCompletion::Failed` 终结并经 event_bus 回灌（与远端结果同路），
-        提交方 `AsyncResult` 因此以 `WorkerError` 终止而非永久挂起。
+        直提任务转发时由 origin 登记租约；peer 被判失联后登记条目立即到期，
+        Worker 递增 ``attempt`` 重新入队并重投到存活节点，旧执行的迟到结果
+        按 attempt fencing 丢弃。语义为 at-least-once：重投成功则返回结果；
+        重投体自身超时则按正常超时失败；重投预算
+        （``crash_failover_max_attempts``）耗尽则以 ``WorkerError`` 终结。
 
-        语义为 **fail-fast**：执行节点失联不触发自动重跑（源节点没有"该任务未
-        执行完"的持久凭据，盲目重跑会静默重复副作用）。需要重跑请用显式重试策略
-        （`@task(retries=...)`）或重新提交。
+        重投会重新执行任务体，副作用可能发生两次——直提任务本就要求幂等。
         """
 
         rt, victim = node_kill_env
@@ -236,21 +236,16 @@ class TestNodeKill:
             )
             victim.kill()
 
-            # 轮询等待终态（给足 failover 检测窗口），终态 = 完成/失败/取消。
-            reached = wait_until(lambda: handle.done(), timeout_s=30.0, interval_s=0.5)
+            # 轮询等待终态：失联检测窗口 + 重投后重新执行（任务体 sleep 30s）。
+            reached = wait_until(lambda: handle.done(), timeout_s=50.0, interval_s=0.5)
             if not reached:
                 pytest.fail(
-                    f"in-flight task did not reach terminal state within 30s "
+                    f"in-flight task did not reach terminal state within 50s "
                     f"after executor node kill (state={handle.state!r})"
                 )
-            # 语义校验：任务未产出结果，必须以异常终结（不得伪装成功）。
+            # 语义校验：要么重投成功返回结果，要么重投后的执行以异常终结
+            # （硬超时 / 重投预算耗尽的 WorkerError）。
             assert handle.exception() is not None or handle.result(timeout=0) == "ok"
-            # 失联终结的错误串须能定位到死亡节点（验证 target_node 一路透传）。
-            exc = handle.exception()
-            if exc is not None:
-                assert victim.node_id in str(exc), (
-                    f"node-lost failure must identify the dead executor: {exc!r}"
-                )
 
 
 # ---------------------------------------------------------------------------
@@ -278,7 +273,7 @@ class TestNodeRestartResume:
         wf_id = ""
 
         # ---- 第一次启动：flow 真实执行并收敛到 Completed ----
-        rt_a = actant.Runtime.with_defaults(name="restart-node", data_dir=data_dir)
+        rt_a = actant.Runtime(name="restart-node", data_dir=data_dir)
         # WorkflowLifecycle 为 Python emit 能力，需在 start() 前链入。
         rt_a.layer("WorkflowLifecycle", "emit").chain(
             lambda e: wf_ids.append(e.workflow_id)
@@ -308,7 +303,7 @@ class TestNodeRestartResume:
             rt_a.stop()
 
         # ---- 重启（同 data_dir recover）：状态恢复 + 已完成不重跑 ----
-        rt_b = actant.Runtime.with_defaults(name="restart-node", data_dir=data_dir)
+        rt_b = actant.Runtime(name="restart-node", data_dir=data_dir)
         rt_b.start()
         try:
             assert wf_id, "workflow id must be captured from the first run"
@@ -370,8 +365,8 @@ def two_local_nodes():
 
     dir_a = tempfile.mkdtemp(prefix="actant-ooo-a-")
     dir_b = tempfile.mkdtemp(prefix="actant-ooo-b-")
-    rt_a = actant.Runtime.with_defaults(name="ooo-a", data_dir=dir_a)
-    rt_b = actant.Runtime.with_defaults(name="ooo-b", data_dir=dir_b)
+    rt_a = actant.Runtime(name="ooo-a", data_dir=dir_a)
+    rt_b = actant.Runtime(name="ooo-b", data_dir=dir_b)
     rt_a.start()
     rt_b.start()
     from tests.python._helpers import connect_peers
@@ -402,7 +397,7 @@ class TestWorkerKillIsolation:
            不拖垮批次内其他任务；
         3. 节点存活，后续任务正常执行。
         """
-        rt = actant.Runtime.with_defaults(name="worker-kill-node", data_dir=str(tmp_path / "data"))
+        rt = actant.Runtime(name="worker-kill-node", data_dir=str(tmp_path / "data"))
         rt.start()
         crash_once_marker = str(tmp_path / "crash_once.marker")
         crash_always_marker = str(tmp_path / "crash_always.marker")

@@ -105,7 +105,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    with Runtime.with_defaults() as rt:
+    with Runtime() as rt:
         # 订阅工作流生命周期事件（Rust 内部路径调用，需在 start 前注册）。
         rt.layer("WorkflowLifecycle", "emit").chain(on_lifecycle)
 

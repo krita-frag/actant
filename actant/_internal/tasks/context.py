@@ -1,6 +1,6 @@
 """任务执行上下文：协作式取消检查点与清理钩子。
 
-本模块是 ``actant.task`` 包的底层依赖，不引用包内其他子模块，避免循环导入。
+本模块是 ``actant.tasks`` 包的底层依赖，不引用包内其他子模块，避免循环导入。
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from typing import Any, Literal
 
 from actant.exceptions import TaskCancelledError
 
-_logger = logging.getLogger("actant.task")
+_logger = logging.getLogger("actant.tasks")
 
 #: 任务状态字面量类型。
 TaskState = Literal["pending", "running", "completed", "failed", "cancelled"]
@@ -26,7 +26,7 @@ class TaskContext:
     """任务执行上下文：协作式取消检查点与清理钩子。
 
     每个通过 ``Task.submit()`` 提交的任务都关联一个 ``TaskContext``，
-    任务函数内可通过 ``actant.get_task_context()`` 获取。它提供：
+    任务函数内可通过 ``actant.tasks.get_task_context()`` 获取。它提供：
 
     - ``is_cancelled()``：协作式检查点，任务应定期调用并优雅退出。
     - ``on_cancel(callback)``：注册清理钩子，取消时自动调用。
@@ -188,7 +188,7 @@ def get_task_context() -> TaskContext | None:
 
         @actant.task
         def long_running():
-            ctx = actant.get_task_context()
+            ctx = actant.tasks.get_task_context()
             for i in range(100):
                 if ctx is not None and ctx.is_cancelled():
                     return "cancelled"

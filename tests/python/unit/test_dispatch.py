@@ -1,12 +1,12 @@
-"""``actant.task._helpers._execute_with_retries`` 单元测试（不依赖 Runtime）。"""
+"""``actant._internal.tasks.helpers._execute_with_retries`` 单元测试（不依赖 Runtime）。"""
 from __future__ import annotations
 
 import cloudpickle
 
-from actant.exceptions import TaskCancelledError
-from actant.task._helpers import (
+from actant._internal.tasks.helpers import (
     _execute_with_retries,
 )
+from actant.exceptions import TaskCancelledError
 
 
 class _FakeCancelToken:

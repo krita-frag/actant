@@ -13,7 +13,8 @@ import time
 
 import pytest
 
-from actant import Runtime, current_workflow_id, flow, task
+from actant import Runtime, flow, task
+from actant.workflow import current_workflow_id
 
 
 class _Events:
@@ -68,7 +69,7 @@ class TestFlowOrchestration:
             return _store.submit(routed).result()
 
         events = _Events()
-        with Runtime.with_defaults() as rt:
+        with Runtime() as rt:
             rt.layer("WorkflowLifecycle", "emit").chain(events)
             result = pipeline(5)
 
@@ -90,7 +91,7 @@ class TestFlowOrchestration:
             return _store.submit(routed).result()
 
         events = _Events()
-        with Runtime.with_defaults() as rt:
+        with Runtime() as rt:
             rt.layer("WorkflowLifecycle", "emit").chain(events)
             with pytest.raises(ValueError):
                 pipeline(5)
@@ -118,7 +119,7 @@ class TestFlowOrchestration:
             return _store.submit(_transform.submit(raw)).result()
 
         events = _Events()
-        with Runtime.with_defaults() as rt:
+        with Runtime() as rt:
             rt.layer("WorkflowLifecycle", "emit").chain(events)
             result = pipeline(3)
             # _transform(3) = 7 → _store("ok-ish") 实际值以函数实现为准。
@@ -140,14 +141,14 @@ class TestFlowOrchestration:
 
         # flow 级不重试：函数体抛错直接传播，不重跑。
         # 任务级重试由 @task(retries=...) 承载（orchestrator 驱动）。
-        @flow(name="wf-retry", retries=1, retry_delay_ms=10)
+        @flow(name="wf-retry")
         def pipeline(src: int) -> int:
             attempts["n"] += 1
             if attempts["n"] == 1:
                 raise RuntimeError("first attempt fails")
             return src * 2
 
-        with Runtime.with_defaults(), pytest.raises(RuntimeError, match="first attempt"):
+        with Runtime(), pytest.raises(RuntimeError, match="first attempt"):
             pipeline(4)
 
         assert attempts["n"] == 1
@@ -163,7 +164,7 @@ class TestFlowOrchestration:
           自投递；否则本用例的函数体会永久挂起）。
         """
         from actant.exceptions import ActantTimeoutError
-        from actant.flow import current_workflow_id
+        from actant.workflow import current_workflow_id
 
         @task(name="it_slow")
         def slow() -> None:
@@ -176,7 +177,7 @@ class TestFlowOrchestration:
             seen["wf"] = current_workflow_id() or ""
             slow.submit().result()
 
-        with Runtime.with_defaults() as rt:
+        with Runtime() as rt:
             started = time.monotonic()
             with pytest.raises(ActantTimeoutError):
                 pipeline()
@@ -205,7 +206,7 @@ class TestFlowOrchestration:
         def pipeline() -> int:
             return 1 + 1
 
-        with Runtime.with_defaults() as rt:
+        with Runtime() as rt:
             rt.layer("WorkflowLifecycle", "emit").chain(events)
             assert pipeline() == 2
 
@@ -228,7 +229,7 @@ class TestFlowOrchestration:
             seen.append(current_workflow_id() or "")
             return _store.submit(_partition.submit(raw, raw)).result()
 
-        with Runtime.with_defaults() as rt:
+        with Runtime() as rt:
             assert pipeline(5) == "stored[ok:5:5]"
             dag = rt.get_dag(seen[0])
             # 执行状态（含 retry_count）仍在 get_workflow_state —— 二者不重复。
@@ -263,7 +264,7 @@ class TestFlowOrchestration:
 
     def test_get_dag_returns_none_for_unknown_workflow(self) -> None:
         """未知工作流 → ``None``（与 ``get_workflow_state`` 同款契约）。"""
-        with Runtime.with_defaults() as rt:
+        with Runtime() as rt:
             assert rt.get_dag("no-such-workflow") is None
 
     def test_get_workflow_history_exposes_event_stream(self) -> None:
@@ -283,7 +284,7 @@ class TestFlowOrchestration:
             seen.append(current_workflow_id() or "")
             return _store.submit(raw).result()
 
-        with Runtime.with_defaults() as rt:
+        with Runtime() as rt:
             assert pipeline(5) == "stored[5]"
             history = rt.get_workflow_history(seen[0])
 
@@ -305,14 +306,14 @@ class TestFlowOrchestration:
 
         # 游标：从中间读取应更短，且不与头部重叠。
         cursor = (history[2]["sequence"], history[2]["timestamp_ms"])
-        with Runtime.with_defaults():
+        with Runtime():
             pass
         tail_history: list[dict] = []
-        with Runtime.with_defaults() as rt2:
+        with Runtime() as rt2:
             tail_history = rt2.get_workflow_history(seen[0], after=cursor)
         assert len(tail_history) < len(history)
 
     def test_get_workflow_history_returns_empty_for_unknown_workflow(self) -> None:
         """未知工作流 → 空列表（历史是**可选**观测面，缺失不构成错误）。"""
-        with Runtime.with_defaults() as rt:
+        with Runtime() as rt:
             assert rt.get_workflow_history("no-such-workflow") == []

@@ -1,11 +1,11 @@
-"""``actant.task.gather`` 单元测试（mock AsyncResult，不依赖 Runtime）。"""
+"""``actant.tasks.gather`` 单元测试（mock AsyncResult，不依赖 Runtime）。"""
 from __future__ import annotations
 
 import pytest
 
+from actant._internal.tasks.async_result import _CompletionFuture
 from actant.exceptions import ActantTimeoutError
-from actant.task._async_result import _CompletionFuture
-from actant.task._gather import gather
+from actant.tasks import gather
 
 
 class _MockHandle:

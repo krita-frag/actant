@@ -1,4 +1,4 @@
-"""``actant.flow`` 运行时单元测试（依赖 Runtime）。"""
+"""``actant._internal.flow`` 运行时单元测试（依赖 Runtime）。"""
 from __future__ import annotations
 
 import importlib
@@ -10,9 +10,7 @@ import pytest
 from actant import Runtime, flow, task
 from actant.exceptions import ActantTimeoutError, InvalidStateError
 
-# `actant.flow` 属性被 actant/__init__ 的 re-export 覆盖为装饰器函数，
-# 需经 importlib 取模块对象。
-_flow_module = importlib.import_module("actant.flow")
+_flow_module = importlib.import_module("actant._internal.flow")
 
 
 @task
@@ -49,7 +47,7 @@ def test_flow_success() -> None:
     def my_flow(x: int) -> int:
         return _add_one.submit(x).result()  # type: ignore[no-any-return]
 
-    with Runtime.with_defaults() as rt:
+    with Runtime() as rt:
         events: list[str] = []
         rt.chain("WorkflowLifecycle", lambda e: events.append(e.kind))
         assert my_flow(5) == 6
@@ -63,7 +61,7 @@ def test_flow_failure() -> None:
     def my_flow() -> None:
         raise ValueError("boom")
 
-    with Runtime.with_defaults() as rt:
+    with Runtime() as rt:
         events: list[str] = []
         rt.chain("WorkflowLifecycle", lambda e: events.append(e.kind))
         with pytest.raises(ValueError, match="boom"):
@@ -79,12 +77,12 @@ def test_flow_body_error_does_not_retry() -> None:
     """
     _flow_retry_count["count"] = 0
 
-    @flow(retries=2, retry_delay_ms=0)  # type: ignore[untyped-decorator]
+    @flow  # type: ignore[untyped-decorator]
     def my_flow() -> str:
         _bump_flow_retry()
         raise RuntimeError("not yet")
 
-    with Runtime.with_defaults(), pytest.raises(RuntimeError, match="not yet"):
+    with Runtime(), pytest.raises(RuntimeError, match="not yet"):
         my_flow()
     assert _flow_retry_count["count"] == 1
 
@@ -101,7 +99,7 @@ def test_flow_timeout() -> None:
     def my_flow() -> str:
         return _slow_task.submit().result()  # type: ignore[no-any-return]
 
-    with Runtime.with_defaults(), pytest.raises(ActantTimeoutError) as excinfo:
+    with Runtime(), pytest.raises(ActantTimeoutError) as excinfo:
         my_flow()
 
     # 抛错源必须是工作流 deadline 归一，而不是别的路径恰好抛了同类异常。
@@ -121,7 +119,7 @@ def test_task_free_flow_deadline_has_no_host() -> None:
         time.sleep(0.2)
         return "done"
 
-    with Runtime.with_defaults():
+    with Runtime():
         assert my_flow() == "done"
 
 
@@ -130,7 +128,7 @@ def test_flow_with_name() -> None:
     def my_flow() -> int:
         return 42
 
-    with Runtime.with_defaults():
+    with Runtime():
         assert my_flow() == 42
 
 
@@ -139,25 +137,18 @@ def test_flow_no_parentheses() -> None:
     def my_flow() -> int:
         return 42
 
-    with Runtime.with_defaults():
+    with Runtime():
         assert my_flow() == 42
 
 
-def test_flow_invalid_retries() -> None:
-    with pytest.raises(ValueError, match="retries"):
-        @flow(retries=-1)  # type: ignore[untyped-decorator]
-        def my_flow() -> None:
-            return None
-
-
 def test_flow_workflow_id_in_context() -> None:
-    from actant.flow import current_workflow_id
+    from actant._internal.flow import current_workflow_id
 
     @flow
     def my_flow() -> str | None:
         return current_workflow_id()
 
-    with Runtime.with_defaults():
+    with Runtime():
         wid = my_flow()
         assert wid is not None
         assert "my_flow" in wid
@@ -183,7 +174,7 @@ def test_flow_failure_strategy_default_unchanged(
 ) -> None:
     """默认（未传 failure_strategy）外壳不携带策略——Rust 应用 FailFast 默认。"""
     captured: dict[str, object] = {}
-    with Runtime.with_defaults() as rt:
+    with Runtime() as rt:
         _spy_submit_workflow(rt, captured, monkeypatch)
 
         @flow  # type: ignore[untyped-decorator]
@@ -199,7 +190,7 @@ def test_flow_failure_strategy_continue_passthrough(
 ) -> None:
     """显式 ``failure_strategy="continue"`` 原样透传给 ``submit_workflow``。"""
     captured: dict[str, object] = {}
-    with Runtime.with_defaults() as rt:
+    with Runtime() as rt:
         _spy_submit_workflow(rt, captured, monkeypatch)
 
         @flow(failure_strategy="continue")  # type: ignore[untyped-decorator]
@@ -225,7 +216,7 @@ def test_flow_timeout_fails_without_reexecution(
         calls["count"] += 1
         return _slow_task.submit().result()  # type: ignore[no-any-return]
 
-    with Runtime.with_defaults(), pytest.raises(ActantTimeoutError):
+    with Runtime(), pytest.raises(ActantTimeoutError):
         my_flow()
     assert calls["count"] == 1
 
@@ -239,21 +230,21 @@ def test_flow_body_error_propagates_without_retry() -> None:
         calls["count"] += 1
         raise RuntimeError("not yet")
 
-    with Runtime.with_defaults(), pytest.raises(RuntimeError, match="not yet"):
+    with Runtime(), pytest.raises(RuntimeError, match="not yet"):
         my_flow()
     assert calls["count"] == 1
 
 
-def test_list_all_workflows_includes_completed() -> None:
-    """已完成工作流离开活跃列表，但存储遍历接口仍能枚举到它（历史记录）。
+def test_list_workflows_include_archived_includes_completed() -> None:
+    """已完成工作流离开活跃列表，但 ``include_archived=True`` 仍能枚举到它。
 
-    ``list_workflows`` 仅返回内存活跃非终态工作流；``list_all_workflows``
+    ``list_workflows()`` 仅返回内存活跃非终态工作流；``include_archived=True``
     以 ``STORE_KEY_DAG`` 前缀扫描 Store 并与活跃集合取并集，故已完成工作流
     仍可枚举，供面板展示历史。
     """
-    from actant.flow import current_workflow_id
+    from actant._internal.flow import current_workflow_id
 
-    with Runtime.with_defaults() as rt:
+    with Runtime() as rt:
         holder: dict[str, Any] = {}
 
         @flow(name="unit_hist_wf")  # type: ignore[untyped-decorator]
@@ -266,13 +257,13 @@ def test_list_all_workflows_includes_completed() -> None:
         # 终态工作流离开"活跃"列表。
         assert workflow_id not in rt.list_workflows()
         # 存储遍历接口仍能枚举到它。
-        assert workflow_id in rt.list_all_workflows()
+        assert workflow_id in rt.list_workflows(include_archived=True)
 
 
-def test_list_all_workflows_unstarted_raises() -> None:
-    """未启动的 Runtime 调用 ``list_all_workflows`` 抛 ``InvalidStateError``。"""
+def test_list_workflows_unstarted_raises() -> None:
+    """未启动的 Runtime 调用 ``list_workflows`` 抛 ``InvalidStateError``。"""
     rt = Runtime()
     with pytest.raises(InvalidStateError):
-        rt.list_all_workflows()
+        rt.list_workflows(include_archived=True)
 
 

@@ -1,4 +1,4 @@
-"""``actant.task._async_result`` 单元测试（不依赖 Runtime）。"""
+"""``actant._internal.tasks.async_result`` 单元测试（不依赖 Runtime）。"""
 from __future__ import annotations
 
 import importlib
@@ -6,11 +6,11 @@ import importlib
 import cloudpickle
 import pytest
 
+from actant._internal.tasks.async_result import AsyncResult
+from actant._internal.tasks.context import TaskContext
 from actant.exceptions import ActantError, ActantTimeoutError
-from actant.task._async_result import AsyncResult
-from actant.task._context import TaskContext
 
-_async_result_module = importlib.import_module("actant.task._async_result")
+_async_result_module = importlib.import_module("actant._internal.tasks.async_result")
 
 
 class _FakeRustCore:
@@ -137,7 +137,7 @@ def test_cancel_rust_core_failure_logged_but_continues(
     runtime._rust_core = _FailingCancelCore()
 
     monkeypatch.setattr(_async_result_module, "get_current_runtime", lambda: runtime)
-    with caplog.at_level("WARNING", logger="actant.task"):
+    with caplog.at_level("WARNING", logger="actant.tasks"):
         assert h.cancel() is True
     assert any(
         "cancel_task failed for" in rec.getMessage() for rec in caplog.records

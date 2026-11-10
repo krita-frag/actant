@@ -3,6 +3,32 @@
 与 Rust 侧 ActantError 枚举一一对应，确保跨层错误类型不丢失。
 """
 
+__all__ = [
+    "ActantError",
+    "ActantTimeoutError",
+    "ActorError",
+    "AlreadyExistsError",
+    "BlockingInEventLoopError",
+    "ConfigError",
+    "FlowReplayError",
+    "InternalError",
+    "InvalidStateError",
+    "MetricsError",
+    "NetworkError",
+    "NotFoundError",
+    "PayloadTooLargeError",
+    "SerializationError",
+    "StorageError",
+    "TaskCancelledError",
+    "TaskError",
+    "WorkerError",
+    "WorkflowCancelledError",
+    "WorkflowError",
+    "WorkflowFailedError",
+    "raise_for_kind",
+    "raise_for_state",
+]
+
 
 class ActantError(RuntimeError):
     """Actant 基础异常。"""
@@ -17,14 +43,17 @@ class _HintedActantError(ActantError):
 
     子类只需声明 `kind` 与 `hint` 两个类属性，构造时自动拼接 hint 后缀，
     避免大量子类重复同一份 __init__ 样板。`hint` 为空则与普通 ActantError
-    一致（如 `FlowReplayError`）。
+    一致（如 `FlowReplayError`）。个别抛出点若不属于该子类的典型场景
+    （如 `InvalidStateError` 表示"缺少 event loop"而非 Runtime 生命周期），
+    可传 ``hint=`` 覆盖，避免给出误导性建议。
     """
 
     kind: str = "internal"
     hint: str = ""
 
-    def __init__(self, message: str) -> None:
-        suffix = f" {self.hint}" if self.hint else ""
+    def __init__(self, message: str, *, hint: str | None = None) -> None:
+        effective = self.hint if hint is None else hint
+        suffix = f" {effective}" if effective else ""
         super().__init__(message + suffix, kind=self.kind)
 
 
@@ -132,6 +161,17 @@ class InvalidStateError(_HintedActantError):
     hint = " Ensure Runtime.start() has been called and the Runtime is not stopped/draining. Use 'with Runtime(...) as rt:' to manage lifecycle."
 
 
+class BlockingInEventLoopError(InvalidStateError):
+    """在运行中的 event loop 线程上执行阻塞等待。
+
+    阻塞会冻结整个循环；调用方应改用 ``await handle`` 或
+    ``await actant.aio.gather(...)``。
+    """
+
+    kind = "blocking_in_event_loop"
+    hint = " Use `await handle` or `await actant.aio.gather(...)` inside async code."
+
+
 class InternalError(_HintedActantError):
     """内部错误。"""
 
@@ -218,6 +258,7 @@ _KIND_TO_EXCEPTION: dict[str, type[ActantError]] = {
     "timeout": ActantTimeoutError,
     "cancelled": TaskCancelledError,
     "invalid_state": InvalidStateError,
+    "blocking_in_event_loop": BlockingInEventLoopError,
     "replay": FlowReplayError,
     "internal": InternalError,
 }
@@ -245,7 +286,7 @@ def raise_for_kind(kind: str, message: str) -> None:
 #
 #     ``[actant:KIND] message``
 #
-# Python 侧 ``_decode_error_kind`` 解析前缀，调用 ``raise_for_kind`` 重建子类。
+# Python 侧 ``decode_error_kind`` 解析前缀，调用 ``raise_for_kind`` 重建子类。
 # 无前缀的 error 字符串视为 ``task`` kind（任务执行失败的默认语义）。
 #
 # 编码格式选择 ``[actant:KIND] `` 而非 JSON：
@@ -255,19 +296,8 @@ def raise_for_kind(kind: str, message: str) -> None:
 _ERROR_KIND_PREFIX = "[actant:"
 
 
-def encode_error_kind(kind: str, message: str) -> str:
-    """将 kind 编码到错误消息前缀，供跨语言传播。
-
-    格式：``[actant:KIND] message``。
-
-    与 ``_decode_error_kind`` 配对使用。Rust 端生成 ``TaskCompletion::Failed``
-    时应使用此格式（Rust 端直接 ``format!`` 即可，无需调用 Python）。
-    """
-    return f"{_ERROR_KIND_PREFIX}{kind}] {message}"
-
-
 def decode_error_kind(error_str: str) -> tuple[str, str]:
-    """解析 ``encode_error_kind`` 编码的错误字符串。
+    """解析 ``[actant:KIND] message`` 前缀编码的错误字符串。
 
     无前缀时返回 ``("task", error_str)``（任务执行失败的默认 kind）。
 

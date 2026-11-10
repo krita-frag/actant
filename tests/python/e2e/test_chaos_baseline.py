@@ -9,7 +9,7 @@
    不丢、慢任务结束后全部收敛。
 
 断言只覆盖 SLA 契约（正确性、零丢失、最终收敛）；吞吐/内存为观测值，
-写入 ``docs/SLA_BASELINE.md`` 供人工对比，不设阈值门禁。任务函数来自
+写入 ``docs/operations/sla-baseline.md`` 供人工对比，不设阈值门禁。任务函数来自
 规范模块 ``tests.python._helpers.reliability_tasks``（原因见其 docstring）。
 """
 
@@ -24,13 +24,13 @@ from typing import TYPE_CHECKING
 import pytest
 
 import actant
-from actant.task import gather, task
+from actant.tasks import gather, task
 from tests.python._helpers import reliability_tasks as rt_tasks
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-    from actant._runtime import Runtime
+    from actant._internal.runtime import Runtime
 
 # 用例总时长上限（秒）。
 CASE_BUDGET_S = 60.0
@@ -57,7 +57,7 @@ def _env_line() -> str:
 @pytest.fixture
 def single_node(tmp_path) -> Iterator[Runtime]:
     """单节点 Runtime，测试后确保停止（避免残留 worker 子进程）。"""
-    rt = actant.Runtime.with_defaults(
+    rt = actant.Runtime(
         name="chaos-node",
         data_dir=str(tmp_path / "data"),
         max_concurrent_tasks=2,
@@ -72,7 +72,7 @@ def single_node(tmp_path) -> Iterator[Runtime]:
 @pytest.fixture
 def default_node(tmp_path) -> Iterator[Runtime]:
     """默认并发度的单节点 Runtime（max_concurrent_tasks = CPU 核数）。"""
-    rt = actant.Runtime.with_defaults(name="chaos-node-wide", data_dir=str(tmp_path / "data"))
+    rt = actant.Runtime(name="chaos-node-wide", data_dir=str(tmp_path / "data"))
     rt.start()
     try:
         yield rt
@@ -111,7 +111,7 @@ class TestLargeFanout:
     def test_large_fanout_throughput(self, default_node) -> None:
         """200 个 noop 任务一次性提交，全部正确聚合。
 
-        吞吐与内存峰值是 sideline 观测值：打印供 docs/SLA_BASELINE.md
+        吞吐与内存峰值是 sideline 观测值：打印供 docs/operations/sla-baseline.md
         记录，不参与断言（CI 机器噪声大，阈值门禁待基线稳定后再加）。
         """
         rss_before = _rss_peak_mib()

@@ -1,7 +1,12 @@
-"""``actant.flow`` 上下文辅助函数单元测试（不依赖 Runtime）。"""
+"""``actant._internal.flow`` 上下文辅助函数单元测试（不依赖 Runtime）。"""
 from __future__ import annotations
 
-from actant.flow import _deadline_failure, _FlowState, current_workflow_id
+from actant._internal.flow import (
+    _deadline_failure,
+    _FlowContext,
+    _FlowState,
+    current_workflow_id,
+)
 
 
 def test_current_workflow_id_outside_flow() -> None:
@@ -21,16 +26,11 @@ def test_flow_state_hands_off_deadline_without_local_judgement() -> None:
     assert not hasattr(state, "is_cancelled")
 
 
-def test_current_workflow_id_reads_local_state() -> None:
-    import importlib
-
-    flow_mod = importlib.import_module("actant.flow")
+def test_current_workflow_id_reads_context_state() -> None:
     state = _FlowState("wf-2")
-    flow_mod._flow_local.state = state
-    try:
+    with _FlowContext(state):
         assert current_workflow_id() == "wf-2"
-    finally:
-        del flow_mod._flow_local.state
+    assert current_workflow_id() is None
 
 
 class TestDeadlineFailurePredicate:

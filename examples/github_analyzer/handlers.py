@@ -13,7 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from actant import RetryCtx, RouteCtx, ScheduleCtx, emit
+from actant import emit
+from actant.capabilities import RetryCtx, RouteCtx, ScheduleCtx
 
 from .models import IssueRecord, RepoStats
 
@@ -45,9 +46,9 @@ class AnalyzeReq:
 class OwnerRouter:
     """按仓库 owner 路由到不同分析节点。
 
-    实现 ``RoutingHandler``：``__call__(ctx) -> str | None``。
+    实现自定义 ask handler：``__call__(ctx) -> str | None``。
     调用方通过 ``task_name`` 传入 ``owner/repo``，按 owner 哈希到分析节点池。
-    命中则返回目标节点，否则弃权（``None``）回退到默认 LocalRouter。
+    命中则返回目标节点，否则弃权（``None``）。
     """
 
     def __init__(self, nodes: list[str]) -> None:
@@ -67,8 +68,8 @@ class OwnerRouter:
 class PrFirstScheduler:
     """PR 优先 + FIFO 调度。
 
-    实现 ``SchedulingHandler``。``pending`` 中以 ``PR:`` 开头的任务优先；
-    无则回退 FIFO（返回队首）。
+    实现自定义 ask handler。``pending`` 中以 ``PR:`` 开头的任务优先；
+    无则弃权（返回 ``None``）。
     """
 
     PREFIX = "PR:"
@@ -88,8 +89,7 @@ class ExponentialBackoffRetry:
     ``attempt < max_retries`` 时返回 ``True``（重试），并触发一次 ``Audit``
     事件记录决策（演示 handler 内组合 effect）。超出上限返回 ``None``（放弃）。
 
-    约定 ``attempt`` 从 1 起算（首次失败 attempt=1），与默认 ``DefaultRetryPolicy``
-    的 ``<`` 语义保持一致。
+    约定 ``attempt`` 从 1 起算（首次失败 attempt=1）。
     """
 
     def __init__(self, max_retries: int = 3) -> None:
@@ -148,7 +148,7 @@ class GithubFetcher:
     """GitHub issues 拉取器（自定义 perform capability）。
 
     委托 ``github_client.load_or_fetch``：缓存命中读本地，否则真实 HTTP。
-    失败时直接抛出异常，交由调用方通过 ``RetryPolicy`` 决策重试。
+    失败时直接抛出异常，交由调用方决定是否重试。
     """
 
     def __call__(self, req: FetchReq) -> list[IssueRecord]:

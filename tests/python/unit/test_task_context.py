@@ -1,4 +1,4 @@
-"""``actant.task._context`` 单元测试（不依赖 Runtime）。"""
+"""``actant._internal.tasks.context`` 单元测试（不依赖 Runtime）。"""
 from __future__ import annotations
 
 import threading
@@ -6,8 +6,8 @@ import time
 
 import pytest
 
+from actant._internal.tasks.context import TaskContext, _task_context_scope
 from actant.exceptions import TaskCancelledError
-from actant.task._context import TaskContext, _task_context_scope
 
 
 def test_task_context_initially_not_cancelled() -> None:
@@ -89,7 +89,7 @@ def test_task_context_callbacks_are_sequential_and_swallow_exceptions() -> None:
 
 
 def test_task_context_scope_sets_and_restores() -> None:
-    from actant.task._context import get_task_context
+    from actant._internal.tasks.context import get_task_context
 
     prev = TaskContext("prev")
     next_ctx = TaskContext("next")
@@ -101,7 +101,7 @@ def test_task_context_scope_sets_and_restores() -> None:
 
 
 def test_get_task_context_outside_scope_returns_none() -> None:
-    from actant.task._context import get_task_context
+    from actant._internal.tasks.context import get_task_context
 
     assert get_task_context() is None
 

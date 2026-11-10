@@ -1,44 +1,10 @@
 """worker 子进程循环（进程池执行后端）。
 
-入口：``python -m actant.task._worker``。由 Rust `ProcessTaskDispatcher`
-通过长度前缀二进制帧 IPC 驱动。子进程是纯 Python 解释器，不持有 Rust 核心、
-不依赖 iroh / PyO3，职责收敛为「读帧 → 反序列化 → 执行 → 回传结果」。
+入口：``python -m actant._internal.tasks.worker``。由 Rust `ProcessTaskDispatcher`
+通过长度前缀二进制帧 IPC 驱动；子进程是纯 Python 解释器，不持有 Rust 核心，
+职责收敛为「读帧 → 反序列化 → 执行 → 回传结果」。
 
-帧协议（双向，Rust ↔ Python）：
-
-- 传输层：stdio pipe，每帧为 ``[4 字节小端长度][1 字节类型][正文]`` 连续写入
-  管道（与 Rust `ProcessTaskDispatcher` 一致）。
-- Rust → Python：
-  - ``Dispatch`` (0x01)：正文 = v2 载荷 = 紧凑控制头部 + ``cloudpickle(func, args,
-    kwargs)``。头部布局见 ``_parse_dispatch_payload``；控制元数据（retries /
-    retry_delay_ms / task_id / workflow_id）内联为二进制头部，仅函数载荷走 cloudpickle。
-  - ``Cancel`` (0x02)：正文空。请求协作取消当前任务。
-  - ``Shutdown`` (0x03)：正文空。优雅退出循环。
-- Python → Rust：
-  - ``Result`` (0x02)：正文 = ``cloudpickle.dumps((success, payload_obj))``，
-    与线程池后端 generic handler 的返回格式完全一致，调用方无缝兼容。
-
-序列化器复用：worker 单任务单线程模型（同一时刻至多执行一个任务），模块级复用
-cloudpickle ``Pickler`` 绑定的 ``BytesIO`` 与读取用 ``BytesIO``，避免每任务新建序列化
-器/缓冲。``Pickler`` 每次 dump 前 ``clear_memo()`` 防 memo 串扰；Unpickler 实例不复用
-（跨 pickle 状态不安全），仅复用输入缓冲区经 ``cloudpickle.load`` 读入。
-
-指标边带：子进程自身计时（如任务执行耗时）通过 stderr 单行上报，格式
-``actant_metric: <name>=<value_ms>``。Rust 侧 ``drain_stderr`` 识别该前缀并
-汇入对应 OTel histogram；其余 stderr 行原样转发为日志。任务得/失败由 Rust
-在父进程依据 Result 帧与超时判定计入 counters，无需子进程上报。
-
-任务日志边带：任务执行期间，``logging`` 输出与 ``print``（stdout
-文本层）被捕获为 ``actant_log: <ts_ms> <level> <task_id> <message>`` 单行写入
-stderr，父进程 ``drain_stderr`` 发布为 ``TaskLog`` 事件（tap 语义，可丢）。
-**stdout 帧通道不可触碰**：捕获仅替换 ``sys.stdout`` 文本包装层——帧写入用的是
-main() 启动时捕获的 raw buffer（``sys.stdout.buffer``），不受代理影响；这同时
-修复了任务内 ``print`` 直写 fd 1 会损坏帧流的隐患。
-
-取消模型：线程读取 stdin 期间持续处理 ``Cancel`` 帧；``Cancel`` 到达时设置
-当前任务（或待分配的下一个任务）的取消事件。执行线程在 ``_execute_with_retries``
-的尝试间检查点 / ``_interruptible_sleep`` 段内协作退出。Rust 侧负责硬超时后的
-强杀回收，本进程只做协作配合。
+帧协议、指标 / 日志边带与取消模型见 ``docs/architecture/worker-model.md``。
 """
 
 from __future__ import annotations
@@ -56,13 +22,13 @@ from typing import Any
 
 import cloudpickle
 
-from actant.task._context import _DispatchTaskContext, _task_context_scope
-from actant.task._helpers import (
+from actant._internal.tasks.context import _DispatchTaskContext, _task_context_scope
+from actant._internal.tasks.helpers import (
     _PAYLOAD_VERSION,
     MAX_FRAME_BYTES,
     _execute_with_retries,
 )
-from actant.task._ref import _resolve_ref_arg
+from actant._internal.tasks.ref import _resolve_ref_arg
 
 # 帧类型常量（与 Rust `ProcessTaskDispatcher` 保持一致）。
 FRAME_DISPATCH = 0x01
@@ -229,7 +195,7 @@ def _parse_dispatch_payload(
 ) -> tuple[int, int, str, str, bytes]:
     """解析 v2 Dispatch 正文，返回 ``(retries, retry_delay_ms, task_id, workflow_id, func_payload)``。
 
-    头部布局与 ``actant/task/_helpers.py::_build_v2_envelope`` 保持一致（小端）：:
+    头部布局与 ``actant/_internal/tasks/helpers.py::_build_v2_envelope`` 保持一致（小端）：:
 
         u8   version   = ``_PAYLOAD_VERSION`` (0x02)
         u32  retries
@@ -499,7 +465,7 @@ def _run_dispatch(payload: bytes, cancel_event: threading.Event) -> bytes:
             task_id, workflow_id, token, silent=True,
         )
     # 任务实际执行时段内（含重试的全部尝试）耗时上报到 stderr 边带，由父进程
-    # drain_stderr 汇入 actant.task.handler_ms 直方图——保持进程池隔离后可观测性
+    # drain_stderr 汇入 actant.tasks.handler_ms 直方图——保持进程池隔离后可观测性
     # 不丢失。指标名与 Rust 侧 METRIC_TASK_HANDLER_MS 是跨语言契约，改名须两侧同步。
     _emit_metric("task.handler_ms", _elapsed_ms(time.monotonic() - t0))
     return _pack_result(success, payload_obj)
@@ -558,10 +524,29 @@ def _reader_loop(
             return
 
 
+def _restore_process_state(cwd: str, env: dict[str, str]) -> None:
+    """把 worker 的工作目录与环境变量恢复到进程启动时的基线。
+
+    任务代码可能 ``os.chdir`` 或修改 ``os.environ``；不恢复会污染同一 worker
+    进程里的后续任务。恢复失败只记录到 stderr（父进程转发为日志），不中断
+    结果回传。
+    """
+    try:
+        os.chdir(cwd)
+    except OSError as exc:
+        print(f"actant worker: failed to restore cwd {cwd!r}: {exc}", file=sys.stderr)
+    for key in set(os.environ) - set(env):
+        os.environ.pop(key, None)
+    os.environ.update(env)
+
+
 def main() -> int:
     stdin = sys.stdin.buffer
     stdout = sys.stdout.buffer
     stderr = sys.stderr
+    # 基线在读取任何任务前捕获；每个任务结束后恢复，保证任务间隔离。
+    baseline_cwd = os.getcwd()
+    baseline_env = dict(os.environ)
 
     # 无界任务队列：同一时刻至多一个任务在执行（进程池每进程一任务），
     # 队列仅缓冲「Dispatch 已读取、主线程尚未启动」的窗口，不会堆积。
@@ -590,6 +575,7 @@ def main() -> int:
             result = _pack_result(False, _ensure_exception(exc))
         finally:
             cancel_holder.clear_current()
+            _restore_process_state(baseline_cwd, baseline_env)
         try:
             _write_frame(stdout, FRAME_RESULT, result)
         except Exception as exc:

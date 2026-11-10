@@ -29,7 +29,7 @@ class MetricsHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
-with actant.Runtime.with_defaults(name="metrics-example") as rt:
+with actant.Runtime(name="metrics-example") as rt:
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 9100), MetricsHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     print("metrics on http://127.0.0.1:9100/metrics, Ctrl+C to stop")

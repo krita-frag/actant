@@ -1,7 +1,7 @@
 """``Task`` 类与 ``@task`` 装饰器。
 
-依赖 ``_async_result``（``AsyncResult`` / ``_resolve_args_with_deps``）、``_context``
-（``TaskContext``）、``_helpers``（``_safe_serialize``）。``actant.flow`` 与
+依赖 ``async_result``（``AsyncResult`` / ``_resolve_args_with_deps``）、``context``
+（``TaskContext``）、``helpers``（``_safe_serialize``）。``actant._internal.flow`` 与
 ``actant.actant`` 的引用延迟导入，避免循环依赖。
 """
 
@@ -13,17 +13,18 @@ from collections.abc import Callable, Iterable
 from functools import wraps
 from typing import Any
 
-from actant._runtime import get_current_runtime
-from actant.exceptions import InvalidStateError
-from actant.task._async_result import AsyncResult, _resolve_args_with_deps
-from actant.task._context import TaskContext
-from actant.task._helpers import (
+from actant._internal.runtime import get_current_runtime
+from actant._internal.tasks.async_result import AsyncResult, _resolve_args_with_deps
+from actant._internal.tasks.backend import resolve_submit_backend
+from actant._internal.tasks.context import TaskContext
+from actant._internal.tasks.helpers import (
     _is_coroutine_function,
     _run_coroutine_on_worker_thread,
     _safe_serialize,
 )
+from actant.exceptions import InvalidStateError
 
-_logger = logging.getLogger("actant.task")
+_logger = logging.getLogger("actant.tasks")
 
 
 def _unpack_item(
@@ -32,7 +33,7 @@ def _unpack_item(
 ) -> tuple[tuple[Any, ...], dict[str, Any]]:
     """按 ``unpack`` 语义解包 ``submit_batch`` 的单个元素。
 
-    支持 ``(args,)`` / ``(args, kwargs)`` 两种形式（与 ``starmap`` 一致）；
+    支持 ``(args,)`` / ``(args, kwargs)`` 两种形式；
     ``unpack=False`` 时元素整体作为唯一位置参数。
     """
     if not unpack:
@@ -53,10 +54,11 @@ class Task:
     Args:
         func: 被包装的函数。
         name: 任务名称（默认 ``模块.函数名``）。
-        timeout_ms: 每次尝试的超时（毫秒），0 表示无超时。
+        timeout_ms: 每次尝试的超时（毫秒）。0 表示不设任务级超时，落到
+            ``default_task_timeout_ms``（默认 30s）。
         retries: 失败后重试次数（默认 0，不重试）。
         retry_delay_ms: 重试间隔（毫秒，默认 0）。
-        tags: 任务标签列表，供 Routing capability 的 ``RouteCtx.tags`` 使用。
+        tags: 任务标签列表，与节点 ``node_labels`` 匹配后才允许放置。
         priority: 任务优先级（有符号整数，越大越优先）。
         silent: ``True`` 时跳过 TaskLifecycle 事件发布（started/completed/
             failed/retried/cancelled 均不 emit）。用于高吞吐批量提交场景，
@@ -76,6 +78,7 @@ class Task:
         retries: int = 0,
         retry_delay_ms: int = 0,
         tags: list[str] | None = None,
+        quota: str | None = None,
         priority: int | None = None,
         silent: bool = False,
     ) -> None:
@@ -85,6 +88,7 @@ class Task:
         self._retries = retries
         self._retry_delay_ms = retry_delay_ms
         self._tags = list(tags) if tags else []
+        self._quota = quota
         self._priority = priority
         self._silent = silent
         # 保留原函数的元数据，使 Task 可被 functools.wraps / inspect 等工具识别。
@@ -97,6 +101,16 @@ class Task:
     @property
     def func(self) -> Callable[..., Any]:
         return self._func
+
+    @property
+    def tags(self) -> list[str]:
+        """任务放置诉求（标签选择器）。"""
+        return list(self._tags)
+
+    @property
+    def quota(self) -> str | None:
+        """任务所需的命名配额。"""
+        return self._quota
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         """本地同步调用（等价于原函数）。
@@ -122,7 +136,12 @@ class Task:
             return _run_coroutine_on_worker_thread(coro)
         return self._func(*args, **kwargs)
 
-    def submit(self, *args: Any, **kwargs: Any) -> AsyncResult:
+    def submit(
+        self,
+        *args: Any,
+        idempotency_key: str | None = None,
+        **kwargs: Any,
+    ) -> AsyncResult:
         """异步提交任务到分布式 Worker，返回 ``AsyncResult`` 句柄。
 
         将函数与参数用 cloudpickle 序列化为 payload，通过
@@ -132,16 +151,38 @@ class Task:
         **任务依赖**：参数中的 ``AsyncResult`` 会自动阻塞解析为其结果，
         使 ``b.submit(a.submit(x))`` 表达依赖关系。
 
+        Args:
+            idempotency_key: 可选的提交幂等键。同一 Runtime 生命周期内用同一
+                键重复提交**不会**产生第二个任务，而是返回首次提交的句柄
+                （并发提交也只入队一次）。键不比对参数：复用键即声明"这是同一次
+                提交"，首次参数为准。已取消/已失败的句柄同样原样返回。
+                键随节点 ``data_dir`` 的 Store 持久化：重启或换进程后同键再提交
+                抛 ``AlreadyExistsError``（消息含首次 ``task_id``），不产生第二次
+                执行；该句柄已不在内存中，首次结果请用
+                ``Runtime.get_task_result(task_id)`` 查询。键基数由调用方
+                控制，未做 TTL/上限裁剪。
+                注意：本参数为保留关键字，任务函数不能收到同名实参。
+
         Raises:
             InvalidStateError: 无活跃 Runtime。
+            ValueError: ``idempotency_key`` 为空字符串或非字符串。
+            AlreadyExistsError: 该键已在当前 ``data_dir`` 提交过，且本进程无对应
+                句柄（如重启后）。
         """
-        return self._submit(args, kwargs, target_node=None, target_endpoint_addr=None)
+        return self._submit(
+            args,
+            kwargs,
+            target_node=None,
+            target_endpoint_addr=None,
+            idempotency_key=idempotency_key,
+        )
 
     def submit_to(
         self,
         target_node: str,
         *args: Any,
         endpoint_addr: str | None = None,
+        idempotency_key: str | None = None,
         **kwargs: Any,
     ) -> AsyncResult:
         """异步提交任务到指定远程 Worker。
@@ -150,6 +191,7 @@ class Task:
             target_node: 目标 Actant ``node_id``。
             endpoint_addr: 目标 ``listen_addresses()["endpoint_addr"]``。
                 若省略，使用 ``target_node`` 作为直连地址。
+            idempotency_key: 提交幂等键，语义同 :meth:`submit`。
 
         Note:
             **执行节点失联时为 fail-fast，不自动重跑**：被指定的节点
@@ -163,6 +205,7 @@ class Task:
             kwargs,
             target_node=target_node,
             target_endpoint_addr=endpoint_addr or target_node,
+            idempotency_key=idempotency_key,
         )
 
     def _submit(
@@ -172,43 +215,22 @@ class Task:
         *,
         target_node: str | None,
         target_endpoint_addr: str | None,
+        idempotency_key: str | None = None,
     ) -> AsyncResult:
-        runtime = get_current_runtime()
-        if runtime is None:
+        backend = resolve_submit_backend()
+        if backend is None:
             raise InvalidStateError(
                 "task.submit: no active Runtime; "
                 "wrap your code in `with actant.Runtime() as rt:`"
             )
-
-        # 单遍解析参数：把上游 AsyncResult 解析为其结果值，同时收集其 task_id
-        # 作为编排依赖边（解析与收集合并一次遍历，避免两遍重复递归）。
-        resolved_args, resolved_kwargs, deps = _resolve_args_with_deps(args, kwargs)
-
-        # 判定：FlowContext 活跃 → orchestrator 驱动的持久化编排路径；
-        # 否则保持独立 @task 直调的任务队列语义不变。
-        from actant.flow import current_flow_state
-
-        flow_state = current_flow_state()
-        if flow_state is not None:
-            return self._flow_submit(
-                runtime, flow_state, resolved_args, resolved_kwargs, deps,
-            )
-
-        task_id, _workflow_id, _payload, _task_ctx, handle, task_def = self._prepare_task_def(
-            resolved_args, resolved_kwargs,
-            target_node=target_node, target_endpoint_addr=target_endpoint_addr,
-            runtime=runtime,
+        return backend.submit_task(
+            self,
+            args,
+            kwargs,
+            target_node=target_node,
+            target_endpoint_addr=target_endpoint_addr,
+            idempotency_key=idempotency_key,
         )
-        core = runtime._rust_core
-        if core is None:
-            runtime.unregister_task(task_id)
-            raise InvalidStateError("Runtime not started: rust_core is None")
-        try:
-            core.submit_task(task_def)
-        except Exception:
-            runtime.unregister_task(task_id)
-            raise
-        return handle
 
     def _flow_submit(
         self,
@@ -221,7 +243,7 @@ class Task:
         """flow 上下文内的提交路径：生成节点 → 持久化 → orchestrator 派发。
 
         节点标识 ``{任务名}-{序号}-{workflow_id}`` 确定性生成（跨重放稳定）；依赖边来自参数树引用的上游节点（``_resolve_args_with_deps``，
-        上游结果已阻塞解析并内联进 payload）；经 ``add_workflow_node`` 先持久化
+        上游结果已阻塞解析并内联进 payload）；经 ``_add_workflow_node`` 先持久化
         再派发。重放命中历史时（节点已存在且指纹一致）不重新提交：已完成 →
         返回记录结果的句柄；进行中 → 返回绑定句柄。
         """
@@ -240,7 +262,7 @@ class Task:
         # 工作流级 deadline）；空 flow 不创建工作流。
         # 经 flow 侧的唯一入口创建，顺带在真正建槽**之后**广播 submitted/started
         # ——创建只此一处，事件时序才能稳定；各自实现一遍会让时序漂移。
-        from actant.flow import _ensure_workflow_created
+        from actant._internal.flow import _ensure_workflow_created
 
         _ensure_workflow_created(runtime, state)
 
@@ -257,14 +279,18 @@ class Task:
             task_id=task_id,
             name=self._name,
             payload=_payload,
-            retry=retry,
             timeout_ms=self._timeout_ms if self._timeout_ms > 0 else None,
             priority=self._priority,
+            tags=self._tags,
+            quota=self._quota,
         )
-        outcome = runtime.add_workflow_node(state.workflow_id, node, deps)
+        # retry 经属性设置：`_DagNode` 构造器只收位置/放置参数，避免参数列
+        # 继续膨胀。
+        node.retry = retry
+        outcome = runtime._add_workflow_node(state.workflow_id, node, deps)
         if not outcome.get("created"):
             # 重放命中：按历史状态重建句柄，不重新提交、不重跑。
-            from actant.flow import _replay_node_outcome
+            from actant._internal.flow import _replay_node_outcome
 
             _replay_node_outcome(runtime, handle, outcome)
         return handle
@@ -300,7 +326,7 @@ class Task:
         if task_id is None:
             task_id = f"{self._name}-{uuid.uuid4().hex[:8]}"
         # 从 flow 上下文继承 workflow_id，使 TaskEvent 归属正确。
-        from actant.flow import current_workflow_id
+        from actant._internal.flow import current_workflow_id
 
         workflow_id = current_workflow_id() or ""
 
@@ -308,15 +334,15 @@ class Task:
         # 1. 参数树中的 Ref（上游大结果 / 用户显式传入）→ _RefArg 帧内联字节
         #    （blob 字节原样搬运，无对象级序列化）。
         # 2. 直传大值（> REF_INLINE_THRESHOLD）→ 落 blob + _RefArg。
-        from actant.task._ref import _degrade_large_values, _materialize_refs
+        from actant._internal.tasks.ref import _degrade_large_values, _materialize_refs
 
         def _fetch(rb: bytes) -> bytes:
-            from actant.task._ref import _value_fetch
+            from actant._internal.tasks.ref import _value_fetch
 
             return _value_fetch(rb, runtime=runtime)
 
         def _store(data: bytes) -> bytes:
-            from actant.task._ref import _value_store
+            from actant._internal.tasks.ref import _value_store
 
             return _value_store(data, runtime=runtime)
 
@@ -364,6 +390,9 @@ class Task:
             target_node=target_node,
             target_endpoint_addr=target_endpoint_addr,
             timeout_ms=self._timeout_ms if self._timeout_ms > 0 else None,
+            tags=self._tags,
+            quota=self._quota,
+            priority=self._priority,
         )
         return task_id, workflow_id, payload, task_ctx, handle, task_def
 
@@ -374,6 +403,7 @@ class Task:
         target_node: str | None = None,
         target_endpoint_addr: str | None = None,
         unpack: bool = False,
+        batch_id: str | None = None,
     ) -> list[AsyncResult]:
         """批量提交多个任务，返回 ``AsyncResult`` 列表。
 
@@ -397,12 +427,12 @@ class Task:
 
         Args:
             items: 可迭代对象，每个元素作为 ``submit`` 的唯一位置参数。
-                与 ``map`` 一致。
             target_node: 路由目标节点 ID（可选）。
             target_endpoint_addr: 路由目标 endpoint 地址（可选）。
             unpack: ``True`` 时每个元素解包为 ``(args, kwargs)`` 或 ``args``
-                tuple。与 ``starmap`` 一致。``False``（默认）时元素整体作为
-                唯一位置参数。
+                tuple。``False``（默认）时元素整体作为唯一位置参数。
+            batch_id: 可选的批次标识。提供时本批任务注册为 batch/array job，
+                逐项终态进度可经 ``Runtime.batch_progress(batch_id)`` 查询。
 
         Returns:
             ``AsyncResult`` 列表，顺序与输入 ``items`` 一致。
@@ -415,13 +445,13 @@ class Task:
 
             @actant.task
             def square(x): return x * x
-            with actant.Runtime.with_defaults():
+            with actant.Runtime():
                 handles = square.submit_batch([1, 2, 3, 4, 5])
                 results = actant.gather(*handles)  # [1, 4, 9, 16, 25]
 
             @actant.task
             def add(a, b): return a + b
-            with actant.Runtime.with_defaults():
+            with actant.Runtime():
                 handles = add.submit_batch([(1, 2), (3, 4)], unpack=True)
                 results = actant.gather(*handles)  # [3, 7]
         """
@@ -435,10 +465,17 @@ class Task:
         # 判定：flow 上下文中逐项走 orchestrator 驱动的编排路径（节点
         # 先持久化再派发），不做批量直调——编排节点的持久化与派发裁决必须
         # 逐节点进行。批量快路径仅保留给独立 @task（任务队列语义）。
-        from actant.flow import current_flow_state
+        from actant._internal.flow import _current_flow_state
 
-        flow_state = current_flow_state()
+        flow_state = _current_flow_state()
         if flow_state is not None:
+            # 编排节点的持久化与派发裁决必须逐节点进行；batch 成员索引需在
+            # 派发前建立，当前 flow 路径无法满足该顺序，故拒绝而非静默丢进度。
+            if batch_id is not None:
+                raise InvalidStateError(
+                    "submit_batch(batch_id=...) is not supported inside an @flow; "
+                    "use standalone @task submission for batch progress tracking"
+                )
             handles: list[AsyncResult] = []
             for item in items:
                 raw_args, raw_kwargs = _unpack_item(item, unpack)
@@ -479,66 +516,21 @@ class Task:
             raise
 
         # 一次性提交到 Rust scheduler。
+        # batch 必须在提交前注册：任务可能在提交返回后立即完成，终态事件
+        # 到达时若成员索引尚未建立，该项进度会永久丢失。
+        if batch_id is not None:
+            core.register_batch(batch_id, registered_ids)
         task_defs = [td for _, _, _, _, td in prepared]
         try:
             core.submit_tasks_batch(task_defs)
         except Exception:
             for tid in registered_ids:
                 runtime.unregister_task(tid)
+            if batch_id is not None:
+                core.remove_batch(batch_id)
             raise
 
         return [handle for _, _, _, handle, _ in prepared]
-
-    def delay(self, *args: Any, **kwargs: Any) -> AsyncResult:
-        """``submit`` 的别名（Celery 风格）。"""
-        return self.submit(*args, **kwargs)
-
-    def map(self, iterable: Iterable[Any]) -> list[AsyncResult]:
-        """对 iterable 中每个元素提交一个任务，返回 ``AsyncResult`` 列表。
-
-        等价于 ``[self.submit(x) for x in xs]``，但内部走 ``submit_batch``
-        批量路径，单次 Rust 调用投递所有 TaskDefinition，比循环 ``submit``
-        快 10-50×。
-
-        Args:
-            iterable: 可迭代对象，每个元素作为 ``submit`` 的唯一位置参数。
-
-        Returns:
-            ``AsyncResult`` 列表，顺序与输入一致。
-
-        用法::
-
-            @actant.task
-            def square(x): return x * x
-            with actant.Runtime.with_defaults():
-                handles = square.map([1, 2, 3])  # 并行批量提交 3 个任务
-                results = actant.gather(*handles)  # [1, 4, 9]
-        """
-        return self.submit_batch(iterable)
-
-    def starmap(self, iterable: Iterable[Any]) -> list[AsyncResult]:
-        """对 iterable 中每个元素解包后提交任务。
-
-        等价于 ``[self.submit(*args) for args in iterable]``，但内部走
-        ``submit_batch(unpack=True)`` 批量路径，单次 Rust 调用投递所有
-        TaskDefinition，对标 ``itertools.starmap`` / Prefect ``task.map(unpack=True)``。
-
-        Args:
-            iterable: 可迭代对象，每个元素为 ``tuple``/``list``，解包后作为
-                ``submit`` 的位置参数。
-
-        Returns:
-            ``AsyncResult`` 列表。
-
-        用法::
-
-            @actant.task
-            def add(a, b): return a + b
-            with actant.Runtime.with_defaults():
-                handles = add.starmap([(1, 2), (3, 4)])
-                results = actant.gather(*handles)  # [3, 7]
-        """
-        return self.submit_batch(iterable, unpack=True)
 
     def __repr__(self) -> str:
         return f"Task(name={self._name!r})"
@@ -552,6 +544,7 @@ def task(
     retries: int = 0,
     retry_delay_ms: int = 0,
     tags: list[str] | None = None,
+    quota: str | None = None,
     priority: int | None = None,
     silent: bool = False,
 ) -> Any:
@@ -571,6 +564,10 @@ def task(
         def train(model):
             ...
 
+        @actant.task(quota="gpu")  # 最多并发执行 N 个（N 由节点配置）
+        def gpu_job(data):
+            ...
+
         @actant.task(silent=True)  # 不发 TaskLifecycle 事件，高吞吐场景
         def bulk_noop(x):
             return x
@@ -578,13 +575,16 @@ def task(
     Args:
         func: 被装饰的函数。为 ``None`` 时返回装饰器工厂（支持参数化装饰）。
         name: 任务名称（默认为 ``模块.函数名``）。
-        timeout_ms: 每次尝试的超时（毫秒），0 表示无超时。
-        retries: 失败重试次数（默认 0）。重试由 generic handler 执行。
+        timeout_ms: 每次尝试的超时（毫秒）。0 表示不设任务级超时，落到
+            ``default_task_timeout_ms``（默认 30s）。
+        retries: 失败重试次数（默认 0）。重试由 Rust Worker 执行。
         retry_delay_ms: 重试间隔（毫秒，默认 0）。
-        tags: 任务标签列表，供 Routing capability 的 ``RouteCtx.tags`` 使用。
-            路由 handler 可基于 tags 决定任务路由目标节点。
-        priority: 任务优先级（有符号整数，越大越优先），供 Scheduling capability
-            的优先级调度器使用。``None`` 表示使用调度器默认优先级。
+        tags: 任务标签列表，与节点 ``node_labels`` 匹配后才允许放置。
+        quota: 任务所需的命名配额（如 ``"gpu"``）。执行节点按
+            ``_ActantConfig(node_quotas={...})`` 声明的容量原子扣减；耗尽时
+            任务延后重入队而非失败。``None`` 表示不占用配额。
+        priority: 任务优先级（有符号整数，越大越优先），供 Rust 调度器使用。
+            ``None`` 表示使用调度器默认优先级。
         silent: ``True`` 时跳过 TaskLifecycle 事件发布。用于高吞吐批量提交
             场景，避免 event_bus 噪声。默认 ``False``。
     """
@@ -597,6 +597,7 @@ def task(
             retries=retries,
             retry_delay_ms=retry_delay_ms,
             tags=tags,
+            quota=quota,
             priority=priority,
             silent=silent,
         )

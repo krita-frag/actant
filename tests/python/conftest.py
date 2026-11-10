@@ -11,17 +11,31 @@
 - ``@pytest.mark.e2e``         端到端测试
 - ``@pytest.mark.regression``  回归测试（针对已发现 bug）
 - ``@pytest.mark.slow``        慢测试（>5s）
+
+同时加载仓库内 ``extensions/act-ext-testkit`` 的 pytest 插件，为测试提供
+``sandbox`` / ``cluster_factory`` / ``testkit_seed`` fixture，以及
+``chaos`` / ``netem`` / ``nat`` / ``adversarial`` 标记。
 """
 
 from __future__ import annotations
 
 import contextlib
 import os
+import sys
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
+
+# testkit 是仓库内扩展而非已安装包：把扩展根目录放进 sys.path 后按模块名
+# 注册插件，避免依赖 editable 安装。
+_EXTENSION_ROOT = Path(__file__).resolve().parents[2] / "extensions" / "act-ext-testkit"
+if str(_EXTENSION_ROOT) not in sys.path:
+    sys.path.insert(0, str(_EXTENSION_ROOT))
+
+pytest_plugins = ["act_ext_testkit.pytest_plugin"]
 
 # ---------------------------------------------------------------------------
 # 提前加载 PyO3 模块：避免 coverage import hook 干扰 pyo3-log 初始化
@@ -37,6 +51,71 @@ def pytest_load_initial_conftests(early_config, parser, args):
     """
     with contextlib.suppress(Exception):  # pragma: no cover - 调试环境可能无 Rust 扩展
         import actant.actant  # noqa: F401
+
+
+# ---------------------------------------------------------------------------
+# 构建新鲜度：Rust 源码比原生扩展新时立即失败
+# ---------------------------------------------------------------------------
+
+_RUST_INPUT_GLOBS = (
+    "Cargo.toml",
+    "build.rs",
+    "src/**/*.rs",
+    "crates/*/Cargo.toml",
+    "crates/*/src/**/*.rs",
+)
+
+
+def _native_extension_path() -> Path | None:
+    """返回已加载原生扩展的文件路径；无法加载时返回 ``None``。"""
+    try:
+        import actant.actant as native
+
+        origin = getattr(native, "__file__", None)
+    except Exception:  # pragma: no cover - 调试环境可能无 Rust 扩展
+        return None
+    return Path(origin) if origin else None
+
+
+def _newest_rust_input(root: Path) -> tuple[float, Path] | None:
+    """返回仓库内最新 Rust 构建输入及其 mtime。"""
+    newest: tuple[float, Path] | None = None
+    for pattern in _RUST_INPUT_GLOBS:
+        for path in root.glob(pattern):
+            if not path.is_file():
+                continue
+            mtime = path.stat().st_mtime
+            if newest is None or mtime > newest[0]:
+                newest = (mtime, path)
+    return newest
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _check_native_extension_freshness() -> None:
+    """原生扩展早于 Rust 源码时立即失败，避免测试跑在过期实现上。
+
+    过期 ``.so`` 的典型症状是大量 ``Broken pipe`` 或 worker 模块入口不一致；
+    在 session 启动时直接失败并指向 ``maturin develop``，比逐个测试报错更可
+    行动。设置 ``ACTANT_SKIP_BUILD_CHECK=1`` 可跳过（仅用于无法重建的排查）。
+    """
+    if os.environ.get("ACTANT_SKIP_BUILD_CHECK") == "1":
+        return
+    extension = _native_extension_path()
+    newest = _newest_rust_input(Path(__file__).resolve().parents[2])
+    if extension is None or not extension.is_file() or newest is None:
+        return
+    extension_mtime = extension.stat().st_mtime
+    if newest[0] <= extension_mtime:
+        return
+    pytest.fail(
+        "原生扩展早于 Rust 源码，测试可能跑在过期实现上：\n"
+        f"  extension: {extension}\n"
+        f"  source:    {newest[1]}\n"
+        "请先运行 `uv run maturin develop` 重建，再重跑测试；"
+        "确需跳过可设置 ACTANT_SKIP_BUILD_CHECK=1。",
+        pytrace=False,
+    )
+
 
 if TYPE_CHECKING:
     from pytest import CallInfo, Item, Session
@@ -107,7 +186,7 @@ def _isolate_runtime_between_tests():
     """
     # 测试前：清除线程局部 Runtime 残留（防上一个测试 with 块异常退出泄漏）
     try:
-        from actant._runtime import _runtime_local
+        from actant._internal.runtime import _runtime_local
 
         if getattr(_runtime_local, "runtime", None) is not None:
             _runtime_local.runtime = None

@@ -1,4 +1,4 @@
-"""``actant.task._helpers`` 单元测试（不依赖 Runtime）。"""
+"""``actant._internal.tasks.helpers`` 单元测试（不依赖 Runtime）。"""
 from __future__ import annotations
 
 import threading
@@ -7,9 +7,8 @@ import time
 import cloudpickle
 import pytest
 
-from actant.exceptions import SerializationError, TaskCancelledError
-from actant.task._context import TaskContext, _task_context_scope
-from actant.task._helpers import (
+from actant._internal.tasks.context import TaskContext, _task_context_scope
+from actant._internal.tasks.helpers import (
     _emit_task_event,
     _execute_with_cancellation,
     _interruptible_sleep,
@@ -17,6 +16,7 @@ from actant.task._helpers import (
     _safe_serialize,
     _suppress_pickle_errors,
 )
+from actant.exceptions import SerializationError, TaskCancelledError
 
 
 class _FakeCancelToken:
@@ -106,8 +106,8 @@ def test_safe_serialize_round_trip() -> None:
     def add(a: int, b: int) -> int:
         return a + b
 
-    from actant.task._helpers import _PAYLOAD_VERSION
-    from actant.task._worker import _parse_dispatch_payload
+    from actant._internal.tasks.helpers import _PAYLOAD_VERSION
+    from actant._internal.tasks.worker import _parse_dispatch_payload
 
     raw = _safe_serialize(add, (1, 2), {"c": 3}, {"timeout_ms": 100}, task_id="t1")
     # 首字节即版本字节。
@@ -128,7 +128,7 @@ def test_safe_serialize_v2_header_fields() -> None:
     def noop() -> None:
         return None
 
-    from actant.task._worker import _parse_dispatch_payload
+    from actant._internal.tasks.worker import _parse_dispatch_payload
 
     raw = _safe_serialize(
         noop,
@@ -159,7 +159,7 @@ def test_parse_dispatch_payload_rejects_bad_version() -> None:
     """非 v2 版本字节或头部截断应显式抛错（协议损坏走防御分支）。"""
     import struct
 
-    from actant.task._worker import _parse_dispatch_payload
+    from actant._internal.tasks.worker import _parse_dispatch_payload
 
     # v1 风格（版本字节 0x01）→ 版本不匹配。
     body = struct.pack("<BIIH", 0x01, 0, 0, 0)
@@ -180,7 +180,7 @@ def test_safe_serialize_fails_for_unserializable() -> None:
 
 
 def test_task_context_scope_sets_and_restores() -> None:
-    from actant.task._context import get_task_context
+    from actant._internal.tasks.context import get_task_context
 
     outer = TaskContext("outer")
     inner = TaskContext("inner")
@@ -193,7 +193,7 @@ def test_task_context_scope_sets_and_restores() -> None:
 
 
 def test_task_context_scope_restores_on_exception() -> None:
-    from actant.task._context import get_task_context
+    from actant._internal.tasks.context import get_task_context
 
     outer = TaskContext("outer")
     with _task_context_scope(outer):
@@ -252,21 +252,21 @@ class _EmitFaker:
 
 
 def test_emit_task_event_on_error_log_swallows(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("actant._effects.emit", _EmitFaker(RuntimeError("emit boom")))
+    monkeypatch.setattr("actant.effects.emit", _EmitFaker(RuntimeError("emit boom")))
     result = _emit_task_event("started", "t1", "wf1", on_error="log")
     assert result is None
 
 
 def test_emit_task_event_on_error_raise_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
     exc = RuntimeError("emit boom")
-    monkeypatch.setattr("actant._effects.emit", _EmitFaker(exc))
+    monkeypatch.setattr("actant.effects.emit", _EmitFaker(exc))
     with pytest.raises(RuntimeError, match="emit boom"):
         _emit_task_event("started", "t1", "wf1", on_error="raise")
 
 
 def test_emit_task_event_on_error_collect_returns(monkeypatch: pytest.MonkeyPatch) -> None:
     exc = RuntimeError("emit boom")
-    monkeypatch.setattr("actant._effects.emit", _EmitFaker(exc))
+    monkeypatch.setattr("actant.effects.emit", _EmitFaker(exc))
     result = _emit_task_event("started", "t1", "wf1", on_error="collect")
     assert result is exc
 
@@ -276,7 +276,7 @@ def test_emit_task_event_on_error_collect_returns(monkeypatch: pytest.MonkeyPatc
 
 def test_event_batcher_close_joins_flush_thread() -> None:
     """close() 应显式 join 后台 flush 线程，避免线程泄漏。"""
-    from actant.task._helpers import _EventBatcher
+    from actant._internal.tasks.helpers import _EventBatcher
 
     batcher = _EventBatcher(flush_interval_ms=1, flush_threshold=100)
     flush_thread = batcher._flush_thread
@@ -294,11 +294,11 @@ def test_event_batcher_close_joins_flush_thread() -> None:
 
 def test_event_batcher_close_flushes_pending_events(monkeypatch: pytest.MonkeyPatch) -> None:
     """close() 应派发 close 前入队但未被后台线程处理的事件。"""
-    from actant.task._helpers import _EventBatcher
+    from actant._internal.tasks.helpers import _EventBatcher
 
     emitted: list[tuple[str, str]] = []
     monkeypatch.setattr(
-        "actant._effects.emit",
+        "actant.effects.emit",
         lambda *args, **kwargs: emitted.append((args[0] if args else "", args[1] if len(args) > 1 else "")),
     )
 
@@ -315,8 +315,8 @@ def test_event_batcher_close_flushes_pending_events(monkeypatch: pytest.MonkeyPa
 
 def test_event_batcher_close_aborts_join_on_stuck_flush(monkeypatch: pytest.MonkeyPatch) -> None:
     """close() 在 flush 线程卡死时应放弃 join 并记录 warning（按 join 超时）。"""
-    from actant.task import _helpers as helpers_module
-    from actant.task._helpers import _EventBatcher
+    from actant._internal.tasks import helpers as helpers_module
+    from actant._internal.tasks.helpers import _EventBatcher
 
     # 缩短 join 超时到 0.3s，使测试快速验证超时分支。
     monkeypatch.setattr(
@@ -331,7 +331,7 @@ def test_event_batcher_close_aborts_join_on_stuck_flush(monkeypatch: pytest.Monk
         # 永久等待直到测试结束释放 blocker（或进程退出）。
         blocker.wait(timeout=30.0)
 
-    monkeypatch.setattr("actant._effects.emit", _stuck_emit)
+    monkeypatch.setattr("actant.effects.emit", _stuck_emit)
 
     batcher = _EventBatcher(flush_interval_ms=1, flush_threshold=100)
     flush_thread = batcher._flush_thread

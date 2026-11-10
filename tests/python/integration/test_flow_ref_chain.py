@@ -28,7 +28,7 @@ from typing import Any
 import pytest
 
 from actant import Runtime, flow, task
-from actant.task._ref import REF_INLINE_THRESHOLD, Ref
+from actant._internal.tasks.ref import REF_INLINE_THRESHOLD, Ref
 
 # 2MB：超过结果帧阈值即可触发 Ref 路径，控制集成测试开销。
 _SIZE = REF_INLINE_THRESHOLD * 2
@@ -79,7 +79,7 @@ def test_flow_large_value_chain_no_deserialization_in_submitter(
         )
         return result
 
-    with Runtime.with_defaults() as rt:
+    with Runtime() as rt:
         rt.serve()
         result = pipeline(_SIZE)
 

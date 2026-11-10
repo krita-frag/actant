@@ -11,25 +11,25 @@
 ## 阶段概览
 
 1. **阶段 1：@task 高层 API**——零配置提交任务，适合 80% 的常见场景。
-2. **阶段 2：自定义 Routing handler**——用 ``ask`` 覆盖路由策略，
-   把特定任务路由到指定节点。
-3. **阶段 3：自定义 RetryPolicy handler**——用 ``ask`` 实现指数退避重试。
+2. **阶段 2：自定义 ask capability**——用 ``ask`` 组合用户自定义路由决策。
+3. **阶段 3：任务重试**——重试由 Rust Worker 执行，不是 Python capability。
 4. **阶段 4：自定义 emit capability**——用 ``emit`` 多播审计事件，
    演示如何声明全新 capability 并注册 handler 链。
 """
 
 from __future__ import annotations
 
-from actant import Runtime, ask, emit
-from actant.capabilities import RetryCtx, RouteCtx
-from actant.task import task
+from actant import Runtime, emit
+from actant.capabilities import RouteCtx
+from actant.effects import ask
+from actant.tasks import task
 
 
 def stage_1_task_api() -> None:
     """``@task`` 是最简 API：装饰一个函数即可提交到 Runtime 执行。
 
-    ``Runtime.with_defaults()`` 预装了默认 handler（本地路由 / FIFO 调度 /
-    无重试），用户无需理解 ERH 即可开始。此阶段适合：
+    ``Runtime()`` 不注册 Python 策略 handler；任务执行、
+    超时与重试由 Rust Worker 负责。此阶段适合：
     - 单节点任务执行
     - 不需要自定义路由/重试/调度策略
     - 快速原型开发
@@ -42,7 +42,7 @@ def stage_1_task_api() -> None:
         print(f"  [fetch_url] processing {url}")
         return 200
 
-    with Runtime.with_defaults():
+    with Runtime():
         # submit() 异步提交，返回 AsyncResult 句柄
         handle = fetch_url.submit("https://example.com")
         # result() 阻塞等待结果
@@ -56,43 +56,42 @@ def stage_1_task_api() -> None:
     print()
 
 
-def stage_2_custom_routing() -> None:
-    """当默认本地路由不够用时，用 ``ask`` 覆盖路由策略。
+def stage_2_custom_ask() -> None:
+    """用 ``ask`` 组合用户自定义决策。
 
-    场景：GPU 任务必须路由到带 GPU 的节点。``Routing`` capability 是
-    ``ask`` 型（决策型），handler 返回 ``Optional[str]``：
-    - 返回非 None：此 handler 决定路由目标
-    - 返回 None：弃权，交给链中下一个 handler 决策
+    场景：按标签选择目标节点。``ask`` 型 capability 的 handler 返回
+    ``Optional[str]``：
+    - 返回非 None：此 handler 决定结果
+    - 返回 None：弃权，交给链中下一个 handler
 
-    后注册的 handler 优先级更高（逆序调用），因此自定义 handler 在
-    默认 LocalRouter 之前被询问。
+    注意：这是**用户自定义 capability**，引擎不会自动把它用于任务放置。
+    真正的放置由 Rust ``RoutePolicy``、节点标签与配额完成。
     """
-    print("=== 阶段 2：自定义 Routing handler ===")
+    print("=== 阶段 2：自定义 ask capability ===")
 
     @task
     def train_model(dataset: str) -> str:
         return f"trained on {dataset}"
 
-    with Runtime.with_defaults() as rt:
-        # 注册自定义路由：带 "gpu" tag 的任务路由到 "gpu-node"
+    with Runtime() as rt:
+        # 注册自定义路由决策：带 "gpu" tag 的任务选择 "gpu-node"
         def gpu_router(ctx: RouteCtx) -> str | None:
-            # RouteCtx 有 tags 属性（通过 kwargs 传入）
             if "gpu" in getattr(ctx, "tags", []):
                 return "gpu-node"
-            return None  # 弃权，回退到默认路由
+            return None  # 弃权
 
-        rt.layer("Routing").chain(gpu_router)
+        rt.layer("MyRouter", "ask").chain(gpu_router)
 
-        # 查询路由决策（不实际提交任务）
+        # 查询自定义决策（不实际提交任务）
         route = ask(
-            "Routing",
+            "MyRouter",
             RouteCtx(task_name="train", peers=["node-a", "node-b"], tags=["gpu"]),
         )
         print(f"  routing(gpu task) -> {route}")
 
-        # 无 gpu tag 时回退到默认本地路由
+        # 无 gpu tag 时 handler 弃权，无后续 handler 则返回 None
         route = ask(
-            "Routing",
+            "MyRouter",
             RouteCtx(task_name="etl", peers=["node-a", "node-b"]),
         )
         print(f"  routing(normal)   -> {route}")
@@ -101,52 +100,26 @@ def stage_2_custom_routing() -> None:
 
 
 
-def stage_3_custom_retry() -> None:
-    """``RetryPolicy`` 是 ``ask`` 型 capability，决定任务失败后是否重试。
+def stage_3_task_retries() -> None:
+    """任务重试由 Rust Worker 执行，不是 Python ``ask`` capability。
 
-    默认 handler（DefaultRetryPolicy）不重试。自定义 handler 可实现指数退避、
-    基于错误类型的差异化重试等策略。
-
-    ``RetryCtx`` 字段：
-    - ``task_id``：任务 ID
-    - ``attempt``：当前尝试次数（从 0 开始）
-    - ``error``：上次失败的错误信息
-    - ``max_retries``：``@task(retries=N)`` 设置的最大重试次数
-
-    注意：cloudpickle 序列化任务到 worker 线程后，闭包变量不跨线程共享，
-    因此本示例不在 task 内读取外部计数器，仅通过日志观察重试行为。
+    ``@task(retries=N)`` 的重试决策在 Rust 侧完成；Python 层的自定义
+    ``ask`` capability 不会被引擎自动调用。需要自定义重试语义时，应在
+    任务内部实现幂等与错误分类，或把重试纳入业务流程。
     """
-    print("=== 阶段 3：自定义 RetryPolicy handler ===")
+    print("=== 阶段 3：任务重试由引擎执行 ===")
 
     @task(retries=3)
     def flaky_task() -> str:
         raise RuntimeError("transient failure")
 
-    with Runtime.with_defaults() as rt:
-        # 自定义重试策略：网络错误指数退避，其他错误不重试
-        def smart_retry(ctx: RetryCtx) -> bool | None:
-            if "transient" in ctx.error:
-                # 临时错误：重试，但不超过 max_retries
-                if ctx.attempt < ctx.max_retries:
-                    print(
-                        f"  [retry] attempt={ctx.attempt}, "
-                        f"will retry (transient error)"
-                    )
-                    return True
-                print(f"  [retry] attempt={ctx.attempt}, max reached, give up")
-                return None  # 弃权，让默认 handler 决定
-            # 非临时错误：不重试
-            print(f"  [retry] attempt={ctx.attempt}, non-transient, no retry")
-            return False
-
-        rt.layer("RetryPolicy").chain(smart_retry)
-
+    with Runtime():
         handle = flaky_task.submit()
-        # flaky_task 总是抛 RuntimeError，重试 3 次后最终失败
+        # flaky_task 总是抛 RuntimeError，Rust 侧重试 3 次后最终失败
         try:
             handle.result(timeout=10.0)
         except RuntimeError:
-            print("  flaky_task 最终失败（重试 3 次后耗尽）")
+            print("  flaky_task 最终失败（Rust 侧重试 3 次后耗尽）")
 
     print()
 
@@ -162,7 +135,7 @@ def stage_4_custom_emit() -> None:
     """
     print("=== 阶段 4：自定义 emit capability ===")
 
-    with Runtime.with_defaults() as rt:
+    with Runtime() as rt:
         audit_log: list[str] = []
         metrics: dict[str, int] = {}
 
@@ -194,15 +167,15 @@ def main() -> None:
     print("Actant 渐进式教程：从 @task 到 ERH\n")
 
     stage_1_task_api()
-    stage_2_custom_routing()
-    stage_3_custom_retry()
+    stage_2_custom_ask()
+    stage_3_task_retries()
     stage_4_custom_emit()
 
     print("=== 教程完成 ===")
     print()
     print("关键要点:")
     print("  1. @task 适合简单场景，零配置即用")
-    print("  2. ask 型 capability（Routing/RetryPolicy/Scheduling）用逆序决策")
+    print("  2. ask 型 capability（自定义名称）用逆序决策")
     print("  3. perform 型 capability 用最后注册的 handler 执行副作用")
     print("  4. emit 型 capability 按顺序调用所有 handler，适合多播")
     print("  5. 自定义 capability 无需 Rust 侧注册，Python 层直接可用")

@@ -15,8 +15,9 @@
 
 用真实的 GitHub REST API 数据验证 ERH 架构在场景下的可行性，覆盖：
 
-- ``ask`` 决策型：``Routing``（按仓库 owner 路由到分析节点）、``Scheduling``（PR 优先于 issue）、
-  ``RetryPolicy``（HTTP 失败指数退避重试）、自定义 ``Throttle``（GitHub 速率限制保护）
+- ``ask`` 决策型：用户自定义 ``AnalyzerRouting``（按 owner 路由）、
+  ``AnalyzerScheduling``（PR 优先）、``AnalyzerRetry``（指数退避）、
+  自定义 ``Throttle``（GitHub 速率限制保护）
 - ``perform`` 副作用型：自定义 ``Fetch``（urllib 真实 HTTP + 本地缓存）、``Analyze``（分仓库聚合）、
   ``ResultStore``（报告落盘 report.txt + report.json）
 - ``emit`` 反应型：自定义 ``Metrics``（计数器采集）、``Audit``（审计事件落盘）

@@ -16,6 +16,7 @@ import time
 import pytest
 
 import actant
+from actant.exceptions import InvalidStateError, TaskCancelledError
 
 
 class TestWorkerLifecycle:
@@ -23,7 +24,7 @@ class TestWorkerLifecycle:
 
     def test_start_serve_stop_completes_cleanly(self) -> None:
         """start → serve → stop 全流程无异常且无 endpoint 警告。"""
-        rt = actant.Runtime.with_defaults()
+        rt = actant.Runtime()
         rt.start()
         rt.serve()
         # 给 worker 守护循环一点时间启动
@@ -34,9 +35,23 @@ class TestWorkerLifecycle:
         elapsed = time.monotonic() - t0
         assert elapsed < 10.0, f"shutdown took {elapsed:.1f}s, expected <10s"
 
+    def test_serve_is_idempotent(self) -> None:
+        """重复 serve() 不得再 spawn 一个执行循环。
+
+        ``start()`` 已经拉起循环；CLI 早先又显式调了一次，导致两个
+        ``worker.run()`` 并行消费同一队列、旧句柄泄漏。
+        """
+        rt = actant.Runtime()
+        rt.start()
+        rt.serve()
+        rt.serve()
+        t0 = time.monotonic()
+        rt.stop()
+        assert time.monotonic() - t0 < 10.0
+
     def test_stop_is_idempotent(self) -> None:
         """重复调用 stop() 不抛异常。"""
-        rt = actant.Runtime.with_defaults()
+        rt = actant.Runtime()
         rt.start()
         rt.serve()
         time.sleep(0.3)
@@ -45,7 +60,7 @@ class TestWorkerLifecycle:
 
     def test_context_manager_cleans_up(self) -> None:
         """with 块退出时自动 stop()。"""
-        with actant.Runtime.with_defaults() as rt:
+        with actant.Runtime() as rt:
             rt.serve()
             time.sleep(0.3)
         # 退出 with 块后 _rust_core 应为 None
@@ -88,3 +103,49 @@ class TestWorkerLifecycle:
         assert "worker stopped" in stderr_text, (
             f"worker did not log 'worker stopped'\nstderr:\n{stderr_text}"
         )
+
+
+class TestWorkerStateCallback:
+    """``on_worker_state`` 的注册与生命周期校验。"""
+
+    def test_requires_started_runtime(self) -> None:
+        rt = actant.Runtime()
+        with pytest.raises(InvalidStateError):
+            rt.on_worker_state(lambda event: None)
+
+    def test_registers_after_start(self) -> None:
+        rt = actant.Runtime.test()
+        rt.start()
+        try:
+            rt.on_worker_state(lambda event: None)
+        finally:
+            rt.stop()
+
+
+@actant.task(name="wl_slow")
+def _slow_task(seconds: float) -> str:
+    """停留在执行中，供 stop() 时仍有未结算句柄的用例使用。"""
+    time.sleep(seconds)
+    return "done"
+
+
+class TestStopSettlesPendingHandles:
+    """stop() 之后在册句柄必须有终态，不能永远停在 running。"""
+
+    def test_stop_settles_inflight_handle_as_cancelled(self) -> None:
+        rt = actant.Runtime()
+        rt.start()
+        handle = _slow_task.submit(30.0)
+        # 等它离开 pending，确保是「在途」而不是「还没投递」。
+        deadline = time.monotonic() + 10
+        while handle.state == "pending" and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert handle.state in {"pending", "running"}
+
+        rt.stop(timeout=0)
+
+        assert handle.state == "cancelled", (
+            f"stop 后句柄应结算为 cancelled，实际 {handle.state!r}"
+        )
+        with pytest.raises(TaskCancelledError):
+            handle.result(timeout=1)

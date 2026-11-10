@@ -9,7 +9,7 @@ import time
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from actant._runtime import Runtime
+    from actant._internal.runtime import Runtime
 
 
 def wait_until(predicate, timeout_s: float = 10.0, interval_s: float = 0.1) -> bool:

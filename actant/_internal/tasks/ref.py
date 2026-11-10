@@ -27,9 +27,9 @@ from typing import Any, cast
 
 import cloudpickle
 
-from actant._runtime import get_current_runtime
+from actant._internal.runtime import get_current_runtime
 
-_logger = logging.getLogger("actant.task")
+_logger = logging.getLogger("actant.tasks")
 
 #: 内联阈值（字节）：任务结果 / 提交参数序列化后超过此值即降级为值引用。
 #: 1MB 远小于 worker 帧上限（256MB），保证降级路径在常规大值场景下即触发；

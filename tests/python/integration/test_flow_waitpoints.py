@@ -20,16 +20,9 @@ import time
 
 import pytest
 
-from actant import (
-    Runtime,
-    current_workflow_id,
-    flow,
-    sleep_until,
-    task,
-    use_runtime,
-    wait_signal,
-)
+from actant import Runtime, flow, task, use_runtime
 from actant.exceptions import InvalidStateError
+from actant.workflow import current_workflow_id, sleep_until, wait_signal
 
 
 @task(name="wp_inc")
@@ -47,6 +40,19 @@ def _signal_once(rt, workflow_id: str, name: str) -> bytes | None:
     返回值 ``None`` 表示"已入缓冲、此刻无等待点被唤醒"，不再是"信号被丢弃"。
     """
     return rt.signal_wait_point(workflow_id, name)
+
+
+def _signal_until_delivered(
+    rt: Runtime, workflow_id: str, name: str, payload: bytes, *, timeout: float = 15.0
+) -> bytes:
+    """带 payload 递交信号，直到等待点接收（未注册时先入缓冲，重试安全）。"""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        delivered = rt.signal_wait_point(workflow_id, name, payload)
+        if delivered is not None:
+            return delivered
+        time.sleep(0.01)
+    raise AssertionError(f"wait point {name!r} was never registered")
 
 
 class _Events:
@@ -83,7 +89,7 @@ class TestFlowWaitPoints:
             order.append("after")
             return _inc.submit(2).result()
 
-        with Runtime.with_defaults():
+        with Runtime():
             started = time.monotonic()
             result = pipeline()
             elapsed = time.monotonic() - started
@@ -108,7 +114,7 @@ class TestFlowWaitPoints:
             return "done"
 
         events = _Events()
-        with Runtime.with_defaults() as rt:
+        with Runtime() as rt:
             rt.layer("WorkflowLifecycle", "emit").chain(events)
 
             def _run() -> None:
@@ -139,7 +145,7 @@ class TestFlowWaitPoints:
             results.append(f"{first is not None}:{second is not None}")
 
         events = _Events()
-        with Runtime.with_defaults() as rt:
+        with Runtime() as rt:
             rt.layer("WorkflowLifecycle", "emit").chain(events)
 
             def _run() -> None:
@@ -155,6 +161,36 @@ class TestFlowWaitPoints:
 
         # 只递交了一次信号：第二次 await 必须因"已 Signaled"立即返回。
         assert results == ["True:True"], results
+
+    def test_signal_payload_is_delivered_and_latched(self) -> None:
+        """信号携带 payload：首次递交胜出，重放 await 与重复递交都返回同一份字节。"""
+        results: list[bytes] = []
+
+        @flow(name="wf-payload")
+        def pipeline() -> None:
+            first = wait_signal("go", timeout_ms=5000)
+            second = wait_signal("go", timeout_ms=5000)
+            results.append(b"|".join([first or b"", second or b""]))
+
+        events = _Events()
+        with Runtime() as rt:
+            rt.layer("WorkflowLifecycle", "emit").chain(events)
+
+            def _run() -> None:
+                with use_runtime(rt):
+                    pipeline()
+
+            thread = threading.Thread(target=_run, daemon=True)
+            thread.start()
+            wf_id = events.await_workflow_id()
+            delivered = _signal_until_delivered(rt, wf_id, "go", b"approve:42")
+            assert delivered == b"approve:42", delivered
+            # 闩锁：第二次递交不覆盖首次 payload，返回历史值。
+            assert rt.signal_wait_point(wf_id, "go", b"late") == b"approve:42"
+            thread.join(timeout=20)
+            assert not thread.is_alive(), "payload signal did not resume flow"
+
+        assert results == [b"approve:42|approve:42"], results
 
     def test_signal_arrives_before_wait_point_is_registered(self) -> None:
         """信号可先于等待点抵达：注册时命中缓冲，递交方**无需重试**。
@@ -180,7 +216,7 @@ class TestFlowWaitPoints:
             seen.append("resumed")
             return "done"
 
-        with Runtime.with_defaults() as rt:
+        with Runtime() as rt:
 
             def _run() -> None:
                 with use_runtime(rt):
@@ -224,7 +260,7 @@ class TestFlowWaitPoints:
             wait_signal("go")
             return "done"
 
-        with Runtime.with_defaults() as rt:
+        with Runtime() as rt:
             rt.layer("WorkflowLifecycle", "emit").chain(events)
 
             def _run() -> None:
@@ -247,7 +283,7 @@ class TestFlowWaitPoints:
         """递给不存在的工作流 → 显式报错（不再静默返回 ``None``）。"""
         from actant.exceptions import NotFoundError
 
-        with Runtime.with_defaults() as rt, pytest.raises(NotFoundError):
+        with Runtime() as rt, pytest.raises(NotFoundError):
             rt.signal_wait_point("no-such-workflow", "go")
 
     def test_signal_retry_after_consumption_is_safe(self) -> None:
@@ -264,7 +300,7 @@ class TestFlowWaitPoints:
             wait_signal("go")
             return "done"
 
-        with Runtime.with_defaults() as rt:
+        with Runtime() as rt:
             rt.layer("WorkflowLifecycle", "emit").chain(events)
 
             def _run() -> None:
@@ -289,7 +325,7 @@ class TestFlowWaitPoints:
             payload = wait_signal("never-arrives", timeout_ms=200)
             return "none" if payload is None else "got"
 
-        with Runtime.with_defaults():
+        with Runtime():
             started = time.monotonic()
             outcome = pipeline()
             elapsed = time.monotonic() - started
@@ -299,7 +335,7 @@ class TestFlowWaitPoints:
 
     def test_wait_outside_flow_raises(self) -> None:
         """非 flow 上下文调用等待原语 → 显式报错（不静默 no-op）。"""
-        with Runtime.with_defaults(), pytest.raises(InvalidStateError):
+        with Runtime(), pytest.raises(InvalidStateError):
             sleep_until(_epoch_ms() + 10)
 
 
@@ -310,7 +346,7 @@ class TestWaitPointDurability:
         data_dir = str(tmp_path / "data")
         wf_id = "wp-restart-wf"
 
-        rt_a = Runtime.with_defaults(name="wp-node", data_dir=data_dir)
+        rt_a = Runtime(name="wp-node", data_dir=data_dir)
         rt_a.start()
         try:
             rt_a.submit_workflow(wf_id)
@@ -318,14 +354,15 @@ class TestWaitPointDurability:
         finally:
             rt_a.stop()
 
-        rt_b = Runtime.with_defaults(name="wp-node", data_dir=data_dir)
+        rt_b = Runtime(name="wp-node", data_dir=data_dir)
         rt_b.start()
         try:
-            # 等待点随快照恢复 → 重启后递交的信号仍被接收。
-            assert rt_b.signal_wait_point(wf_id, "go") is not None, (
-                "wait point must survive restart"
+            # 等待点随快照恢复 → 重启后递交的信号仍被接收，payload 原样保留。
+            delivered = rt_b.signal_wait_point(wf_id, "go", b"durable-payload")
+            assert delivered == b"durable-payload", (
+                f"wait point must survive restart with payload, got {delivered!r}"
             )
-            # 已唤醒的等待点：park 立即返回（"已收到 → 直接返回"）。
-            assert rt_b.wait_wait_point(wf_id, "go", timeout_ms=1000) == b""
+            # 已唤醒的等待点：park 立即返回历史 payload（"已收到 → 直接返回"）。
+            assert rt_b.wait_wait_point(wf_id, "go", timeout_ms=1000) == b"durable-payload"
         finally:
             rt_b.stop()

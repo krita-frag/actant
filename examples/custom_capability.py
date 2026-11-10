@@ -3,9 +3,15 @@
 演示扩展能力：
 
 - 用 ``rt.layer(name, kind)`` 直接注册自定义 capability（自动创建 meta）
-- 用 Protocol 约定 handler 签名（``RoutingHandler`` / ``StoreHandler`` 等）
+- 用 Protocol 约定自定义 handler 签名（``RouteCtx`` / ``ScheduleCtx`` 等 payload 助手）
 - 多 handler 链式组合：ask 逆序决策、emit 顺序多播、perform 取末位
-- 用自定义 Store capability 替换内置副作用，无需 Rust 介入
+
+.. note::
+    自定义 capability 只由用户代码自己 ``ask`` / ``perform`` / ``emit`` 驱动，
+    引擎不会自动调用它们。示例里的 ``KVStore`` 是独立名字，**不会替换内置
+    ``Store``**；要覆盖引擎侧数据面请用 ``rt.layer("Store").chain(...)``。
+    ``MyRouter`` / ``MyScheduler`` 同理——真实的放置由 Rust ``RoutePolicy`` /
+    ``Scheduler`` 或第 3 层外部调度器承担。
 
 运行::
 
@@ -17,14 +23,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from actant import (
-    RouteCtx,
-    Runtime,
-    ScheduleCtx,
-    ask,
-    emit,
-    perform,
-)
+from actant import Runtime, emit, perform
+from actant.capabilities import RouteCtx, ScheduleCtx
+from actant.effects import ask
 
 # Handler Protocol 类型从 capabilities 子模块导入（未在顶层 re-export）。
 
@@ -42,7 +43,7 @@ class ThrottleCtx:
 
 
 class TagAwareRouter:
-    """按标签路由的 RoutingHandler。
+    """按标签路由的自定义 ask handler。
 
     实现 ``RoutingHandler`` Protocol：``__call__(ctx) -> str | None``。
     返回 None 表示弃权，交由链中下一个 handler 决策。
@@ -53,13 +54,13 @@ class TagAwareRouter:
             return "gpu-node"
         if "io-heavy" in ctx.tags:
             return "io-node"
-        return None  # 弃权 → 回退到默认 LocalRouter
+        return None  # 弃权 → 无后续 handler 时 ask 返回 None
 
 
 class PriorityScheduler:
-    """按优先级前缀选任务的 SchedulingHandler。
+    """按优先级前缀选任务的自定义 ask handler。
 
-    pending 中以 ``P0:`` 开头的任务优先；无则弃权，回退到默认 FIFO。
+    pending 中以 ``P0:`` 开头的任务优先；无则弃权。
     """
 
     def __call__(self, ctx: ScheduleCtx) -> str | None:
@@ -91,21 +92,21 @@ class InMemoryStore:
 
 
 def main() -> None:
-    with Runtime.with_defaults() as rt:
+    with Runtime() as rt:
         # 注册自定义 handler：chain 顺序决定 ask 决策优先级（后注册=高优先级）。
-        rt.layer("Routing").chain(TagAwareRouter())
-        rt.layer("Scheduling").chain(PriorityScheduler())
+        rt.layer("MyRouter", "ask").chain(TagAwareRouter())
+        rt.layer("MyScheduler", "ask").chain(PriorityScheduler())
 
         print("=== ask：多 handler 决策链 ===")
         # tag=gpu → TagAwareRouter 命中 "gpu-node"。
-        print(f"  gpu task    -> {ask('Routing', RouteCtx('train', peers=['a', 'b'], tags=['gpu']))}")
-        # 无标签 → TagAwareRouter 弃权，回退默认 LocalRouter（哈希到 peer）。
-        print(f"  plain task  -> {ask('Routing', RouteCtx('etl', peers=['a', 'b']))}")
+        print(f"  gpu task    -> {ask('MyRouter', RouteCtx('train', peers=['a', 'b'], tags=['gpu']))}")
+        # 无标签 → TagAwareRouter 弃权，无后续 handler 时返回 None。
+        print(f"  plain task  -> {ask('MyRouter', RouteCtx('etl', peers=['a', 'b']))}")
         # P0 优先级 → PriorityScheduler 命中 "P0:urgent"。
-        sched = ask("Scheduling", ScheduleCtx("wf", pending=["t1", "P0:urgent", "t2"]))
+        sched = ask("MyScheduler", ScheduleCtx("wf", pending=["t1", "P0:urgent", "t2"]))
         print(f"  P0 priority -> {sched}")
-        # 无 P0 → PriorityScheduler 弃权，回退默认 FIFO（返回 "t1"）。
-        print(f"  no P0       -> {ask('Scheduling', ScheduleCtx('wf', pending=['t1', 't2']))}")
+        # 无 P0 → PriorityScheduler 弃权，返回 None。
+        print(f"  no P0       -> {ask('MyScheduler', ScheduleCtx('wf', pending=['t1', 't2']))}")
 
         print("\n=== 自定义 capability：Throttle ===")
         # 用 dataclass 作为请求 payload，注册自定义 ask capability。

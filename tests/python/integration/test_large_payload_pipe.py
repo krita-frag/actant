@@ -28,7 +28,7 @@ _big_blob = task(_big_blob_fn)
 @pytest.mark.timeout(10)
 def test_large_payload_roundtrip_via_pipe() -> None:
     """~1MB 结果载荷经 pipe 帧路径返回，字节内容完整无损。"""
-    with Runtime.with_defaults() as rt:
+    with Runtime() as rt:
         rt.serve()
         handle: AsyncResult[Any] = _big_blob.submit(_PAYLOAD_SIZE)
         deadline = time.monotonic() + 10

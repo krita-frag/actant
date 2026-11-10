@@ -6,7 +6,7 @@
 
 - ``pool/start_ms_n`` — Runtime 启动耗时（含 N 个 worker 子进程 spawn）。
 - ``pool/first_dispatch_ms_n`` — 全新 Runtime 上**首个**任务端到端延迟
-  （冷启动惩罚：子进程解释器启动 + `_worker.py` 模块导入 + IPC 预热）。
+  （冷启动惩罚：子进程解释器启动 + `worker.py` 模块导入 + IPC 预热）。
 - ``pool/steady_state_us`` — 热池稳态分发延迟（worker 复用，无进程创建）：
   ``first_dispatch`` 与 ``steady_state`` 的差值即一次性冷启动成本，
   差值示意"若不池化、每任务新建进程"的浪费。
@@ -51,7 +51,7 @@ def _make_runtime(num_workers: int) -> actant.Runtime:
         network=_NetworkConfig(preset="none"),
         max_concurrent_tasks=num_workers,
     )
-    return actant.Runtime.with_defaults(config=cfg)
+    return actant.Runtime(config=cfg)
 
 
 def _measure_cold_start(num_workers: int, repeats: int) -> dict[str, float]:

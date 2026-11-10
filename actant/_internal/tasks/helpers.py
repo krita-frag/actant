@@ -1,6 +1,6 @@
 """任务序列化 / 执行 / 事件广播辅助函数。
 
-依赖 ``_context``（``get_task_context``），不依赖 ``AsyncResult`` / ``Task``，
+依赖 ``context``（``get_task_context``），不依赖 ``AsyncResult`` / ``Task``，
 避免循环导入。
 """
 
@@ -19,38 +19,29 @@ from typing import Any, Literal, cast
 
 import cloudpickle
 
+from actant._internal.tasks.context import get_task_context
 from actant.exceptions import ActantError, SerializationError, TaskCancelledError
-from actant.task._context import get_task_context
 
 CallbackErrorPolicy = Literal["log", "raise", "collect"]
 
-_logger = logging.getLogger("actant.task")
+_logger = logging.getLogger("actant.tasks")
 
 
 # ---------------------------------------------------------------------------
-# 事件 batching：累积 TaskLifecycle 事件，按时间窗口或数量阈值批量派发。
-#
-# 设计动机：每个 task 触发 started + completed 两次 emit，对 event_bus 形成
-# N×2 次独立 publish。在高吞吐场景（4 worker × 1000 tasks = 4000 events）
-# 下，emit 调用本身成为瓶颈。Batching 通过累积事件到 buffer，按 1ms 窗口
-# 或 100 个事件阈值触发一次批量派发，将 emit 次数降为 N/100。
-#
-# 使用方式：通过 ``_EventBatcherScope`` 上下文管理器在调用方作用域内
-# 启用 batching；未启用时 ``_emit_task_event`` 直接同步 emit，零开销。
+# 事件 batching：按时间窗口或数量阈值批量派发 TaskLifecycle 事件。
+# 设计动机、阈值与错误策略见 docs/guide/tasks.md 的「生命周期事件批处理」。
 # ---------------------------------------------------------------------------
 
 # close() 时 join 后台 flush 线程的超时时间（秒）。
 # 暴露为模块常量便于测试覆盖超时分支（避免每次测试等待 5s）。
 _EVENT_BATCHER_CLOSE_JOIN_TIMEOUT: float = 5.0
 
-# Dispatch 载荷版本字节（与 `actant/task/_worker.py` 保持一致）。
+# Dispatch 载荷版本字节（与 `actant/_internal/tasks/worker.py` 保持一致）。
 # v2：控制元数据内联为紧凑二进制头部，载荷仅序列化 (func, args, kwargs)。
 _PAYLOAD_VERSION = 0x02
 
-# worker 帧协议上限——正常任务载荷（cloudpickle 函数 + 参数）远小于该值，
-# 超限只可能是长度字段被腐蚀（按其读入体会造成无意义巨量分配）或载荷失控
-# 膨胀。提交侧（_safe_serialize）与 worker 读帧侧共用此上限：前者快速失败，
-# 后者按协议损坏处理。单点定义，worker（_worker.py）从这里导入。
+# worker 帧协议上限。超限只可能是长度字段被腐蚀或载荷失控膨胀；
+# 提交侧与 worker 读帧侧共用此上限。单点定义，worker.py 从这里导入。
 MAX_FRAME_BYTES = 256 * 1024 * 1024
 
 
@@ -469,7 +460,7 @@ def _execute_with_retries(
     失败时若仍有重试次数，则等待可中断的 ``retry_delay_ms`` 后重试；
     否则返回异常对象。成功时返回结果对象。
 
-    执行位置：worker 子进程主线程（``actant.task._worker`` 的唯一执行路径）。
+    执行位置：worker 子进程主线程（``actant._internal.tasks.worker`` 的唯一执行路径）。
 
     Args:
         silent: ``True`` 时跳过所有 TaskLifecycle 事件发布。
@@ -562,7 +553,7 @@ def _build_v2_envelope(
 ) -> bytes:
     """构建 v2 Dispatch 正文：紧凑控制头部 + ``cloudpickle(func, args, kwargs)``。
 
-    头部布局（小端，与 ``actant/task/_worker.py::_parse_dispatch_payload`` 一致）：:
+    头部布局（小端，与 ``actant/_internal/tasks/worker.py::_parse_dispatch_payload`` 一致）：:
 
         u8   version   = ``_PAYLOAD_VERSION`` (0x02)
         u32  retries
@@ -612,7 +603,7 @@ def _safe_serialize(
     超限载荷会被 worker 以协议损坏拒绝并触发无意义的 crash-failover 重试，在提交侧
     快速失败并指明上限更可诊断。大载荷应经 ``Ref``/``ValueStore`` 值引用传递
     （超过 ``REF_INLINE_THRESHOLD`` 的参数已自动降级，见
-    ``actant/task/_ref.py``）。
+    ``actant/_internal/tasks/ref.py``）。
     """
     try:
         envelope = _build_v2_envelope(func, args, kwargs, options, task_id)
@@ -790,8 +781,8 @@ def _emit_task_event(
             )
             return None
     try:
-        from actant._effects import emit as _emit
         from actant.capabilities import TASK_LIFECYCLE, TaskEvent
+        from actant.effects import emit as _emit
 
         _emit(
             TASK_LIFECYCLE,

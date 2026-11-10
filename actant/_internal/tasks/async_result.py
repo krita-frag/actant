@@ -1,32 +1,13 @@
-"""``AsyncResult``：异步任务结果句柄与任务依赖解析。
+"""``AsyncResult``：任务结果句柄、并行等待原语与任务依赖解析。
 
-依赖 ``_context``（TaskContext / TaskState）与 ``_helpers``
+依赖 ``context``（TaskContext / TaskState）与 ``helpers``
 （``_suppress_pickle_errors``）。任务依赖解析（``_collect_dep_ids`` /
-``_resolve_args_with_deps``）因紧耦合 ``AsyncResult`` 亦置于本模块，
-供 ``Task.submit`` / ``submit_batch`` 使用。
+``_resolve_args_with_deps``）与 ``gather`` 因紧耦合
+``AsyncResult`` 的内部完成协议亦置于本模块，供 ``Task.submit`` /
+``submit_batch`` 使用。异步并行等待在 ``actant.aio.gather``。
 
-## Intrusively-linked Futures 设计
-
-为支持 ``gather`` 高效等待多个 handle，``AsyncResult`` 内部维护一个
-``_CompletionFuture``（基于 ``threading.Condition``）。所有等待同一 handle
-的消费者共享同一个 future 实例：
-
-- ``result()`` / ``wait()`` 通过 future 的 ``wait()`` 一次性阻塞等待，
-  避免轮询。
-- ``add_done_callback`` 注册的回调以 *intrusive linked-list* 形式串接
-  在 future 上，完成时仅触发一次链表遍历。这使 ``gather(N)`` 的总调度
-  开销从 O(N) 次独立 Event wait 降到 1 次 future wait + O(N) 次回调派发。
-
-跨 handle 等待（``gather``）则借助一个 *共享* future：将所有 handle
-的完成信号汇聚到单个 ``threading.Event``，``gather`` 仅等待该 event
-一次，避免 N 次 ``wait_for`` 累加延迟。
-
-## 结果内部形态
-
-``_result`` 单字段两态：小结果为对象缓存（``result()`` 直接返回）；大结果
-（结果帧 > ``REF_INLINE_THRESHOLD``）为 ``Ref``（``result()`` 经 ValueStore
-透明拉取反序列化）。访问路径只有 ``result()`` 一个方法；``ref()`` 暴露大
-结果的 ``Ref`` 句柄。``__await__`` 经完成回调直通 event loop（无等待线程）。
+完成 future 共享、侵入式回调链表与大结果 ``Ref`` 的形态见
+``docs/guide/tasks.md`` 的「等待与回调」「大结果与 Ref」。
 """
 
 from __future__ import annotations
@@ -36,22 +17,43 @@ import logging
 import pickle
 import threading
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any, cast
 
 import cloudpickle
 
-from actant._runtime import get_current_runtime
-from actant.exceptions import ActantError, ActantTimeoutError, TaskCancelledError
-from actant.task._context import TaskContext, TaskState
-from actant.task._helpers import (
+from actant._internal.runtime import get_current_runtime
+from actant._internal.tasks.context import TaskContext, TaskState
+from actant._internal.tasks.helpers import (
     _emit_task_event,
     _invoke_callback,
     _invoke_callbacks,
     _suppress_pickle_errors,
 )
-from actant.task._ref import Ref
+from actant._internal.tasks.ref import Ref
+from actant.exceptions import (
+    ActantError,
+    ActantTimeoutError,
+    BlockingInEventLoopError,
+    TaskCancelledError,
+)
 
-_logger = logging.getLogger("actant.task")
+_logger = logging.getLogger("actant.tasks")
+
+
+def _raise_if_blocking_in_loop() -> None:
+    """在 event loop 线程上阻塞等待会冻结整个循环，立即转为可操作的错误。
+
+    只由真正会阻塞的路径调用；已完成结果的读取不经过这里。
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    raise BlockingInEventLoopError(
+        "blocking task wait inside a running event loop"
+    )
+
 
 # 任务终态集合：完成协议在持锁时先置终态、锁外才 set future，因此判断"是否
 # 已完成"必须以 _state 终态为准而非 _future.is_set()（后者存在窗口）。
@@ -87,10 +89,14 @@ class _CompletionFuture:
             return self._done
 
     def wait(self, timeout: float | None) -> bool:
-        """阻塞直到完成或超时。返回 ``True`` 若已完成。"""
+        """阻塞直到完成或超时。返回 ``True`` 若已完成。
+
+        已完成时直接返回；否则在 event loop 线程上立即报错，避免冻结循环。
+        """
         with self._cond:
             if self._done:
                 return True
+            _raise_if_blocking_in_loop()
             self._cond.wait(timeout=timeout)
             return self._done
 
@@ -603,4 +609,142 @@ def _resolve_args_with_deps(
     return resolved_args, resolved_kwargs, ids
 
 
-__all__ = ["AsyncResult"]
+@dataclass(frozen=True, slots=True)
+class BatchProgress:
+    """一批任务的进度快照。
+
+    核心 `BatchTracker` 维护每批任务的终态计数（Completed/Failed/Cancelled），
+    ``pending`` 由总数减去已结算项推导；Python 侧只做类型化包装，
+    不重复计数逻辑。
+
+    Attributes:
+        batch_id: 批次标识。
+        total: 已注册的任务总数。
+        completed: 成功完成数。
+        failed: 失败数。
+        cancelled: 取消数。
+        pending: 尚未结算的任务数（含运行中与未出队）。
+        finished: 所有任务均已结算（无论成功或失败）。
+    """
+
+    batch_id: str
+    total: int
+    completed: int
+    failed: int
+    cancelled: int
+    pending: int
+    finished: bool
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> BatchProgress:
+        return cls(
+            batch_id=str(data["batch_id"]),
+            total=int(data["total"]),
+            completed=int(data["completed"]),
+            failed=int(data["failed"]),
+            cancelled=int(data["cancelled"]),
+            pending=int(data["pending"]),
+            finished=bool(data["finished"]),
+        )
+
+
+def gather(
+    *handles: AsyncResult,
+    timeout: float | None = None,
+    return_exceptions: bool = False,
+) -> list[Any]:
+    """并行等待多个 ``AsyncResult`` 完成，返回结果列表。
+
+    与 ``asyncio.gather`` / ``ray.get`` 语义一致：所有任务并行执行，
+    等待全部完成后返回结果。与顺序 ``result()`` 不同，``gather`` 等待的是
+    **最慢**的任务而非所有任务时长之和。
+
+    ## 实现细节
+
+    利用 ``AsyncResult._future`` 的 intrusive callback 链：在所有 handle
+    上注册一个共享 ``threading.Event`` 的 set 操作，主线程仅等待该 event
+    一次。当最慢的 handle 完成时，event 被 set，主线程立即唤醒——
+    无需 N 次 ``wait_for`` 累加，避免超时检查的 N 倍开销。
+
+    Args:
+        *handles: 一个或多个 ``AsyncResult``。
+        timeout: 整体最大等待秒数，``None`` 表示无限等待。超时抛 ``ActantTimeoutError``。
+        return_exceptions: ``True`` 时，失败任务的结果为异常对象而非抛出；
+            ``False``（默认）时，任一任务失败立即抛出该异常（其他任务不受影响）。
+
+    Returns:
+        结果列表，顺序与输入 ``handles`` 一致。
+
+    Raises:
+        ActantTimeoutError: 等待超时。
+        ActantError: 任一任务失败（``return_exceptions=False`` 时）。
+        ValueError: 无 handles。
+
+    用法::
+
+        a = task1.submit(x)
+        b = task2.submit(y)
+        c = task3.submit(z)
+        results = actant.gather(a, b, c)  # 并行等待，返回 [ra, rb, rc]
+
+    大批量扇出推荐与 :meth:`Task.submit_batch` 配对：``submit_batch`` 用单次
+    Rust 调用投递全部任务（省去 N 次 Python→Rust 边界），``gather`` 并行等待
+    全部完成——即高吞吐基准验证的最优路径（``submit_batch(…); gather(*handles)``）。
+    """
+    if not handles:
+        raise ValueError("gather() requires at least one AsyncResult")
+
+    # Fast path: 若所有 handle 已完成，跳过共享 event 设置。
+    pending = [h for h in handles if not h.done()]
+    if pending:
+        # 共享 event：任一 handle 完成时通过 intrusive callback set 它。
+        # 主线程仅在此 event 上等待一次，避免 N 次 wait_for 累加延迟。
+        shared_event = threading.Event()
+        remaining_lock = threading.Lock()
+        # 使用 list 包装剩余计数以便闭包内 mutable 访问。
+        remaining: list[int] = [len(pending)]
+
+        def _on_done() -> None:
+            with remaining_lock:
+                remaining[0] -= 1
+                last = remaining[0] == 0
+            if last:
+                shared_event.set()
+
+        for h in pending:
+            # 注册 intrusive callback 到 handle 的 CompletionFuture。
+            # 回调本身轻量（仅原子递减 + 条件 set），不阻塞 handle 完成路径。
+            h._future.add_callback(_on_done)
+
+        # 主线程等待：所有 handle 完成或超时。
+        # 共享 event 仅在最慢 handle 完成时被 set，因此 wait() 实际等待时长
+        # 等于 max(handle_i 完成时间)，而非 sum。
+        _raise_if_blocking_in_loop()
+        if not shared_event.wait(timeout=timeout):
+            raise ActantTimeoutError(
+                f"gather: at least one handle did not complete within {timeout}s"
+            )
+
+    results: list[Any] = []
+    for h in handles:
+        if return_exceptions:
+            # exception() 对已完成的 handle 立即返回异常对象；成功时返回 None。
+            # 因此成功任务需要再调用 result() 获取实际返回值。
+            try:
+                exc = h.exception(timeout=0)
+            except TaskCancelledError:
+                # 已取消任务：作为异常收集（与 asyncio.gather 的 return_exceptions
+                # 语义一致，取消也视为异常）。
+                results.append(TaskCancelledError(f"task {h.task_id!r} was cancelled"))
+                continue
+            if exc is None:
+                results.append(h.result(timeout=0))
+            else:
+                results.append(exc)
+        else:
+            # result() 对已完成的 handle 立即返回或抛出异常。
+            results.append(h.result(timeout=0))
+    return results
+
+
+__all__ = ["AsyncResult", "BatchProgress", "gather"]

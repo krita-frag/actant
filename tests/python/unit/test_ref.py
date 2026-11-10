@@ -14,18 +14,9 @@ from typing import Any
 import cloudpickle
 import pytest
 
-from actant import Runtime
-from actant.capabilities import (
-    BUILTIN_CAPABILITIES,
-    PYTHON_ONLY_CAPABILITIES,
-    RUST_BACKED_CAPABILITIES,
-    VALUE_STORE,
-    ValueStoreReq,
-)
-from actant.exceptions import ActantTimeoutError, InvalidStateError
-from actant.task._async_result import AsyncResult, _collect_dep_ids
-from actant.task._gather import gather_async
-from actant.task._ref import (
+from actant import Runtime, aio
+from actant._internal.tasks.async_result import AsyncResult, _collect_dep_ids
+from actant._internal.tasks.ref import (
     REF_INLINE_THRESHOLD,
     Ref,
     _degrade_large_values,
@@ -33,9 +24,18 @@ from actant.task._ref import (
     _RefArg,
     _resolve_ref_arg,
 )
+from actant.capabilities import (
+    BUILTIN_CAPABILITIES,
+    PYTHON_ONLY_CAPABILITIES,
+    RUST_BACKED_CAPABILITIES,
+    VALUE_STORE,
+    WIRED_CAPABILITIES,
+    ValueStoreReq,
+)
+from actant.exceptions import ActantTimeoutError, InvalidStateError
 
-# ``actant.task`` 包属性被顶层 @task 装饰器遮蔽，经 importlib 取模块对象供 monkeypatch。
-ref_module = importlib.import_module("actant.task._ref")
+# 模块对象直接可用；注意 ``actant.task`` 是顶层装饰器，``actant.tasks`` 是命名空间。
+ref_module = importlib.import_module("actant._internal.tasks.ref")
 
 
 # ───────────────────────── ValueStore capability ─────────────────────────
@@ -47,7 +47,7 @@ def test_value_store_capability_declared() -> None:
     assert BUILTIN_CAPABILITIES[VALUE_STORE].kind == "perform"
     assert VALUE_STORE in PYTHON_ONLY_CAPABILITIES
     assert VALUE_STORE not in RUST_BACKED_CAPABILITIES
-    assert len(BUILTIN_CAPABILITIES) == 9
+    assert len(BUILTIN_CAPABILITIES) == len(WIRED_CAPABILITIES)
 
 
 def test_value_store_roundtrip_via_rust_bridge() -> None:
@@ -338,8 +338,8 @@ def test_await_cancelled_handle() -> None:
     asyncio.run(_main())
 
 
-def test_gather_async_timeout_and_exceptions() -> None:
-    """gather_async：桥接 future 等待，超时抛 ActantTimeoutError；return_exceptions 语义不变。"""
+def test_aio_gather_timeout_and_exceptions() -> None:
+    """aio.gather：桥接 future 等待，超时抛 ActantTimeoutError；return_exceptions 语义不变。"""
 
     async def _main() -> None:
         done_h = AsyncResult("done")
@@ -349,28 +349,28 @@ def test_gather_async_timeout_and_exceptions() -> None:
         pending_h = AsyncResult("pending")
 
         # 全部完成 + return_exceptions=True：失败结果为异常对象。
-        results = await gather_async(done_h, fail_h, timeout=1.0, return_exceptions=True)
+        results = await aio.gather(done_h, fail_h, timeout=1.0, return_exceptions=True)
         assert results[0] == 1
         assert isinstance(results[1], ValueError)
         # return_exceptions=False：失败异常透传。
         with pytest.raises(ValueError, match="bad"):
-            await gather_async(done_h, fail_h, timeout=1.0)
+            await aio.gather(done_h, fail_h, timeout=1.0)
         # 超时：pending 未完成 → ActantTimeoutError。
         with pytest.raises(ActantTimeoutError):
-            await gather_async(done_h, pending_h, timeout=0.05)
+            await aio.gather(done_h, pending_h, timeout=0.05)
 
     asyncio.run(_main())
     _no_await_threads()
 
 
-def test_gather_async_none_result_value() -> None:
+def test_aio_gather_none_result_value() -> None:
     """await / gather 对 None 结果（对象缓存态初值）同样正确投递。"""
 
     async def _main() -> None:
         h = AsyncResult("t1")
         h._set_result(None)
         assert await h is None
-        results = await gather_async(h, timeout=1.0)
+        results = await aio.gather(h, timeout=1.0)
         assert results == [None]
 
     asyncio.run(_main())

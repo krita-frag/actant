@@ -20,7 +20,7 @@ import actant
 @pytest.fixture(scope="session")
 def runtime():
     """session 级 Runtime：所有基准测试复用，减少 iroh endpoint 启动开销。"""
-    with actant.Runtime.with_defaults() as rt:
+    with actant.Runtime() as rt:
         yield rt
 
 
