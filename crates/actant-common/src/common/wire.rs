@@ -11,7 +11,12 @@ use crate::common::model::HlcTimestamp;
 /// 集中管理可避免跨模块漂移，使协议变更可在一处审计。
 pub mod constants {
     /// 当前协议版本。协议格式发生破坏性变更时递增。
-    pub const WIRE_PROTOCOL_VERSION: u8 = 1;
+    ///
+    /// v2：任务放置字段（`TaskDefinition.tags` / `quota` / `pinned_target`）、
+    /// 节点可用配额（`NodeHeartbeat.available_quotas`）与 DAG 节点放置字段
+    /// 进入 postcard/rkyv 布局。v1 节点解码 v2 帧会失败，滚动升级期间新旧
+    /// 节点不可混跑；本地 LMDB 中的 DAG/execution 存档同样需要重建。
+    pub const WIRE_PROTOCOL_VERSION: u8 = 2;
 
     // --- Gossip 话题前缀与名称 ---
 
@@ -24,12 +29,6 @@ pub mod constants {
     pub const TOPIC_WORKFLOW_STATE_RESP_PREFIX: &str = "actant:wf-state-resp:";
     /// 跨节点任务取消广播话题。
     pub const TOPIC_CANCEL: &str = "actant:cancel";
-    /// Capability gossip 话题。
-    ///
-    /// 注意：与其他 `actant:` 前缀的 gossip topic 不同，此 topic 使用 `actant://` 前缀。
-    /// 这是因为 capability gossip 走 `network.gossip_broadcast` 路径（直传字符串），不经过
-    /// `Topic` 构造器；保持稳定字符串便于跨版本兼容性审计。
-    pub const TOPIC_CAPABILITY_GOSSIP: &str = "actant://capability/gossip";
 
     // --- LMDB 持久化存储键前缀 ---
 
@@ -45,6 +44,9 @@ pub mod constants {
         /// 与 [`WAIT`] 同批落盘、同批删除——等待点跨重启存活而其信号不存活的
         /// 不对称会让缓冲在重启路径上失效。
         pub const SIGNAL_BUF: &str = "orch:sigbuf:";
+        /// 确定性上下文值快照：flow 体在历史中记录的时间/随机值。
+        /// 与 exec/pending 同批落盘，使重放跨重启返回同一组值。
+        pub const CONTEXT: &str = "orch:ctx:";
         /// 事件水位：快照已包含的最后一个事件的 `EventId`，
         /// recover 时据此只重放其后的事件（快照 + 事件重放，序号对齐）。
         pub const EVENT_SEQ: &str = "orch:eventseq:";
@@ -368,9 +370,9 @@ pub use traceparent::TraceContext;
 // 所有话题构造必须通过 `Topic::task(...)` 等构造器进行。
 pub use constants::{
     store_keys::{
-        DAG as STORE_KEY_DAG, EVENT_SEQ as STORE_KEY_EVENT_SEQ, EXEC as STORE_KEY_EXEC,
-        LEASE as STORE_KEY_LEASE, PENDING as STORE_KEY_PENDING, RESULT as STORE_KEY_RESULT,
-        SIGNAL_BUF as STORE_KEY_SIGNAL_BUF, WAIT as STORE_KEY_WAIT,
+        CONTEXT as STORE_KEY_CONTEXT, DAG as STORE_KEY_DAG, EVENT_SEQ as STORE_KEY_EVENT_SEQ,
+        EXEC as STORE_KEY_EXEC, LEASE as STORE_KEY_LEASE, PENDING as STORE_KEY_PENDING,
+        RESULT as STORE_KEY_RESULT, SIGNAL_BUF as STORE_KEY_SIGNAL_BUF, WAIT as STORE_KEY_WAIT,
     },
     TOPIC_CANCEL, TOPIC_DAG_STATE, TOPIC_FAILOVER, TOPIC_HEADS, TOPIC_HEARTBEAT,
     TOPIC_WORKFLOW_STATE_REQ, TOPIC_WORKFLOW_STATE_RESP_PREFIX, WIRE_PROTOCOL_VERSION,
@@ -457,7 +459,6 @@ impl Topic {
                 constants::TOPIC_FAILOVER => TopicRoute::Failover,
                 constants::TOPIC_HEADS => TopicRoute::Heads,
                 constants::TOPIC_CANCEL => TopicRoute::Cancel,
-                constants::TOPIC_CAPABILITY_GOSSIP => TopicRoute::CapabilityGossip,
                 _ => TopicRoute::Unknown,
             }
         }
@@ -521,8 +522,6 @@ pub enum TopicRoute {
     Heads,
     /// 跨节点任务取消广播话题。
     Cancel,
-    /// Capability 元信息 gossip 话题（广播节点 → capability 元信息）。
-    CapabilityGossip,
     /// 未识别话题 — 记录日志后丢弃。
     Unknown,
 }
@@ -594,12 +593,18 @@ struct WireSigningKeys {
     /// 最近一次注册的密钥。用于无来源节点字段的消息及未按 node 注册的
     /// 旧接口（[`set_wire_signing_key`]）。
     primary: Option<std::sync::Arc<Vec<u8>>>,
+    /// `primary` 对应的来源节点（`None` = 由 [`set_wire_signing_key`] 设置）。
+    ///
+    /// 用于在节点以空密钥重新注册（禁用签名）时精确清除它留下的 primary，
+    /// 避免同进程后续无密钥 Runtime 被残留密钥强制要求 MAC。
+    primary_node: Option<NodeId>,
 }
 
 static WIRE_SIGNING_KEYS: parking_lot::RwLock<WireSigningKeys> =
     parking_lot::RwLock::new(WireSigningKeys {
         per_node: Vec::new(),
         primary: None,
+        primary_node: None,
     });
 
 // 当前线程的入站 trace 上下文。
@@ -669,12 +674,26 @@ impl Drop for TraceScopeGuard {
 /// 注册指定节点的 wire message 签名密钥（`RuntimeBuilder::build` 每次构建调用）。
 ///
 /// 同进程多 Runtime 的密钥隔离语义见 [`WireSigningKeys`] 文档。重复注册同一
-/// node 覆盖前值；传入空 `Vec` 表示该节点禁用签名（仅移除该节点条目，
-/// 不影响其他节点与 primary）。
+/// node 覆盖前值；传入空 `Vec` 表示该节点禁用签名（移除该节点条目）。
+/// `primary` 若来自该节点：还有其它已注册节点时回落到最近注册者，全部注销时
+/// 清除——既保证存活 Runtime 的无来源节点消息仍可签名，又使后续禁用签名的
+/// Runtime 不必被迫携带 MAC。
 pub fn register_wire_signing_key(node: &NodeId, key: Vec<u8>) {
     let mut reg = WIRE_SIGNING_KEYS.write();
     if key.is_empty() {
         reg.per_node.retain(|(n, _)| n != node);
+        if reg.primary_node.as_ref() == Some(node) {
+            match reg.per_node.last().map(|(n, k)| (n.clone(), k.clone())) {
+                Some((next_node, next_key)) => {
+                    reg.primary = Some(next_key);
+                    reg.primary_node = Some(next_node);
+                }
+                None => {
+                    reg.primary = None;
+                    reg.primary_node = None;
+                }
+            }
+        }
         return;
     }
     let key = std::sync::Arc::new(key);
@@ -683,6 +702,7 @@ pub fn register_wire_signing_key(node: &NodeId, key: Vec<u8>) {
         None => reg.per_node.push((node.clone(), key.clone())),
     }
     reg.primary = Some(key);
+    reg.primary_node = Some(node.clone());
 }
 
 /// 设置进程级 primary 签名密钥（无 node 作用域的旧接口）。
@@ -692,11 +712,13 @@ pub fn register_wire_signing_key(node: &NodeId, key: Vec<u8>) {
 /// 的单元测试。重复调用覆盖前值；传入空 `Vec` 等价于清除 primary
 /// （禁用 primary 侧签名）。
 pub fn set_wire_signing_key(key: Vec<u8>) {
-    WIRE_SIGNING_KEYS.write().primary = if key.is_empty() {
+    let mut reg = WIRE_SIGNING_KEYS.write();
+    reg.primary = if key.is_empty() {
         None
     } else {
         Some(std::sync::Arc::new(key))
     };
+    reg.primary_node = None;
 }
 
 /// 读取当前生效的签名密钥：优先按消息来源节点查找，退化到 primary。
@@ -961,12 +983,25 @@ pub struct NodeHeartbeat {
     /// 超限整体置空。
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+    /// 本节点各命名配额的**剩余**容量（心跳时刻快照）。
+    ///
+    /// 路由策略据此跳过已满节点；执行节点仍会重新原子扣减，心跳仅用于
+    /// 减少无效转发（最终一致）。
+    #[serde(default)]
+    pub available_quotas: BTreeMap<String, u32>,
     /// 节点记录签名（身份与信任）：发送方 iroh endpoint 私钥对本结构
     /// （`signature = None` 序列化）的 ed25519 签名。验证公钥来自
     /// `endpoint_addr`（endpoint id 即公钥），无需密钥分发。
     /// `None` = 未签名（`require_signed_records = false` 时接受）。
     #[serde(default)]
     pub signature: Option<Vec<u8>>,
+    /// 节点拓扑角色。路由策略据此排除不执行任务的 orchestrator 节点。
+    /// 旧版本节点缺省为 [`crate::common::NodeRole::Both`]，保持 P2P 兼容。
+    #[serde(default)]
+    pub role: crate::common::NodeRole,
+    /// 本节点是否正在 draining。路由策略据此跳过该节点的新任务。
+    #[serde(default)]
+    pub draining: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -990,7 +1025,6 @@ pub enum WireTaskOutcome {
     Completed(Vec<u8>),
     Failed(String),
     Cancelled,
-    Skipped,
 }
 
 /// 跨节点任务取消广播消息。
@@ -1016,8 +1050,8 @@ pub struct WireDagStateUpdate {
 
 /// [`WireTaskState`] 变体的稳定字符串标识符。
 ///
-/// 这是 Rust↔Python 状态映射的唯一真相来源。
-/// `as_str()` 和 `from_python_str()` 均引用这些常量，确保双向不漂移。
+/// 这是 Rust→Python 状态映射的唯一真相来源。
+/// `as_str()` 引用这些常量，确保不漂移。
 ///
 /// 注意：此处无 `PENDING` 常量，因为 `WireTaskState` 仅携带分发后状态。
 /// Pending 由 `WireTaskState` 条目缺失表示，并在编排器侧以 `Phase::Pending` 呈现。
@@ -1026,7 +1060,6 @@ pub mod state_str {
     pub const COMPLETED: &str = "Completed";
     pub const FAILED: &str = "Failed";
     pub const CANCELLED: &str = "Cancelled";
-    pub const SKIPPED: &str = "Skipped";
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1035,7 +1068,6 @@ pub enum WireTaskState {
     Completed { result: Vec<u8> },
     Failed { error: String },
     Cancelled,
-    Skipped,
 }
 
 impl WireTaskState {
@@ -1048,32 +1080,6 @@ impl WireTaskState {
             WireTaskState::Completed { .. } => state_str::COMPLETED,
             WireTaskState::Failed { .. } => state_str::FAILED,
             WireTaskState::Cancelled => state_str::CANCELLED,
-            WireTaskState::Skipped => state_str::SKIPPED,
-        }
-    }
-
-    /// 将 Python 层的状态字符串解析为 `WireTaskState`。
-    ///
-    /// 与 `state_str` 常量（小写形式）做大小写不敏感比较，
-    /// 以容忍异构 gossip 来源。无法识别的状态字符串返回 `None`。
-    pub fn from_python_str(state: &str, data: Vec<u8>) -> Option<Self> {
-        // 与规范常量做大小写不敏感比较。
-        let lower = state.to_ascii_lowercase();
-        let ok = |c: &'static str| lower == c.to_ascii_lowercase();
-        if ok(state_str::COMPLETED) {
-            Some(WireTaskState::Completed { result: data })
-        } else if ok(state_str::FAILED) {
-            Some(WireTaskState::Failed {
-                error: String::from_utf8_lossy(&data).into_owned(),
-            })
-        } else if ok(state_str::RUNNING) {
-            Some(WireTaskState::Running)
-        } else if ok(state_str::CANCELLED) {
-            Some(WireTaskState::Cancelled)
-        } else if ok(state_str::SKIPPED) {
-            Some(WireTaskState::Skipped)
-        } else {
-            None
         }
     }
 }
@@ -1085,7 +1091,6 @@ impl WireTaskOutcome {
             WireTaskOutcome::Completed(_) => state_str::COMPLETED,
             WireTaskOutcome::Failed(_) => state_str::FAILED,
             WireTaskOutcome::Cancelled => state_str::CANCELLED,
-            WireTaskOutcome::Skipped => state_str::SKIPPED,
         }
     }
 }

@@ -222,6 +222,7 @@ fn test_decode_logs_warning_on_version_mismatch() {
         message: WireMessage::NodeHeartbeat(NodeHeartbeat {
             signature: None,
             labels: BTreeMap::new(),
+            available_quotas: BTreeMap::new(),
             platform: None,
             node_id: node("n"),
             active_workflows: vec![],
@@ -229,6 +230,8 @@ fn test_decode_logs_warning_on_version_mismatch() {
             available_slots: 0,
             max_slots: 0,
             endpoint_addr: None,
+            role: crate::common::NodeRole::Both,
+            draining: false,
         }),
         traceparent: None,
         mac: None,
@@ -262,6 +265,7 @@ fn wire_envelope_wrap_injects_w3c_traceparent() {
     let msg = WireMessage::NodeHeartbeat(NodeHeartbeat {
         signature: None,
         labels: BTreeMap::new(),
+        available_quotas: BTreeMap::new(),
         platform: None,
         node_id: node("n1"),
         active_workflows: vec![],
@@ -269,6 +273,8 @@ fn wire_envelope_wrap_injects_w3c_traceparent() {
         available_slots: 0,
         max_slots: 0,
         endpoint_addr: None,
+        role: crate::common::NodeRole::Both,
+        draining: false,
     });
     let envelope = WireEnvelope::wrap(msg);
     // traceparent 字段必须非空，且为合法 W3C 格式。
@@ -288,6 +294,7 @@ fn wire_envelope_roundtrip_preserves_traceparent() {
     let msg = WireMessage::NodeHeartbeat(NodeHeartbeat {
         signature: None,
         labels: BTreeMap::new(),
+        available_quotas: BTreeMap::new(),
         platform: None,
         node_id: node("n2"),
         active_workflows: vec![],
@@ -295,6 +302,8 @@ fn wire_envelope_roundtrip_preserves_traceparent() {
         available_slots: 0,
         max_slots: 0,
         endpoint_addr: None,
+        role: crate::common::NodeRole::Both,
+        draining: false,
     });
     let envelope = WireEnvelope::wrap(msg);
     let original_tp = envelope.traceparent.clone().unwrap();
@@ -316,6 +325,7 @@ fn wire_envelope_wrap_within_scope_produces_child_traceparent() {
     let msg = WireMessage::NodeHeartbeat(NodeHeartbeat {
         signature: None,
         labels: BTreeMap::new(),
+        available_quotas: BTreeMap::new(),
         platform: None,
         node_id: node("n3"),
         active_workflows: vec![],
@@ -323,6 +333,8 @@ fn wire_envelope_wrap_within_scope_produces_child_traceparent() {
         available_slots: 0,
         max_slots: 0,
         endpoint_addr: None,
+        role: crate::common::NodeRole::Both,
+        draining: false,
     });
     let envelope = WireEnvelope::wrap(msg);
     let child_tp = envelope.traceparent.as_ref().unwrap();
@@ -348,6 +360,7 @@ fn wire_envelope_wrap_after_scope_drop_returns_to_root() {
         let envelope = WireEnvelope::wrap(WireMessage::NodeHeartbeat(NodeHeartbeat {
             signature: None,
             labels: BTreeMap::new(),
+            available_quotas: BTreeMap::new(),
             platform: None,
             node_id: node("n4"),
             active_workflows: vec![],
@@ -355,6 +368,8 @@ fn wire_envelope_wrap_after_scope_drop_returns_to_root() {
             available_slots: 0,
             max_slots: 0,
             endpoint_addr: None,
+            role: crate::common::NodeRole::Both,
+            draining: false,
         }));
         envelope.traceparent.unwrap()
     };
@@ -363,6 +378,7 @@ fn wire_envelope_wrap_after_scope_drop_returns_to_root() {
     let envelope = WireEnvelope::wrap(WireMessage::NodeHeartbeat(NodeHeartbeat {
         signature: None,
         labels: BTreeMap::new(),
+        available_quotas: BTreeMap::new(),
         platform: None,
         node_id: node("n4"),
         active_workflows: vec![],
@@ -370,6 +386,8 @@ fn wire_envelope_wrap_after_scope_drop_returns_to_root() {
         available_slots: 0,
         max_slots: 0,
         endpoint_addr: None,
+        role: crate::common::NodeRole::Both,
+        draining: false,
     }));
     let root_tp = envelope.traceparent.unwrap();
     let root = TraceContext::parse(&root_tp).unwrap();
@@ -392,6 +410,7 @@ fn wire_mac_protects_traceparent_field() {
     let envelope = WireEnvelope::wrap(WireMessage::NodeHeartbeat(NodeHeartbeat {
         signature: None,
         labels: BTreeMap::new(),
+        available_quotas: BTreeMap::new(),
         platform: None,
         node_id: node("n5"),
         active_workflows: vec![],
@@ -399,6 +418,8 @@ fn wire_mac_protects_traceparent_field() {
         available_slots: 0,
         max_slots: 0,
         endpoint_addr: None,
+        role: crate::common::NodeRole::Both,
+        draining: false,
     }));
     let original_tp = envelope.traceparent.clone().unwrap();
     let mut bytes = crate::common::encode_postcard(&envelope).unwrap();
@@ -451,32 +472,6 @@ fn wire_task_state_as_str_returns_canonical_values() {
         state_str::FAILED
     );
     assert_eq!(WireTaskState::Cancelled.as_str(), state_str::CANCELLED);
-    assert_eq!(WireTaskState::Skipped.as_str(), state_str::SKIPPED);
-}
-
-#[test]
-fn wire_task_state_from_python_str_parses_all_states() {
-    assert!(matches!(
-        WireTaskState::from_python_str("Running", vec![]),
-        Some(WireTaskState::Running)
-    ));
-    assert!(matches!(
-        WireTaskState::from_python_str("completed", vec![1]),
-        Some(WireTaskState::Completed { result }) if result == vec![1]
-    ));
-    assert!(matches!(
-        WireTaskState::from_python_str("FAILED", b"oops".to_vec()),
-        Some(WireTaskState::Failed { error }) if error == "oops"
-    ));
-    assert!(matches!(
-        WireTaskState::from_python_str("CANCELLED", vec![]),
-        Some(WireTaskState::Cancelled)
-    ));
-    assert!(matches!(
-        WireTaskState::from_python_str("skipped", vec![]),
-        Some(WireTaskState::Skipped)
-    ));
-    assert!(WireTaskState::from_python_str("Unknown", vec![]).is_none());
 }
 
 #[test]
@@ -490,7 +485,6 @@ fn wire_task_outcome_as_str_returns_canonical_values() {
         state_str::FAILED
     );
     assert_eq!(WireTaskOutcome::Cancelled.as_str(), state_str::CANCELLED);
-    assert_eq!(WireTaskOutcome::Skipped.as_str(), state_str::SKIPPED);
 }
 
 // --- WireEnvelope MAC（节点身份认证 + 共享密钥签名） ---
@@ -506,6 +500,7 @@ fn heartbeat_msg(n: &str) -> WireMessage {
     WireMessage::NodeHeartbeat(NodeHeartbeat {
         signature: None,
         labels: BTreeMap::new(),
+        available_quotas: BTreeMap::new(),
         platform: None,
         node_id: node(n),
         active_workflows: vec![],
@@ -513,6 +508,8 @@ fn heartbeat_msg(n: &str) -> WireMessage {
         available_slots: 1,
         max_slots: 4,
         endpoint_addr: Some("test-addr".to_string()),
+        role: crate::common::NodeRole::Both,
+        draining: false,
     })
 }
 
@@ -640,6 +637,7 @@ fn trace_scope_guard_restore_recovers_previous_scope() {
         WireEnvelope::wrap(WireMessage::NodeHeartbeat(NodeHeartbeat {
             signature: None,
             labels: BTreeMap::new(),
+            available_quotas: BTreeMap::new(),
             platform: None,
             node_id: node("nested"),
             active_workflows: vec![],
@@ -647,6 +645,8 @@ fn trace_scope_guard_restore_recovers_previous_scope() {
             available_slots: 0,
             max_slots: 0,
             endpoint_addr: None,
+            role: crate::common::NodeRole::Both,
+            draining: false,
         }))
         .traceparent
         .unwrap()
@@ -816,6 +816,76 @@ fn two_runtimes_with_different_keys_do_not_interfere() {
     // 清理全局注册表，避免污染其他 MAC 测试。
     crate::common::register_wire_signing_key(&node_a, Vec::new());
     crate::common::register_wire_signing_key(&node_b, Vec::new());
+    set_wire_signing_key(Vec::new());
+}
+
+/// 回归测试：节点以空密钥重新注册时必须清除它留下的 `primary`。
+///
+/// 否则同进程后续禁用签名的 Runtime 出站消息不带 MAC，而进程内仍残留
+/// `primary` 使接收侧要求 MAC，跨进程消息会被全部丢弃（表现为集群无法收敛）。
+#[test]
+fn clearing_node_key_clears_primary_it_owned() {
+    let _guard = MAC_TEST_LOCK.lock().unwrap();
+    let n = node("rt-reset");
+    set_wire_signing_key(Vec::new());
+    crate::common::register_wire_signing_key(&n, b"rt-reset-key".to_vec());
+
+    // 注册密钥后，该节点的消息带 MAC。
+    let signed = WireEnvelope::wrap(heartbeat_msg("rt-reset"));
+    assert!(signed.mac.is_some());
+
+    // 以空密钥重新注册：该节点及它留下的 primary 一并清除。
+    crate::common::register_wire_signing_key(&n, Vec::new());
+    let unsigned = WireEnvelope::wrap(heartbeat_msg("rt-reset"));
+    assert!(
+        unsigned.mac.is_none(),
+        "clearing node key must also clear the primary it registered"
+    );
+    let bytes = postcard::to_allocvec(&unsigned).unwrap();
+    assert!(
+        WireEnvelope::decode(&bytes).is_some(),
+        "unsigned message must decode after the node key is cleared"
+    );
+
+    set_wire_signing_key(Vec::new());
+}
+
+/// 回归测试：注销 primary 拥有者后，primary 必须回落到其余已注册节点。
+///
+/// 无来源节点字段的消息（`WorkflowStateResponse`）依赖 primary 签名；若直接
+/// 清空 primary，存活节点的响应会变成无 MAC，被仍持有 per-node 密钥的对端丢弃。
+#[test]
+fn clearing_primary_owner_falls_back_to_remaining_node() {
+    let _guard = MAC_TEST_LOCK.lock().unwrap();
+    let a = node("rt-fallback-a");
+    let b = node("rt-fallback-b");
+    set_wire_signing_key(Vec::new());
+    crate::common::register_wire_signing_key(&a, b"rt-fallback-key".to_vec());
+    crate::common::register_wire_signing_key(&b, b"rt-fallback-key".to_vec());
+
+    // b 最后注册，持有 primary；注销 b 后 primary 应回落到 a。
+    crate::common::register_wire_signing_key(&b, Vec::new());
+
+    let response = WireEnvelope::wrap(WireMessage::WorkflowStateResponse(
+        crate::common::WorkflowStateResponse {
+            workflow_id: crate::common::WorkflowId::from("wf-fallback"),
+            dag: None,
+            execution: None,
+            pending: None,
+        },
+    ));
+    assert!(
+        response.mac.is_some(),
+        "origin-less message must still be signed via the remaining node key"
+    );
+    let bytes = postcard::to_allocvec(&response).unwrap();
+    assert!(
+        WireEnvelope::decode(&bytes).is_some(),
+        "message signed with the fallen-back primary must decode"
+    );
+
+    // 清理全局注册表，避免污染其他 MAC 测试。
+    crate::common::register_wire_signing_key(&a, Vec::new());
     set_wire_signing_key(Vec::new());
 }
 

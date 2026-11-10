@@ -37,6 +37,10 @@ fn make_task_dispatch() -> WireMessage {
         enqueued_at_ms: 0,
         target_endpoint_addr: None,
         origin_endpoint_addr: None,
+        tags: Vec::new(),
+        quota: None,
+        pinned_target: false,
+        lease_deadline_ms: 0,
     })
 }
 
@@ -49,12 +53,15 @@ fn make_node_heartbeat() -> WireMessage {
         signature: None,
         labels: std::collections::BTreeMap::new(),
         platform: None,
+        available_quotas: std::collections::BTreeMap::new(),
         node_id: NodeId::from("node-bench-self"),
         active_workflows,
         timestamp_ms: 1_700_000_000_000,
         available_slots: 8,
         max_slots: 16,
         endpoint_addr: Some("endpoint-bench-addr".into()),
+        role: actant_core::common::NodeRole::Both,
+        draining: false,
     })
 }
 

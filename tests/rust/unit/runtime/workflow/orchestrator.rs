@@ -6,10 +6,8 @@ use crate::runtime::network::{
 };
 use crate::runtime::state::Store;
 use crate::runtime::workflow::dag::Terminal;
-use crate::runtime::workflow::orchestrator::types::ConditionEvaluator;
 // `WaitCondition` 由下方「统一工作流历史」段落的 import 引入（同一文件作用域），此处不重复导入。
 use crate::runtime::workflow::{Dag, DagNode, FailureScope, Phase, WaitPointState};
-use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -20,11 +18,14 @@ fn make_node(id: &str, name: &str) -> DagNode {
     DagNode {
         task_id: TaskId::from(id.to_string()),
         name: name.to_string(),
-        payload: crate::common::payload::sign(TEST_SIGNING_KEY, b"").unwrap(),
+        // 与生产一致：Python 提交侧存原始字节，签名由 orchestrator 派发时完成。
+        payload: Vec::new(),
         retry_policy: None,
         timeout_ms: None,
         priority: 0,
         metadata: HashMap::new(),
+        tags: Vec::new(),
+        quota: None,
     }
 }
 
@@ -73,6 +74,32 @@ async fn submit_registers_workflow_in_state() {
     assert!(orch.has_workflow(&wf));
     let ids = orch.active_workflow_ids();
     assert!(ids.contains(&wf));
+}
+
+#[tokio::test]
+async fn start_propagates_node_tags_and_quota() {
+    let orch = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
+    let wf = WorkflowId::from("wf-placement");
+    let mut dag = Dag::new();
+    let mut node = make_node("t1", "root");
+    node.tags = vec!["engine=a".into(), "gpu".into()];
+    node.quota = Some("gpu".into());
+    dag.add_node(node).unwrap();
+
+    orch.submit(wf.clone(), dag).await.unwrap();
+    let tasks = orch.start(&wf).unwrap();
+
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(
+        tasks[0].tags,
+        vec!["engine=a".to_string(), "gpu".to_string()]
+    );
+    assert_eq!(tasks[0].quota.as_deref(), Some("gpu"));
+    assert_eq!(
+        crate::common::payload::verify(TEST_SIGNING_KEY, &tasks[0].payload).unwrap(),
+        Vec::<u8>::new(),
+        "dispatched payload must be signed exactly once from the unsigned node payload"
+    );
 }
 
 /// `adopt_workflow` 在无本地 store 数据时插入占位符（`SlotState::Loading`）。
@@ -167,7 +194,7 @@ async fn completing_task_returns_ready_successors() {
     orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
     orch.start(&wf).unwrap();
 
-    let (ready, _, terminal) = orch
+    let (ready, terminal) = orch
         .on_task_completed(&wf, &TaskId::from("t1"), b"r1".to_vec())
         .await
         .unwrap();
@@ -177,52 +204,6 @@ async fn completing_task_returns_ready_successors() {
         !terminal,
         "workflow should not be terminal after completing only the root task"
     );
-}
-
-#[tokio::test]
-async fn condition_evaluator_automatically_activates_branch() {
-    struct AlwaysTrue;
-    #[async_trait]
-    impl ConditionEvaluator for AlwaysTrue {
-        async fn evaluate(
-            &self,
-            _workflow_id: &WorkflowId,
-            _task_id: &TaskId,
-            _condition: &str,
-        ) -> crate::common::Result<bool> {
-            Ok(true)
-        }
-    }
-
-    let orch = Orchestrator::new()
-        .with_signing_key(TEST_SIGNING_KEY.to_vec())
-        .with_condition_evaluator(Arc::new(AlwaysTrue));
-    let wf = WorkflowId::from("wf-1");
-
-    let mut dag = Dag::new();
-    dag.add_node(make_node("t1", "root")).unwrap();
-    dag.add_node(make_node("t2", "left")).unwrap();
-    dag.add_conditional_edge(
-        TaskId::from("t1"),
-        TaskId::from("t2"),
-        "go_left".to_string(),
-    )
-    .unwrap();
-
-    orch.submit(wf.clone(), dag).await.unwrap();
-    let roots = orch.start(&wf).unwrap();
-    assert_eq!(roots.len(), 1);
-
-    let (ready, conditional, _) = orch
-        .on_task_completed(&wf, &TaskId::from("t1"), b"r1".to_vec())
-        .await
-        .unwrap();
-    assert!(
-        conditional.is_empty(),
-        "conditional edges should be handled internally"
-    );
-    assert_eq!(ready.len(), 1);
-    assert_eq!(ready[0].id, TaskId::from("t2"));
 }
 
 #[tokio::test]
@@ -238,7 +219,7 @@ async fn completing_last_task_signals_workflow_terminal() {
     orch.on_task_completed(&wf, &TaskId::from("t2"), b"r2".to_vec())
         .await
         .unwrap();
-    let (ready, _, terminal) = orch
+    let (ready, terminal) = orch
         .on_task_completed(&wf, &TaskId::from("t3"), b"r3".to_vec())
         .await
         .unwrap();
@@ -262,101 +243,26 @@ async fn completing_diamond_join_waits_for_both_predecessors() {
     orch.start(&wf).unwrap();
 
     // Complete root t1 → t2 and t3 become ready
-    let (ready, _, _) = orch
+    let (ready, _) = orch
         .on_task_completed(&wf, &TaskId::from("t1"), b"r1".to_vec())
         .await
         .unwrap();
     assert_eq!(ready.len(), 2);
 
     // Complete t2 → t4 NOT ready (still waiting on t3)
-    let (ready, _, _) = orch
+    let (ready, _) = orch
         .on_task_completed(&wf, &TaskId::from("t2"), b"r2".to_vec())
         .await
         .unwrap();
     assert!(ready.is_empty());
 
     // Complete t3 → t4 NOW ready
-    let (ready, _, _) = orch
+    let (ready, _) = orch
         .on_task_completed(&wf, &TaskId::from("t3"), b"r3".to_vec())
         .await
         .unwrap();
     assert_eq!(ready.len(), 1);
     assert_eq!(ready[0].id, TaskId::from("t4"));
-}
-
-#[tokio::test]
-async fn skip_conditional_branch_skips_task_without_failing_workflow() {
-    let orch = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
-    let wf = WorkflowId::from("wf-1");
-
-    // t1 → t2 → t3 where t2 is skipped
-    let dag = make_linear_dag();
-    orch.submit(wf.clone(), dag).await.unwrap();
-    orch.start(&wf).unwrap();
-
-    orch.skip_conditional_branch(&wf, &TaskId::from("t2"))
-        .await
-        .unwrap();
-
-    let state = orch.get_state(&wf).unwrap();
-    let t2_state = state.tasks.get(&TaskId::from("t2")).unwrap();
-    assert_eq!(t2_state.state, Phase::Skipped);
-}
-
-/// 回归测试：节点同时是某前驱的普通后继和另一前驱的条件后继时，
-/// `skip_conditional_branch` 不得将其错误跳过。
-///
-/// 场景：
-/// ```text
-///     t1 ──普通──→ t3
-///     t2 ──条件──→ t3
-/// ```
-/// t3 的 pending = 2（t1 普通 + t2 条件）。当 t2 的条件分支不激活时，
-/// `skip_conditional_branch(t3)` 应仅减少一次 pending（2→1），不跳过 t3，
-/// 因为 t3 仍等待 t1 的普通完成。t3 的状态应保持 Pending。
-#[tokio::test]
-async fn skip_conditional_branch_does_not_skip_node_also_regular_successor() {
-    let orch = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
-    let wf = WorkflowId::from("wf-mixed");
-
-    // t1 ──普通──→ t3
-    // t2 ──条件──→ t3
-    let mut dag = Dag::new();
-    dag.add_node(make_node("t1", "regular_pred")).unwrap();
-    dag.add_node(make_node("t2", "cond_pred")).unwrap();
-    dag.add_node(make_node("t3", "join")).unwrap();
-    dag.add_edge(TaskId::from("t1"), TaskId::from("t3"))
-        .unwrap();
-    dag.add_conditional_edge(TaskId::from("t2"), TaskId::from("t3"), "maybe".to_string())
-        .unwrap();
-    orch.submit(wf.clone(), dag).await.unwrap();
-    orch.start(&wf).unwrap();
-
-    // 模拟 t2 的条件分支不激活：调用 skip_conditional_branch(t3)。
-    // t3 的 pending 应从 2 减为 1，状态保持 Pending（不跳过）。
-    let ready = orch
-        .skip_conditional_branch(&wf, &TaskId::from("t3"))
-        .await
-        .unwrap();
-
-    // 不应返回任何 ready 任务（t3 的 pending 仍为 1）
-    assert!(
-        ready.is_empty(),
-        "t3 should not be ready: it still waits for t1"
-    );
-
-    let state = orch.get_state(&wf).unwrap();
-    let t3_state = state.tasks.get(&TaskId::from("t3")).unwrap();
-    assert_ne!(
-        t3_state.state,
-        Phase::Skipped,
-        "t3 must not be skipped: it is still a regular successor of t1"
-    );
-    assert_eq!(
-        t3_state.state,
-        Phase::Pending,
-        "t3 should remain Pending while waiting for t1"
-    );
 }
 
 #[tokio::test]
@@ -613,6 +519,34 @@ async fn workflow_timeout_self_delivers_cancel_locally() {
     assert_eq!(decoded.task_id, roots[0].id);
 }
 
+/// 回归：注入网络后，派发的工作流任务必须携带本节点 endpoint addr。
+///
+/// `origin_node` 是逻辑名（Python 嵌入下等于 Runtime.name），不能作为网络
+/// 地址；远端 completion 会优先使用 `origin_endpoint_addr` 直连回编排节点。
+#[tokio::test]
+async fn workflow_tasks_carry_origin_endpoint_addr_when_network_set() {
+    let transport = Arc::new(BroadcastCaptureTransport::new("n1"));
+    let orch = Orchestrator::new()
+        .with_signing_key(TEST_SIGNING_KEY.to_vec())
+        .with_network(transport);
+
+    let wf = WorkflowId::from("wf-origin-addr");
+    orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
+    let roots = orch.start(&wf).unwrap();
+
+    assert!(
+        !roots.is_empty(),
+        "workflow should expose at least one root"
+    );
+    for task in &roots {
+        assert_eq!(
+            task.origin_endpoint_addr.as_deref(),
+            Some("capture"),
+            "dispatched workflow task must carry the local endpoint addr"
+        );
+    }
+}
+
 /// 回归测试：未注入网络时，超时监控仍标记工作流失败但不广播取消。
 #[tokio::test]
 async fn workflow_timeout_without_network_marks_failed_without_broadcast() {
@@ -827,7 +761,7 @@ async fn high_fanout_dag_completes_correctly() {
         assert_eq!(roots.len(), 1, "fanout={fanout}: single root");
 
         // 完成 root，应一次性释放全部 fanout 个子任务。
-        let (ready, _, terminal) = orch
+        let (ready, terminal) = orch
             .on_task_completed(&wf, &TaskId::from("root"), b"r".to_vec())
             .await
             .unwrap();
@@ -844,7 +778,7 @@ async fn high_fanout_dag_completes_correctly() {
         // 逐个完成子任务；最后一个应触发 workflow 终态。
         for i in 0..fanout {
             let child_id = TaskId::from(format!("c{i}"));
-            let (_, _, terminal) = orch
+            let (_, terminal) = orch
                 .on_task_completed(&wf, &child_id, b"c".to_vec())
                 .await
                 .unwrap();
@@ -866,8 +800,7 @@ async fn high_fanout_dag_completes_correctly() {
 
 // ---- 持久化恢复（重建 Orchestrator 内存状态 + 运行中任务重置为 Pending）----
 
-/// 恢复需要与提交时一致的有效负载签名密钥，否则重建的 ready 任务会因
-/// "signing disabled but payload appears signed" 而失败。
+/// 恢复出的 ready 任务同样在派发时签名，故恢复配置须与节点侧校验密钥一致。
 fn recover_config() -> ActantConfig {
     ActantConfig {
         payload_signing_key: TEST_SIGNING_KEY.to_vec(),
@@ -894,7 +827,7 @@ async fn recover_reconstructs_workflow_and_resumes_to_terminal() {
     let roots = orch.start(&wf).unwrap();
     assert_eq!(roots.len(), 1);
     orch.mark_task_running(&wf, &roots[0].id).unwrap();
-    let (ready, _, _) = orch
+    let (ready, _) = orch
         .on_task_completed(&wf, &TaskId::from("t1"), b"r1".to_vec())
         .await
         .unwrap();
@@ -937,7 +870,7 @@ async fn recover_reconstructs_workflow_and_resumes_to_terminal() {
         .on_task_completed(&wf, &TaskId::from("t2"), b"r2".to_vec())
         .await
         .unwrap();
-    let (_, _, terminal) = recovered
+    let (_, terminal) = recovered
         .on_task_completed(&wf, &TaskId::from("t3"), b"r3".to_vec())
         .await
         .unwrap();
@@ -982,7 +915,7 @@ async fn recover_resumes_workflow_submitted_before_progress_flush() {
         .on_task_completed(&wf, &TaskId::from("t2"), b"r2".to_vec())
         .await
         .unwrap();
-    let (_, _, terminal) = recovered
+    let (_, terminal) = recovered
         .on_task_completed(&wf, &TaskId::from("t3"), b"r3".to_vec())
         .await
         .unwrap();
@@ -1003,13 +936,12 @@ async fn late_completion_after_cancel_does_not_change_terminal_state() {
     orch.mark_task_running(&wf, &TaskId::from("t1")).unwrap();
     orch.cancel(&wf).await.unwrap();
 
-    let (ready, conditional, terminal) = orch
+    let (ready, terminal) = orch
         .on_task_completed(&wf, &TaskId::from("t1"), b"late".to_vec())
         .await
         .unwrap();
 
     assert!(ready.is_empty(), "no ready successors may be returned");
-    assert!(conditional.is_empty());
     assert!(
         !terminal,
         "skipped late completion must not report a fresh terminal transition"
@@ -1044,7 +976,7 @@ async fn late_completion_after_failure_does_not_revive_workflow() {
     .unwrap();
     assert_eq!(orch.get_state(&wf).unwrap().state, Phase::Failed);
 
-    let (ready, _, terminal) = orch
+    let (ready, terminal) = orch
         .on_task_completed(&wf, &TaskId::from("t1"), b"late".to_vec())
         .await
         .unwrap();
@@ -1089,77 +1021,14 @@ async fn submit_with_timeout_persists_deadline_across_recover() {
     );
 }
 
-// ---- 条件边求值失败不得丢弃 ready 后继 ----
-
-/// 求值器返回 Err 时：`on_task_completed` 不应整体失败，已就绪的普通后继
-/// 照常返回，求值失败的条件边原样交还调用方外部处理（重试同一完成消息
-/// 不会因任务已终态被守卫拒绝而永久卡死）。
-#[tokio::test]
-async fn condition_evaluator_error_defers_edge_and_keeps_ready() {
-    struct AlwaysErr;
-    #[async_trait]
-    impl ConditionEvaluator for AlwaysErr {
-        async fn evaluate(
-            &self,
-            _workflow_id: &WorkflowId,
-            _task_id: &TaskId,
-            _condition: &str,
-        ) -> crate::common::Result<bool> {
-            Err(ActantError::Internal("evaluator down".into()))
-        }
-    }
-
-    let orch = Orchestrator::new()
-        .with_signing_key(TEST_SIGNING_KEY.to_vec())
-        .with_condition_evaluator(Arc::new(AlwaysErr));
-    let wf = WorkflowId::from("wf-cond-err");
-
-    // t1 ──普通──→ t3
-    // t1 ──条件──→ t2
-    let mut dag = Dag::new();
-    dag.add_node(make_node("t1", "root")).unwrap();
-    dag.add_node(make_node("t2", "cond_succ")).unwrap();
-    dag.add_node(make_node("t3", "plain_succ")).unwrap();
-    dag.add_edge(TaskId::from("t1"), TaskId::from("t3"))
-        .unwrap();
-    dag.add_conditional_edge(TaskId::from("t1"), TaskId::from("t2"), "maybe".to_string())
-        .unwrap();
-
-    orch.submit(wf.clone(), dag).await.unwrap();
-    orch.start(&wf).unwrap();
-
-    let (ready, conditional, terminal) = orch
-        .on_task_completed(&wf, &TaskId::from("t1"), b"r1".to_vec())
-        .await
-        .unwrap();
-
-    assert!(
-        !terminal,
-        "workflow must not be terminal with t2/t3 still outstanding"
-    );
-    // 普通后继 t3 照常就绪并被返回。
-    assert_eq!(ready.len(), 1, "ready successor must not be dropped");
-    assert_eq!(ready[0].id, TaskId::from("t3"));
-    // 求值失败的条件边原样交还调用方。
-    assert_eq!(
-        conditional,
-        vec![(TaskId::from("t2"), "maybe".to_string())],
-        "failed conditional edge must be deferred to the caller"
-    );
-
-    // t2 仍是 Pending（未被跳过也未被激活）。
-    let state = orch.get_state(&wf).unwrap();
-    assert_eq!(state.tasks[&TaskId::from("t2")].state, Phase::Pending);
-}
-
 // ---- 超时失败的工作流写入 Failed 事件 ----
 
 /// 工作流级硬超时触发后，除状态翻转外还应向 `workflow:{id}` topic 写入
-/// `WorkflowEventPayload::Failed` 事件（对齐 fail_task 路径）。
+/// `JournalEvent::Failed` 事件（对齐 fail_task 路径）。
 #[tokio::test]
 async fn workflow_timeout_writes_failed_event_to_event_log() {
     use crate::runtime::state::event_log::{EventLog, MemoryEventLog};
-    use crate::runtime::workflow::orchestrator::types::WorkflowEventPayload;
+    use crate::runtime::workflow::orchestrator::types::JournalEvent;
 
     let mut config = ActantConfig::default();
     config.workflow.state_poll_interval_ms = 20;
@@ -1186,8 +1055,8 @@ async fn workflow_timeout_writes_failed_event_to_event_log() {
     let topic = format!("workflow:{}", wf.as_str());
     let entries = event_log.read_after(&topic, None).unwrap();
     let has_failed_event = entries.iter().any(|entry| {
-        postcard::from_bytes::<WorkflowEventPayload>(&entry.payload)
-            .is_ok_and(|p| matches!(p, WorkflowEventPayload::Failed { .. }))
+        postcard::from_bytes::<JournalEvent>(&entry.payload)
+            .is_ok_and(|p| matches!(p, JournalEvent::Failed { .. }))
     });
     assert!(
         has_failed_event,
@@ -1241,6 +1110,41 @@ async fn handle_task_failure_retries_with_incremented_attempt_and_carries_it_on_
         t1.state,
         Phase::Pending,
         "orchestrator retry resets the task to Pending (awaiting redispatch)"
+    );
+}
+
+/// 重试等待按 `backoff_multiplier` 指数增长，并被 `max_delay_ms` 钳制。
+#[tokio::test]
+async fn handle_task_failure_applies_retry_backoff_and_cap() {
+    let orch = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
+    let wf = WorkflowId::from("wf-backoff");
+
+    let mut dag = Dag::new();
+    let mut node = make_node("t1", "retryable");
+    node.retry_policy = Some(RetryPolicy {
+        max_retries: 3,
+        delay_ms: 100,
+        backoff_multiplier: 3.0,
+        max_delay_ms: 500,
+    });
+    dag.add_node(node).unwrap();
+    orch.submit(wf.clone(), dag).await.unwrap();
+    orch.start(&wf).unwrap();
+
+    let mut delays = Vec::new();
+    for _ in 0..3 {
+        orch.mark_task_running(&wf, &TaskId::from("t1")).unwrap();
+        let (_, delay) = orch
+            .handle_task_failure(&wf, &TaskId::from("t1"), "boom".into())
+            .await
+            .unwrap()
+            .expect("retry budget remains");
+        delays.push(delay);
+    }
+    assert_eq!(
+        delays,
+        vec![100, 300, 500],
+        "delay must grow by backoff_multiplier and stop at max_delay_ms"
     );
 }
 
@@ -1417,7 +1321,7 @@ async fn on_task_completed_without_attempt_info_still_accepts_results() {
     orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
     orch.start(&wf).unwrap();
 
-    let (ready, _, terminal) = orch
+    let (ready, terminal) = orch
         .on_task_completed(&wf, &TaskId::from("t1"), b"r1".to_vec())
         .await
         .unwrap();
@@ -1429,11 +1333,11 @@ async fn on_task_completed_without_attempt_info_still_accepts_results() {
 // ───────────────────────── 统一工作流历史（快照 + 事件重放）─────────────────────────
 
 use crate::runtime::state::event_log::{EventLog, MemoryEventLog};
-use crate::runtime::workflow::orchestrator::types::WorkflowEventPayload;
+use crate::runtime::workflow::orchestrator::types::JournalEvent;
 use crate::runtime::workflow::WaitCondition;
 
 /// 读取工作流 topic 的全部事件并解码。
-fn read_history(event_log: &MemoryEventLog, wf: &WorkflowId) -> Vec<WorkflowEventPayload> {
+fn read_history(event_log: &MemoryEventLog, wf: &WorkflowId) -> Vec<JournalEvent> {
     let topic = format!("workflow:{}", wf.as_str());
     event_log
         .read_after(&topic, None)
@@ -1443,25 +1347,26 @@ fn read_history(event_log: &MemoryEventLog, wf: &WorkflowId) -> Vec<WorkflowEven
         .collect()
 }
 
-fn event_names(events: &[WorkflowEventPayload]) -> Vec<&'static str> {
+fn event_names(events: &[JournalEvent]) -> Vec<&'static str> {
     events
         .iter()
         .map(|p| match p {
-            WorkflowEventPayload::Submitted { .. } => "Submitted",
-            WorkflowEventPayload::NodeAdded { .. } => "NodeAdded",
-            WorkflowEventPayload::TaskDispatched { .. } => "TaskDispatched",
-            WorkflowEventPayload::Started { .. } => "Started",
-            WorkflowEventPayload::TaskRunning { .. } => "TaskRunning",
-            WorkflowEventPayload::TaskCompleted { .. } => "TaskCompleted",
-            WorkflowEventPayload::TaskFailed { .. } => "TaskFailed",
-            WorkflowEventPayload::TaskCancelled { .. } => "TaskCancelled",
-            WorkflowEventPayload::Completed { .. } => "Completed",
-            WorkflowEventPayload::Cancelled { .. } => "Cancelled",
-            WorkflowEventPayload::Failed { .. } => "Failed",
-            WorkflowEventPayload::WaitPointRegistered { .. } => "WaitPointRegistered",
-            WorkflowEventPayload::SignalReceived { .. } => "SignalReceived",
-            WorkflowEventPayload::TimerFired { .. } => "TimerFired",
-            WorkflowEventPayload::Recovered { .. } => "Recovered",
+            JournalEvent::Submitted { .. } => "Submitted",
+            JournalEvent::NodeAdded { .. } => "NodeAdded",
+            JournalEvent::TaskDispatched { .. } => "TaskDispatched",
+            JournalEvent::Started { .. } => "Started",
+            JournalEvent::TaskRunning { .. } => "TaskRunning",
+            JournalEvent::TaskCompleted { .. } => "TaskCompleted",
+            JournalEvent::TaskFailed { .. } => "TaskFailed",
+            JournalEvent::TaskCancelled { .. } => "TaskCancelled",
+            JournalEvent::Completed { .. } => "Completed",
+            JournalEvent::Cancelled { .. } => "Cancelled",
+            JournalEvent::Failed { .. } => "Failed",
+            JournalEvent::WaitPointRegistered { .. } => "WaitPointRegistered",
+            JournalEvent::SignalReceived { .. } => "SignalReceived",
+            JournalEvent::TimerFired { .. } => "TimerFired",
+            JournalEvent::ContextValue { .. } => "ContextValue",
+            JournalEvent::Recovered { .. } => "Recovered",
         })
         .collect()
 }
@@ -1492,7 +1397,7 @@ async fn submit_appends_node_added_event_per_node() {
     let nodes: Vec<String> = read_history(&event_log, &wf)
         .into_iter()
         .filter_map(|p| match p {
-            WorkflowEventPayload::NodeAdded { node, .. } => Some(node.task_id.to_string()),
+            JournalEvent::NodeAdded { node, .. } => Some(node.task_id.to_string()),
             _ => None,
         })
         .collect();
@@ -1523,7 +1428,7 @@ async fn recover_replays_events_after_snapshot_watermark() {
     // 快照落盘：水位停在 Started/TaskRunning。
     orch.flush_dirty().await.unwrap();
     // 崩溃前未落盘的完成：TaskCompleted 事件只存在于历史。
-    let (ready, _, _) = orch
+    let (ready, _) = orch
         .on_task_completed(&wf, &TaskId::from("t1"), b"r1".to_vec())
         .await
         .unwrap();
@@ -1534,7 +1439,7 @@ async fn recover_replays_events_after_snapshot_watermark() {
     let history = read_history(&event_log, &wf);
     assert!(history.iter().any(|p| matches!(
         p,
-        WorkflowEventPayload::TaskCompleted { result, .. }
+        JournalEvent::TaskCompleted { result, .. }
             if result == b"r1".to_vec().as_slice() || *result == b"r1"
     )));
 
@@ -1588,7 +1493,7 @@ async fn replay_is_idempotent_for_duplicate_events() {
     let recovered = Orchestrator::recover(store.clone(), recover_config(), Some(event_log))
         .await
         .unwrap();
-    let duplicate = WorkflowEventPayload::TaskCompleted {
+    let duplicate = JournalEvent::TaskCompleted {
         workflow_id: wf.clone(),
         task_id: TaskId::from("t1"),
         result: b"r1".to_vec(),
@@ -1669,7 +1574,9 @@ async fn workflow_history_covers_all_state_transitions() {
         },
     )
     .unwrap();
-    orch.signal_wait_point(&wfw, "go").unwrap().unwrap();
+    orch.signal_wait_point(&wfw, "go", Vec::new())
+        .unwrap()
+        .unwrap();
     let fired = orch.poll_expired_timers().await.unwrap();
     assert_eq!(fired.len(), 1, "expired timer should fire once");
 
@@ -1747,20 +1654,30 @@ async fn signal_wait_point_none_for_unknown_and_idempotent_on_repeat() {
         .unwrap();
 
     // 未知 key → None，且信号**入缓冲**并记为独立历史条目（这是「查历史」
-    // 机制的前置条件，故此处明确断言它**入了缓冲**）。
-    assert_eq!(orch.signal_wait_point(&wf, "nope").unwrap(), None);
-    assert!(
+    // 机制的前置条件，故此处明确断言它**入了缓冲**且保留了 payload）。
+    assert_eq!(
+        orch.signal_wait_point(&wf, "nope", b"buffered".to_vec())
+            .unwrap(),
+        None
+    );
+    assert_eq!(
         orch.state
             .pending_signals
             .get(&wf)
-            .is_some_and(|buf| buf.contains_key("nope")),
-        "未知 key 的信号应入缓冲，而不是被丢弃"
+            .and_then(|buf| buf.get("nope").map(|v| v.value().clone())),
+        Some(b"buffered".to_vec()),
+        "未知 key 的信号应入缓冲并保留 payload，而不是被丢弃"
     );
 
-    let first = orch.signal_wait_point(&wf, "go").unwrap();
-    assert_eq!(first, Some(Vec::<u8>::new()));
-    let second = orch.signal_wait_point(&wf, "go").unwrap();
-    assert_eq!(first, second, "repeat signal must return the same payload");
+    let first = orch
+        .signal_wait_point(&wf, "go", b"first".to_vec())
+        .unwrap();
+    assert_eq!(first, Some(b"first".to_vec()));
+    // 闩锁：重复递交返回首次 payload，不覆盖。
+    let second = orch
+        .signal_wait_point(&wf, "go", b"second".to_vec())
+        .unwrap();
+    assert_eq!(first, second, "repeat signal must return the first payload");
 
     let names = event_names(&read_history(&event_log, &wf));
     // 2 = 缓冲的 "nope"（1）+ 唤醒 "go"（1）；重复递交 "go" 不追加第三条。
@@ -1782,7 +1699,7 @@ async fn wait_point_waiter_wakes_on_signal() {
 
     // 先注册后 signal。
     let rx = orch.register_wait_point_waiter(wf.clone(), "go");
-    orch.signal_wait_point(&wf, "go").unwrap();
+    orch.signal_wait_point(&wf, "go", Vec::new()).unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(1), rx)
         .await
         .expect("waiter must wake on signal")
@@ -1900,8 +1817,10 @@ async fn waitpoints_survive_recover_and_stay_reachable() {
 
     // signal 在恢复后的 orchestrator 上可达。
     let rx = recovered.register_wait_point_waiter(wf.clone(), "go");
-    let signaled = recovered.signal_wait_point(&wf, "go").unwrap();
-    assert_eq!(signaled, Some(Vec::<u8>::new()));
+    let signaled = recovered
+        .signal_wait_point(&wf, "go", b"after-restart".to_vec())
+        .unwrap();
+    assert_eq!(signaled, Some(b"after-restart".to_vec()));
     tokio::time::timeout(std::time::Duration::from_secs(1), rx)
         .await
         .expect("recovered waitpoint waiter must wake")
@@ -2124,7 +2043,11 @@ async fn signal_before_registration_is_buffered_and_consumed() {
     orch.start(&wf).unwrap();
 
     // 等待点尚未注册 → 入缓冲，返回 None 表示"无等待点被唤醒"。
-    assert_eq!(orch.signal_wait_point(&wf, "go").unwrap(), None);
+    assert_eq!(
+        orch.signal_wait_point(&wf, "go", b"early".to_vec())
+            .unwrap(),
+        None
+    );
     assert!(
         orch.state
             .pending_signals
@@ -2143,13 +2066,12 @@ async fn signal_before_registration_is_buffered_and_consumed() {
     )
     .unwrap();
     let table = orch.state.waitpoints.get(&wf).expect("waitpoints 表");
-    assert!(
-        matches!(
-            table.get("go").unwrap().state,
-            WaitPointState::Signaled { .. }
-        ),
-        "缓冲命中后等待点应直接为 Signaled"
-    );
+    match &table.get("go").unwrap().state {
+        WaitPointState::Signaled { payload } => {
+            assert_eq!(payload, b"early", "缓冲命中必须带回首次递交的 payload");
+        }
+        other => panic!("缓冲命中后等待点应直接为 Signaled，实际 {other:?}"),
+    }
     drop(table);
     // 消费后出缓冲。
     assert!(
@@ -2161,8 +2083,11 @@ async fn signal_before_registration_is_buffered_and_consumed() {
         "缓冲应已被消费"
     );
 
-    // 重复递交（闩锁）：命中已 Signaled 的等待点 → 返回 payload。
-    assert_eq!(orch.signal_wait_point(&wf, "go").unwrap(), Some(Vec::new()));
+    // 重复递交（闩锁）：命中已 Signaled 的等待点 → 返回首次 payload，不覆盖。
+    assert_eq!(
+        orch.signal_wait_point(&wf, "go", b"late".to_vec()).unwrap(),
+        Some(b"early".to_vec())
+    );
 }
 
 /// 闩锁：同一 key 重复递交不重复入历史（重试安全）。
@@ -2173,15 +2098,30 @@ async fn repeated_signal_while_buffered_is_a_no_op() {
     orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
     orch.start(&wf).unwrap();
 
-    assert_eq!(orch.signal_wait_point(&wf, "go").unwrap(), None);
+    assert_eq!(
+        orch.signal_wait_point(&wf, "go", b"early".to_vec())
+            .unwrap(),
+        None
+    );
     let first_len = orch
         .state
         .pending_signals
         .get(&wf)
         .map(|buf| buf.len())
         .unwrap_or(0);
-    // 重试：仍是 None（不报错、不新增条目）。
-    assert_eq!(orch.signal_wait_point(&wf, "go").unwrap(), None);
+    // 重试：仍是 None（不报错、不新增条目、不覆盖首次 payload）。
+    assert_eq!(
+        orch.signal_wait_point(&wf, "go", b"late".to_vec()).unwrap(),
+        None
+    );
+    assert_eq!(
+        orch.state
+            .pending_signals
+            .get(&wf)
+            .and_then(|buf| buf.get("go").map(|v| v.value().clone())),
+        Some(b"early".to_vec()),
+        "闩锁：首次递交的 payload 必须胜出"
+    );
     assert_eq!(
         orch.state
             .pending_signals
@@ -2201,7 +2141,10 @@ async fn buffered_signal_is_not_consumed_by_suspend_condition() {
     orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
     orch.start(&wf).unwrap();
 
-    assert_eq!(orch.signal_wait_point(&wf, "gate").unwrap(), None);
+    assert_eq!(
+        orch.signal_wait_point(&wf, "gate", Vec::new()).unwrap(),
+        None
+    );
     orch.register_wait_point(&wf, "gate", WaitCondition::Suspend)
         .unwrap();
 
@@ -2225,7 +2168,7 @@ async fn buffered_signal_is_not_consumed_by_suspend_condition() {
 async fn signal_to_unknown_workflow_is_not_found() {
     let orch = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
     let err = orch
-        .signal_wait_point(&WorkflowId::from("nope"), "go")
+        .signal_wait_point(&WorkflowId::from("nope"), "go", Vec::new())
         .unwrap_err();
     assert!(
         matches!(err, ActantError::NotFound(_)),
@@ -2300,7 +2243,11 @@ async fn replay_buffers_signal_that_precedes_registration() {
     orch.flush_dirty().await.unwrap();
     // 信号先到（此时无等待点 → 入缓冲），随后才注册等待点。
     // 两者都在水位之后，故 recover 必须靠重放重建这一顺序。
-    assert_eq!(orch.signal_wait_point(&wf, "late").unwrap(), None);
+    assert_eq!(
+        orch.signal_wait_point(&wf, "late", b"replayed".to_vec())
+            .unwrap(),
+        None
+    );
     orch.register_wait_point(
         &wf,
         "late",
@@ -2326,13 +2273,14 @@ async fn replay_buffers_signal_that_precedes_registration() {
         .await
         .unwrap();
     let table = recovered.state.waitpoints.get(&wf).expect("等待点应被重放");
-    assert!(
-        matches!(
-            table.get("late").unwrap().state,
-            WaitPointState::Signaled { .. }
+    let wp = table.get("late").unwrap();
+    match &wp.state {
+        WaitPointState::Signaled { payload } => assert_eq!(
+            payload, b"replayed",
+            "重放后：先到信号的 payload 必须原样保留"
         ),
-        "重放后：先到的信号必须仍生效（等待点 Signaled），而不是被丢弃"
-    );
+        other => panic!("重放后：先到的信号必须仍生效（Signaled），实际 {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2462,4 +2410,43 @@ async fn all_workflow_ids_without_store_falls_back_to_active() {
 
     let ids = orch.all_workflow_ids().await;
     assert_eq!(ids, vec![wf]);
+}
+
+/// 上下文值只读查询：缺失返回 `None` 且**不写历史**；已记录返回值字节，
+/// 且重复 resolve 命中记录、不追加事件。
+#[tokio::test]
+async fn get_context_value_reads_without_writing_history() {
+    let event_log = Arc::new(MemoryEventLog::default());
+    let orch = Orchestrator::new()
+        .with_signing_key(TEST_SIGNING_KEY.to_vec())
+        .with_event_log(event_log.clone());
+    let wf = WorkflowId::from("wf-ctx-read");
+    orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
+
+    let ctx_events = || {
+        read_history(&event_log, &wf)
+            .into_iter()
+            .filter(|e| matches!(e, JournalEvent::ContextValue { .. }))
+            .count()
+    };
+
+    assert_eq!(orch.get_context_value(&wf, "missing").unwrap(), None);
+    assert_eq!(ctx_events(), 0, "只读查询不得为缺失键追加事件");
+
+    let resolved = orch
+        .resolve_context_value(&wf, "k", "kind", b"v".to_vec())
+        .unwrap();
+    assert_eq!(resolved, b"v");
+    assert_eq!(
+        orch.get_context_value(&wf, "k").unwrap(),
+        Some(b"v".to_vec())
+    );
+    assert_eq!(ctx_events(), 1);
+
+    // 重复 resolve 命中已记录值（候选被丢弃），历史不增长。
+    let again = orch
+        .resolve_context_value(&wf, "k", "kind", b"other".to_vec())
+        .unwrap();
+    assert_eq!(again, b"v");
+    assert_eq!(ctx_events(), 1);
 }

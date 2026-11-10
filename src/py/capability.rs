@@ -1,12 +1,11 @@
 //! PyO3 桥接：将 Rust `CapabilityRuntime` 暴露给 Python。
 //!
-//! Python 侧通过 `actant._runtime.Runtime` 包装此 `PyCapabilityRuntime`，
-//! 并额外维护 Python handler 注册表（Python callable 无法直接实现 Rust `Handler` trait）。
+//! Python 侧通过 `actant._internal.runtime.Runtime` 包装此 `PyCapabilityRuntime`。
 //!
 //! # 设计
 //!
 //! - `PyCapabilityRuntime`：Rust 强类型 `CapabilityRuntime` 的 PyO3 包装，仅处理 Rust 内置 capability
-//! - Python handler 注册：在 Python 侧 `actant._runtime.Runtime` 中用 dict 维护
+//! - Python handler 注册：完全在 Python 侧 `actant._internal.runtime.Runtime` 中用 dict 维护
 //! - 调用 `ask/perform/emit` 时，Python Runtime 优先查 Python 注册表，未命中再调用此 Rust Runtime
 
 use std::sync::Arc;
@@ -18,16 +17,13 @@ use pyo3::Bound;
 use actant_core::runtime::capability::{
     builtin_capabilities, register_defaults, CapabilityRuntime, EffectKind,
 };
-use actant_core::runtime::capability::{
-    NodeLifecycle, Serialization, Store, TaskLifecycle, WorkflowLifecycle,
-};
+use actant_core::runtime::capability::{Store, TaskLifecycle, WorkflowLifecycle};
 
 use super::gil_thread::GilThread;
-use super::handler::{chain_python_handler, PythonHandlerRegistry};
 
 /// Rust `CapabilityRuntime` 的 PyO3 包装。
 ///
-/// Python 侧通过 `actant._runtime.Runtime` 持有此对象，用于：
+/// Python 侧通过 `actant._internal.runtime.Runtime` 持有此对象，用于：
 /// - 查询已注册的 Rust 内置 capability
 /// - 注册 Rust 实现的 handler（内置模块启动时）
 /// - 调用 Rust 内置 capability 的 effect
@@ -40,7 +36,6 @@ pub struct PyCapabilityRuntime {
     /// 用于 `perform_async` / `ask_async` 的 GIL 线程池，
     /// 将 tokio 任务结果安全地回调到 Python asyncio loop。
     gil_thread: GilThread,
-    registry: PythonHandlerRegistry,
 }
 
 impl PyCapabilityRuntime {
@@ -56,7 +51,6 @@ impl PyCapabilityRuntime {
             inner,
             tokio,
             gil_thread,
-            registry: PythonHandlerRegistry::new(),
         }
     }
 }
@@ -76,7 +70,6 @@ impl PyCapabilityRuntime {
             inner,
             tokio,
             gil_thread: GilThread::new(),
-            registry: PythonHandlerRegistry::new(),
         })
     }
 
@@ -112,33 +105,9 @@ impl PyCapabilityRuntime {
         Ok(list)
     }
 
-    /// 返回指定 capability 的 handler 数量。
-    fn handler_count(&self, name: &str) -> usize {
-        self.inner
-            .capabilities()
-            .iter()
-            .find(|m| m.name == name)
-            .and_then(|m| self.inner.handler_count_by_type_id(m.type_id))
-            .unwrap_or(0)
-    }
-
-    /// 将 Python callable 注册为指定 capability 的 handler。
-    ///
-    /// Python handler 会被包装为 `ErasedHandler` 并挂到 Rust Runtime 的 handler 链末尾，
-    /// 从而与 Rust 内置 handler 共享同一条分发路径。
-    #[pyo3(signature = (name, handler))]
-    fn chain_python_handler(&mut self, name: &str, handler: &Bound<'_, PyAny>) -> PyResult<()> {
-        let handler = handler.clone().unbind();
-        chain_python_handler(&self.inner, &self.registry, name, handler).ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "chain_python_handler: capability '{}' not supported",
-                name
-            ))
-        })
-    }
-
-    /// 决策型 effect 分发（Rust 内置 handler）。
-    fn dispatch_ask<'py>(
+    /// 决策型 effect 公开入口（Rust 内置 handler）。
+    #[pyo3(signature = (name, request))]
+    fn ask<'py>(
         &self,
         py: Python<'py>,
         name: &str,
@@ -147,38 +116,7 @@ impl PyCapabilityRuntime {
         dispatch_ask(py, name, request, self.inner.clone(), &self.tokio)
     }
 
-    /// 副作用型 effect 分发（Rust 内置 handler）。
-    fn dispatch_perform<'py>(
-        &self,
-        py: Python<'py>,
-        name: &str,
-        request: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        dispatch_perform(py, name, request, self.inner.clone(), &self.tokio)
-    }
-
-    /// 反应型 effect 分发（Rust 内置 handler）。
-    fn dispatch_emit(
-        &self,
-        py: Python<'_>,
-        name: &str,
-        request: &Bound<'_, PyAny>,
-    ) -> PyResult<()> {
-        dispatch_emit(py, name, request, self.inner.clone(), &self.tokio)
-    }
-
-    /// 决策型 effect 公开入口。
-    #[pyo3(signature = (name, request))]
-    fn ask<'py>(
-        &self,
-        py: Python<'py>,
-        name: &str,
-        request: &Bound<'_, PyAny>,
-    ) -> PyResult<Option<Bound<'py, PyAny>>> {
-        self.dispatch_ask(py, name, request)
-    }
-
-    /// 副作用型 effect 公开入口。
+    /// 副作用型 effect 公开入口（Rust 内置 handler）。
     #[pyo3(signature = (name, request))]
     fn perform<'py>(
         &self,
@@ -186,7 +124,7 @@ impl PyCapabilityRuntime {
         name: &str,
         request: &Bound<'_, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        self.dispatch_perform(py, name, request)
+        dispatch_perform(py, name, request, self.inner.clone(), &self.tokio)
     }
 
     /// 副作用型 effect **异步**公开入口。
@@ -275,10 +213,10 @@ impl PyCapabilityRuntime {
         )
     }
 
-    /// 反应型 effect 公开入口。
+    /// 反应型 effect 公开入口（Rust 内置 handler）。
     #[pyo3(signature = (name, request))]
     fn emit(&self, py: Python<'_>, name: &str, request: &Bound<'_, PyAny>) -> PyResult<()> {
-        self.dispatch_emit(py, name, request)
+        dispatch_emit(py, name, request, self.inner.clone(), &self.tokio)
     }
 }
 
@@ -286,13 +224,11 @@ impl PyCapabilityRuntime {
 crate::capability_registry! {
     ask: {}
     perform: {
-        "Serialization" => Serialization => super::types::SerializationCodec,
         "Store" => Store => super::types::StoreCodec,
     }
     emit: {
         "TaskLifecycle" => TaskLifecycle => super::types::TaskLifecycleCodec,
         "WorkflowLifecycle" => WorkflowLifecycle => super::types::WorkflowLifecycleCodec,
-        "NodeLifecycle" => NodeLifecycle => super::types::NodeLifecycleCodec,
     }
 }
 

@@ -2,7 +2,7 @@ pub mod capability;
 pub mod config;
 pub mod error;
 pub(crate) mod gil_thread;
-pub mod handler;
+pub(crate) mod route_policy;
 pub mod runtime;
 pub mod types;
 

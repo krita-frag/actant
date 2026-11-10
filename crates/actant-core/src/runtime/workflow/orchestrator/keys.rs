@@ -4,8 +4,8 @@
 //! 以及在有前驱依赖时构造带 MAC 签名的 task payload。
 
 use crate::common::{
-    Result, TaskId, WorkflowId, STORE_KEY_DAG, STORE_KEY_EVENT_SEQ, STORE_KEY_EXEC,
-    STORE_KEY_PENDING, STORE_KEY_RESULT, STORE_KEY_SIGNAL_BUF, STORE_KEY_WAIT,
+    Result, TaskId, WorkflowId, STORE_KEY_CONTEXT, STORE_KEY_DAG, STORE_KEY_EVENT_SEQ,
+    STORE_KEY_EXEC, STORE_KEY_PENDING, STORE_KEY_RESULT, STORE_KEY_SIGNAL_BUF, STORE_KEY_WAIT,
 };
 use crate::runtime::workflow::{Dag, WorkflowExecution};
 
@@ -32,6 +32,11 @@ pub(super) fn wait_key(wf_id: &WorkflowId) -> String {
 /// 信号缓冲快照键：与 [`wait_key`] 同批落盘 / 同批删除。
 pub(super) fn signal_buf_key(wf_id: &WorkflowId) -> String {
     format!("{}{}", STORE_KEY_SIGNAL_BUF, wf_id.as_str())
+}
+
+/// 确定性上下文值快照键：与 exec/pending 同批落盘。
+pub(super) fn context_key(wf_id: &WorkflowId) -> String {
+    format!("{}{}", STORE_KEY_CONTEXT, wf_id.as_str())
 }
 
 pub(super) fn event_seq_key(wf_id: &WorkflowId) -> String {

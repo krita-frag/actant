@@ -33,6 +33,8 @@ fn build_linear_dag(n: usize) -> Dag {
             timeout_ms: None,
             priority: 0,
             metadata: HashMap::new(),
+            tags: Vec::new(),
+            quota: None,
         })
         .unwrap();
         if i > 0 {
@@ -60,6 +62,8 @@ fn build_wide_dag(n: usize) -> Dag {
         timeout_ms: None,
         priority: 0,
         metadata: HashMap::new(),
+        tags: Vec::new(),
+        quota: None,
     })
     .unwrap();
     dag.add_node(DagNode {
@@ -70,6 +74,8 @@ fn build_wide_dag(n: usize) -> Dag {
         timeout_ms: None,
         priority: 0,
         metadata: HashMap::new(),
+        tags: Vec::new(),
+        quota: None,
     })
     .unwrap();
     for i in 0..(n - 2) {
@@ -82,6 +88,8 @@ fn build_wide_dag(n: usize) -> Dag {
             timeout_ms: None,
             priority: 0,
             metadata: HashMap::new(),
+            tags: Vec::new(),
+            quota: None,
         })
         .unwrap();
         dag.add_edge(root.clone(), mid.clone()).unwrap();

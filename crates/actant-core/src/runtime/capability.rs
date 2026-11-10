@@ -19,35 +19,17 @@ use std::any::{Any, TypeId};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use crate::common::{ActantError, ActorId, NodeId};
+use crate::common::{ActantError, ActorId};
 
 /// 能力的声明 trait。
 pub trait Capability: Send + Sync + 'static {
     type Request: Send + Sync + 'static;
     type Response: Send + Sync + 'static;
-}
-
-/// 可在节点间序列化传输的 capability 元信息。
-///
-/// 由 [`CapabilityMeta`] 转换而来，用于 capability gossip 广播。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct GossipCapabilityMeta {
-    pub name: String,
-    pub default_kind: EffectKind,
-}
-
-impl From<CapabilityMeta> for GossipCapabilityMeta {
-    fn from(meta: CapabilityMeta) -> Self {
-        Self {
-            name: meta.name.to_string(),
-            default_kind: meta.default_kind,
-        }
-    }
 }
 
 /// Effect 执行语义。
@@ -332,13 +314,6 @@ pub struct CapabilityRuntime {
     codecs: DashMap<TypeId, Arc<dyn CapabilityCodec>>,
     actor_system: parking_lot::RwLock<Option<Arc<crate::runtime::actor::ActorSystem>>>,
     actor_ids: DashMap<TypeId, crate::common::ActorId>,
-    /// 从 capability gossip 学到的远端节点 capability 元信息。
-    /// key 为远端节点 id，value 为该节点广播的 capability 列表。
-    peer_capabilities: DashMap<NodeId, Vec<GossipCapabilityMeta>>,
-    /// 反向索引：capability name → 持有该 capability 的远端节点集合。
-    /// 由 `update_peer_capabilities` 自动维护，避免 `peer_capabilities.iter()`
-    /// 全表扫描（O(N×M)）查找持有某 capability 的节点。
-    cap_to_peers: DashMap<String, DashSet<NodeId>>,
 }
 
 impl Default for CapabilityRuntime {
@@ -355,8 +330,6 @@ impl CapabilityRuntime {
             codecs: DashMap::new(),
             actor_system: parking_lot::RwLock::new(None),
             actor_ids: DashMap::new(),
-            peer_capabilities: DashMap::new(),
-            cap_to_peers: DashMap::new(),
         }
     }
 
@@ -697,48 +670,10 @@ impl CapabilityRuntime {
     pub fn capabilities(&self) -> Vec<CapabilityMeta> {
         self.metas.read().clone()
     }
-
-    /// 更新指定远端节点的 capability 元信息。
-    ///
-    /// 通常由 `CapabilityGossipActor::handle_gossip` 在收到邻居广播后调用。
-    pub fn update_peer_capabilities(
-        &self,
-        node_id: NodeId,
-        capabilities: Vec<GossipCapabilityMeta>,
-    ) {
-        // 维护反向索引：先移除该节点在旧 capability 集合中的全部条目，
-        // 再按新 capability 列表重新插入。避免 stale 条目累积。
-        for entry in self.cap_to_peers.iter() {
-            entry.value().remove(&node_id);
-        }
-        for cap in &capabilities {
-            self.cap_to_peers
-                .entry(cap.name.clone())
-                .or_default()
-                .insert(node_id.clone());
-        }
-        self.peer_capabilities.insert(node_id, capabilities);
-    }
-
-    /// 返回指定远端节点已知的 capability 元信息。
-    pub fn peer_capabilities(&self, node_id: &NodeId) -> Option<Vec<GossipCapabilityMeta>> {
-        self.peer_capabilities
-            .get(node_id)
-            .map(|e| e.value().clone())
-    }
-
-    /// 返回所有已知有 capability 元信息的远端节点 id。
-    pub fn peer_nodes(&self) -> Vec<NodeId> {
-        self.peer_capabilities
-            .iter()
-            .map(|e| e.key().clone())
-            .collect()
-    }
 }
 
 pub mod actor;
 pub mod builtins;
-pub mod gossip;
 
 pub use builtins::*;
 

@@ -108,6 +108,7 @@ fn sample_request() -> DirectRequest {
         task_name: "tn".to_string(),
         outcome: crate::common::WireTaskOutcome::Completed(vec![1]),
         worker_node: NodeId::from("node-A".to_string()),
+        attempt: 0,
     }
 }
 

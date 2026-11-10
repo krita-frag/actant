@@ -260,6 +260,7 @@ async fn init_worker_with_fifo_scheduler_spawns_actor_and_returns_worker() {
     let dispatcher = hermetic_dispatcher();
     let failover = make_failover(&node_id, &network).await;
     let handle = tokio::runtime::Handle::current();
+    let labels = std::collections::BTreeMap::new();
 
     let worker = init_worker(WorkerInitParams {
         scheduler: None,
@@ -267,6 +268,8 @@ async fn init_worker_with_fifo_scheduler_spawns_actor_and_returns_worker() {
         node_id: &node_id,
         network: &network,
         event_bus,
+        node_labels: &labels,
+        route_policy: None,
         scheduler_kind: scheduler_kind::FIFO,
         worker_config: &WorkerConfig::default(),
         actor_system: actor_system.clone(),
@@ -275,7 +278,6 @@ async fn init_worker_with_fifo_scheduler_spawns_actor_and_returns_worker() {
         tokio_handle: handle,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
-        capability_gossip: None,
     })
     .await
     .expect("init_worker FIFO ok");
@@ -293,6 +295,7 @@ async fn init_worker_with_priority_scheduler_spawns_actor() {
     let dispatcher = hermetic_dispatcher();
     let failover = make_failover(&node_id, &network).await;
     let handle = tokio::runtime::Handle::current();
+    let labels = std::collections::BTreeMap::new();
 
     let worker = init_worker(WorkerInitParams {
         scheduler: None,
@@ -300,6 +303,8 @@ async fn init_worker_with_priority_scheduler_spawns_actor() {
         node_id: &node_id,
         network: &network,
         event_bus,
+        node_labels: &labels,
+        route_policy: None,
         scheduler_kind: scheduler_kind::PRIORITY,
         worker_config: &WorkerConfig::default(),
         actor_system: actor_system.clone(),
@@ -308,7 +313,6 @@ async fn init_worker_with_priority_scheduler_spawns_actor() {
         tokio_handle: handle,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
-        capability_gossip: None,
     })
     .await
     .expect("init_worker PRIORITY ok");
@@ -325,6 +329,7 @@ async fn init_worker_with_unknown_scheduler_kind_returns_config_error() {
     let dispatcher = hermetic_dispatcher();
     let failover = make_failover(&node_id, &network).await;
     let handle = tokio::runtime::Handle::current();
+    let labels = std::collections::BTreeMap::new();
 
     let result = init_worker(WorkerInitParams {
         scheduler: None,
@@ -332,6 +337,8 @@ async fn init_worker_with_unknown_scheduler_kind_returns_config_error() {
         node_id: &node_id,
         network: &network,
         event_bus,
+        node_labels: &labels,
+        route_policy: None,
         scheduler_kind: "lifo",
         worker_config: &WorkerConfig::default(),
         actor_system: actor_system.clone(),
@@ -340,7 +347,6 @@ async fn init_worker_with_unknown_scheduler_kind_returns_config_error() {
         tokio_handle: handle,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
-        capability_gossip: None,
     })
     .await;
 
@@ -359,6 +365,7 @@ async fn init_worker_attaches_optional_actor_ids_when_provided() {
     let dispatcher = hermetic_dispatcher();
     let failover = make_failover(&node_id, &network).await;
     let handle = tokio::runtime::Handle::current();
+    let labels = std::collections::BTreeMap::new();
     let workflow_actor_id = ActorId::workflow(&node_id);
     let dag_gossip_actor_id = ActorId::dag_gossip(&node_id);
 
@@ -368,6 +375,8 @@ async fn init_worker_attaches_optional_actor_ids_when_provided() {
         node_id: &node_id,
         network: &network,
         event_bus,
+        node_labels: &labels,
+        route_policy: None,
         scheduler_kind: scheduler_kind::FIFO,
         worker_config: &WorkerConfig::default(),
         actor_system: actor_system.clone(),
@@ -376,7 +385,6 @@ async fn init_worker_attaches_optional_actor_ids_when_provided() {
         tokio_handle: handle,
         workflow_actor_id: Some(workflow_actor_id.clone()),
         dag_gossip_actor_id: Some(dag_gossip_actor_id.clone()),
-        capability_gossip: None,
     })
     .await
     .expect("init_worker with actor ids ok");
@@ -412,11 +420,10 @@ use crate::common::DiscoveryMode;
 fn make_test_config() -> ActantConfig {
     let mut config = ActantConfig::default();
     config.network.discovery_mode = DiscoveryMode::new_unchecked(discovery_mode::NONE);
-    config.network.capability_gossip_interval_ms = 60_000;
     config.worker.drain_timeout_secs = 5;
     // 进程池后端：build 会急切拉起 worker 子进程。测试只验证编排子系统，
     // 不真正派发任务；减少进程数并指定解释器路径即可（子进程即使因缺少
-    // `actant.task._worker` 模块立即退出也不影响这些断言）。
+    // `actant._internal.tasks.worker` 模块立即退出也不影响这些断言）。
     config.worker.num_worker_processes = 1;
     config.worker.worker_program = "python3".to_string();
     config.payload_signing_key = b"test-signing-key".to_vec();
@@ -434,6 +441,63 @@ async fn build_without_data_dir_returns_config_error() {
         "expected Config error when data_dir missing, got: {:?}",
         result.map(|_| ())
     );
+}
+
+/// 回归测试：注册密钥之后构建失败（此处为 LMDB 存储打开失败），
+/// 不得把该节点的 wire 密钥留在进程级注册表中。
+///
+/// 校验方式：用该节点的 heartbeat 取 MAC，再与“本测试独占密钥”计算的期望值
+/// 比较。若条目已注销，wrap 会退化到 primary（可能是其他测试的密钥）或
+/// 无 MAC，均不等于期望值；从而不受并行测试的全局 primary 影响。
+#[tokio::test]
+async fn failed_build_after_key_registration_does_not_leak_wire_key() {
+    let dir = tempdir().unwrap();
+    // 用普通文件占用 store 路径，使 LMDB 打开在密钥注册之后失败。
+    std::fs::write(dir.path().join("store"), b"occupied").unwrap();
+
+    let node_id = make_node("node-build-key-leak");
+    let key = b"builder-leak-unique-key".to_vec();
+    let mut config = make_test_config();
+    config.payload_signing_key = key.clone();
+
+    let result = RuntimeBuilder::new(node_id.clone(), config)
+        .with_data_dir(dir.path().to_str().unwrap().to_string())
+        .build()
+        .await;
+    assert!(
+        result.is_err(),
+        "build must fail when the store path is occupied by a file"
+    );
+
+    let envelope = crate::common::WireEnvelope::wrap(crate::common::WireMessage::NodeHeartbeat(
+        crate::common::NodeHeartbeat {
+            signature: None,
+            labels: std::collections::BTreeMap::new(),
+            platform: None,
+            available_quotas: std::collections::BTreeMap::new(),
+            node_id: node_id.clone(),
+            active_workflows: vec![],
+            timestamp_ms: crate::common::epoch_millis(),
+            available_slots: 0,
+            max_slots: 0,
+            endpoint_addr: None,
+            role: crate::common::NodeRole::Both,
+            draining: false,
+        },
+    ));
+    let mac = envelope.mac;
+    let unsigned = crate::common::WireEnvelope {
+        mac: None,
+        ..envelope
+    };
+    if let Some(mac) = mac {
+        let bytes = crate::common::encode_postcard(&unsigned).unwrap();
+        let expected = crate::common::payload::wire_mac(&key, &bytes).unwrap();
+        assert_ne!(
+            mac, expected,
+            "failed build must not leave the node's wire key registered"
+        );
+    }
 }
 
 #[tokio::test]
@@ -637,6 +701,8 @@ fn make_signed_node(id: &str, name: &str, signing_key: &[u8]) -> DagNode {
         timeout_ms: None,
         priority: 0,
         metadata: std::collections::HashMap::new(),
+        tags: Vec::new(),
+        quota: None,
     }
 }
 
@@ -681,7 +747,7 @@ async fn build_redispatches_recovered_pending_tasks_only() {
     let roots = pre.start(&wf).unwrap();
     assert_eq!(roots.len(), 1);
     pre.mark_task_running(&wf, &roots[0].id).unwrap();
-    let (ready, _, _) = pre
+    let (ready, _) = pre
         .on_task_completed(&wf, &crate::common::TaskId::from("t1"), b"r1".to_vec())
         .await
         .unwrap();
@@ -798,10 +864,10 @@ async fn build_with_injected_transport_uses_it_as_live_network() {
         .await
         .expect("build with injected transport should succeed");
 
-    // build 会对能力 gossip topic 订阅（builder 装配必经路径）。注入传输层若
-    // 真是 live network，该订阅会被记录；内置 NetworkManager 则不会写入此桩。
+    // failover 装配会订阅 heartbeat topic。注入传输层若真是 live network，
+    // 该订阅会被记录；内置 NetworkManager 则不会写入此桩。
     assert!(
-        mock.subscribed_to(crate::common::wire::constants::TOPIC_CAPABILITY_GOSSIP),
+        mock.subscribed_to(crate::common::wire::constants::TOPIC_HEARTBEAT),
         "injected transport must be the live network and receive build-time subscriptions"
     );
 
@@ -851,6 +917,87 @@ async fn build_applies_injected_discovery() {
     );
 
     runtime.shutdown().await.expect("shutdown ok");
+}
+
+/// 委托 MemoryEventLog 并记录 append 次数；测试只经 orchestrator 的提交路径
+/// 触发写入，不直接调用 log.append。
+struct RecordingEventLog {
+    inner: crate::runtime::state::event_log::MemoryEventLog,
+    appends: std::sync::atomic::AtomicUsize,
+}
+
+impl RecordingEventLog {
+    fn new() -> Self {
+        Self {
+            inner: Default::default(),
+            appends: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+impl crate::runtime::state::event_log::EventLog for RecordingEventLog {
+    fn append(
+        &self,
+        topic: &str,
+        payload: &[u8],
+    ) -> crate::common::Result<crate::runtime::state::event_log::EventId> {
+        self.appends
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.append(topic, payload)
+    }
+
+    fn read_after(
+        &self,
+        topic: &str,
+        after: Option<&crate::runtime::state::event_log::EventId>,
+    ) -> crate::common::Result<Vec<crate::runtime::state::event_log::LogEntry>> {
+        self.inner.read_after(topic, after)
+    }
+
+    fn latest(
+        &self,
+        topic: &str,
+    ) -> crate::common::Result<Option<crate::runtime::state::event_log::LogEntry>> {
+        self.inner.latest(topic)
+    }
+
+    fn count(&self, topic: &str) -> crate::common::Result<usize> {
+        self.inner.count(topic)
+    }
+
+    fn trim_absorbed(
+        &self,
+        topic: &str,
+        up_to: &crate::runtime::state::event_log::EventId,
+        keep: usize,
+    ) -> crate::common::Result<usize> {
+        self.inner.trim_absorbed(topic, up_to, keep)
+    }
+}
+
+#[tokio::test]
+async fn injected_event_log_receives_workflow_submission() {
+    let dir = tempdir().unwrap();
+    let log = Arc::new(RecordingEventLog::new());
+    let orchestrator = init_orchestrator(
+        Some(dir.path().to_str().unwrap()),
+        &make_node("node-event-log-seam"),
+        &ActantConfig::default(),
+        Some(log.clone()),
+    )
+    .await
+    .unwrap();
+
+    let wf = crate::common::WorkflowId::from("wf-event-log-seam");
+    let mut dag = Dag::new();
+    dag.add_node(make_signed_node("t1", "only", b"test-signing-key"))
+        .unwrap();
+    orchestrator.submit(wf, dag).await.unwrap();
+
+    assert!(
+        log.appends.load(std::sync::atomic::Ordering::Relaxed) >= 2,
+        "submit must append Submitted + NodeAdded through the injected EventLog"
+    );
 }
 
 /// build 在无持久化（内存模式编排器）时不应重派发任何任务。

@@ -2,6 +2,70 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+/// 节点拓扑角色。
+///
+/// 拓扑是部署配置而非两套运行时：同一套 core 通过角色决定
+/// 「是否参与 workflow claim」「是否执行本地任务」「是否驱动 flow host」。
+///
+/// - [`NodeRole::Both`]（默认）：P2P 节点，既能编排也能执行本地任务。
+/// - [`NodeRole::Orchestrator`]：只参与 claim 与 workflow 推进，不执行本地任务。
+/// - [`NodeRole::Worker`]：只执行任务，永不 claim workflow、不驱动 flow host。
+///
+/// 序列化名固定为 `"both"` / `"orchestrator"` / `"worker"`，是 CLI 与
+/// 配置文件的公开契约。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeRole {
+    /// 既能编排也能执行本地任务（P2P 默认）。
+    #[default]
+    Both,
+    /// 仅编排：参与 claim、推进 workflow，不执行本地任务。
+    Orchestrator,
+    /// 仅执行：不 claim workflow、不驱动 flow host。
+    Worker,
+}
+
+impl NodeRole {
+    /// 解析角色名（`"both"` / `"orchestrator"` / `"worker"`）。
+    ///
+    /// 未知名称返回 [`crate::common::ActantError::Config`]，不做静默回退。
+    pub fn parse(s: &str) -> Result<Self, crate::common::ActantError> {
+        match s {
+            "both" => Ok(Self::Both),
+            "orchestrator" => Ok(Self::Orchestrator),
+            "worker" => Ok(Self::Worker),
+            other => Err(crate::common::ActantError::Config(format!(
+                "unknown node role '{other}': expected one of both, orchestrator, worker"
+            ))),
+        }
+    }
+
+    /// 稳定字符串名（与 serde 序列化一致）。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Both => "both",
+            Self::Orchestrator => "orchestrator",
+            Self::Worker => "worker",
+        }
+    }
+
+    /// 是否参与 workflow claim / 故障接管 / flow host。
+    pub fn can_orchestrate(&self) -> bool {
+        matches!(self, Self::Both | Self::Orchestrator)
+    }
+
+    /// 是否允许在本节点执行任务。
+    pub fn can_execute_locally(&self) -> bool {
+        matches!(self, Self::Both | Self::Worker)
+    }
+}
+
+impl std::fmt::Display for NodeRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// 发现模式 — 内置策略名称。
 ///
 /// 包装 `String` 的新类型，构造须经过 [`DiscoveryMode::parse`] 校验。
@@ -226,6 +290,11 @@ pub mod scheduler_kind {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerConfig {
+    /// 节点拓扑角色：决定是否 claim workflow 与是否执行本地任务。
+    ///
+    /// 默认 [`NodeRole::Both`]，保持 P2P 行为不变。
+    #[serde(default)]
+    pub role: NodeRole,
     /// 调度器类型，内置项见 [`scheduler_kind`]。
     #[serde(default = "default_scheduler_kind")]
     pub scheduler_kind: SchedulerKind,
@@ -240,6 +309,19 @@ pub struct WorkerConfig {
     pub drain_timeout_secs: u64,
     /// 本地无法执行的任务（仅提交节点或远程转发失败）重新入队前的延迟（毫秒）。
     pub remote_fallback_delay_ms: u64,
+    /// 任务因"无节点满足放置诉求"被延后（`Defer`）的最长等待时间（毫秒）。
+    ///
+    /// 超过该时长仍无匹配节点时，任务转为 `Failed` 并上报
+    /// `no node satisfies required labels`，避免永久挂起。默认 30000ms。
+    #[serde(default = "default_starvation_timeout_ms")]
+    pub starvation_timeout_ms: u64,
+    /// 本节点声明的命名配额容量（如 `"gpu": 2`）。
+    ///
+    /// 任务携带 `quota` 时，执行节点在本地原子扣减；容量耗尽则延后重入队。
+    /// 心跳广播每项的**剩余**容量，路由策略据此避免转发到已满节点。
+    /// 单维命名计数；多维资源（CPU/mem 向量）属第 3 层，不进核心。
+    #[serde(default)]
+    pub node_quotas: BTreeMap<String, u32>,
     /// worker 子进程数（进程池大小）。每个 worker 进程同一时刻执行一个任务，
     /// 杀进程即精确终止一个任务。默认 `num_cpus`。
     pub num_worker_processes: usize,
@@ -250,7 +332,7 @@ pub struct WorkerConfig {
     #[serde(default)]
     pub worker_program: String,
     /// 传给 `worker_program` 的参数（不含 program 自身）。Python 绑定层注入
-    /// 模块入口形如 `["-m", "actant.task._worker"]`。
+    /// 模块入口形如 `["-m", "actant._internal.tasks.worker"]`。
     #[serde(default)]
     pub worker_args: Vec<String>,
     /// 注入 worker 子进程的环境变量。空表 = 完全继承父进程环境。
@@ -296,11 +378,16 @@ fn default_scheduler_kind() -> SchedulerKind {
     SchedulerKind::default()
 }
 
+fn default_starvation_timeout_ms() -> u64 {
+    30_000
+}
+
 impl Default for WorkerConfig {
     fn default() -> Self {
         // 进程池模型：worker 进程数与并发度默认取 CPU 核数。
         let proc_count = num_cpus::get().max(1);
         Self {
+            role: NodeRole::default(),
             scheduler_kind: default_scheduler_kind(),
             default_task_timeout_ms: 30000,
             max_concurrent_tasks: proc_count,
@@ -308,6 +395,8 @@ impl Default for WorkerConfig {
             broadcast_retry_base_delay_ms: 100,
             drain_timeout_secs: 30,
             remote_fallback_delay_ms: 500,
+            starvation_timeout_ms: default_starvation_timeout_ms(),
+            node_quotas: BTreeMap::new(),
             num_worker_processes: proc_count,
             crash_failover_max_attempts: 3,
             worker_program: String::new(),
@@ -360,9 +449,6 @@ pub struct NetworkConfig {
     /// iroh 绑定的 IPv4 监听 IP。空字符串或 "0.0.0.0" = 所有接口（默认）。
     #[serde(default)]
     pub listen_ip: String,
-    /// Capability gossip 广播间隔（毫秒）。默认 60 秒。
-    #[serde(default = "default_capability_gossip_interval_ms")]
-    pub capability_gossip_interval_ms: u64,
     /// 网络事件有界通道容量。
     ///
     /// `NetworkManager` 内部使用此容量的 `mpsc::channel` 缓冲 `NetworkEvent`。
@@ -396,10 +482,6 @@ pub struct NetworkConfig {
     pub require_signed_records: bool,
 }
 
-fn default_capability_gossip_interval_ms() -> u64 {
-    NetworkConfig::DEFAULT_CAPABILITY_GOSSIP_INTERVAL_MS
-}
-
 fn default_event_channel_capacity() -> usize {
     NetworkConfig::DEFAULT_EVENT_CHANNEL_CAPACITY
 }
@@ -413,8 +495,6 @@ impl NetworkConfig {
     pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
     /// 默认直连请求-响应超时（30s）。
     pub const DEFAULT_DIRECT_REQUEST_TIMEOUT_MS: u64 = 30_000;
-    /// 默认 capability gossip 广播间隔（60s）。
-    pub const DEFAULT_CAPABILITY_GOSSIP_INTERVAL_MS: u64 = 60_000;
     /// 默认网络事件通道容量。
     pub const DEFAULT_EVENT_CHANNEL_CAPACITY: usize = 1024;
 }
@@ -444,7 +524,6 @@ impl Default for NetworkConfig {
             direct_request_timeout_ms: default_direct_request_timeout_ms(),
             listen_port: 0,
             listen_ip: String::new(),
-            capability_gossip_interval_ms: default_capability_gossip_interval_ms(),
             event_channel_capacity: default_event_channel_capacity(),
             dns_origin_domain: String::new(),
             relay_endpoints: Vec::new(),
@@ -543,8 +622,9 @@ impl Default for StoreConfig {
     fn default() -> Self {
         Self {
             data_dir: None,
-            // LMDB mmap 上限（2 GiB）。须足够支撑生产负载，但不会预分配磁盘空间。
-            map_size: 2 * 1024 * 1024 * 1024,
+            // LMDB mmap 上限（32 GiB）。这是虚拟地址预留，不预分配磁盘空间；
+            // 实际占用随数据增长。预留足够大是为了避免长跑写满后必须停机扩容。
+            map_size: 32 * 1024 * 1024 * 1024,
             max_dbs: 16,
             sync_mode: SyncMode::default(),
         }

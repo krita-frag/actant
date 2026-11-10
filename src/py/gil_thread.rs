@@ -2,6 +2,7 @@ use crossbeam_channel as channel;
 use pyo3::prelude::*;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 type Task = Box<dyn FnOnce(Python<'_>) + Send + 'static>;
 
@@ -23,7 +24,13 @@ const GIL_QUEUE_CAPACITY: usize = 1024;
 /// 线程常驻，每个任务单独 `Python::attach` 获取 GIL，任务间释放 GIL，
 /// 避免永久持有 GIL 导致主线程死锁。
 pub(crate) struct GilThread {
-    tx: Arc<channel::Sender<Task>>,
+    /// 通道唯一的 Sender 放在共享 `Option` 里。
+    ///
+    /// 关闭通道只需 `take()` 一次：即使还有其他 `GilThread` 克隆（各自持同一
+    /// `Arc`）存活，Sender 本身也已被释放，`recv()` 会立即返回 `Err`。若像
+    /// 早先那样在字段里存 `Arc<Sender>`，克隆存活时 drop 只减少引用计数，
+    /// 通道不关闭、worker 不退出，Drop 里的 `join()` 就永久阻塞。
+    tx: Arc<parking_lot::Mutex<Option<channel::Sender<Task>>>>,
     // 持有 JoinHandle 以便在 Drop 时等待线程退出，避免 dangling thread。
     _handle: Option<JoinHandle<()>>,
 }
@@ -37,15 +44,20 @@ impl GilThread {
     /// 唤醒延迟低，且 `attach` 内部使用缓存的 `GILGuard` 开销极小。
     pub fn new() -> Self {
         let (tx, rx) = channel::bounded::<Task>(GIL_QUEUE_CAPACITY);
-        let tx = Arc::new(tx);
+        let tx = Arc::new(parking_lot::Mutex::new(Some(tx)));
 
         let handle = thread::spawn(move || {
             while let Ok(task) = rx.recv() {
                 // 每个任务单独 attach GIL，任务执行完毕后释放。
                 // 这样主线程（Python 解释器）在 GilThread 空闲时能正常获取 GIL。
-                Python::attach(|py| {
-                    task(py);
-                });
+                //
+                // 用 `try_attach` 而非 `attach`：Drop 超时会把本线程 detach，
+                // 若解释器已在收尾，`attach` 会直接 abort 进程，`try_attach`
+                // 只返回 `None`，据此退出循环即可。
+                if Python::try_attach(task).is_none() {
+                    tracing::warn!("gil_thread: interpreter unavailable; worker exiting");
+                    break;
+                }
             }
         });
 
@@ -69,7 +81,11 @@ impl GilThread {
     where
         F: FnOnce(Python<'_>) + Send + 'static,
     {
-        self.tx.try_send(Box::new(task))
+        let task: Task = Box::new(task);
+        match self.tx.lock().clone() {
+            Some(sender) => sender.try_send(task),
+            None => Err(channel::TrySendError::Disconnected(task)),
+        }
     }
 
     /// 向 GIL worker 发送闭包；若队列已满或 worker 退出，则降级为
@@ -86,7 +102,15 @@ impl GilThread {
     where
         F: FnOnce(Python<'_>) + Send + 'static,
     {
-        match self.tx.try_send(Box::new(task)) {
+        let task: Task = Box::new(task);
+        let Some(sender) = self.tx.lock().clone() else {
+            // 通道已被 drop 方关闭（Runtime 正在收尾）：就地执行，保证结果
+            // 不会因为「没人接收」而丢失。
+            tracing::warn!("gil_thread channel closed; running task inline");
+            Python::attach(task);
+            return;
+        };
+        match sender.try_send(task) {
             Ok(()) => {}
             Err(channel::TrySendError::Full(boxed)) => {
                 tracing::warn!(
@@ -112,24 +136,42 @@ impl Clone for GilThread {
     }
 }
 
+/// `Drop` 里等待 worker 退出的上限。
+///
+/// worker 单个任务只做「设置 Future 结果」这类微秒级操作，正常远快于此值；
+/// 超时说明它正卡在 `Python::attach` 上等 GIL，而当前线程恰好持着 GIL
+/// （GC / 解释器退出时就是这种情况）——继续等就是死锁。
+const WORKER_JOIN_TIMEOUT: Duration = Duration::from_millis(500);
+
 impl Drop for GilThread {
     fn drop(&mut self) {
-        // 最后一个持有 JoinHandle 的实例 drop 时关闭发送端并等待线程退出。
-        // 持有克隆体的实例不拥有 JoinHandle，只负责让 Arc<Sender> 自然释放。
-        if self._handle.is_some() {
-            // 关闭 channel：显式 drop sender 触发 recv 返回 Err。
-            // 用一个零容量 sender 占位以保持字段类型不变。
-            let (dummy_tx, _) = channel::bounded::<Task>(0);
-            let tx = std::mem::replace(&mut self.tx, Arc::new(dummy_tx));
-            drop(tx);
-            if let Some(handle) = self._handle.take() {
-                // 注意：JoinHandle::join 会阻塞当前线程。若 Drop 在持 GIL 状态下
-                // 被触发（如 Python 进程退出时 GC），worker 仍在执行 task 中的
-                // `Python::attach` 可能导致短暂等待——但 worker 处理单个 task 很快
-                // （设置 Future 结果），通常 <1ms。`py.detach` 在 Drop 中难以使用
-                // （Drop 不能 take Python token），故选择短暂 join。
-                let _ = handle.join();
-            }
+        // 只有持有 JoinHandle 的实例负责关闭通道；克隆体不参与。
+        if self._handle.is_none() {
+            return;
+        }
+        // 关闭 channel：取走唯一 Sender 并释放，`recv()` 立即返回 Err。
+        drop(self.tx.lock().take());
+
+        let Some(handle) = self._handle.take() else {
+            return;
+        };
+        // 带超时地等待线程退出。`Drop` 可能在持 GIL 时触发，而无条件
+        // `handle.join()` 会与「worker 正阻塞在 attach」互等死锁，因此不能直接
+        // join：把 join 挪到旁路线程，主线程只等一个有界时间。
+        let (done_tx, done_rx) = channel::bounded::<()>(1);
+        let joiner = thread::spawn(move || {
+            let _ = handle.join();
+            let _ = done_tx.send(());
+        });
+        if done_rx.recv_timeout(WORKER_JOIN_TIMEOUT).is_ok() {
+            let _ = joiner.join();
+        } else {
+            tracing::warn!(
+                timeout_ms = WORKER_JOIN_TIMEOUT.as_millis() as u64,
+                "gil_thread worker did not exit in time; detaching it"
+            );
+            // 旁路线程仍在等那个 worker；丢弃句柄避免在此处再阻塞一次。
+            std::mem::forget(joiner);
         }
     }
 }
@@ -138,10 +180,19 @@ impl Drop for GilThread {
 mod tests {
     use super::*;
 
+    /// 显式初始化解释器。
+    ///
+    /// worker 循环用 `try_attach`（不在解释器收尾时 abort 进程），它**不会**
+    /// 像 `attach` 那样借 auto-initialize 自动拉起解释器；测试进程里必须先
+    /// 自己初始化，否则 worker 首次取 GIL 就会看到 None。
+    fn ensure_python() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(pyo3::Python::initialize);
+    }
+
     #[test]
     fn gil_thread_executes_task() {
-        // pyo3 auto-initialize feature（dev-dependency）确保首次 Python::attach
-        // 时自动初始化解释器，无需手动调用 prepare_freethreaded_python。
+        ensure_python();
         let gw = GilThread::new();
 
         let (tx, rx) = channel::unbounded::<i32>();
@@ -155,8 +206,7 @@ mod tests {
 
     #[test]
     fn gil_thread_send_or_run_runs_inline_when_disconnected() {
-        // pyo3 auto-initialize feature（dev-dependency）确保首次 Python::attach
-        // 时自动初始化解释器，无需手动调用 prepare_freethreaded_python。
+        ensure_python();
         // 构造 GilThread，drop 原始实例（关闭 sender + join worker）。
         let gw = GilThread::new();
         drop(gw);

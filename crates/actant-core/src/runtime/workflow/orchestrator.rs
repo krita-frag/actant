@@ -10,10 +10,11 @@
 //! 本文件仅保留子模块声明与公共 re-export，保持外部 API 不变。
 
 mod keys;
-/// `pub(crate)`：`WorkflowEventPayload` 是事件历史的载荷类型，crate 内
+/// `pub(crate)`：`JournalEvent` 是事件历史的载荷类型，crate 内
 /// （含测试）需可解码 `EventLog` 条目；不对外部 crate 暴露。
 pub mod types;
 
+mod context;
 mod execution;
 mod persistence;
 pub mod queries;

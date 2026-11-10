@@ -153,6 +153,9 @@ async fn worker_drain_transitions_state_to_draining() {
 async fn worker_schedule_task_sets_target_node() {
     let worker = make_worker("node-A");
     let mut task = TaskDefinition {
+        tags: Vec::new(),
+        quota: None,
+        pinned_target: false,
         id: TaskId::from("t-1".to_string()),
         name: "echo".to_string(),
         payload: Vec::new(),
@@ -166,6 +169,7 @@ async fn worker_schedule_task_sets_target_node() {
         enqueued_at_ms: 0,
         target_endpoint_addr: None,
         origin_endpoint_addr: None,
+        lease_deadline_ms: 0,
     };
     let result = worker
         .schedule_task(task.clone(), NodeId::from("node-B".to_string()))
@@ -175,25 +179,64 @@ async fn worker_schedule_task_sets_target_node() {
     task.target_node = Some(NodeId::from("node-B".to_string()));
 }
 
+#[test]
+fn quota_defer_clears_unpinned_route_target_but_keeps_pin() {
+    fn task(pinned: bool) -> TaskDefinition {
+        TaskDefinition {
+            id: TaskId::from("t-1".to_string()),
+            name: "echo".to_string(),
+            payload: Vec::new(),
+            workflow_id: None,
+            target_node: Some(NodeId::from("node-B".to_string())),
+            origin_node: None,
+            retry_policy: None,
+            priority: 0,
+            timeout_ms: None,
+            attempt: 0,
+            enqueued_at_ms: 0,
+            target_endpoint_addr: Some("addr-b".to_string()),
+            origin_endpoint_addr: None,
+            tags: Vec::new(),
+            quota: Some("gpu".to_string()),
+            pinned_target: pinned,
+            lease_deadline_ms: 0,
+        }
+    }
+
+    let mut routed = task(false);
+    Worker::release_routing_target_on_quota_defer(&mut routed);
+    assert!(routed.target_node.is_none());
+    assert!(routed.target_endpoint_addr.is_none());
+
+    let mut pinned = task(true);
+    Worker::release_routing_target_on_quota_defer(&mut pinned);
+    assert_eq!(
+        pinned.target_node.as_ref().map(|n| n.0.as_str()),
+        Some("node-B")
+    );
+    assert_eq!(pinned.target_endpoint_addr.as_deref(), Some("addr-b"));
+}
+
+#[tokio::test]
+async fn clear_task_tracking_removes_defer_and_reroute_state() {
+    let worker = make_worker("node-A");
+    worker
+        .defer_starts
+        .lock()
+        .insert("t-1".to_string(), std::time::Instant::now());
+    worker.reroute_counts.lock().insert("t-1".to_string(), 2);
+
+    worker.clear_task_tracking("t-1");
+
+    assert!(worker.defer_starts.lock().is_empty());
+    assert!(worker.reroute_counts.lock().is_empty());
+}
+
 #[tokio::test]
 async fn worker_discover_peers_returns_empty_with_mock_transport() {
     let worker = make_worker("node-A");
     let peers = worker.discover_peers().await.expect("discover_peers ok");
     assert!(peers.is_empty());
-}
-
-#[tokio::test]
-async fn worker_clear_capacity_callback_releases_reference() {
-    let calls = StdArc::new(std::sync::Mutex::new(Vec::new()));
-    let calls_clone = calls.clone();
-    let cb: Arc<dyn Fn(u32, u32) + Send + Sync> = Arc::new(move |avail, max| {
-        calls_clone.lock().unwrap().push((avail, max));
-    });
-    let mut worker = make_worker("node-A").with_capacity_callback(cb);
-    // clear 后再调用 notify_capacity 不应 panic 且不再触发回调。
-    worker.clear_capacity_callback();
-    // 间接验证：running_task_count 不依赖 callback。
-    assert_eq!(worker.running_task_count(), 0);
 }
 
 // ───────────────────────── NetworkEventRouter 测试 ─────────────────────────
@@ -212,7 +255,6 @@ async fn router_handle_peer_connected_publishes_event() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
-        capability_gossip: None,
         failover: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
@@ -248,7 +290,6 @@ async fn router_handle_peer_disconnected_publishes_event() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
-        capability_gossip: None,
         failover: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
@@ -283,7 +324,6 @@ async fn router_handle_message_unknown_topic_is_noop() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
-        capability_gossip: None,
         failover: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
@@ -314,7 +354,6 @@ async fn router_handle_message_heartbeat_dispatches_to_failover() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
-        capability_gossip: None,
         failover: Some(failover.clone()),
         cancel_flags: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
@@ -324,12 +363,15 @@ async fn router_handle_message_heartbeat_dispatches_to_failover() {
         signature: None,
         labels: std::collections::BTreeMap::new(),
         platform: None,
+        available_quotas: std::collections::BTreeMap::new(),
         node_id: NodeId::from("node-HB".to_string()),
         active_workflows: Vec::new(),
         timestamp_ms: 12345,
         available_slots: 4,
         max_slots: 8,
         endpoint_addr: Some("peer-node-HB".to_string()),
+        role: crate::common::NodeRole::Both,
+        draining: false,
     };
     // 构造 heartbeat 主题的 WireEnvelope
     let envelope =
@@ -362,7 +404,6 @@ async fn router_handle_task_result_returns_false_without_actor_system() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
-        capability_gossip: None,
         failover: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
@@ -375,6 +416,7 @@ async fn router_handle_task_result_returns_false_without_actor_system() {
             "echo".to_string(),
             crate::common::WireTaskOutcome::Completed(vec![1, 2, 3]),
             NodeId::from("node-Z".to_string()),
+            0,
         )
         .await;
     assert!(
@@ -513,6 +555,9 @@ async fn worker_schedule_task_with_real_scheduler() {
     );
 
     let task = TaskDefinition {
+        tags: Vec::new(),
+        quota: None,
+        pinned_target: false,
         id: TaskId::from("t-sched".to_string()),
         name: "test_task".to_string(),
         payload: Vec::new(),
@@ -526,6 +571,7 @@ async fn worker_schedule_task_with_real_scheduler() {
         enqueued_at_ms: 0,
         target_endpoint_addr: None,
         origin_endpoint_addr: None,
+        lease_deadline_ms: 0,
     };
     worker
         .schedule_task(task, NodeId::from("node-target".to_string()))
@@ -592,7 +638,6 @@ fn make_router(node_id: &str) -> (NetworkEventRouter, EventBus, Arc<MockTranspor
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
-        capability_gossip: None,
         failover: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
@@ -621,7 +666,6 @@ async fn router_handle_message_cancel_broadcast_sets_cancel_flag() {
             actor_system: None,
             workflow_actor_id: None,
             dag_gossip_actor_id: None,
-            capability_gossip: None,
             failover: None,
             cancel_flags: cancel_flags.clone(),
             cancelled_tasks: cancelled_tasks.clone(),
@@ -653,6 +697,9 @@ async fn router_handle_message_task_dispatch_enqueues_to_scheduler() {
     let (router, _event_bus, _network) = make_router("node-dispatch");
 
     let task = TaskDefinition {
+        tags: Vec::new(),
+        quota: None,
+        pinned_target: false,
         id: TaskId::from("t-dispatch".to_string()),
         name: "dispatch_test".to_string(),
         payload: vec![1, 2, 3],
@@ -666,6 +713,7 @@ async fn router_handle_message_task_dispatch_enqueues_to_scheduler() {
         enqueued_at_ms: 0,
         target_endpoint_addr: None,
         origin_endpoint_addr: None,
+        lease_deadline_ms: 0,
     };
     let envelope =
         crate::common::WireEnvelope::wrap(crate::common::WireMessage::TaskDispatch(task.clone()));
@@ -708,7 +756,6 @@ async fn router_handle_message_dag_state_update_dispatches_to_dag_gossip_actor()
         actor_system: Some(actor_system),
         workflow_actor_id: None,
         dag_gossip_actor_id: Some(dag_gossip_actor_id),
-        capability_gossip: None,
         failover: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
@@ -756,7 +803,6 @@ async fn router_handle_message_failover_claim_dispatches_to_failover() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
-        capability_gossip: None,
         failover: Some(failover.clone()),
         cancel_flags: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
@@ -804,6 +850,9 @@ async fn router_handle_direct_request_dispatch_task_sends_ack() {
     let (router, _event_bus, _network) = make_router("node-direct");
 
     let task = TaskDefinition {
+        tags: Vec::new(),
+        quota: None,
+        pinned_target: false,
         id: TaskId::from("t-direct".to_string()),
         name: "direct_test".to_string(),
         payload: Vec::new(),
@@ -817,6 +866,7 @@ async fn router_handle_direct_request_dispatch_task_sends_ack() {
         enqueued_at_ms: 0,
         target_endpoint_addr: None,
         origin_endpoint_addr: None,
+        lease_deadline_ms: 0,
     };
     let channel = DirectResponseChannel::test_stub();
 
@@ -847,6 +897,7 @@ async fn router_handle_direct_request_task_result_publishes_event() {
                 task_name: "result_test".to_string(),
                 outcome: crate::common::WireTaskOutcome::Completed(vec![42]),
                 worker_node: NodeId::from("node-worker".to_string()),
+                attempt: 0,
             }),
             channel,
         })
@@ -858,6 +909,77 @@ async fn router_handle_direct_request_task_result_publishes_event() {
         .expect("event published in time")
         .expect("event present");
     assert!(matches!(event, BusEvent::TaskCompleted(_)));
+}
+
+#[tokio::test]
+async fn router_fences_standalone_task_results_by_attempt() {
+    let network = Arc::new(MockTransport::new("node-fence"));
+    let event_bus = EventBus::new();
+    let failover = Arc::new(crate::runtime::workflow::FailoverManager::new(
+        NodeId::from("node-fence".to_string()),
+        network.clone() as Arc<dyn Transport>,
+        Arc::new(crate::runtime::actor::ActorSystem::new()),
+        crate::common::ActorId::workflow(&NodeId::from("node-fence".to_string())),
+    ));
+    let mut task = unrouted_task();
+    task.id = TaskId::from("t-fence");
+    task.attempt = 2;
+    failover.record_outbound(&task, &NodeId::from("node-peer".to_string()), None);
+
+    let router = NetworkEventRouter::new(NetworkEventRouterConfig {
+        network: network.clone() as Arc<dyn Transport>,
+        event_bus: event_bus.clone(),
+        scheduler: Arc::new(MockScheduler::new()),
+        actor_system: None,
+        workflow_actor_id: None,
+        dag_gossip_actor_id: None,
+        failover: Some(failover.clone()),
+        cancel_flags: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+        cancelled_tasks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+    });
+    let mut sub = event_bus.subscribe(BusTopic::TaskCompleted);
+
+    let result = |attempt: u32| {
+        Box::new(DirectRequest::TaskResult {
+            workflow_id: WorkflowId::from(String::new()),
+            task_id: TaskId::from("t-fence"),
+            task_name: "fenced".to_string(),
+            outcome: crate::common::WireTaskOutcome::Completed(vec![1]),
+            worker_node: NodeId::from("node-peer".to_string()),
+            attempt,
+        })
+    };
+
+    // 旧 attempt 的迟到结果：拒绝，且不得解除新 attempt 的在途登记。
+    router
+        .handle(NetworkEvent::DirectRequest {
+            peer_id: "peer".to_string(),
+            request: result(1),
+            channel: DirectResponseChannel::test_stub(),
+        })
+        .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), sub.recv())
+            .await
+            .is_err(),
+        "stale result must not publish a completion"
+    );
+    assert_eq!(failover.outbound_len(), 1);
+
+    // 与登记一致的 attempt：接受并清出登记。
+    router
+        .handle(NetworkEvent::DirectRequest {
+            peer_id: "peer".to_string(),
+            request: result(2),
+            channel: DirectResponseChannel::test_stub(),
+        })
+        .await;
+    let event = tokio::time::timeout(Duration::from_millis(500), sub.recv())
+        .await
+        .expect("current attempt must publish in time")
+        .expect("event present");
+    assert!(matches!(event, BusEvent::TaskCompleted(_)));
+    assert_eq!(failover.outbound_len(), 0);
 }
 
 #[tokio::test]
@@ -902,6 +1024,7 @@ async fn router_handle_message_empty_workflow_id_routes_to_event_bus() {
             "empty_wf_task".to_string(),
             crate::common::WireTaskOutcome::Failed("test error".to_string()),
             NodeId::from("node-remote".to_string()),
+            0,
         )
         .await;
     assert!(accepted, "empty workflow_id should return true");
@@ -911,24 +1034,6 @@ async fn router_handle_message_empty_workflow_id_routes_to_event_bus() {
         .expect("event published in time")
         .expect("event present");
     assert!(matches!(event, BusEvent::TaskFailed(_)));
-}
-
-#[tokio::test]
-async fn router_handle_task_result_skipped_outcome_returns_false() {
-    let (router, _event_bus, _network) = make_router("node-skip");
-
-    let accepted = router
-        .handle_task_result(
-            WorkflowId::from("wf-skip".to_string()),
-            TaskId::from("t-skip".to_string()),
-            "skip_task".to_string(),
-            crate::common::WireTaskOutcome::Skipped,
-            NodeId::from("node-remote".to_string()),
-        )
-        .await;
-    // Skipped outcome without actor_system falls through to publish_remote_completion
-    // which returns true
-    assert!(accepted);
 }
 
 #[tokio::test]
@@ -943,6 +1048,7 @@ async fn router_handle_task_result_cancelled_outcome_publishes_event() {
             "cancel_task".to_string(),
             crate::common::WireTaskOutcome::Cancelled,
             NodeId::from("node-remote".to_string()),
+            0,
         )
         .await;
     assert!(accepted, "cancelled outcome should return true");
@@ -1031,7 +1137,6 @@ async fn router_handle_direct_request_dispatch_task_ack_rejected() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
-        capability_gossip: None,
         failover: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
@@ -1074,7 +1179,6 @@ async fn router_handle_message_heads_exchange_dispatches_to_dag_gossip_actor() {
         actor_system: Some(actor_system),
         workflow_actor_id: None,
         dag_gossip_actor_id: Some(dag_gossip_actor_id),
-        capability_gossip: None,
         failover: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
@@ -1397,13 +1501,38 @@ fn make_worker_with_transport(node_id: &str, transport: Arc<dyn Transport>) -> W
     )
 }
 
-// ───────────────────────── select_remote_target tests ─────────────────────────
+fn unrouted_task() -> TaskDefinition {
+    TaskDefinition {
+        id: TaskId::from("t-route".to_string()),
+        name: "route_test".to_string(),
+        payload: Vec::new(),
+        workflow_id: None,
+        target_node: None,
+        origin_node: None,
+        retry_policy: None,
+        priority: 0,
+        timeout_ms: None,
+        attempt: 0,
+        enqueued_at_ms: 0,
+        target_endpoint_addr: None,
+        origin_endpoint_addr: None,
+        tags: Vec::new(),
+        quota: None,
+        pinned_target: false,
+        lease_deadline_ms: 0,
+    }
+}
+
+// ───────────────────────── route_task tests ─────────────────────────
 
 #[tokio::test]
 async fn select_remote_target_without_failover_returns_none() {
     let transport = Arc::new(ConfigurableMockTransport::new("node-A"));
     let worker = make_worker_with_transport("node-A", transport);
-    assert!(worker.select_remote_target().is_none());
+    assert!(matches!(
+        worker.route_task(&unrouted_task()),
+        crate::runtime::workflow::RouteDecision::Local
+    ));
 }
 
 #[tokio::test]
@@ -1425,16 +1554,22 @@ async fn select_remote_target_filters_unavailable_peers() {
         signature: None,
         labels: std::collections::BTreeMap::new(),
         platform: None,
+        available_quotas: std::collections::BTreeMap::new(),
         node_id: NodeId::from("node-B".to_string()),
         active_workflows: Vec::new(),
         timestamp_ms: crate::common::epoch_millis(),
         available_slots: 0,
         max_slots: 8,
         endpoint_addr: Some("node-B-addr".to_string()),
+        role: crate::common::NodeRole::Both,
+        draining: false,
     };
     failover.handle_heartbeat(&hb);
 
-    assert!(worker.select_remote_target().is_none());
+    assert!(matches!(
+        worker.route_task(&unrouted_task()),
+        crate::runtime::workflow::RouteDecision::Local
+    ));
 }
 
 #[tokio::test]
@@ -1456,16 +1591,25 @@ async fn select_remote_target_returns_peer_with_more_available_slots() {
         signature: None,
         labels: std::collections::BTreeMap::new(),
         platform: None,
+        available_quotas: std::collections::BTreeMap::new(),
         node_id: NodeId::from("node-B".to_string()),
         active_workflows: Vec::new(),
         timestamp_ms: crate::common::epoch_millis(),
         available_slots: 8,
         max_slots: 8,
         endpoint_addr: Some("node-B-addr".to_string()),
+        role: crate::common::NodeRole::Both,
+        draining: false,
     };
     failover.handle_heartbeat(&hb);
 
-    let (target, addr) = worker.select_remote_target().expect("should select peer");
+    let (target, addr) = match worker.route_task(&unrouted_task()) {
+        crate::runtime::workflow::RouteDecision::Remote {
+            node_id,
+            endpoint_addr,
+        } => (node_id, endpoint_addr),
+        other => panic!("expected remote decision, got {other:?}"),
+    };
     assert_eq!(target.as_str(), "node-B");
     assert_eq!(addr, "node-B-addr");
 }
@@ -1497,19 +1641,25 @@ async fn select_remote_target_skips_stale_heartbeat() {
         signature: None,
         labels: std::collections::BTreeMap::new(),
         platform: None,
+        available_quotas: std::collections::BTreeMap::new(),
         node_id: NodeId::from("node-B".to_string()),
         active_workflows: Vec::new(),
         timestamp_ms: crate::common::epoch_millis(),
         available_slots: 8,
         max_slots: 8,
         endpoint_addr: Some("node-B-addr".to_string()),
+        role: crate::common::NodeRole::Both,
+        draining: false,
     };
     failover.handle_heartbeat(&hb);
     // last_heartbeat_ms 由接收方本地时钟记录；真实等待超过
     // failure_timeout_ms（100ms）使其失联。
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    assert!(worker.select_remote_target().is_none());
+    assert!(matches!(
+        worker.route_task(&unrouted_task()),
+        crate::runtime::workflow::RouteDecision::Local
+    ));
 }
 
 #[tokio::test]
@@ -1531,16 +1681,22 @@ async fn select_remote_target_peer_not_better_than_local_returns_none() {
         signature: None,
         labels: std::collections::BTreeMap::new(),
         platform: None,
+        available_quotas: std::collections::BTreeMap::new(),
         node_id: NodeId::from("node-B".to_string()),
         active_workflows: Vec::new(),
         timestamp_ms: crate::common::epoch_millis(),
         available_slots: 4,
         max_slots: 4,
         endpoint_addr: Some("node-B-addr".to_string()),
+        role: crate::common::NodeRole::Both,
+        draining: false,
     };
     failover.handle_heartbeat(&hb);
 
-    assert!(worker.select_remote_target().is_none());
+    assert!(matches!(
+        worker.route_task(&unrouted_task()),
+        crate::runtime::workflow::RouteDecision::Local
+    ));
 }
 
 // ───────────────────────── forward_remote_task tests ─────────────────────────
@@ -1554,6 +1710,9 @@ async fn forward_remote_task_uses_target_endpoint_addr_when_present() {
     let worker = make_worker_with_transport("node-A", transport.clone());
 
     let task = TaskDefinition {
+        tags: Vec::new(),
+        quota: None,
+        pinned_target: false,
         id: TaskId::from("t-forward".to_string()),
         name: "forward_test".to_string(),
         payload: Vec::new(),
@@ -1567,6 +1726,7 @@ async fn forward_remote_task_uses_target_endpoint_addr_when_present() {
         enqueued_at_ms: 0,
         target_endpoint_addr: Some("custom-endpoint-addr".to_string()),
         origin_endpoint_addr: None,
+        lease_deadline_ms: 0,
     };
 
     let result = worker
@@ -1588,6 +1748,9 @@ async fn forward_remote_task_falls_back_to_node_id() {
     let worker = make_worker_with_transport("node-A", transport.clone());
 
     let task = TaskDefinition {
+        tags: Vec::new(),
+        quota: None,
+        pinned_target: false,
         id: TaskId::from("t-forward".to_string()),
         name: "forward_test".to_string(),
         payload: Vec::new(),
@@ -1601,6 +1764,7 @@ async fn forward_remote_task_falls_back_to_node_id() {
         enqueued_at_ms: 0,
         target_endpoint_addr: None,
         origin_endpoint_addr: None,
+        lease_deadline_ms: 0,
     };
 
     let result = worker
@@ -1619,6 +1783,9 @@ async fn forward_remote_task_rejected_ack_returns_error() {
     let worker = make_worker_with_transport("node-A", transport);
 
     let task = TaskDefinition {
+        tags: Vec::new(),
+        quota: None,
+        pinned_target: false,
         id: TaskId::from("t-forward".to_string()),
         name: "forward_test".to_string(),
         payload: Vec::new(),
@@ -1632,6 +1799,7 @@ async fn forward_remote_task_rejected_ack_returns_error() {
         enqueued_at_ms: 0,
         target_endpoint_addr: None,
         origin_endpoint_addr: None,
+        lease_deadline_ms: 0,
     };
 
     let result = worker
@@ -1644,6 +1812,9 @@ async fn forward_remote_task_rejected_ack_returns_error() {
 
 fn make_remote_task(origin: &str) -> TaskDefinition {
     TaskDefinition {
+        tags: Vec::new(),
+        quota: None,
+        pinned_target: false,
         id: TaskId::from("t-remote".to_string()),
         name: "remote_task".to_string(),
         payload: vec![1, 2, 3],
@@ -1657,11 +1828,15 @@ fn make_remote_task(origin: &str) -> TaskDefinition {
         enqueued_at_ms: 0,
         target_endpoint_addr: None,
         origin_endpoint_addr: Some("origin-addr".to_string()),
+        lease_deadline_ms: 0,
     }
 }
 
 fn make_local_task() -> TaskDefinition {
     TaskDefinition {
+        tags: Vec::new(),
+        quota: None,
+        pinned_target: false,
         id: TaskId::from("t-local".to_string()),
         name: "local_task".to_string(),
         payload: vec![1, 2, 3],
@@ -1675,6 +1850,7 @@ fn make_local_task() -> TaskDefinition {
         enqueued_at_ms: 0,
         target_endpoint_addr: None,
         origin_endpoint_addr: None,
+        lease_deadline_ms: 0,
     }
 }
 
@@ -1890,6 +2066,9 @@ async fn publish_task_completion_remote_rejected_with_full_channel_publishes_fai
 
 fn make_task_for_completion(id: &str, name: &str) -> TaskDefinition {
     TaskDefinition {
+        tags: Vec::new(),
+        quota: None,
+        pinned_target: false,
         id: TaskId::from(id.to_string()),
         name: name.to_string(),
         payload: Vec::new(),
@@ -1903,6 +2082,7 @@ fn make_task_for_completion(id: &str, name: &str) -> TaskDefinition {
         enqueued_at_ms: 0,
         target_endpoint_addr: None,
         origin_endpoint_addr: None,
+        lease_deadline_ms: 0,
     }
 }
 
@@ -2312,6 +2492,9 @@ async fn worker_crash_reenqueues_task_for_failover() {
     );
 
     scheduler.seed(TaskDefinition {
+        tags: Vec::new(),
+        quota: None,
+        pinned_target: false,
         id: TaskId::from("t-crash".to_string()),
         name: "crash_task".to_string(),
         payload: Vec::new(),
@@ -2325,6 +2508,7 @@ async fn worker_crash_reenqueues_task_for_failover() {
         enqueued_at_ms: 0,
         target_endpoint_addr: None,
         origin_endpoint_addr: None,
+        lease_deadline_ms: 0,
     });
 
     let pending_tx = worker.start_pending_result_loop();
@@ -2430,6 +2614,9 @@ async fn forward_remote_task_unexpected_response_returns_error() {
     let worker = make_worker_with_transport("node-A", transport);
 
     let task = TaskDefinition {
+        tags: Vec::new(),
+        quota: None,
+        pinned_target: false,
         id: TaskId::from("t-forward".to_string()),
         name: "forward_test".to_string(),
         payload: Vec::new(),
@@ -2443,6 +2630,7 @@ async fn forward_remote_task_unexpected_response_returns_error() {
         enqueued_at_ms: 0,
         target_endpoint_addr: None,
         origin_endpoint_addr: None,
+        lease_deadline_ms: 0,
     };
 
     let result = worker
@@ -2460,6 +2648,9 @@ async fn forward_remote_task_network_error_returns_error() {
     let worker = make_worker_with_transport("node-A", transport);
 
     let task = TaskDefinition {
+        tags: Vec::new(),
+        quota: None,
+        pinned_target: false,
         id: TaskId::from("t-forward".to_string()),
         name: "forward_test".to_string(),
         payload: Vec::new(),
@@ -2473,6 +2664,7 @@ async fn forward_remote_task_network_error_returns_error() {
         enqueued_at_ms: 0,
         target_endpoint_addr: None,
         origin_endpoint_addr: None,
+        lease_deadline_ms: 0,
     };
 
     let result = worker
@@ -2510,6 +2702,9 @@ async fn publish_drained_task_cancellation_publishes_local_cancelled_event() {
     let (pending_tx, _pending_rx) = tokio::sync::mpsc::channel::<PendingResult>(4);
 
     let task = TaskDefinition {
+        tags: Vec::new(),
+        quota: None,
+        pinned_target: false,
         id: TaskId::from("t-drain-local".to_string()),
         name: "drain-local".to_string(),
         payload: vec![],
@@ -2523,6 +2718,7 @@ async fn publish_drained_task_cancellation_publishes_local_cancelled_event() {
         enqueued_at_ms: 0,
         target_endpoint_addr: None,
         origin_endpoint_addr: None,
+        lease_deadline_ms: 0,
     };
 
     // 本地任务结算只发布事件：drain 丢弃的任务以 TaskCancelled
@@ -2560,6 +2756,9 @@ async fn publish_drained_task_cancellation_enqueues_remote_result_for_origin() {
     let (pending_tx, mut pending_rx) = tokio::sync::mpsc::channel::<PendingResult>(4);
 
     let task = TaskDefinition {
+        tags: Vec::new(),
+        quota: None,
+        pinned_target: false,
         id: TaskId::from("t-drain-remote".to_string()),
         name: "drain-remote".to_string(),
         payload: vec![],
@@ -2573,6 +2772,7 @@ async fn publish_drained_task_cancellation_enqueues_remote_result_for_origin() {
         enqueued_at_ms: 0,
         target_endpoint_addr: None,
         origin_endpoint_addr: None,
+        lease_deadline_ms: 0,
     };
 
     // 远端任务（origin != 本节点）：结算经直连回传 origin 节点，本地不落
@@ -2622,6 +2822,7 @@ async fn pending_result_loop_publishes_compensation_event_on_max_attempts() {
         task_name: "comp".to_string(),
         outcome: crate::common::WireTaskOutcome::Completed(vec![1]),
         worker_node: NodeId::from("node-comp".to_string()),
+        attempt: 0,
     };
     pending_tx
         .send(PendingResult {

@@ -57,14 +57,6 @@ async fn store_handler_roundtrip_via_actor() {
 }
 
 #[test]
-fn gossip_meta_from_capability_meta_preserves_fields() {
-    let meta = CapabilityMeta::new::<Store>("Store", EffectKind::Perform);
-    let gossip: GossipCapabilityMeta = meta.into();
-    assert_eq!(gossip.name, "Store");
-    assert_eq!(gossip.default_kind, EffectKind::Perform);
-}
-
-#[test]
 fn effect_kind_variants_are_distinct() {
     assert_ne!(EffectKind::Ask, EffectKind::Perform);
     assert_ne!(EffectKind::Perform, EffectKind::Emit);
@@ -275,61 +267,6 @@ async fn runtime_chain_after_bind_returns_error() {
     assert!(matches!(result, Err(ActantError::Internal(_))));
 }
 
-#[test]
-fn runtime_update_peer_capabilities_stores_and_indexes() {
-    let rt = CapabilityRuntime::new();
-    let node = NodeId::from("peer-A".to_string());
-    let caps = vec![
-        GossipCapabilityMeta {
-            name: "Store".to_string(),
-            default_kind: EffectKind::Perform,
-        },
-        GossipCapabilityMeta {
-            name: "Execute".to_string(),
-            default_kind: EffectKind::Perform,
-        },
-    ];
-    rt.update_peer_capabilities(node.clone(), caps.clone());
-    assert_eq!(rt.peer_capabilities(&node), Some(caps));
-    assert_eq!(rt.peer_nodes(), vec![node.clone()]);
-}
-
-#[test]
-fn runtime_update_peer_capabilities_replaces_existing() {
-    let rt = CapabilityRuntime::new();
-    let node = NodeId::from("peer-B".to_string());
-    rt.update_peer_capabilities(
-        node.clone(),
-        vec![GossipCapabilityMeta {
-            name: "Store".to_string(),
-            default_kind: EffectKind::Perform,
-        }],
-    );
-    rt.update_peer_capabilities(
-        node.clone(),
-        vec![GossipCapabilityMeta {
-            name: "Execute".to_string(),
-            default_kind: EffectKind::Perform,
-        }],
-    );
-    let caps = rt.peer_capabilities(&node).unwrap();
-    assert_eq!(caps.len(), 1);
-    assert_eq!(caps[0].name, "Execute");
-}
-
-#[test]
-fn runtime_peer_capabilities_returns_none_for_unknown_node() {
-    let rt = CapabilityRuntime::new();
-    let node = NodeId::from("unknown".to_string());
-    assert!(rt.peer_capabilities(&node).is_none());
-}
-
-#[test]
-fn runtime_peer_nodes_returns_empty_when_no_peers() {
-    let rt = CapabilityRuntime::new();
-    assert!(rt.peer_nodes().is_empty());
-}
-
 #[tokio::test]
 async fn ask_without_bound_actor_system_returns_error() {
     let rt = CapabilityRuntime::new();
@@ -374,15 +311,13 @@ async fn ask_without_codec_returns_error() {
 }
 
 #[test]
-fn builtin_capabilities_returns_all_five() {
+fn builtin_capabilities_returns_all_wired() {
     let caps = builtin_capabilities();
-    assert_eq!(caps.len(), 5);
+    assert_eq!(caps.len(), 3);
     let names: Vec<&str> = caps.iter().map(|c| c.name).collect();
-    assert!(names.contains(&"Serialization"));
     assert!(names.contains(&"Store"));
     assert!(names.contains(&"TaskLifecycle"));
     assert!(names.contains(&"WorkflowLifecycle"));
-    assert!(names.contains(&"NodeLifecycle"));
 }
 
 #[test]
@@ -391,7 +326,7 @@ fn register_defaults_registers_all_codecs() {
     register_defaults(&rt);
     // register_defaults 注册 codec 与空 layer（ensure_layer），
     // 使所有内置 capability 都有 layer entry。
-    assert_eq!(rt.capability_count(), 5);
+    assert_eq!(rt.capability_count(), 3);
     // handler_count 查 layer 中 handler 数量，应为 0（空 layer）
     assert_eq!(rt.handler_count::<Store>(), 0);
 }
@@ -445,7 +380,6 @@ fn runtime_default_equivalent_to_new() {
     assert_eq!(rt.capability_count(), 0);
     assert!(rt.capabilities().is_empty());
     assert_eq!(rt.handler_count::<Store>(), 0);
-    assert!(rt.peer_nodes().is_empty());
 }
 
 #[test]
@@ -485,8 +419,8 @@ async fn ensure_layer_after_bind_does_not_spawn_actor() {
 
     // bind 后 ensure_layer 不 spawn 新 CapabilityActor：
     // actor 表已 snapshot，新 layer 不会出现 actor 条目。
-    rt.ensure_layer::<NodeLifecycle>(NodeLifecycle::meta());
-    let type_id = std::any::TypeId::of::<NodeLifecycle>();
+    rt.ensure_layer::<TaskLifecycle>(TaskLifecycle::meta());
+    let type_id = std::any::TypeId::of::<TaskLifecycle>();
     assert!(rt.actor_ids.get(&type_id).is_none());
 }
 
@@ -792,96 +726,6 @@ async fn emit_with_local_handler_error_propagates() {
 // 调用方收到聚合错误，且失败 handler 之后的 handler 仍被调用。
 
 // =========================================================================
-// Serialization handler / register_serialization_handler
-// =========================================================================
-
-// =========================================================================
-// update_peer_capabilities 反向索引维护
-// =========================================================================
-
-#[test]
-fn update_peer_capabilities_maintains_reverse_index() {
-    let rt = CapabilityRuntime::new();
-
-    // peer-A 声明 Store + Execute
-    rt.update_peer_capabilities(
-        NodeId::from("peer-A".to_string()),
-        vec![
-            GossipCapabilityMeta {
-                name: "Store".to_string(),
-                default_kind: EffectKind::Perform,
-            },
-            GossipCapabilityMeta {
-                name: "Execute".to_string(),
-                default_kind: EffectKind::Perform,
-            },
-        ],
-    );
-
-    // peer-B 声明 Store
-    rt.update_peer_capabilities(
-        NodeId::from("peer-B".to_string()),
-        vec![GossipCapabilityMeta {
-            name: "Store".to_string(),
-            default_kind: EffectKind::Perform,
-        }],
-    );
-
-    // 验证 peer_nodes 包含两个 peer
-    let mut nodes = rt.peer_nodes();
-    nodes.sort_by(|a, b| a.0.cmp(&b.0));
-    assert_eq!(nodes.len(), 2);
-    assert_eq!(nodes[0].0, "peer-A");
-    assert_eq!(nodes[1].0, "peer-B");
-
-    // peer-A 更新为只声明 Execute → Store 反向索引应移除 peer-A
-    rt.update_peer_capabilities(
-        NodeId::from("peer-A".to_string()),
-        vec![GossipCapabilityMeta {
-            name: "Execute".to_string(),
-            default_kind: EffectKind::Perform,
-        }],
-    );
-
-    // peer-A 的 capability 列表应只有 Execute
-    let peer_a_caps = rt
-        .peer_capabilities(&NodeId::from("peer-A".to_string()))
-        .unwrap();
-    assert_eq!(peer_a_caps.len(), 1);
-    assert_eq!(peer_a_caps[0].name, "Execute");
-}
-
-#[test]
-fn update_peer_capabilities_removes_node_from_all_old_capabilities() {
-    let rt = CapabilityRuntime::new();
-    let node = NodeId::from("peer-churn".to_string());
-
-    // 声明 3 个 capability
-    rt.update_peer_capabilities(
-        node.clone(),
-        vec![
-            GossipCapabilityMeta {
-                name: "Cap1".to_string(),
-                default_kind: EffectKind::Perform,
-            },
-            GossipCapabilityMeta {
-                name: "Cap2".to_string(),
-                default_kind: EffectKind::Perform,
-            },
-            GossipCapabilityMeta {
-                name: "Cap3".to_string(),
-                default_kind: EffectKind::Perform,
-            },
-        ],
-    );
-
-    // 更新为空列表 → 应从所有反向索引中移除
-    rt.update_peer_capabilities(node.clone(), vec![]);
-    let caps = rt.peer_capabilities(&node).unwrap();
-    assert!(caps.is_empty());
-}
-
-// =========================================================================
 // bind_actor_system 多次绑定 / spawn 失败路径
 // =========================================================================
 
@@ -895,12 +739,11 @@ async fn bind_actor_system_spawns_actors_for_registered_codecs() {
     let actor_system = Arc::new(crate::runtime::actor::ActorSystem::new());
     Arc::clone(&rt).bind_actor_system(actor_system).await;
 
-    // 5 个内置 capability（Serialization/Store/TaskLifecycle/WorkflowLifecycle/
-    // NodeLifecycle）均注册了 codec + layer → 应有 5 个 actor_ids
-    // （Store 有 handler，其余 4 个空 layer）
+    // 3 个内置 capability（Store/TaskLifecycle/WorkflowLifecycle）均注册了
+    // codec + layer → 应有 3 个 actor_ids（Store 有 handler，其余 2 个空 layer）
     let type_id_store = std::any::TypeId::of::<Store>();
     assert!(rt.actor_ids.get(&type_id_store).is_some());
-    let type_id_lifecycle = std::any::TypeId::of::<NodeLifecycle>();
+    let type_id_lifecycle = std::any::TypeId::of::<TaskLifecycle>();
     assert!(rt.actor_ids.get(&type_id_lifecycle).is_some());
 }
 
@@ -943,7 +786,7 @@ async fn bind_actor_system_with_duplicate_actor_id_warns_but_continues() {
     let type_id_store = std::any::TypeId::of::<Store>();
     assert!(rt.actor_ids.get(&type_id_store).is_none());
     // 但其他 capability 应正常 spawn
-    let type_id_lifecycle = std::any::TypeId::of::<NodeLifecycle>();
+    let type_id_lifecycle = std::any::TypeId::of::<TaskLifecycle>();
     assert!(rt.actor_ids.get(&type_id_lifecycle).is_some());
 }
 

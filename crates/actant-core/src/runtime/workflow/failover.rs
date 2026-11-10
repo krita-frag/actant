@@ -1,39 +1,10 @@
 //! 基于心跳与租约的工作流故障转移。
 //!
-//! [`FailoverManager`] 维护远端节点心跳、可用槽位、活跃 workflow 列表和本地租约。
-//! 当节点被判定失效时，所有健康节点使用一致性哈希
-//! [`should_claim_workflow`] 对 workflow 归属做
-//! 确定性选择，只有获选节点会 claim 并重新调度该 workflow 的运行中任务。
-//!
-//! ## 时间参数
-//!
-//! [`FailoverConfig`] 要求
-//! `heartbeat_interval_ms < failure_timeout_ms < lease_duration_ms`。这个关系保证：
-//! - 节点有足够心跳机会，不会因为单次延迟就被误判；
-//! - 故障判定完成前旧租约不会先过期；
-//! - claim 后的租约有明确过期时间，避免永久双主。
-//!
-//! ## 持久化
-//!
-//! 新 claim 的租约同时记录墙钟时间和单调 deadline；从 store 恢复的租约没有
-//! 单调基线，只能回退到墙钟过期判断。
-//!
-//! ## 两条失联处置腿
-//!
-//! 判失效后按"谁的账谁认"分两腿，覆盖执行器与编排器两种死亡形态：
-//!
-//! 1. **孤儿编排**（既有）：peer 的 `active_workflows` 非空 ⇒ 它是那些 workflow
-//!    的编排者，按一致性哈希 `claim` 接管并 `reschedule_running_tasks`。
-//! 2. **在途转发**：peer 是**执行器**时 `active_workflows` 为空，
-//!    但它身上跑着**本节点转发过去**的任务。这些任务登记在
-//!    [`FailoverManager::outbound`]，失联时终结为 `TaskCompletion::Failed`
-//!    并经 event_bus 发布（与远端结果回灌同一条路），使提交方 `AsyncResult`
-//!    不会永久挂起。
-//!
-//! 第 2 腿刻意**不重派发**：源节点没有"该任务未执行完"的持久凭据，盲目重跑
-//! 会静默重复副作用；重跑交由显式重试策略（重试裁决）或提交方重提。
+//! [`FailoverManager`] 维护心跳、可用槽位、活跃 workflow 与本地租约；节点失效后
+//! 由健康节点通过一致性哈希选主并 claim 接管。时间参数约束、两条失联处置腿
+//! 与租约持久化语义见 `docs/architecture/failover.md`。
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -43,8 +14,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::common::{
     should_claim_workflow, ActorId, FailoverConfig, NodeHeartbeat, NodeId, OrchestratorClaim,
-    PlatformInfo, Result, TaskCompletion, TaskId, WireEnvelope, WireMessage, WorkflowId,
-    STORE_KEY_LEASE, TOPIC_FAILOVER, TOPIC_HEADS, TOPIC_HEARTBEAT,
+    PlatformInfo, Result, TaskCompletion, TaskDefinition, TaskId, WireEnvelope, WireMessage,
+    WorkflowId, STORE_KEY_LEASE, TOPIC_FAILOVER, TOPIC_HEADS, TOPIC_HEARTBEAT,
 };
 use crate::runtime::actor::ActorSystem;
 use crate::runtime::event_bus::{BusEvent, EventBus};
@@ -76,12 +47,18 @@ struct PeerState {
     endpoint_addr: Option<String>,
     labels: BTreeMap<String, String>,
     platform: Option<PlatformInfo>,
+    /// 对端各命名配额的剩余容量（最近一次心跳快照）。
+    available_quotas: BTreeMap<String, u32>,
+    /// 对端拓扑角色（用于路由排除 orchestrator）。
+    role: crate::common::NodeRole,
+    /// 对端是否正在 draining。
+    draining: bool,
 }
 
 /// 已转发到远端 peer、结果尚未回来的在途任务条目。
 ///
-/// 只保存**构造失败完成事件所需的最小字段**（不含 payload）——登记表是"路由
-/// 记账"，不是任务副本，避免为每个在途任务额外持有一份可能达 MiB 级的 payload。
+/// 保存任务快照是为了租约到期后由 origin 重新入队——重投必须有完整载荷。
+/// 登记表条目随结果回传或重投移除，不会长期驻留。
 #[derive(Debug, Clone)]
 pub struct OutboundTask {
     /// 任务所属 workflow（直提任务为空串 id）。
@@ -95,6 +72,9 @@ pub struct OutboundTask {
     pub target_endpoint_addr: Option<String>,
     /// 登记时刻，用于诊断"在途过久"。
     pub forwarded_at: Instant,
+    /// 转发时的任务快照。直提任务租约到期后用它重新入队；编排任务仅用于
+    /// 失败完成事件字段。
+    pub task: TaskDefinition,
 }
 
 /// 对外暴露的 peer 视图（节点可见性）。
@@ -110,6 +90,15 @@ pub struct PeerInfo {
     pub labels: BTreeMap<String, String>,
     #[serde(default)]
     pub platform: Option<PlatformInfo>,
+    /// 对端各命名配额的剩余容量（心跳快照）。
+    #[serde(default)]
+    pub available_quotas: BTreeMap<String, u32>,
+    /// 对端拓扑角色。
+    #[serde(default)]
+    pub role: crate::common::NodeRole,
+    /// 对端是否正在 draining。
+    #[serde(default)]
+    pub draining: bool,
 }
 
 impl From<&PeerState> for PeerInfo {
@@ -123,6 +112,9 @@ impl From<&PeerState> for PeerInfo {
             endpoint_addr: state.endpoint_addr.clone(),
             labels: state.labels.clone(),
             platform: state.platform.clone(),
+            available_quotas: state.available_quotas.clone(),
+            role: state.role,
+            draining: state.draining,
         }
     }
 }
@@ -221,14 +213,25 @@ pub struct FailoverManager {
     event_bus: Option<EventBus>,
     /// 本节点平台信息，随心跳广播。
     platform: Option<PlatformInfo>,
-    /// 本节点用户自定义标签，随心跳广播。
-    labels: BTreeMap<String, String>,
+    /// 本节点用户自定义标签，随心跳广播。运行时可整体替换。
+    labels: parking_lot::RwLock<BTreeMap<String, String>>,
+    /// 本节点拓扑角色。`Worker` 不参与 claim，也不会接管失联节点的 workflow。
+    role: crate::common::NodeRole,
+    /// 本节点是否正在 draining，随心跳广播。
+    draining: AtomicBool,
     /// 节点身份密钥（endpoint keypair）。`Some` 时心跳以私钥签名。
     signing_key: Option<iroh::SecretKey>,
     /// `true` 时拒绝缺签/坏签的入站心跳（身份与信任）。
     require_signed_records: bool,
     /// 允许加入集群的 iroh endpoint id（z32 字符串）。空 = 不校验成员资格。
     allowed_peer_ids: Vec<String>,
+    /// 故障注入：本节点忽略其心跳的 peer（模拟单向网络分区）。
+    blocked_peers: Arc<DashMap<NodeId, ()>>,
+    /// 故障注入：心跳静默截止时刻（epoch ms）。之前不广播心跳。
+    heartbeat_paused_until_ms: Arc<AtomicU64>,
+    /// 本节点命名配额计数器（用于心跳广播剩余容量）。由 builder 在 Worker
+    /// 创建后注入；`None` 时广播空表（等价"不提供任何配额"）。
+    local_quota_tracker: Arc<parking_lot::Mutex<Option<Arc<crate::runtime::quota::QuotaTracker>>>>,
 }
 
 impl Drop for FailoverManager {
@@ -283,10 +286,15 @@ impl FailoverManager {
             outbound: Arc::new(DashMap::new()),
             event_bus: None,
             platform: None,
-            labels: BTreeMap::new(),
+            labels: parking_lot::RwLock::new(BTreeMap::new()),
+            role: crate::common::NodeRole::default(),
+            draining: AtomicBool::new(false),
             signing_key: None,
             require_signed_records: false,
             allowed_peer_ids: Vec::new(),
+            blocked_peers: Arc::new(DashMap::new()),
+            heartbeat_paused_until_ms: Arc::new(AtomicU64::new(0)),
+            local_quota_tracker: Arc::new(parking_lot::Mutex::new(None)),
         };
         fm.recover_leases_from_store();
         fm
@@ -319,6 +327,34 @@ impl FailoverManager {
         postcard::to_allocvec(&unsigned).unwrap_or_default()
     }
 
+    /// 设置本节点拓扑角色。
+    ///
+    /// `Worker` 角色的节点永不参与 workflow claim / 故障接管；角色同时随
+    /// 心跳广播，供其他节点的路由策略排除不执行任务的 orchestrator。
+    pub fn with_role(mut self, role: crate::common::NodeRole) -> Self {
+        self.role = role;
+        self
+    }
+
+    /// 返回本节点拓扑角色。
+    pub fn role(&self) -> crate::common::NodeRole {
+        self.role
+    }
+
+    /// 应用运行时节点状态更新（标签 / draining）。
+    ///
+    /// 配额由共享的 `QuotaTracker` 承载，调用方在 [`crate::runtime::workflow::Worker`]
+    /// 侧更新即可；此处只维护随心跳广播的标签与 draining 标志。
+    /// 标签超限由调用方先行校验，此处直接整表替换。
+    pub fn apply_node_state(&self, update: &crate::common::NodeStateUpdate) {
+        if let Some(labels) = &update.labels {
+            *self.labels.write() = labels.clone();
+        }
+        if let Some(draining) = update.draining {
+            self.draining.store(draining, Ordering::Relaxed);
+        }
+    }
+
     /// 注入本节点元数据（平台信息 + 标签），随心跳广播。
     pub fn with_node_metadata(
         mut self,
@@ -326,15 +362,16 @@ impl FailoverManager {
         labels: BTreeMap<String, String>,
     ) -> Self {
         self.platform = platform;
-        self.labels = if crate::common::model::node_labels_within_limit(&labels) {
-            labels
-        } else {
-            tracing::warn!(
-                "node_labels exceed {} bytes; labels will not be advertised",
-                crate::common::model::NODE_LABELS_MAX_BYTES
-            );
-            BTreeMap::new()
-        };
+        self.labels =
+            parking_lot::RwLock::new(if crate::common::model::node_labels_within_limit(&labels) {
+                labels
+            } else {
+                tracing::warn!(
+                    "node_labels exceed {} bytes; labels will not be advertised",
+                    crate::common::model::NODE_LABELS_MAX_BYTES
+                );
+                BTreeMap::new()
+            });
         self
     }
 
@@ -409,6 +446,14 @@ impl FailoverManager {
         *self.scheduler.lock() = Some(scheduler);
     }
 
+    /// 注入本节点配额计数器：心跳随之广播各配额剩余容量。
+    ///
+    /// 采用 setter 而非构造参数，保持既有 `FailoverManager::new` 调用点不变；
+    /// builder 在 Worker 创建后调用（Worker 持有同一 Arc）。
+    pub fn set_quota_tracker(&self, tracker: Arc<crate::runtime::quota::QuotaTracker>) {
+        *self.local_quota_tracker.lock() = Some(tracker);
+    }
+
     /// 注入本地事件总线，用于失联时终结在途任务（见 `fail_outbound_tasks_to`）。
     ///
     /// 采用 builder 方法而非构造参数，是为了让既有 11 处
@@ -424,20 +469,22 @@ impl FailoverManager {
     /// 覆盖旧值（重路由场景下目标是最后一次转发目标）。
     pub fn record_outbound(
         &self,
-        task_id: &TaskId,
+        task: &TaskDefinition,
         target_node: &NodeId,
         target_endpoint_addr: Option<&str>,
-        workflow_id: WorkflowId,
-        task_name: &str,
     ) {
         self.outbound.insert(
-            task_id.as_str().to_string(),
+            task.id.as_str().to_string(),
             OutboundTask {
-                workflow_id,
-                task_name: task_name.to_string(),
+                workflow_id: task
+                    .workflow_id
+                    .clone()
+                    .unwrap_or_else(|| WorkflowId::from(String::new())),
+                task_name: task.name.clone(),
                 target_node: target_node.clone(),
                 target_endpoint_addr: target_endpoint_addr.map(str::to_string),
                 forwarded_at: Instant::now(),
+                task: task.clone(),
             },
         );
     }
@@ -447,6 +494,45 @@ impl FailoverManager {
     /// 由 Worker 网络事件路由在收到该任务的远端结果时调用。
     pub fn clear_outbound(&self, task_id: &str) {
         self.outbound.remove(task_id);
+    }
+
+    /// 取出并移除所有租约已失效的直提任务登记。
+    ///
+    /// 判定统一走 [`TaskDefinition::lease_expired_at`]：无有效租约（从未租出
+    /// 或已被放弃）与已过截止时刻对检查点等效。编排任务不参与租约重投。
+    pub fn take_expired_standalone(&self, now_ms: u64) -> Vec<(String, OutboundTask)> {
+        let keys: Vec<String> = self
+            .outbound
+            .iter()
+            .filter(|entry| {
+                let task = &entry.value().task;
+                task.workflow_id.is_none() && task.lease_expired_at(now_ms)
+            })
+            .map(|entry| entry.key().clone())
+            .collect();
+        let mut expired = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some((_, entry)) = self.outbound.remove(&key) {
+                expired.push((key, entry));
+            }
+        }
+        expired
+    }
+
+    /// 取出并移除在途登记，除非结果比登记更旧（严格 fencing）。
+    ///
+    /// 用于直提任务的结果 fencing：租约重投后旧执行的迟到结果不得被接受，
+    /// 也不得移除新 attempt 的登记。
+    ///
+    /// 判据是 `entry.attempt <= attempt` 而非相等——attempt 有两个独立的
+    /// 推进者：origin 的租约重投，以及**执行节点自己的崩溃转移**
+    /// （本地派发崩溃后 `attempt += 1` 并在同节点重投）。后者不经过 origin，
+    /// origin 的登记仍停留在转发时的 attempt。若要求精确相等，执行节点自愈
+    /// 后的结果会被误判为陈旧并丢弃，origin 随后还会按租约再投一次。
+    pub fn take_outbound_if_not_stale(&self, task_id: &str, attempt: u32) -> Option<OutboundTask> {
+        self.outbound
+            .remove_if(task_id, |_, entry| entry.task.attempt <= attempt)
+            .map(|(_, entry)| entry)
     }
 
     /// 当前在途登记条数（诊断 / 测试用）。
@@ -530,35 +616,46 @@ impl FailoverManager {
         }
     }
 
-    /// 失联处置第 2 腿：把目标为 `dead` 的在途任务终结为 `TaskFailed`。
+    /// 失联处置第 2 腿：终结编排任务，直提任务转入租约重投。
     ///
-    /// 发布走 event_bus（与 `network_router::publish_remote_completion` 同一条路）：
-    /// - 直提任务：Python 事件泵解析 `AsyncResult` 为异常，句柄不会永久挂起；
-    /// - 编排任务：事件泵照常回灌 orchestrator，由重试裁决决定是否重派发。
+    /// - 直提任务：把登记条目的租约置为立即到期，由 Worker 的租约检查点重新
+    ///   入队（`attempt` 递增，旧执行结果被 fencing 拒绝）；
+    /// - 编排任务：照常发布 `TaskFailed`，由事件泵回灌 orchestrator 决定重试。
     ///
-    /// 返回终结的任务数，供调用方决定是否需要打日志。
+    /// 返回终结为失败的任务数，供调用方决定是否需要打日志。
     async fn fail_outbound_tasks_to(&self, dead: &NodeId) -> usize {
         let drained = self.drain_outbound_to(dead);
         if drained.is_empty() {
             return 0;
         }
-        let count = drained.len();
-        let Some(event_bus) = self.event_bus.as_ref() else {
-            tracing::warn!(
-                node = %dead.as_str(),
-                count,
-                "no event_bus on FailoverManager; in-flight tasks cannot be settled"
-            );
-            return count;
-        };
-        for (task_id, entry) in drained {
+        let event_bus = self.event_bus.as_ref();
+        let mut failed = 0usize;
+        let mut resent = 0usize;
+        for (task_id, mut entry) in drained {
+            if entry.workflow_id.as_str().is_empty() {
+                // 直提任务不在此处直接重投：放弃租约后由 origin 的租约检查点
+                // （`expire_standalone_leases`）下一 tick 取走并重投——重投权在
+                // origin 手上，这里只负责把任务交还。
+                entry.task.relinquish_lease();
+                self.outbound.insert(task_id, entry);
+                resent += 1;
+                continue;
+            }
+            let Some(event_bus) = event_bus else {
+                tracing::warn!(
+                    node = %dead.as_str(),
+                    task_id = %task_id,
+                    "no event_bus on FailoverManager; in-flight task cannot be settled"
+                );
+                continue;
+            };
             crate::metrics::inc_failover_node_lost_tasks();
             tracing::warn!(
                 task_id = %task_id,
                 node = %dead.as_str(),
                 workflow_id = %entry.workflow_id.as_str(),
                 in_flight_ms = entry.forwarded_at.elapsed().as_millis() as u64,
-                "executor node lost; settling in-flight task as failed"
+                "executor node lost; settling in-flight workflow task as failed"
             );
             // 错误 kind 复用既有的 `worker`（执行侧基础设施失败），不新增 kind：
             // 新增 kind 需同时改 `ActorErrorKind` 与 Python `_KIND_TO_EXCEPTION`
@@ -572,15 +669,24 @@ impl FailoverManager {
                     "worker",
                     &format!(
                         "executor node {} was lost before the task produced a result; \
-                         the task is settled as failed and is NOT re-run automatically",
+                         the orchestrated task is settled as failed and retried by the \
+                         workflow policy",
                         dead.as_str()
                     ),
                 ),
                 target_node: Some(dead.clone()),
             };
             event_bus.publish(BusEvent::TaskFailed(completion));
+            failed += 1;
         }
-        count
+        if resent > 0 {
+            tracing::warn!(
+                node = %dead.as_str(),
+                count = resent,
+                "executor node lost; standalone tasks are queued for lease re-dispatch"
+            );
+        }
+        failed
     }
 
     /// 订阅 failover 相关 gossip topic。
@@ -604,6 +710,13 @@ impl FailoverManager {
     ///
     /// 如果查询本地 workflow 状态、序列化 heartbeat 或网络广播失败，返回错误。
     pub async fn send_heartbeat(&self) -> Result<()> {
+        if crate::common::epoch_millis() < self.heartbeat_paused_until_ms.load(Ordering::Relaxed) {
+            tracing::debug!(
+                node = %self.node_id.0,
+                "heartbeat suppressed by fault injection"
+            );
+            return Ok(());
+        }
         let active_workflows = self.active_workflow_ids().await?;
         let now_ms = crate::common::epoch_millis();
         let endpoint_addr = self
@@ -619,8 +732,16 @@ impl FailoverManager {
             max_slots: self.local_max_capacity.load(Ordering::Relaxed),
             endpoint_addr,
             platform: self.platform.clone(),
-            labels: self.labels.clone(),
+            labels: self.labels.read().clone(),
+            available_quotas: self
+                .local_quota_tracker
+                .lock()
+                .as_ref()
+                .map(|t| t.available_map())
+                .unwrap_or_default(),
             signature: None,
+            role: self.role,
+            draining: self.draining.load(Ordering::Relaxed),
         };
         // 节点记录签名：持有身份密钥时对签名域 ed25519 签名。签名失败不阻塞
         // 心跳（require_signed_records 的接收方将拒绝，问题显式暴露）。
@@ -674,6 +795,41 @@ impl FailoverManager {
         self.peers.remove(node_id);
     }
 
+    /// 故障注入：模拟本节点到 `node_id` 的单向网络分区。
+    ///
+    /// 立即从 peer 视图移除并忽略其后续心跳（直到 [`Self::unblock_peer`]）。
+    /// 与真实断连的差异：本节点仍可向其发起直连请求，但心跳/容量视图不可见，
+    /// 足以触发失联判定与副本接管。
+    pub fn block_peer(&self, node_id: &NodeId) {
+        self.blocked_peers.insert(node_id.clone(), ());
+        if self.peers.remove(node_id).is_some() {
+            crate::metrics::dec_connected_peers();
+        }
+        tracing::info!(node = %node_id.0, "fault injection: peer blocked");
+    }
+
+    /// 解除 [`Self::block_peer`] 施加的分区，允许再次接收其心跳。
+    pub fn unblock_peer(&self, node_id: &NodeId) {
+        self.blocked_peers.remove(node_id);
+        tracing::info!(node = %node_id.0, "fault injection: peer unblocked");
+    }
+
+    /// 故障注入：在接下来的 `ms` 毫秒内不广播心跳。
+    ///
+    /// 传 0 立即恢复。用于模拟网络抖动/心跳延迟，观察对端失联判定。
+    pub fn pause_heartbeat_for_ms(&self, ms: u64) {
+        let until = crate::common::epoch_millis().saturating_add(ms);
+        self.heartbeat_paused_until_ms
+            .store(until, Ordering::Relaxed);
+        tracing::info!(ms, "fault injection: heartbeat paused");
+    }
+
+    /// 故障注入：给本节点 HLC 施加时钟偏移（毫秒，可正可负）。
+    pub fn inject_hlc_drift_ms(&self, ms: i64) {
+        self.clock.inject_drift_ms(ms);
+        tracing::info!(ms, "fault injection: HLC drift injected");
+    }
+
     /// Remove peers whose last heartbeat exceeds the failure timeout and return their info.
     /// Also decrements the connected_peers gauge for each removed peer.
     pub fn expire_stale_peers(&self) -> Vec<(NodeId, PeerInfo)> {
@@ -706,6 +862,14 @@ impl FailoverManager {
     /// 如果本地 `WorkflowActor` adopt 失败、租约持久化失败、claim 序列化失败
     /// 或网络广播失败，返回错误。
     pub async fn claim_workflow(&self, workflow_id: &WorkflowId) -> Result<()> {
+        if !self.role.can_orchestrate() {
+            tracing::debug!(
+                workflow = %workflow_id.0,
+                role = %self.role,
+                "skipping workflow claim: node role does not orchestrate"
+            );
+            return Ok(());
+        }
         let now_ms = crate::common::epoch_millis();
         let now_monotonic = std::time::Instant::now();
         let lease_duration_ms = self.lease_duration_ms;
@@ -966,6 +1130,9 @@ impl FailoverManager {
     /// 单个 workflow 接管或重调度失败只记录错误并继续处理其他 workflow，避免一个
     /// 损坏状态阻塞整批故障恢复。
     pub async fn detect_and_claim_failed_nodes(&self) {
+        if !self.role.can_orchestrate() {
+            return;
+        }
         let stale = self.expire_stale_peers();
         if !stale.is_empty() {
             tracing::info!(
@@ -976,9 +1143,15 @@ impl FailoverManager {
         let now_ms = crate::common::epoch_millis();
         let timeout_ms = self.failure_timeout_ms();
         let my_id = &self.node_id;
-        // 选举候选集合：仅存活节点（expire 后视图中的 peer + 本节点）。
+        // 选举候选集合：仅存活且具备编排角色的节点（Worker 永不 claim，
+        // 若留在候选集里，孤儿 workflow 可能被哈希给它而无人接管）。
         let candidate_ids: Vec<String> = {
-            let mut ids: Vec<_> = self.peers.iter().map(|e| e.key().0.clone()).collect();
+            let mut ids: Vec<_> = self
+                .peers
+                .iter()
+                .filter(|e| e.value().role.can_orchestrate())
+                .map(|e| e.key().0.clone())
+                .collect();
             ids.push(my_id.0.clone());
             ids
         };
@@ -1113,6 +1286,13 @@ impl FailoverManager {
         if hb.node_id != self.node_id && !self.verify_heartbeat(hb) {
             return;
         }
+        if hb.node_id != self.node_id && self.blocked_peers.contains_key(&hb.node_id) {
+            tracing::debug!(
+                node = %hb.node_id.0,
+                "ignoring heartbeat from blocked peer (fault injection)"
+            );
+            return;
+        }
         if hb.node_id != self.node_id {
             tracing::debug!(
                 "received heartbeat from {} with {} active workflows",
@@ -1130,12 +1310,18 @@ impl FailoverManager {
                 endpoint_addr: None,
                 labels: BTreeMap::new(),
                 platform: None,
+                available_quotas: BTreeMap::new(),
+                role: crate::common::NodeRole::default(),
+                draining: false,
             });
             peer.last_heartbeat_ms = received_at_ms;
             peer.active_workflows = hb.active_workflows.iter().cloned().collect();
             peer.available_slots = hb.available_slots;
             peer.max_slots = hb.max_slots;
             peer.endpoint_addr = hb.endpoint_addr.clone();
+            peer.available_quotas = hb.available_quotas.clone();
+            peer.role = hb.role;
+            peer.draining = hb.draining;
             // 入站标签与发送侧同限：超限整体置空，防止恶意 peer 用超大标签集
             // 经 PeerState 常驻与 peers() 输出放大带宽。
             peer.labels = if crate::common::model::node_labels_within_limit(&hb.labels) {

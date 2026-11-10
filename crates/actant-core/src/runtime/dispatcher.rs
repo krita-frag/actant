@@ -1,32 +1,9 @@
-//! 本模块负责将任务 payload 分发给 worker 子进程并管理进程池。
+//! 任务 payload 分发与 worker 进程池管理。
 //!
-//! 进程池是唯一的任务执行后端：每个任务由独立的 worker 子进程执行，杀进程即
-//! 精确终止一个任务，实现严格的进程级隔离。与工作流编排无直接耦合，属于通用
-//! 执行基础设施。
+//! 进程池是唯一的任务执行后端；模块不感知 worker 的实现语言——可执行文件、
+//! 入口参数与环境变量由 [`WorkerLaunchSpec`] 提供，载荷正文对 Rust 不透明。
 //!
-//! 本模块**不感知 worker 的实现语言**：可执行文件、入口参数与环境变量全部由
-//! [`WorkerLaunchSpec`] 在构造时提供——Python 绑定层注入解释器路径与模块入口，
-//! Rust 嵌入方可注入任意可执行程序。核心侧不出现任何语言专有字面量。
-//!
-//! # 通信协议
-//!
-//! 传输层为 stdio pipe 上的长度前缀二进制帧：每帧为
-//! ``[4 字节小端长度][1 字节类型][正文]``，帧头与正文连续写入同一管道：
-//!
-//! ```text
-//! pipe 上 [4 字节长度][1 字节类型][正文]
-//! ```
-//!
-//! - 父 → 子：`Dispatch`(0x01) 正文 = 不透明载荷（头部承载
-//!   retries/retry_delay_ms/task_id/workflow_id，编码由 worker 侧实现约定）；
-//!   `Cancel`(0x02) 为空正文。关闭时由 `shutdown` 直接强杀空闲 worker
-//!   （不发送关闭帧）。
-//! - 子 → 父：`Result`(0x02) 正文 = 不透明结果载荷，由绑定层按 worker 侧
-//!   约定解包。
-//!
-//! 本模块对正文格式不感知——payload 对 Rust 不透明，仅作字节校验与搬运。
-//! 帧类型字节与正文编码是**跨语言契约**：worker 侧实现（含绑定层）必须与此处
-//! 的常量保持一致。
+//! 进程隔离、IPC 帧协议与跨语言契约见 `docs/architecture/worker-model.md`。
 
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
@@ -37,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::Semaphore;
 
@@ -59,7 +36,7 @@ pub fn new_cancel_flag() -> CancelFlag {
     Arc::new(AtomicBool::new(false))
 }
 
-// 帧类型常量（与 `actant/task/_worker.py` 保持一致）。
+// 帧类型常量（与 `actant/_internal/tasks/worker.py` 保持一致）。
 const FRAME_DISPATCH: u8 = 0x01;
 const FRAME_CANCEL: u8 = 0x02;
 // 子进程回传的结果帧类型。
@@ -70,6 +47,11 @@ const CANCEL_FRAME_BYTES: [u8; 5] = [1, 0, 0, 0, FRAME_CANCEL];
 
 /// 帧头长度：4 字节小端长度。
 const FRAME_HEADER_LEN: usize = 4;
+
+/// 单帧长度上限（长度字段含类型字节），与 Python 侧
+/// `actant/_internal/tasks/helpers.py::MAX_FRAME_BYTES` 一致。长度字段来自
+/// 子进程 stdout，读端必须在分配正文缓冲前据此拒绝被腐蚀的值。
+const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
 
 /// 一个 worker 子进程：同一时刻恰好执行一个任务。
 struct WorkerProc {
@@ -100,8 +82,14 @@ async fn write_frame<W: AsyncWrite + Unpin>(
     msg_type: u8,
     body: &[u8],
 ) -> Result<(), ActantError> {
+    let frame_len = 1 + body.len();
+    if frame_len > MAX_FRAME_BYTES {
+        return Err(ActantError::Worker(format!(
+            "frame length {frame_len} exceeds protocol limit {MAX_FRAME_BYTES}"
+        )));
+    }
     let mut header = [0u8; FRAME_HEADER_LEN + 1];
-    let frame_len: u32 = (1 + body.len()) as u32;
+    let frame_len: u32 = frame_len as u32;
     header[..FRAME_HEADER_LEN].copy_from_slice(&frame_len.to_le_bytes());
     header[FRAME_HEADER_LEN] = msg_type;
     let total = header.len() + body.len();
@@ -135,40 +123,53 @@ impl WorkerProc {
         write_frame(&mut self.stdin, msg_type, body).await
     }
 
-    /// 异步地从 stdout 读结果帧正文。
-    ///
-    /// 先读 5 字节帧头（4B 长度 + 1B 类型），再按帧头长度读完整正文。
-    /// 到达 EOF（worker 崩溃或正常退出）返回 `Ok(None)`。
+    /// 异步地从 stdout 读结果帧正文；到达 EOF 返回 `Ok(None)`。
     async fn read_result_frame(&mut self) -> Result<Option<Vec<u8>>, ActantError> {
-        let mut header = [0u8; FRAME_HEADER_LEN + 1];
-        match self.stdout.read_exact(&mut header).await {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(map_io("worker stdout")(e)),
-        }
-        let mut len_bytes = [0u8; FRAME_HEADER_LEN];
-        len_bytes.copy_from_slice(&header[..FRAME_HEADER_LEN]);
-        let len = u32::from_le_bytes(len_bytes) as usize;
-        if len < 1 {
-            return Err(ActantError::Worker(
-                "worker returned invalid frame length".into(),
-            ));
-        }
-        let msg_type = header[FRAME_HEADER_LEN];
-        let body_len = len - 1;
-        let mut buf = vec![0u8; body_len];
-        self.stdout
-            .read_exact(&mut buf)
-            .await
-            .map_err(map_io("worker stdout"))?;
-        if msg_type != FRAME_RESULT {
-            tracing::warn!(
-                frame_type = msg_type,
-                "worker returned unexpected frame type (expected Result)"
-            );
-        }
-        Ok(Some(buf))
+        read_frame(&mut self.stdout).await
     }
+}
+
+/// 从 worker stdout 读结果帧正文，与 `write_frame` 对称。
+///
+/// 帧头 = 4B 小端长度（含类型字节）+ 1B 类型。长度字段来自子进程，必须在分配
+/// 正文缓冲前按 `MAX_FRAME_BYTES` 校验，否则一个被腐蚀的长度就会触发 GiB 级
+/// 分配。到达 EOF（worker 崩溃或正常退出）返回 `Ok(None)`。
+///
+/// 独立为自由函数以便注入任意 `AsyncRead`（tokio duplex 等）做封闭测试。
+async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Option<Vec<u8>>, ActantError> {
+    let mut header = [0u8; FRAME_HEADER_LEN + 1];
+    match reader.read_exact(&mut header).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(map_io("worker stdout")(e)),
+    }
+    let mut len_bytes = [0u8; FRAME_HEADER_LEN];
+    len_bytes.copy_from_slice(&header[..FRAME_HEADER_LEN]);
+    let len = u32::from_le_bytes(len_bytes) as usize;
+    if len < 1 {
+        return Err(ActantError::Worker(
+            "worker returned invalid frame length".into(),
+        ));
+    }
+    if len > MAX_FRAME_BYTES {
+        return Err(ActantError::Worker(format!(
+            "worker frame length {len} exceeds protocol limit {MAX_FRAME_BYTES}"
+        )));
+    }
+    let msg_type = header[FRAME_HEADER_LEN];
+    let body_len = len - 1;
+    let mut buf = vec![0u8; body_len];
+    reader
+        .read_exact(&mut buf)
+        .await
+        .map_err(map_io("worker stdout"))?;
+    if msg_type != FRAME_RESULT {
+        tracing::warn!(
+            frame_type = msg_type,
+            "worker returned unexpected frame type (expected Result)"
+        );
+    }
+    Ok(Some(buf))
 }
 
 fn map_io(ctx: &'static str) -> impl Fn(std::io::Error) -> ActantError + 'static {
@@ -379,6 +380,12 @@ impl ProcessTaskDispatcher {
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // 独立进程组：worker 派生的子进程继承同一 pgid，取消 / 超时按组
+        // 终止，避免只杀 worker 导致孙进程泄漏。
+        #[cfg(unix)]
+        {
+            cmd.process_group(0);
+        }
         let mut child = cmd
             .spawn()
             .map_err(|e| ActantError::Worker(format!("failed to spawn worker: {e}")))?;
@@ -423,13 +430,8 @@ impl ProcessTaskDispatcher {
         // 泄漏一个常驻 Python 子进程。
         if self.shutting_down.load(Ordering::Acquire) {
             let mut worker = worker;
-            if let Err(e) = worker.child.start_kill() {
-                tracing::warn!(error = %e, "failed to kill worker released after shutdown");
-            }
             tokio::spawn(async move {
-                if let Err(e) = worker.child.wait().await {
-                    tracing::warn!(error = %e, "failed to reap worker released after shutdown");
-                }
+                Self::force_kill(&mut worker.child).await;
             });
             return;
         }
@@ -486,10 +488,41 @@ impl ProcessTaskDispatcher {
         let _ = worker; // 丢弃已终止的 worker
     }
 
-    /// 强制终止子进程并等待其回收，避免僵尸进程。
+    /// 强制终止 worker 进程树并等待回收，避免僵尸与孙进程泄漏。
+    ///
+    /// Unix 先向 worker 所在进程组发 `SIGKILL`（`spawn_one` 以
+    /// `process_group(0)` 建立独立 pgid）；Windows 用 `taskkill /T /F`
+    /// 终止整棵进程树。最后仍调用 `start_kill` 兜底（例如 pgid 已失效）。
     async fn force_kill(child: &mut Child) {
-        let _ = child.start_kill();
-        let _ = child.wait().await;
+        #[cfg(unix)]
+        if let Some(pid) = child.id() {
+            if let Ok(pgid) = libc::pid_t::try_from(pid) {
+                // SAFETY: 负 pid 表示向整个进程组发送信号；pgid 在 spawn 时建立。
+                let rc = unsafe { libc::kill(-pgid, libc::SIGKILL) };
+                if rc != 0 {
+                    let err = std::io::Error::last_os_error();
+                    tracing::debug!(error = %err, pid, "failed to kill worker process group");
+                }
+            }
+        }
+        #[cfg(windows)]
+        if let Some(pid) = child.id() {
+            let status = tokio::process::Command::new("taskkill")
+                .args(["/T", "/F", "/PID", &pid.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await;
+            if let Err(e) = status {
+                tracing::debug!(error = %e, pid, "failed to run taskkill for worker tree");
+            }
+        }
+        if let Err(e) = child.start_kill() {
+            tracing::debug!(error = %e, "failed to signal worker after group kill");
+        }
+        if let Err(e) = child.wait().await {
+            tracing::warn!(error = %e, "failed to reap worker after group kill");
+        }
     }
 
     /// 替补一个已崩溃/被杀的 worker。

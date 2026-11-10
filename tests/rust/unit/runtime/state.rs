@@ -449,3 +449,201 @@ fn store_rejects_mismatched_fmt_version() {
         "mismatched format version must produce a semantic error, got: {msg}"
     );
 }
+
+// ───────────────────────── 容量与 key 约束 ─────────────────────────
+
+#[test]
+fn store_rejects_empty_key() {
+    let dir = tempdir().unwrap();
+    let store = LmdbStore::open(dir.path()).unwrap();
+    let err = store.put("", b"v").unwrap_err();
+    assert!(err.to_string().contains("must not be empty"), "got: {err}");
+}
+
+#[test]
+fn store_rejects_oversized_key() {
+    let dir = tempdir().unwrap();
+    let store = LmdbStore::open(dir.path()).unwrap();
+
+    let oversized = "k".repeat(MAX_KEY_BYTES + 1);
+    let err = store.put(&oversized, b"v").unwrap_err();
+    assert!(
+        err.to_string().contains(&MAX_KEY_BYTES.to_string()),
+        "oversized key must report the LMDB limit, got: {err}"
+    );
+
+    let max = "k".repeat(MAX_KEY_BYTES);
+    store.put(&max, b"v").unwrap();
+    assert_eq!(store.get(&max).unwrap(), Some(b"v".to_vec()));
+}
+
+#[test]
+fn store_map_full_reports_actionable_error() {
+    let dir = tempdir().unwrap();
+    let config = StoreConfig {
+        data_dir: None,
+        map_size: 1024 * 1024,
+        max_dbs: 4,
+        sync_mode: crate::common::SyncMode::NoSync,
+    };
+    let store = LmdbStore::open_with_config(dir.path(), &config).unwrap();
+
+    let value = vec![0u8; 128 * 1024];
+    let mut last_err = None;
+    for i in 0..64 {
+        if let Err(e) = store.put(&format!("k{i}"), &value) {
+            last_err = Some(e);
+            break;
+        }
+    }
+    let err = last_err.expect("tiny map must eventually reject writes");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("map is full") && msg.contains("store.map_size"),
+        "MapFull must map to an actionable error, got: {msg}"
+    );
+}
+
+#[test]
+fn store_storage_stats_reports_capacity_and_readers() {
+    let dir = tempdir().unwrap();
+    let config = StoreConfig {
+        data_dir: None,
+        map_size: 64 * 1024 * 1024,
+        max_dbs: 4,
+        ..Default::default()
+    };
+    let store = LmdbStore::open_with_config(dir.path(), &config).unwrap();
+    store.put("a", b"1").unwrap();
+    store.put("b", b"2").unwrap();
+
+    let stats = store.storage_stats().unwrap();
+    assert!(stats.map_size >= config.map_size as u64);
+    assert!(stats.used_bytes > 0);
+    assert!(stats.file_bytes > 0);
+    assert!(stats.entries >= 2);
+    assert_eq!(stats.max_readers, MAX_READERS);
+    assert!(stats.utilization() > 0.0);
+    assert!(stats.utilization() < 1.0);
+}
+
+#[test]
+fn store_backup_round_trips() {
+    let dir = tempdir().unwrap();
+    let store = LmdbStore::open(dir.path()).unwrap();
+    store.put("k1", b"v1").unwrap();
+    store.put("k2", b"v2").unwrap();
+
+    let backup_dir = tempdir().unwrap();
+    let backup_path = backup_dir.path().join("data.mdb");
+    let size = store.backup_to(&backup_path).unwrap();
+    assert!(size > 0);
+    assert!(backup_path.exists());
+
+    // 备份目录可直接作为新的 store 打开。
+    let restored = LmdbStore::open(backup_dir.path()).unwrap();
+    assert_eq!(restored.get("k1").unwrap(), Some(b"v1".to_vec()));
+    assert_eq!(restored.get("k2").unwrap(), Some(b"v2".to_vec()));
+}
+
+// ───────────────────────── 分页扫描与区间删除 ─────────────────────────
+
+#[test]
+fn store_scan_prefix_page_walks_in_order() {
+    let dir = tempdir().unwrap();
+    let store = LmdbStore::open(dir.path()).unwrap();
+    for i in 1..=5 {
+        store
+            .put(&format!("a:{i}"), format!("v{i}").as_bytes())
+            .unwrap();
+    }
+    store.put("b:1", b"other").unwrap();
+
+    let first = store.scan_prefix_page("a:", None, 2).unwrap();
+    assert_eq!(
+        first.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+        vec!["a:1", "a:2"]
+    );
+
+    let second = store.scan_prefix_page("a:", Some("a:2"), 2).unwrap();
+    assert_eq!(
+        second.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+        vec!["a:3", "a:4"]
+    );
+
+    let third = store.scan_prefix_page("a:", Some("a:4"), 2).unwrap();
+    assert_eq!(
+        third.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+        vec!["a:5"]
+    );
+
+    assert!(store
+        .scan_prefix_page("a:", Some("a:5"), 2)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn store_scan_prefix_last_does_not_leak_adjacent_prefixes() {
+    let dir = tempdir().unwrap();
+    let store = LmdbStore::open(dir.path()).unwrap();
+    store.put("a:1", b"one").unwrap();
+    store.put("aa:1", b"two").unwrap();
+    store.put("ab:1", b"three").unwrap();
+
+    let last_a_colon = store.scan_prefix_last("a:").unwrap().unwrap();
+    assert_eq!(last_a_colon.0, "a:1");
+
+    let last_a = store.scan_prefix_last("a").unwrap().unwrap();
+    assert_eq!(last_a.0, "ab:1");
+}
+
+#[test]
+fn store_delete_range_removes_only_closed_interval() {
+    let dir = tempdir().unwrap();
+    let store = LmdbStore::open(dir.path()).unwrap();
+    for i in 1..=4 {
+        store.put(&format!("a:{i}"), b"v").unwrap();
+    }
+    store.put("b:1", b"v").unwrap();
+
+    let removed = store.delete_range("a:", "a:2").unwrap();
+    assert_eq!(removed, 2);
+    assert_eq!(store.get("a:3").unwrap(), Some(b"v".to_vec()));
+    assert_eq!(store.get("a:4").unwrap(), Some(b"v".to_vec()));
+    assert_eq!(store.get("b:1").unwrap(), Some(b"v".to_vec()));
+    assert_eq!(store.get("a:1").unwrap(), None);
+}
+
+#[tokio::test]
+async fn async_store_scan_prefix_page_and_delete_range() {
+    let dir = tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    for i in 1..=3 {
+        store.put(&format!("p:{i}"), b"v").await.unwrap();
+    }
+
+    let page = store.scan_prefix_page("p:", None, 2).await.unwrap();
+    assert_eq!(page.len(), 2);
+
+    let removed = store.delete_range("p:", "p:2").await.unwrap();
+    assert_eq!(removed, 2);
+    assert_eq!(store.scan_prefix("p:").await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn async_store_storage_stats_and_backup() {
+    let dir = tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    store.put("k", b"v").await.unwrap();
+
+    let stats = store.storage_stats().await.unwrap();
+    assert!(stats.entries >= 1);
+
+    let backup_dir = tempdir().unwrap();
+    let size = store
+        .backup_to(backup_dir.path().join("data.mdb"))
+        .await
+        .unwrap();
+    assert!(size > 0);
+}

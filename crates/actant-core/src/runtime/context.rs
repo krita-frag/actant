@@ -14,10 +14,7 @@ use crate::runtime::dispatcher::TaskDispatcher;
 use crate::runtime::event_bus::EventBus;
 use crate::runtime::network::Transport;
 use crate::runtime::state::Store;
-use crate::runtime::workflow::{FailoverManager, Orchestrator, Worker};
-
-// Re-export init_worker params so Runtime can construct them without exposing internals.
-use crate::runtime::builder::{init_worker, WorkerInitParams};
+use crate::runtime::workflow::{Orchestrator, Worker};
 
 /// 非 Actor 化后台任务的取消句柄集合类型。
 ///
@@ -50,6 +47,38 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    /// 故障注入：给本节点编排器 HLC 施加时钟偏移（毫秒，可正可负），0 恢复。
+    pub fn inject_hlc_drift_ms(&self, ms: i64) {
+        if let Some(orchestrator) = self.orchestrator.as_ref() {
+            orchestrator.inject_hlc_drift_ms(ms);
+        }
+    }
+
+    /// 本节点 Worker 的 FailoverManager（故障注入钩子入口）。
+    pub fn failover_manager(
+        &self,
+    ) -> Option<Arc<crate::runtime::workflow::failover::FailoverManager>> {
+        self.worker.as_ref().and_then(|w| w.failover_manager())
+    }
+
+    /// 运行时更新节点状态：标签 / 配额容量 / draining。
+    ///
+    /// 标签与 draining 同时写入本地路由视图和心跳广播视图；配额容量更新
+    /// 共享的 `QuotaTracker`。任一字段为 `None` 表示保持当前值。
+    pub fn update_node_state(
+        &self,
+        update: &crate::common::NodeStateUpdate,
+    ) -> Result<(), ActantError> {
+        let worker = self.worker.as_ref().ok_or_else(|| {
+            ActantError::InvalidState("runtime has no worker to update node state".into())
+        })?;
+        worker.apply_node_state(update)?;
+        if let Some(failover) = worker.failover_manager() {
+            failover.apply_node_state(update);
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         node_id: NodeId,
@@ -178,46 +207,6 @@ impl Runtime {
         self.network.broadcast(TOPIC_CANCEL, bytes).await
     }
 
-    /// 使用当前 Runtime 的子系统初始化一个 [`Worker`]。
-    ///
-    /// 返回的 worker 共享本 Runtime 的 `task_dispatcher`，避免重复创建线程池。
-    /// 调用方需要自行保存返回的 worker（例如写入 `Runtime.worker` 字段，
-    /// 或在外部持有其 `Arc`）。
-    pub async fn init_worker(
-        &self,
-        tokio_handle: tokio::runtime::Handle,
-    ) -> crate::common::Result<Arc<Worker>> {
-        let failover = Arc::new(
-            FailoverManager::new(
-                self.node_id.clone(),
-                self.network.clone(),
-                self.actor_system.clone(),
-                self.workflow_actor_id.clone(),
-            )
-            // 失联时终结在途任务的发布出口（与本 Runtime 同一 event_bus）。
-            .with_event_bus(self.event_bus.clone()),
-        );
-        let dag_gossip_actor_id = crate::common::ActorId::dag_gossip(&self.node_id);
-        let worker = init_worker(WorkerInitParams {
-            scheduler: None,
-            orchestrator_ingest: false,
-            node_id: &self.node_id,
-            network: &self.network,
-            event_bus: self.event_bus.clone(),
-            scheduler_kind: self.config.worker.scheduler_kind.as_str(),
-            worker_config: &self.config.worker,
-            actor_system: self.actor_system.clone(),
-            task_dispatcher: self.task_dispatcher.clone(),
-            failover: &failover,
-            tokio_handle,
-            workflow_actor_id: Some(self.workflow_actor_id.clone()),
-            dag_gossip_actor_id: Some(dag_gossip_actor_id),
-            capability_gossip: None,
-        })
-        .await?;
-        Ok(Arc::new(worker))
-    }
-
     /// 优雅关闭 Runtime：停止所有关键 Actor 并等待其实际退出。
     ///
     /// 关闭顺序：Worker → SchedulerActor → FailoverActor → DagGossipActor
@@ -300,9 +289,14 @@ impl Runtime {
         //    执行：否则 Endpoint 被无声 drop 会触发 iroh 的
         //    "Endpoint dropped without calling Endpoint::close. Aborting ungracefully."
         //    警告，并可能中断在途 gossip/直连请求。
-        self.network
-            .shutdown()
-            .await
+        let network_result = self.network.shutdown().await;
+
+        // 8. 释放进程级 wire 签名注册。同进程后续 Runtime 可能禁用签名；
+        //    若本 Runtime 的 primary 密钥残留，会强制它们出站带 MAC，
+        //    而对端（尤其是独立进程）无法验证，导致消息被丢弃。
+        crate::common::register_wire_signing_key(&self.node_id, Vec::new());
+
+        network_result
             .map_err(|e| ActantError::Network(format!("failed to shutdown network: {e}")))?;
 
         Ok(())

@@ -44,8 +44,6 @@ pub enum Topic {
     TaskFailed,
     /// 任务被取消。
     TaskCancelled,
-    /// 任务被跳过（条件分支未命中）。
-    TaskSkipped,
     /// 对端连接 / 断开。
     NetworkPeer,
     /// 任务级日志流：worker 子进程经 stderr 边带上报的任务日志。
@@ -67,7 +65,6 @@ impl Topic {
             Topic::TaskCompleted => "TaskCompleted",
             Topic::TaskFailed => "TaskFailed",
             Topic::TaskCancelled => "TaskCancelled",
-            Topic::TaskSkipped => "TaskSkipped",
             Topic::NetworkPeer => "NetworkPeer",
             Topic::TaskLog => "TaskLog",
             Topic::ActorLifecycleError => "ActorLifecycleError",
@@ -101,7 +98,6 @@ pub enum BusEvent {
     TaskCompleted(TaskCompletion),
     TaskFailed(TaskCompletion),
     TaskCancelled(TaskCompletion),
-    TaskSkipped(TaskCompletion),
 
     // -- 网络 --
     PeerConnected(NodeId),
@@ -151,7 +147,6 @@ impl BusEvent {
             BusEvent::TaskCompleted(_) => Topic::TaskCompleted,
             BusEvent::TaskFailed(_) => Topic::TaskFailed,
             BusEvent::TaskCancelled(_) => Topic::TaskCancelled,
-            BusEvent::TaskSkipped(_) => Topic::TaskSkipped,
             BusEvent::PeerConnected(_) | BusEvent::PeerDisconnected(_) => Topic::NetworkPeer,
             BusEvent::TaskLog { .. } => Topic::TaskLog,
             BusEvent::ActorLifecycleError { .. } => Topic::ActorLifecycleError,
@@ -199,6 +194,11 @@ impl Clone for SubscriberSlot {
 #[derive(Clone)]
 pub struct EventBus {
     inner: Arc<DashMap<Topic, Vec<SubscriberSlot>>>,
+    /// 逐任务日志订阅者：按 `task_id` 分桶，只接收该任务的 `TaskLog`。
+    ///
+    /// 在全局 `TaskLog` 话题之上再提供一条按任务过滤的通道，消费方无需
+    /// 自行丢弃其它任务日志（高并发时全局流噪声很大）。同为 tap 语义。
+    task_log_subscribers: Arc<DashMap<TaskId, Vec<SubscriberSlot>>>,
     /// 新订阅者的默认容量。
     default_capacity: usize,
     /// `TaskEnqueued` 专用唤醒信号。
@@ -223,6 +223,7 @@ impl EventBus {
     pub fn with_config(config: EventBusConfig) -> Self {
         Self {
             inner: Arc::new(DashMap::new()),
+            task_log_subscribers: Arc::new(DashMap::new()),
             default_capacity: config.subscriber_capacity,
             task_enqueued_notify: Arc::new(tokio::sync::Notify::new()),
         }
@@ -265,6 +266,36 @@ impl EventBus {
         rx
     }
 
+    /// 订阅单个任务的日志通道。
+    ///
+    /// 只接收该 `task_id` 的 [`BusEvent::TaskLog`]，其它任务日志不会进入
+    /// 该通道。与全局 `Topic::TaskLog` 订阅并存，供需要逐任务关联日志
+    /// （如把任务日志写入独立文件/面板）的消费方使用。tap 语义不变。
+    pub fn subscribe_task_logs(&self, task_id: TaskId) -> mpsc::Receiver<BusEvent> {
+        self.subscribe_task_logs_with_capacity(task_id, self.default_capacity)
+    }
+
+    /// 使用自定义通道容量订阅单个任务的日志通道。
+    pub fn subscribe_task_logs_with_capacity(
+        &self,
+        task_id: TaskId,
+        capacity: usize,
+    ) -> mpsc::Receiver<BusEvent> {
+        // 逐任务订阅表按 task_id 分桶；接收端被丢弃后条目不会自行消失。
+        // 超过阈值时做一次全表清扫，避免长生命周期进程按任务数无限增长。
+        if self.task_log_subscribers.len() > 1024 {
+            self.task_log_subscribers
+                .retain(|_, slots| slots.iter().any(|s| !s.sender.is_closed()));
+        }
+        let (tx, rx) = mpsc::channel(capacity);
+        self.task_log_subscribers
+            .entry(task_id)
+            .or_default()
+            .value_mut()
+            .push(SubscriberSlot::new(tx, capacity));
+        rx
+    }
+
     /// 非阻塞发布事件：对所有订阅者执行 `try_send`，通道满即丢弃。
     ///
     /// 无 await 点，同步或异步上下文均可调用。事件丢失仅影响观测
@@ -272,6 +303,46 @@ impl EventBus {
     pub fn publish(&self, event: BusEvent) {
         let topic = event.topic();
         Self::broadcast_to_subscribers(&self.inner, topic, &event);
+        if let BusEvent::TaskLog { task_id, .. } = &event {
+            Self::broadcast_task_log(&self.task_log_subscribers, task_id, &event);
+        }
+    }
+
+    /// 将 `TaskLog` 投递给订阅该任务日志的消费者，满即丢。
+    fn broadcast_task_log(
+        subscribers: &DashMap<TaskId, Vec<SubscriberSlot>>,
+        task_id: &TaskId,
+        event: &BusEvent,
+    ) {
+        let slots: Vec<SubscriberSlot> = subscribers
+            .get(task_id)
+            .map(|subs| subs.value().clone())
+            .unwrap_or_default();
+        if slots.is_empty() {
+            return;
+        }
+
+        let mut needs_prune = false;
+        for slot in slots {
+            match slot.sender.try_send(event.clone()) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    tracing::debug!(
+                        task_id = task_id.as_str(),
+                        "task log subscriber channel full, dropping observability event"
+                    );
+                    crate::metrics::inc_event_bus_publish_dropped();
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    needs_prune = true;
+                }
+            }
+        }
+        if needs_prune {
+            if let Some(mut subs) = subscribers.get_mut(task_id) {
+                subs.value_mut().retain(|s| !s.sender.is_closed());
+            }
+        }
     }
 
     /// 将事件以 `try_send` 广播给话题的所有订阅者，满即丢。

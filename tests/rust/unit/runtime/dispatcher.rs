@@ -198,6 +198,81 @@ mod send_frame {
     }
 }
 
+// ───────────────────────── read_frame 长度上限（伪帧头 OOM 回归） ─────────────────────────
+
+mod read_frame {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    fn header(frame_len: u32, msg_type: u8) -> Vec<u8> {
+        let mut bytes = frame_len.to_le_bytes().to_vec();
+        bytes.push(msg_type);
+        bytes
+    }
+
+    #[tokio::test]
+    async fn rejects_u32_max_length_before_allocating() {
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        // 只投递 5 字节伪帧头：读端若先按长度分配，这里会尝试 4GiB。
+        writer
+            .write_all(&header(u32::MAX, FRAME_RESULT))
+            .await
+            .expect("write header");
+        drop(writer);
+        let err = read_frame(&mut reader)
+            .await
+            .expect_err("oversized length must be rejected");
+        assert!(
+            err.to_string().contains("exceeds protocol limit"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_length_one_above_limit() {
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        let oversized = (MAX_FRAME_BYTES + 1) as u32;
+        writer
+            .write_all(&header(oversized, FRAME_RESULT))
+            .await
+            .expect("write header");
+        drop(writer);
+        assert!(read_frame(&mut reader).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_zero_length() {
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        writer
+            .write_all(&header(0, FRAME_RESULT))
+            .await
+            .expect("write header");
+        drop(writer);
+        let err = read_frame(&mut reader)
+            .await
+            .expect_err("zero length must be rejected");
+        assert!(err.to_string().contains("invalid frame length"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn reads_body_for_valid_frame() {
+        let body = b"result payload".to_vec();
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        let mut bytes = header((1 + body.len()) as u32, FRAME_RESULT);
+        bytes.extend_from_slice(&body);
+        writer.write_all(&bytes).await.expect("write frame");
+        drop(writer);
+        assert_eq!(read_frame(&mut reader).await.unwrap(), Some(body));
+    }
+
+    #[tokio::test]
+    async fn clean_eof_returns_none() {
+        let (writer, mut reader) = tokio::io::duplex(64);
+        drop(writer);
+        assert_eq!(read_frame(&mut reader).await.unwrap(), None);
+    }
+}
+
 // ───────────────────────── 取消轮询器契约（TOCTOU 回归） ─────────────────────────
 //
 // 取消轮询器契约（TOCTOU 防护）：若结果臂在 poller「检查 active 之后、写 Cancel 帧之前」

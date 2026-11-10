@@ -38,6 +38,10 @@ fn make_task(idx: usize, priority: i32) -> TaskDefinition {
         enqueued_at_ms: 0,
         target_endpoint_addr: None,
         origin_endpoint_addr: None,
+        tags: Vec::new(),
+        quota: None,
+        pinned_target: false,
+        lease_deadline_ms: 0,
     }
 }
 

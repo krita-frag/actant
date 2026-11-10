@@ -126,18 +126,10 @@ async fn store_accessor_round_trips_data() {
     assert_eq!(val, Some(b"hello".to_vec()));
 }
 
-#[tokio::test]
-async fn set_worker_and_getter_roundtrip() {
+#[test]
+fn worker_slot_starts_empty_and_reports_absence() {
     let rt = make_runtime_only("node-E");
     assert!(rt.worker().is_none());
-
-    let worker = rt
-        .init_worker(tokio::runtime::Handle::current())
-        .await
-        .expect("init worker");
-    let mut rt_mut = rt;
-    rt_mut.set_worker(worker);
-    assert!(rt_mut.worker().is_some());
 }
 
 #[tokio::test]

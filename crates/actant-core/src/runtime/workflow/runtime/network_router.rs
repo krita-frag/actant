@@ -34,10 +34,6 @@ pub(crate) struct NetworkEventRouterConfig {
     pub(crate) workflow_actor_id: Option<crate::common::ActorId>,
     /// 本地 DagGossipActor 的 id。若存在，工作流状态请求/响应会直接路由给它。
     pub(crate) dag_gossip_actor_id: Option<crate::common::ActorId>,
-    /// Capability gossip 处理器。若存在，`TOPIC_CAPABILITY_GOSSIP` 上的
-    /// gossip 消息会通过 `handle_gossip` 更新本地 capability 视图。
-    pub(crate) capability_gossip:
-        Option<Arc<crate::runtime::capability::gossip::CapabilityGossipActor>>,
     /// 故障转移管理器。若存在，入站 Heartbeat / Claim wire 消息会直连分发到
     /// `handle_heartbeat` / `handle_claim`（控制面指令不经过 EventBus）。
     pub(crate) failover: Option<Arc<crate::runtime::workflow::FailoverManager>>,
@@ -52,7 +48,6 @@ pub(crate) struct NetworkEventRouter {
     actor_system: Option<Arc<ActorSystem>>,
     workflow_actor_id: Option<crate::common::ActorId>,
     dag_gossip_actor_id: Option<crate::common::ActorId>,
-    capability_gossip: Option<Arc<crate::runtime::capability::gossip::CapabilityGossipActor>>,
     failover: Option<Arc<crate::runtime::workflow::FailoverManager>>,
     cancel_flags: Arc<parking_lot::Mutex<HashMap<String, CancelFlag>>>,
     cancelled_tasks: Arc<parking_lot::Mutex<HashMap<String, Instant>>>,
@@ -67,7 +62,6 @@ impl NetworkEventRouter {
             actor_system: cfg.actor_system,
             workflow_actor_id: cfg.workflow_actor_id,
             dag_gossip_actor_id: cfg.dag_gossip_actor_id,
-            capability_gossip: cfg.capability_gossip,
             failover: cfg.failover,
             cancel_flags: cfg.cancel_flags,
             cancelled_tasks: cfg.cancelled_tasks,
@@ -106,17 +100,13 @@ impl NetworkEventRouter {
         let topic = Topic::from(topic_str);
         // 解码一次后在整个分发过程中复用。失败时直接返回（避免每个分支重复 decode）。
         //
-        // 但**不是所有话题都走 `WireEnvelope`**：`Cancel` / `CapabilityGossip`
-        // 的载荷是裸 postcard（`CancelBroadcast` / `CapabilityGossipMsg`），
-        // 对它们尝试解包只会得到一条"failed to deserialize WireEnvelope"的
-        // WARN——而消息其实会被下面的分支正常处理。那是对每一条合法取消广播
-        // 的恒定误报（本节点自投递的取消也走这里，单机路径上同样出现），
-        // 会让人误以为消息被丢弃。故按话题路由决定是否需要解包。
-        let decoded = if matches!(
-            topic.classify(),
-            crate::common::wire::TopicRoute::Cancel
-                | crate::common::wire::TopicRoute::CapabilityGossip
-        ) {
+        // 但 `Cancel` 话题不走 `WireEnvelope`：它的载荷是裸 postcard 编码的
+        // `CancelBroadcast`，对它们尝试解包只会得到一条
+        // "failed to deserialize WireEnvelope" 的 WARN——而消息其实会被下面的
+        // 分支正常处理。那是对每一条合法取消广播的恒定误报（本节点自投递的
+        // 取消也走这里，单机路径上同样出现），会让人误以为消息被丢弃。
+        // 故按话题路由决定是否需要解包。
+        let decoded = if matches!(topic.classify(), crate::common::wire::TopicRoute::Cancel) {
             None
         } else {
             WireEnvelope::decode(payload)
@@ -309,15 +299,6 @@ impl NetworkEventRouter {
                         }));
                 }
             }
-            crate::common::TopicRoute::CapabilityGossip => {
-                // Capability 元信息 gossip。payload 是裸 postcard 编码的
-                // `CapabilityGossipMsg`，不包裹在 `WireEnvelope` 中。
-                if let Some(ref gossip) = self.capability_gossip {
-                    gossip.handle_gossip(payload);
-                } else {
-                    tracing::debug!("received capability gossip but no gossip handler configured");
-                }
-            }
             crate::common::TopicRoute::Unknown => {}
         }
     }
@@ -355,9 +336,17 @@ impl NetworkEventRouter {
                 task_name,
                 outcome,
                 worker_node,
+                attempt,
             } => {
                 let accepted = self
-                    .handle_task_result(workflow_id, task_id, task_name, outcome, worker_node)
+                    .handle_task_result(
+                        workflow_id,
+                        task_id,
+                        task_name,
+                        outcome,
+                        worker_node,
+                        attempt,
+                    )
                     .await;
                 let response = crate::runtime::network::DirectResponse::TaskResultAck { accepted };
                 if let Err(e) = self.network.send_direct_response(channel, response).await {
@@ -446,13 +435,26 @@ impl NetworkEventRouter {
         task_name: String,
         outcome: WireTaskOutcome,
         worker_node: NodeId,
+        attempt: u32,
     ) -> bool {
-        // 远端已回报该任务的结果，本地对它的命运已有定论 → 清出"在途
-        // 转发"登记，避免该节点后续失联时对同一任务重复发布失败事件。
-        if let Some(failover) = self.failover.as_ref() {
-            failover.clear_outbound(task_id.as_str());
-        }
         if workflow_id.as_str().is_empty() {
+            // 直提任务的结果按 attempt fencing：比登记更旧的迟到结果不得被接受，
+            // 也不得移除新 attempt 的在途登记。执行节点崩溃转移会自行推进 attempt，
+            // 那种「比登记更新」的结果是当前有效结果，必须接受。
+            if let Some(failover) = self.failover.as_ref() {
+                if failover
+                    .take_outbound_if_not_stale(task_id.as_str(), attempt)
+                    .is_none()
+                {
+                    tracing::warn!(
+                        task_id = %task_id.as_str(),
+                        attempt,
+                        worker = %worker_node.as_str(),
+                        "rejecting stale standalone task result"
+                    );
+                    return false;
+                }
+            }
             self.publish_remote_completion(
                 &workflow_id,
                 &task_id,
@@ -462,6 +464,12 @@ impl NetworkEventRouter {
             )
             .await;
             return true;
+        }
+
+        // 远端已回报该任务的结果，本地对它的命运已有定论 → 清出"在途
+        // 转发"登记，避免该节点后续失联时对同一任务重复发布失败事件。
+        if let Some(failover) = self.failover.as_ref() {
+            failover.clear_outbound(task_id.as_str());
         }
 
         let Some(ref actor_system) = self.actor_system else {
@@ -497,14 +505,6 @@ impl NetworkEventRouter {
             }
             WireTaskOutcome::Failed(error) => TaskResultOutcome::Failed(error),
             WireTaskOutcome::Cancelled => TaskResultOutcome::Cancelled,
-            WireTaskOutcome::Skipped => {
-                tracing::warn!(
-                    workflow_id = %workflow_id.as_str(),
-                    task_id = %task_id.as_str(),
-                    "unexpected Skipped outcome in remote task result; ignoring"
-                );
-                return false;
-            }
         };
         let payload = match encode(&(
             workflow_id.clone(),
@@ -629,17 +629,10 @@ impl NetworkEventRouter {
                 task_name: task_name.to_string(),
                 target_node: Some(worker_node.clone()),
             },
-            WireTaskOutcome::Skipped => TaskCompletion::Skipped {
-                workflow_id: workflow_id.clone(),
-                task_id: task_id.clone(),
-                task_name: task_name.to_string(),
-                target_node: Some(worker_node.clone()),
-            },
         };
         let bus_event = match &completion {
             TaskCompletion::Failed { .. } => BusEvent::TaskFailed(completion),
             TaskCompletion::Cancelled { .. } => BusEvent::TaskCancelled(completion),
-            TaskCompletion::Skipped { .. } => BusEvent::TaskSkipped(completion),
             TaskCompletion::Completed { .. } => BusEvent::TaskCompleted(completion),
         };
         self.event_bus.publish(bus_event);

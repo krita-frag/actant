@@ -1,6 +1,7 @@
 pub mod backoff;
 pub mod config;
 pub mod error;
+pub mod journal;
 pub mod model;
 pub mod payload;
 pub mod serialization;
@@ -41,23 +42,25 @@ pub fn should_claim_workflow(
 pub use backoff::{ExponentialBackoff, REMOTE_CALL_MAX_RETRY_DELAY};
 pub use config::{
     discovery_mode, scheduler_kind, ActantConfig, ActorConfig, DiscoveryMode, EventBusConfig,
-    FailoverConfig, GossipConfig, NetworkConfig, SchedulerKind, StoreConfig, SyncMode,
+    FailoverConfig, GossipConfig, NetworkConfig, NodeRole, SchedulerKind, StoreConfig, SyncMode,
     WorkerConfig, WorkflowConfig,
 };
 pub use error::{format_error_kind, ActantError, Result};
 pub use wire::TopicRoute;
 // 领域类型 — 公共 API
+pub use journal::{JournalEvent, JournalRecord, JOURNAL_SCHEMA_VERSION};
 pub use model::{
     node_labels_within_limit, ActorErrorEnvelope, ActorErrorKind, ActorId, ActorMessage,
-    ActorMessageResult, ActorStatus, BlobHash, HlcTimestamp, HybridLogicalClock, MessageId, NodeId,
-    PlatformInfo, RetryPolicy, TaskCompletion, TaskDefinition, TaskId, WorkflowId,
-    NODE_LABELS_MAX_BYTES,
+    ActorMessageResult, ActorStatus, BlobHash, DagNode, HlcTimestamp, HybridLogicalClock,
+    MessageId, NodeId, NodeStateUpdate, PlatformInfo, RetryPolicy, TaskCompletion, TaskDefinition,
+    TaskId, WaitCondition, WorkflowId, WorkflowInvocation, NODE_LABELS_MAX_BYTES,
 };
 // 协议类型 — crate 内部
 pub use wire::{
-    OrchestratorClaim, Topic, WireTaskResult, STORE_KEY_DAG, STORE_KEY_EVENT_SEQ, STORE_KEY_EXEC,
-    STORE_KEY_LEASE, STORE_KEY_PENDING, STORE_KEY_RESULT, STORE_KEY_SIGNAL_BUF, STORE_KEY_WAIT,
-    TOPIC_FAILOVER, TOPIC_HEADS, TOPIC_HEARTBEAT, TOPIC_WORKFLOW_STATE_REQ,
+    OrchestratorClaim, Topic, WireTaskResult, STORE_KEY_CONTEXT, STORE_KEY_DAG,
+    STORE_KEY_EVENT_SEQ, STORE_KEY_EXEC, STORE_KEY_LEASE, STORE_KEY_PENDING, STORE_KEY_RESULT,
+    STORE_KEY_SIGNAL_BUF, STORE_KEY_WAIT, TOPIC_FAILOVER, TOPIC_HEADS, TOPIC_HEARTBEAT,
+    TOPIC_WORKFLOW_STATE_REQ,
 };
 // 请求-响应协议所需类型（公共 API）
 pub use payload::{

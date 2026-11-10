@@ -68,11 +68,23 @@ struct Instruments {
     /// 每次 publish 后采样，带 `topic` 标签。用于预警队列堆积。
     event_bus_subscriber_depth: Gauge<u64>,
 
+    // -- 存储 gauges --
+    store_map_size_bytes: Gauge<u64>,
+    store_used_bytes: Gauge<u64>,
+    store_file_bytes: Gauge<u64>,
+    store_utilization_ratio: Gauge<f64>,
+    store_readers: Gauge<u64>,
+    store_max_readers: Gauge<u64>,
+    /// LMDB 容量类错误（MapFull / ReadersFull）累计次数。
+    store_capacity_errors: Counter<u64>,
+
     // -- 任务转发计数器 --
     task_forward_succeeded: Counter<u64>,
     task_forward_failed: Counter<u64>,
     task_forward_fallback_local: Counter<u64>,
     task_forward_reroute: Counter<u64>,
+    /// 因无匹配节点被延后（`Defer`）的任务次数。
+    task_deferred: Counter<u64>,
 
     // -- UpDownCounter（可增可减的仪表）--
     running_tasks: UpDownCounter<i64>,
@@ -215,6 +227,36 @@ impl Instruments {
                 )
                 .build(),
 
+            // -- 存储 gauges --
+            store_map_size_bytes: meter
+                .u64_gauge("actant.store.map_size_bytes")
+                .with_description("Configured LMDB mmap limit (virtual address reservation)")
+                .build(),
+            store_used_bytes: meter
+                .u64_gauge("actant.store.used_bytes")
+                .with_description("Bytes occupied by live data, excluding free pages")
+                .build(),
+            store_file_bytes: meter
+                .u64_gauge("actant.store.file_bytes")
+                .with_description("Data file high-water mark including reusable free pages")
+                .build(),
+            store_utilization_ratio: meter
+                .f64_gauge("actant.store.utilization_ratio")
+                .with_description("Data file high-water mark divided by the configured map size")
+                .build(),
+            store_readers: meter
+                .u64_gauge("actant.store.readers")
+                .with_description("Currently active LMDB reader slots")
+                .build(),
+            store_max_readers: meter
+                .u64_gauge("actant.store.max_readers")
+                .with_description("Configured LMDB reader slot limit")
+                .build(),
+            store_capacity_errors: meter
+                .u64_counter("actant.store.capacity_errors")
+                .with_description("LMDB MapFull / ReadersFull errors")
+                .build(),
+
             // -- 任务转发计数器 --
             task_forward_succeeded: meter
                 .u64_counter("actant.tasks.forward.succeeded")
@@ -231,6 +273,10 @@ impl Instruments {
             task_forward_reroute: meter
                 .u64_counter("actant.tasks.forward.reroute")
                 .with_description("Tasks re-routed to a different node")
+                .build(),
+            task_deferred: meter
+                .u64_counter("actant.tasks.deferred")
+                .with_description("Tasks deferred because no node satisfies placement requirements")
                 .build(),
 
             // -- UpDownCounter --
@@ -283,7 +329,7 @@ impl Instruments {
                 .with_description("Payload deserialization latency in ms")
                 .build(),
             task_handler_ms: meter
-                .u64_histogram("actant.task.handler_ms")
+                .u64_histogram("actant.tasks.handler_ms")
                 .with_description("Task handler execution latency in ms")
                 .build(),
             event_bridge_ms: meter
@@ -551,6 +597,37 @@ pub fn set_event_bus_subscriber_depth(topic: &str, depth: u64) {
         .record(depth, &[KeyValue::new("topic", topic.to_string())]);
 }
 
+/// 记录一次存储容量快照。
+///
+/// 由 `Store::storage_stats` 在读取后调用：打开节点时至少记录一次，
+/// 运维侧可周期性调用 `storage_stats` 刷新。
+pub fn set_store_stats(
+    map_size: u64,
+    used_bytes: u64,
+    file_bytes: u64,
+    readers: u64,
+    max_readers: u64,
+) {
+    let instr = instruments();
+    instr.store_map_size_bytes.record(map_size, &[]);
+    instr.store_used_bytes.record(used_bytes, &[]);
+    instr.store_file_bytes.record(file_bytes, &[]);
+    instr.store_readers.record(readers, &[]);
+    instr.store_max_readers.record(max_readers, &[]);
+
+    let ratio = if map_size == 0 {
+        0.0
+    } else {
+        file_bytes as f64 / map_size as f64
+    };
+    instr.store_utilization_ratio.record(ratio, &[]);
+}
+
+/// 记录一次 LMDB 容量类错误（`MapFull` / `ReadersFull`）。
+pub fn record_store_capacity_error() {
+    instruments().store_capacity_errors.add(1, &[]);
+}
+
 pub fn inc_task_forward_succeeded() {
     instruments().task_forward_succeeded.add(1, &[]);
 }
@@ -565,6 +642,11 @@ pub fn inc_task_forward_fallback_local() {
 
 pub fn inc_task_forward_reroute() {
     instruments().task_forward_reroute.add(1, &[]);
+}
+
+/// 记录一次任务因无匹配节点被延后（`Defer`）。
+pub fn inc_task_deferred() {
+    instruments().task_deferred.add(1, &[]);
 }
 
 pub fn inc_running_tasks() {

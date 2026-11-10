@@ -28,6 +28,10 @@ fn make_task(idx: usize) -> TaskDefinition {
         enqueued_at_ms: 0,
         target_endpoint_addr: None,
         origin_endpoint_addr: None,
+        tags: Vec::new(),
+        quota: None,
+        pinned_target: false,
+        lease_deadline_ms: 0,
     }
 }
 
@@ -40,6 +44,8 @@ fn make_node(idx: usize) -> DagNode {
         timeout_ms: Some(30_000),
         priority: 0,
         metadata: std::collections::HashMap::new(),
+        tags: Vec::new(),
+        quota: None,
     }
 }
 

@@ -1,26 +1,11 @@
 //! Worker 执行运行时。
 //!
-//! [`Worker`] 是每个节点上的任务执行循环：它从 [`Scheduler`] 拉取
-//! [`TaskDefinition`]，决定本地执行还是转发远端，
-//! 然后通过 [`TaskDispatcher`]
-//! 调用实际 handler。Worker 不理解任务 payload 的业务语义，只处理签名后的字节、
-//! 超时、取消、并发槽位和结果投递。
+//! [`Worker`] 从 [`Scheduler`] 拉取 [`TaskDefinition`]，决定本地执行还是转发远端，
+//! 再经 [`TaskDispatcher`] 调用 handler；不理解 payload 的业务语义，只处理签名后的
+//! 字节、超时、取消、并发槽位与结果投递。
 //!
-//! ## 主循环结构
-//!
-//! 1. 启动网络事件循环，订阅 task / heartbeat / DAG state / cancel 等 topic。
-//! 2. 启动远端结果重试循环和取消 TTL 清理循环。
-//! 3. 获取 `TaskEnqueued` 专用 `Notify` 信号，SchedulerActor 在 `enqueue` 后
-//!    触发 `notify_task_enqueued()` 唤醒 Worker 拉取任务。
-//! 4. 为每个任务获取 semaphore 槽位，注册 cancel flag，执行或转发任务。
-//! 5. 将任务结果投递回 origin 节点或本地 WorkflowActor。
-//!
-//! ## 关闭语义
-//!
-//! [`Worker::shutdown`] 只发送取消信号；真正的 drain、任务线程池关闭和 iroh
-//! endpoint 关闭由 [`crate::runtime::Runtime::shutdown`] 编排。这样可以保证
-//! Actor、dispatcher 和网络按固定顺序退出，避免 Drop 阶段互相等待。
-//!
+//! 主循环步骤与关闭顺序见 `docs/architecture/worker-model.md`。
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -148,6 +133,19 @@ async fn prefetch_tasks(
     }
 }
 
+/// 直提任务租约检查间隔。
+///
+/// 只影响"发现过期"的延迟，不影响任务本身的超时语义；与节点失联判定窗口
+/// （`failure_timeout_ms`）相互独立。
+const STANDALONE_LEASE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// 当前 epoch 毫秒；时钟早于 epoch 时退化为 0。
+fn epoch_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis() as u64)
+}
+
 /// 远端转发失败 / submit-only 回退重入队的每任务弹跳上限。
 ///
 /// 与 [`WorkerConfig::crash_failover_max_attempts`]（进程崩溃故障转移）相互独立：
@@ -200,9 +198,6 @@ pub struct Worker {
     workflow_actor_id: Option<crate::common::ActorId>,
     /// 本地 DagGossipActor 的 id。用于处理工作流状态请求/响应主题。
     dag_gossip_actor_id: Option<crate::common::ActorId>,
-    /// Capability gossip 处理器。用于接收 `TOPIC_CAPABILITY_GOSSIP` 上的远端 capability 广播，
-    /// 通过 `NetworkEventRouter` 路由到 `handle_gossip`。
-    capability_gossip: Option<Arc<crate::runtime::capability::gossip::CapabilityGossipActor>>,
     /// 远端 peer 容量视图，用于 unrouted task 的自动路由。
     failover: Option<Arc<crate::runtime::workflow::FailoverManager>>,
     /// 远端路由策略：默认内置实现，可经 `with_route_policy` 注入。
@@ -224,6 +219,18 @@ pub struct Worker {
     broadcast_retry_attempts: usize,
     broadcast_retry_base_delay: Duration,
     remote_fallback_delay: Duration,
+    /// 任务因无匹配节点被 `Defer` 的最长等待时间。
+    starvation_timeout: Duration,
+    /// 本地节点标签（放置适配校验用）。运行时可整体替换。
+    local_labels: Arc<parking_lot::RwLock<std::collections::BTreeMap<String, String>>>,
+    /// 节点拓扑角色：Orchestrator 不执行本地任务。
+    role: crate::common::NodeRole,
+    /// soft draining 标志：为 true 时本地路由不再选择本节点，在途任务继续完成。
+    /// 与 `WorkerState::Draining`（关停流程）不同，此标志可逆。
+    draining: Arc<std::sync::atomic::AtomicBool>,
+    /// 每个任务首次进入 `Defer` 的时刻，用于 starvation 超时判定。
+    /// 任务成功路由/本地执行时移除。
+    defer_starts: Arc<parking_lot::Mutex<HashMap<String, Instant>>>,
     pending_result_channel_capacity: usize,
     /// 批量 prefetch 的最小/最大批量。由 [`WorkerConfig::prefetch_min`] /
     /// [`WorkerConfig::prefetch_max`] 配置，构造时归一化保证 `min <= max`。
@@ -255,6 +262,13 @@ pub struct Worker {
     /// 即使 ``wait_for_ready`` 在 ``run()`` 设值后才调用也能立即返回，
     /// 避免 notify 先于 wait 导致的永久阻塞。
     ready: Arc<tokio::sync::watch::Sender<bool>>,
+    /// batch/array job 逐项进度计数器。终态完成事件经
+    /// [`BatchTracker::record_terminal`](crate::runtime::batch::BatchTracker::record_terminal)
+    /// 更新；绑定层用 [`Worker::batch_tracker`] 注册与查询。
+    batch_tracker: Arc<crate::runtime::batch::BatchTracker>,
+    /// 本节点命名配额计数器（容量来自 `WorkerConfig::node_quotas`）。
+    /// 任务派发前原子扣减，守卫随任务生命周期归还；心跳广播剩余容量。
+    quota_tracker: Arc<crate::runtime::quota::QuotaTracker>,
 }
 
 /// [`Worker::report_task_result`] 的返回值（回传 Python 事件泵的重试裁决）。
@@ -268,11 +282,6 @@ pub struct TaskReportResponse {
 }
 
 impl Worker {
-    /// Clear the capacity callback, releasing any captured references.
-    pub fn clear_capacity_callback(&mut self) {
-        self.capacity_callback = None;
-    }
-
     /// 构造一个未绑定 ActorSystem 的 Worker。
     ///
     /// Builder 随后会通过 `with_*` 方法注入 SchedulerActor id、WorkflowActor id、
@@ -289,6 +298,10 @@ impl Worker {
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let (state_tx, _) = tokio::sync::watch::channel(WorkerState::Running);
         let max_concurrent = config.max_concurrent_tasks;
+        let batch_tracker = Arc::new(crate::runtime::batch::BatchTracker::new());
+        let quota_tracker = Arc::new(crate::runtime::quota::QuotaTracker::new(
+            config.node_quotas.clone(),
+        ));
         Self {
             node_id,
             network,
@@ -300,7 +313,6 @@ impl Worker {
             actor_system: None,
             workflow_actor_id: None,
             dag_gossip_actor_id: None,
-            capability_gossip: None,
             failover: None,
             route_policy: Arc::new(crate::runtime::workflow::DefaultRoutePolicy),
             orchestrator_ingest: false,
@@ -315,6 +327,11 @@ impl Worker {
             broadcast_retry_attempts: config.broadcast_retry_attempts,
             broadcast_retry_base_delay: Duration::from_millis(config.broadcast_retry_base_delay_ms),
             remote_fallback_delay: Duration::from_millis(config.remote_fallback_delay_ms),
+            starvation_timeout: Duration::from_millis(config.starvation_timeout_ms),
+            local_labels: Arc::new(parking_lot::RwLock::new(std::collections::BTreeMap::new())),
+            role: config.role,
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            defer_starts: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             pending_result_channel_capacity: config.pending_result_channel_capacity,
             prefetch_min: config.prefetch_min.max(1),
             prefetch_max: config.prefetch_max.max(config.prefetch_min.max(1)),
@@ -326,7 +343,19 @@ impl Worker {
             // `watch::channel` 返回 (Sender, Receiver)，仅保留 Sender；
             // 等待方通过 `subscribe()` 获取自己的 Receiver。
             ready: Arc::new(tokio::sync::watch::channel(false).0),
+            batch_tracker,
+            quota_tracker,
         }
+    }
+
+    /// 本节点命名配额计数器句柄（心跳广播剩余容量）。
+    pub fn quota_tracker(&self) -> &Arc<crate::runtime::quota::QuotaTracker> {
+        &self.quota_tracker
+    }
+
+    /// batch/array job 逐项进度计数器句柄。
+    pub fn batch_tracker(&self) -> &Arc<crate::runtime::batch::BatchTracker> {
+        &self.batch_tracker
     }
 
     /// 设置底层 SchedulerActor 的 id，供 `Runtime::shutdown` 同步等待 Actor 退出。
@@ -381,12 +410,6 @@ impl Worker {
         self
     }
 
-    /// 覆盖崩溃故障转移的最大执行次数（测试用）。
-    pub fn with_crash_failover_max_attempts(mut self, max: u32) -> Self {
-        self.crash_failover_max_attempts = max;
-        self
-    }
-
     pub fn with_drain_timeout(mut self, timeout: Duration) -> Self {
         self.drain_timeout = timeout;
         self
@@ -404,18 +427,6 @@ impl Worker {
 
     pub(crate) fn with_dag_gossip_actor_id(mut self, id: crate::common::ActorId) -> Self {
         self.dag_gossip_actor_id = Some(id);
-        self
-    }
-
-    /// 注入 Capability gossip 处理器。
-    ///
-    /// `NetworkEventRouter` 在收到 `TOPIC_CAPABILITY_GOSSIP` gossip 消息时，
-    /// 通过此 handler 的 `handle_gossip` 方法更新本地 capability 视图。
-    pub(crate) fn with_capability_gossip(
-        mut self,
-        gossip: Arc<crate::runtime::capability::gossip::CapabilityGossipActor>,
-    ) -> Self {
-        self.capability_gossip = Some(gossip);
         self
     }
 
@@ -439,6 +450,42 @@ impl Worker {
     ) -> Self {
         self.route_policy = policy;
         self
+    }
+
+    /// 设置节点拓扑角色（`RuntimeBuilder::with_role` 可覆盖配置）。
+    pub fn with_role(mut self, role: crate::common::NodeRole) -> Self {
+        self.role = role;
+        self
+    }
+
+    /// 注入本地节点标签。放置策略用它判断本地是否满足任务 tags。
+    pub fn with_local_labels(self, labels: std::collections::BTreeMap<String, String>) -> Self {
+        *self.local_labels.write() = labels;
+        self
+    }
+
+    /// 应用运行时节点状态更新。
+    ///
+    /// 标签整表覆盖（超限返回配置错误，不静默丢弃）；配额容量整表覆盖
+    /// （在用量按差值保留）；draining 为可逆软停。
+    pub fn apply_node_state(&self, update: &crate::common::NodeStateUpdate) -> Result<()> {
+        if let Some(labels) = &update.labels {
+            if !crate::common::model::node_labels_within_limit(labels) {
+                return Err(crate::common::ActantError::Config(format!(
+                    "node labels exceed {} bytes",
+                    crate::common::model::NODE_LABELS_MAX_BYTES
+                )));
+            }
+            *self.local_labels.write() = labels.clone();
+        }
+        if let Some(quotas) = &update.quotas {
+            self.quota_tracker.set_capacities(quotas.clone());
+        }
+        if let Some(draining) = update.draining {
+            self.draining
+                .store(draining, std::sync::atomic::Ordering::Release);
+        }
+        Ok(())
     }
 
     pub(crate) fn with_failover_manager(
@@ -541,6 +588,26 @@ impl Worker {
             return true;
         }
         false
+    }
+
+    /// 配额延后时释放路由目标：路由器选择的目标（`pinned_target=false`）在
+    /// 本节点容量耗尽时不是提交方意图，清空后重新参与路由；`submit_to` 的
+    /// 显式 pin 保持不变，由本地 starvation 语义兜底。
+    fn release_routing_target_on_quota_defer(task: &mut TaskDefinition) {
+        if !task.pinned_target {
+            task.target_node = None;
+            task.target_endpoint_addr = None;
+        }
+    }
+
+    /// 清除任务的重路由 / 饥饿跟踪状态。
+    ///
+    /// 任务到达终态（成功、失败、取消）后必须调用：`defer_starts` 与
+    /// `reroute_counts` 以 task_id 为键且没有自动过期，遗留条目既泄漏内存，
+    /// 也会在 task_id 复用时把新任务误判为早已 starvation。
+    fn clear_task_tracking(&self, task_id: &str) {
+        self.defer_starts.lock().remove(task_id);
+        self.reroute_counts.lock().remove(task_id);
     }
 
     /// 返回当前 Worker 状态。
@@ -768,7 +835,6 @@ impl Worker {
             actor_system: self.actor_system.clone(),
             workflow_actor_id: self.workflow_actor_id.clone(),
             dag_gossip_actor_id: self.dag_gossip_actor_id.clone(),
-            capability_gossip: self.capability_gossip.clone(),
             failover: self.failover.clone(),
             cancel_flags: self.cancel_flags.clone(),
             cancelled_tasks: self.cancelled_tasks.clone(),
@@ -893,6 +959,11 @@ impl Worker {
                 return Ok(());
             }
 
+            // 直提任务租约检查点：远端执行超时未回结果则重新入队。
+            // 放在循环顶部，保证有 inflight 任务持续 dispatch 时也按期检查。
+            self.expire_standalone_leases(&node_id, network.as_ref(), &event_bus, pending_tx)
+                .await;
+
             // 取下一个任务：优先从 inflight 队列取（避免 dequeue 调用）；
             // inflight 空时触发 prefetch 批量拉取。
             // 每次 select! 同时监听 cancel 信号，确保 drain 命令即时响应。
@@ -968,11 +1039,16 @@ impl Worker {
                         let _ = state_sender.send_replace(WorkerState::Stopped);
                         return Ok(());
                     }
-                    batch = prefetch_tasks(&self.scheduler, self.fast_scheduler.as_ref(), task_enqueued_notify, prefetch_limit) => batch,
+                    batch = prefetch_tasks(&self.scheduler, self.fast_scheduler.as_ref(), task_enqueued_notify, prefetch_limit) => Some(batch),
+                    // 空闲时也要周期性回到循环顶部检查租约，避免等待新任务期间
+                    // 让已转发任务的在途登记无限期滞留。
+                    _ = tokio::time::sleep(STANDALONE_LEASE_CHECK_INTERVAL) => None,
+                };
+                let Some(mut batch) = prefetch_result else {
+                    continue;
                 };
                 // prefetch_tasks 返回非空 batch（内部保证）。
                 // 第一个任务作为当前任务，剩余入 inflight 供后续循环快速取用。
-                let mut batch = prefetch_result;
                 let first = batch.remove(0);
                 if !batch.is_empty() {
                     inflight.extend(batch);
@@ -985,15 +1061,108 @@ impl Worker {
 
             let mut task = task;
             if task.target_node.is_none() {
-                if let Some((target_node, target_endpoint_addr)) = self.select_remote_target() {
-                    tracing::debug!(
-                        task_id = %task.id.as_str(),
-                        target_node = %target_node.as_str(),
-                        "routing unrouted task to remote peer"
-                    );
-                    task.target_node = Some(target_node);
-                    task.target_endpoint_addr = Some(target_endpoint_addr);
+                match self.route_task(&task) {
+                    crate::runtime::workflow::RouteDecision::Local => {
+                        self.defer_starts.lock().remove(task.id.as_str());
+                    }
+                    crate::runtime::workflow::RouteDecision::Remote {
+                        node_id: target_node,
+                        endpoint_addr,
+                    } => {
+                        self.defer_starts.lock().remove(task.id.as_str());
+                        tracing::debug!(
+                            task_id = %task.id.as_str(),
+                            target_node = %target_node.as_str(),
+                            "routing unrouted task to remote peer"
+                        );
+                        task.target_node = Some(target_node);
+                        task.target_endpoint_addr = Some(endpoint_addr);
+                    }
+                    crate::runtime::workflow::RouteDecision::Defer { reason } => {
+                        crate::metrics::inc_task_deferred();
+                        tracing::info!(
+                            task_id = %task.id.as_str(),
+                            reason = %reason,
+                            "deferring task: no eligible node for placement requirements"
+                        );
+                        if self.starvation_exceeded(task.id.as_str()) {
+                            self.clear_task_tracking(task.id.as_str());
+                            crate::metrics::inc_tasks_failed();
+                            let completion = TaskCompletion::Failed {
+                                workflow_id: task
+                                    .workflow_id
+                                    .clone()
+                                    .unwrap_or_else(|| WorkflowId::from(String::new())),
+                                task_id: task.id.clone(),
+                                task_name: task.name.clone(),
+                                error: format_error_kind(
+                                    "routing",
+                                    &format!(
+                                        "no node satisfies required labels after {}ms: {}",
+                                        self.starvation_timeout.as_millis(),
+                                        reason
+                                    ),
+                                ),
+                                target_node: task.target_node.clone(),
+                            };
+                            publish_task_completion(
+                                completion,
+                                &task,
+                                &node_id,
+                                network.as_ref(),
+                                &event_bus,
+                                pending_tx,
+                                self.pending_result_channel_capacity,
+                            )
+                            .await;
+                            continue;
+                        }
+                        // 退避重入队：不阻塞主循环，延迟后重新交给路由器。
+                        let scheduler = self.scheduler.clone();
+                        let delay = self.remote_fallback_delay;
+                        tokio::spawn(async move {
+                            tokio::time::sleep(delay).await;
+                            if let Err(e) = scheduler.enqueue(task).await {
+                                tracing::warn!("failed to re-enqueue deferred task: {}", e);
+                            }
+                        });
+                        continue;
+                    }
                 }
+            } else if task.target_node.as_ref() == Some(&node_id)
+                && !crate::runtime::workflow::labels_match(&self.local_labels.read(), &task.tags)
+            {
+                // 显式固定到本节点但本地标签不满足诉求：任务无处可去，直接失败。
+                crate::metrics::inc_tasks_failed();
+                let completion = TaskCompletion::Failed {
+                    workflow_id: task
+                        .workflow_id
+                        .clone()
+                        .unwrap_or_else(|| WorkflowId::from(String::new())),
+                    task_id: task.id.clone(),
+                    task_name: task.name.clone(),
+                    error: format_error_kind(
+                        "routing",
+                        &format!(
+                            "target node {} does not satisfy required labels: {}",
+                            node_id.as_str(),
+                            task.tags.join(",")
+                        ),
+                    ),
+                    target_node: task.target_node.clone(),
+                };
+                self.clear_task_tracking(task.id.as_str());
+                publish_task_completion(
+                    completion,
+                    &task,
+                    &node_id,
+                    network.as_ref(),
+                    &event_bus,
+                    pending_tx,
+                    self.pending_result_channel_capacity,
+                )
+                .await;
+                continue;
             }
 
             if cancelled_tasks.lock().contains_key(task.id.as_str()) {
@@ -1001,7 +1170,7 @@ impl Worker {
                     task_id = %task.id.as_str(),
                     "skipping cancelled task before execution"
                 );
-                // 记录 cancel latency：从取消注册到任务被跳过的耗时。
+                // 记录 cancel latency：从取消注册到任务被拦截（未执行）的耗时。
                 {
                     let registry = cancelled_tasks.lock();
                     if let Some(ts) = registry.get(task.id.as_str()) {
@@ -1021,12 +1190,18 @@ impl Worker {
                 event_bus.publish(BusEvent::TaskCancelled(completion));
                 cancelled_tasks.lock().remove(task.id.as_str());
                 crate::metrics::dec_cancelled_tasks_pending();
+                self.clear_task_tracking(task.id.as_str());
                 continue;
             }
 
-            if let Some(ref target) = task.target_node {
-                if target != &node_id {
-                    match self.forward_remote_task(&task, target).await {
+            if let Some(target) = task.target_node.clone() {
+                if target != node_id {
+                    if task.workflow_id.is_none() {
+                        // 直提任务：租约从转发时刻起算（非 0 截止时刻）。远端不
+                        // 解释该字段，到期由 origin 的租约检查点负责重投。
+                        task.lease_deadline_ms = self.standalone_lease_deadline(&task);
+                    }
+                    match self.forward_remote_task(&task, &target).await {
                         Ok(()) => {
                             crate::metrics::inc_task_forward_succeeded();
                             // 转发成功：清零弹跳计数，后续失败重新从 1 计。
@@ -1035,13 +1210,9 @@ impl Worker {
                             // failover 据此终结该任务，避免提交方永久挂起。
                             if let Some(failover) = self.failover.as_ref() {
                                 failover.record_outbound(
-                                    &task.id,
-                                    target,
+                                    &task,
+                                    &target,
                                     task.target_endpoint_addr.as_deref(),
-                                    task.workflow_id
-                                        .clone()
-                                        .unwrap_or_else(|| WorkflowId::from(String::new())),
-                                    &task.name,
                                 );
                             }
                             continue;
@@ -1076,6 +1247,7 @@ impl Worker {
                                     ),
                                     target_node: task.target_node.clone(),
                                 };
+                                self.clear_task_tracking(task.id.as_str());
                                 publish_task_completion(
                                     completion,
                                     &task,
@@ -1141,6 +1313,7 @@ impl Worker {
                         ),
                         target_node: task.target_node.clone(),
                     };
+                    self.clear_task_tracking(task.id.as_str());
                     publish_task_completion(
                         completion,
                         &task,
@@ -1178,6 +1351,73 @@ impl Worker {
                 .acquire_owned()
                 .await
                 .map_err(|_| ActantError::Internal("semaphore closed".into()))?;
+
+            // 命名配额准入（分布式信号量）：在拿到并发槽位后、派发前原子扣减。
+            // 容量耗尽时归还槽位并延后重入队——配额是"等待"而不是"失败"，
+            // 与标签无匹配的 Defer 语义一致；starvation 超时后转 Failed。
+            // 守卫随 spawn 闭包移动，在所有终态路径上 Drop 归还。
+            let quota_guard = match self.quota_tracker.try_acquire(task.quota.as_deref()) {
+                Ok(guard) => guard,
+                Err(err) => {
+                    crate::metrics::inc_task_deferred();
+                    tracing::debug!(
+                        task_id = task.id.as_str(),
+                        quota = err.key(),
+                        "quota exhausted, deferring task"
+                    );
+                    if self.starvation_exceeded(task.id.as_str()) {
+                        self.clear_task_tracking(task.id.as_str());
+                        crate::metrics::inc_tasks_failed();
+                        let completion = TaskCompletion::Failed {
+                            workflow_id: task
+                                .workflow_id
+                                .clone()
+                                .unwrap_or_else(|| WorkflowId::from(String::new())),
+                            task_id: task.id.clone(),
+                            task_name: task.name.clone(),
+                            error: crate::runtime::workflow::unschedulable_quota_reason(err.key()),
+                            target_node: task.target_node.clone(),
+                        };
+                        publish_task_completion(
+                            completion,
+                            &task,
+                            &node_id,
+                            network.as_ref(),
+                            &event_bus,
+                            pending_tx,
+                            self.pending_result_channel_capacity,
+                        )
+                        .await;
+                        drop(permit);
+                        self.notify_capacity();
+                        continue;
+                    }
+                    let scheduler = self.scheduler.clone();
+                    let delay = self.remote_fallback_delay;
+                    // 配额是节点级资源：路由器选择的目标（`pinned_target=false`）
+                    // 在本节点容量耗尽时不是提交方意图，必须清空以重新参与路由。
+                    // 否则任务会一直钉在本节点轮询直到 starvation 失败，即使其他
+                    // 节点有空闲容量。`submit_to` 的显式 pin 保持不变，由本地
+                    // starvation 语义兜底。
+                    let mut retry_task = task;
+                    Self::release_routing_target_on_quota_defer(&mut retry_task);
+                    let tracker = self.quota_tracker.clone();
+                    tokio::spawn(async move {
+                        tokio::select! {
+                            _ = tokio::time::sleep(delay) => {}
+                            _ = tracker.wait_for_release() => {}
+                        }
+                        if let Err(e) = scheduler.enqueue(retry_task).await {
+                            tracing::warn!("failed to re-enqueue quota-deferred task: {}", e);
+                        }
+                    });
+                    drop(permit);
+                    self.notify_capacity();
+                    continue;
+                }
+            };
+            self.defer_starts.lock().remove(task.id.as_str());
+
             let cancel_flags = cancel_flags.clone();
 
             self.notify_capacity();
@@ -1348,6 +1588,8 @@ impl Worker {
 
             tokio::spawn(async move {
                 let _permit = permit;
+                // 配额守卫随任务生命周期存在，闭包内任意 return 都会在 Drop 归还。
+                let _quota_guard = quota_guard;
                 let task_id_dbg = task.id.clone();
                 tracing::debug!(task = ?task_id_dbg, name = %task_name, "task executing");
 
@@ -1577,13 +1819,46 @@ impl Worker {
         }
     }
 
-    fn select_remote_target(&self) -> Option<(NodeId, String)> {
-        let failover = self.failover.as_ref()?;
+    /// 对未路由任务做放置决策。
+    ///
+    /// 无 failover 视图（纯内存测试桩）时只能依据本地标签：满足则本地执行，
+    /// 否则延后。策略返回 `Local` 时仍做一次本地适配复核——自定义策略不得
+    /// 绕过"本地标签必须满足任务 tags"的硬约束。
+    fn route_task(&self, task: &TaskDefinition) -> crate::runtime::workflow::RouteDecision {
+        use crate::runtime::workflow::{
+            labels_match, quota_available, unschedulable_quota_reason, unschedulable_reason,
+            RouteDecision,
+        };
+
+        let local_quota_ok =
+            quota_available(&self.quota_tracker.available_map(), task.quota.as_deref());
+        let local_fits = self.role.can_execute_locally()
+            && !self.draining.load(std::sync::atomic::Ordering::Acquire)
+            && labels_match(&self.local_labels.read(), &task.tags)
+            && local_quota_ok;
+        let Some(failover) = self.failover.as_ref() else {
+            return if local_fits {
+                RouteDecision::Local
+            } else {
+                RouteDecision::Defer {
+                    reason: match task.quota.as_deref() {
+                        Some(key) if !local_quota_ok => unschedulable_quota_reason(key),
+                        _ => unschedulable_reason(&task.tags),
+                    },
+                }
+            };
+        };
         let local_available =
             u32::try_from(self.running_tasks.available_permits()).unwrap_or(u32::MAX);
         let ctx = crate::runtime::workflow::RouteContext {
+            local_role: self.role,
+            local_draining: self.draining.load(std::sync::atomic::Ordering::Acquire),
             local_available_slots: local_available,
             heartbeat_ttl_ms: failover.failure_timeout_ms(),
+            local_labels: self.local_labels.read().clone(),
+            required_tags: task.tags.clone(),
+            required_quota: task.quota.clone(),
+            local_available_quotas: self.quota_tracker.available_map(),
         };
         let candidates: Vec<crate::runtime::workflow::RouteCandidate> = failover
             .get_peer_infos()
@@ -1593,10 +1868,133 @@ impl Worker {
                 endpoint_addr: info.endpoint_addr,
                 available_slots: info.available_slots,
                 max_slots: info.max_slots,
+                role: info.role,
+                draining: info.draining,
                 last_heartbeat_ms: info.last_heartbeat_ms,
+                labels: info.labels,
+                available_quotas: info.available_quotas,
             })
             .collect();
-        self.route_policy.select_target(&ctx, &candidates)
+        match self.route_policy.select_target(&ctx, &candidates) {
+            RouteDecision::Local if !local_fits => RouteDecision::Defer {
+                reason: match task.quota.as_deref() {
+                    Some(key) if !local_quota_ok => unschedulable_quota_reason(key),
+                    _ => unschedulable_reason(&task.tags),
+                },
+            },
+            other => other,
+        }
+    }
+
+    /// 记录首次 `Defer` 时刻并判断是否已超过 starvation 超时。
+    ///
+    /// `starvation_timeout_ms = 0` 表示不设上限（任务持续等待，直到出现
+    /// 匹配节点或配额归还），与 `default_task_timeout_ms = 0` 的"无超时"
+    /// 约定一致。
+    fn starvation_exceeded(&self, task_id: &str) -> bool {
+        if self.starvation_timeout.is_zero() {
+            return false;
+        }
+        let mut starts = self.defer_starts.lock();
+        let start = starts
+            .entry(task_id.to_string())
+            .or_insert_with(Instant::now);
+        start.elapsed() >= self.starvation_timeout
+    }
+
+    /// 直提任务转发到远端时的租约截止时刻。
+    ///
+    /// 取任务硬超时 + 节点失联判定窗口：超时后执行侧本应结束，再给一个失联
+    /// 判定窗口让迟到结果有机会回来；两者都没有时退化为 30s 宽限。
+    fn standalone_lease_deadline(&self, task: &TaskDefinition) -> u64 {
+        let timeout_ms = task
+            .timeout_ms
+            .unwrap_or(self.task_timeout.as_millis() as u64);
+        let grace_ms = self
+            .failover
+            .as_ref()
+            .map_or(30_000, |failover| failover.failure_timeout_ms());
+        epoch_millis()
+            .saturating_add(timeout_ms)
+            .saturating_add(grace_ms)
+    }
+
+    /// 检查直提任务租约：到期未回结果则重新入队，超过重投上限则终结为失败。
+    async fn expire_standalone_leases(
+        &self,
+        node_id: &NodeId,
+        network: &dyn Transport,
+        event_bus: &EventBus,
+        pending_results: &tokio::sync::mpsc::Sender<PendingResult>,
+    ) {
+        let Some(failover) = self.failover.as_ref() else {
+            return;
+        };
+        let expired = failover.take_expired_standalone(epoch_millis());
+        for (task_id, entry) in expired {
+            let mut task = entry.task;
+            if task.workflow_id.is_some() {
+                continue;
+            }
+            let next_attempt = task.attempt.saturating_add(1);
+            if next_attempt >= self.crash_failover_max_attempts {
+                crate::metrics::inc_tasks_failed();
+                tracing::warn!(
+                    task_id = %task_id,
+                    attempt = next_attempt,
+                    max_attempts = self.crash_failover_max_attempts,
+                    last_target = %entry.target_node.as_str(),
+                    "standalone task lease expired; retry budget exhausted"
+                );
+                let completion = TaskCompletion::Failed {
+                    workflow_id: WorkflowId::from(String::new()),
+                    task_id: task.id.clone(),
+                    task_name: task.name.clone(),
+                    error: format_error_kind(
+                        "worker",
+                        &format!(
+                            "task lease expired after {} attempt(s); last executor {} did not \
+                             produce a result within the lease window",
+                            next_attempt,
+                            entry.target_node.as_str()
+                        ),
+                    ),
+                    target_node: Some(entry.target_node),
+                };
+                self.clear_task_tracking(task.id.as_str());
+                publish_task_completion(
+                    completion,
+                    &task,
+                    node_id,
+                    network,
+                    event_bus,
+                    pending_results,
+                    self.pending_result_channel_capacity,
+                )
+                .await;
+                continue;
+            }
+
+            crate::metrics::inc_task_forward_reroute();
+            tracing::warn!(
+                task_id = %task_id,
+                attempt = next_attempt,
+                last_target = %entry.target_node.as_str(),
+                "standalone task lease expired; re-enqueueing for re-dispatch"
+            );
+            task.attempt = next_attempt;
+            task.target_node = None;
+            task.target_endpoint_addr = None;
+            // 旧租约随重投作废：下一次转发会重新授予。
+            task.relinquish_lease();
+            let id = task.id.clone();
+            if let Err(e) = self.scheduler.enqueue(task).await {
+                tracing::warn!(
+                    task_id = %id.as_str(),
+                    "failed to re-enqueue leased standalone task: {e}"
+                );
+            }
+        }
     }
 
     async fn forward_remote_task(&self, task: &TaskDefinition, target: &NodeId) -> Result<()> {

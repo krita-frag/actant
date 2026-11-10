@@ -238,16 +238,6 @@ fn bus_event_topic_all_variants() {
         Topic::TaskCancelled
     );
     assert_eq!(
-        BusEvent::TaskSkipped(TaskCompletion::Skipped {
-            workflow_id: wf.clone(),
-            task_id: tid.clone(),
-            task_name: "n".into(),
-            target_node: None,
-        })
-        .topic(),
-        Topic::TaskSkipped
-    );
-    assert_eq!(
         BusEvent::PeerDisconnected(nid.clone()).topic(),
         Topic::NetworkPeer
     );
@@ -381,25 +371,6 @@ async fn publish_task_cancelled_roundtrip() {
 }
 
 #[tokio::test]
-async fn publish_task_skipped_roundtrip() {
-    let bus = EventBus::new();
-    let mut rx = bus.subscribe(Topic::TaskSkipped);
-
-    bus.publish(BusEvent::TaskSkipped(TaskCompletion::Skipped {
-        workflow_id: WorkflowId::from("wf-1"),
-        task_id: TaskId::from("t-1"),
-        task_name: "n".into(),
-        target_node: None,
-    }));
-
-    let ev = tokio::time::timeout(Duration::from_millis(500), rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(matches!(ev, BusEvent::TaskSkipped(_)));
-}
-
-#[tokio::test]
 async fn event_bus_default_creates_valid_instance() {
     let bus = EventBus::default();
     let mut rx = bus.subscribe(Topic::TaskStarted);
@@ -415,3 +386,81 @@ async fn event_bus_default_creates_valid_instance() {
 // DirectRequest 不走 EventBus（参见 src/runtime/event_bus.rs 顶部注释与
 // `NetworkEventRouter::handle_direct_request` 的 `other` 分支）：点对点请求-响应
 // 由接收方直接处理或回送 Error，无独占投递路径，故此处无对应测试用例。
+
+// ───────────────────────── per-task log channel ─────────────────────────
+
+fn task_log(task: &str, message: &str) -> BusEvent {
+    BusEvent::TaskLog {
+        task_id: TaskId::from(task),
+        level: "INFO".into(),
+        message: message.into(),
+    }
+}
+
+#[tokio::test]
+async fn task_log_channel_filters_by_task_id() {
+    let bus = EventBus::new();
+    let mut rx = bus.subscribe_task_logs(TaskId::from("t-1"));
+
+    bus.publish(task_log("t-2", "other task"));
+    bus.publish(task_log("t-1", "mine"));
+
+    let ev = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+        .await
+        .expect("recv in time")
+        .expect("event present");
+    match ev {
+        BusEvent::TaskLog {
+            task_id, message, ..
+        } => {
+            assert_eq!(task_id.as_str(), "t-1");
+            assert_eq!(message, "mine");
+        }
+        other => panic!("unexpected event: {:?}", other),
+    }
+    // 只有一条事件：其它任务日志被过滤。
+    assert!(tokio::time::timeout(Duration::from_millis(100), rx.recv())
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn global_task_log_topic_still_receives_all_tasks() {
+    let bus = EventBus::new();
+    let mut global = bus.subscribe(Topic::TaskLog);
+    let mut per_task = bus.subscribe_task_logs(TaskId::from("t-1"));
+
+    bus.publish(task_log("t-1", "a"));
+    bus.publish(task_log("t-2", "b"));
+
+    assert!(matches!(
+        global.recv().await.unwrap(),
+        BusEvent::TaskLog { .. }
+    ));
+    assert!(matches!(
+        global.recv().await.unwrap(),
+        BusEvent::TaskLog { .. }
+    ));
+    assert!(matches!(
+        per_task.recv().await.unwrap(),
+        BusEvent::TaskLog { .. }
+    ));
+}
+
+#[tokio::test]
+async fn closed_task_log_subscriber_is_pruned_on_publish() {
+    let bus = EventBus::new();
+    let tx_task = TaskId::from("t-1");
+    let rx = bus.subscribe_task_logs(tx_task.clone());
+    drop(rx);
+
+    bus.publish(task_log("t-1", "after close"));
+
+    let mut rx2 = bus.subscribe_task_logs(tx_task);
+    bus.publish(task_log("t-1", "after resubscribe"));
+    let ev = tokio::time::timeout(Duration::from_millis(500), rx2.recv())
+        .await
+        .expect("recv in time")
+        .expect("event present");
+    assert!(matches!(ev, BusEvent::TaskLog { .. }));
+}

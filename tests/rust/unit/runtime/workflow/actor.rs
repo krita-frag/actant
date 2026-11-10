@@ -18,6 +18,8 @@ fn make_node(id: &str, name: &str) -> DagNode {
         timeout_ms: None,
         priority: 0,
         metadata: HashMap::new(),
+        tags: Vec::new(),
+        quota: None,
     }
 }
 
@@ -38,7 +40,7 @@ async fn workflow_actor_submit_and_start_roundtrip() {
         .call(
             &actor_id,
             workflow_methods::SUBMIT,
-            encode(&(wf_id.clone(), dag)).unwrap(),
+            encode(&(wf_id.clone(), dag, None::<WorkflowInvocation>)).unwrap(),
         )
         .await
         .unwrap();
@@ -65,6 +67,9 @@ async fn scheduler_actor_enqueue_and_dequeue() {
         .unwrap();
 
     let tasks = vec![TaskDefinition {
+        tags: Vec::new(),
+        quota: None,
+        pinned_target: false,
         id: TaskId::from("t1"),
         name: "task1".into(),
         payload: vec![1, 2, 3],
@@ -78,6 +83,7 @@ async fn scheduler_actor_enqueue_and_dequeue() {
         enqueued_at_ms: 0,
         target_endpoint_addr: None,
         origin_endpoint_addr: None,
+        lease_deadline_ms: 0,
     }];
 
     system
@@ -151,6 +157,9 @@ async fn scheduler_actor_close_and_is_empty() {
             &actor_id,
             scheduler_methods::ENQUEUE,
             encode(&TaskDefinition {
+                tags: Vec::new(),
+                quota: None,
+                pinned_target: false,
                 id: TaskId::from("t1"),
                 name: "task1".into(),
                 payload: Vec::new(),
@@ -164,6 +173,7 @@ async fn scheduler_actor_close_and_is_empty() {
                 enqueued_at_ms: 0,
                 target_endpoint_addr: None,
                 origin_endpoint_addr: None,
+                lease_deadline_ms: 0,
             })
             .unwrap(),
         )
@@ -215,7 +225,7 @@ async fn failover_actor_unknown_method_returns_error() {
 // ───────────────────────── 结果回灌单路化 ─────────────────────────
 
 use crate::runtime::state::event_log::{EventLog, MemoryEventLog};
-use crate::runtime::workflow::orchestrator::types::WorkflowEventPayload;
+use crate::runtime::workflow::orchestrator::types::JournalEvent;
 use crate::runtime::workflow::{FailureStrategy, Phase, Terminal};
 
 /// 构造带事件日志的 WorkflowActor 并 spawn。
@@ -260,23 +270,24 @@ fn count_events(event_log: &MemoryEventLog, wf_id: &WorkflowId) -> HashMap<Strin
     let topic = format!("workflow:{}", wf_id.as_str());
     let mut counts: HashMap<String, usize> = HashMap::new();
     for entry in event_log.read_after(&topic, None).unwrap() {
-        let payload: WorkflowEventPayload = postcard::from_bytes(&entry.payload).unwrap();
+        let payload: JournalEvent = postcard::from_bytes(&entry.payload).unwrap();
         let name = match payload {
-            WorkflowEventPayload::Submitted { .. } => "Submitted",
-            WorkflowEventPayload::NodeAdded { .. } => "NodeAdded",
-            WorkflowEventPayload::TaskDispatched { .. } => "TaskDispatched",
-            WorkflowEventPayload::Started { .. } => "Started",
-            WorkflowEventPayload::TaskRunning { .. } => "TaskRunning",
-            WorkflowEventPayload::TaskCompleted { .. } => "TaskCompleted",
-            WorkflowEventPayload::TaskFailed { .. } => "TaskFailed",
-            WorkflowEventPayload::TaskCancelled { .. } => "TaskCancelled",
-            WorkflowEventPayload::Completed { .. } => "Completed",
-            WorkflowEventPayload::Cancelled { .. } => "Cancelled",
-            WorkflowEventPayload::Failed { .. } => "Failed",
-            WorkflowEventPayload::WaitPointRegistered { .. } => "WaitPointRegistered",
-            WorkflowEventPayload::SignalReceived { .. } => "SignalReceived",
-            WorkflowEventPayload::TimerFired { .. } => "TimerFired",
-            WorkflowEventPayload::Recovered { .. } => "Recovered",
+            JournalEvent::Submitted { .. } => "Submitted",
+            JournalEvent::NodeAdded { .. } => "NodeAdded",
+            JournalEvent::TaskDispatched { .. } => "TaskDispatched",
+            JournalEvent::Started { .. } => "Started",
+            JournalEvent::TaskRunning { .. } => "TaskRunning",
+            JournalEvent::TaskCompleted { .. } => "TaskCompleted",
+            JournalEvent::TaskFailed { .. } => "TaskFailed",
+            JournalEvent::TaskCancelled { .. } => "TaskCancelled",
+            JournalEvent::Completed { .. } => "Completed",
+            JournalEvent::Cancelled { .. } => "Cancelled",
+            JournalEvent::Failed { .. } => "Failed",
+            JournalEvent::WaitPointRegistered { .. } => "WaitPointRegistered",
+            JournalEvent::SignalReceived { .. } => "SignalReceived",
+            JournalEvent::TimerFired { .. } => "TimerFired",
+            JournalEvent::ContextValue { .. } => "ContextValue",
+            JournalEvent::Recovered { .. } => "Recovered",
         };
         *counts.entry(name.to_string()).or_default() += 1;
     }
@@ -303,7 +314,7 @@ async fn task_result_three_paths_idempotent() {
         .call(
             &actor_id,
             workflow_methods::SUBMIT,
-            encode(&(wf_id.clone(), dag)).unwrap(),
+            encode(&(wf_id.clone(), dag, None::<WorkflowInvocation>)).unwrap(),
         )
         .await
         .unwrap();
@@ -447,7 +458,7 @@ async fn remote_failure_fail_fast_fails_workflow() {
         .call(
             &actor_id,
             workflow_methods::SUBMIT,
-            encode(&(wf_id.clone(), dag)).unwrap(),
+            encode(&(wf_id.clone(), dag, None::<WorkflowInvocation>)).unwrap(),
         )
         .await
         .unwrap();
@@ -515,7 +526,7 @@ async fn gossip_failure_continue_strategy_consistent_across_paths() {
         .call(
             &actor_id,
             workflow_methods::SUBMIT,
-            encode(&(wf_id.clone(), dag)).unwrap(),
+            encode(&(wf_id.clone(), dag, None::<WorkflowInvocation>)).unwrap(),
         )
         .await
         .unwrap();

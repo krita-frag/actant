@@ -12,6 +12,7 @@ pub mod event_log;
 pub use crate::common::{HlcTimestamp, HybridLogicalClock};
 
 use std::fs;
+use std::ops::Bound;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
@@ -26,6 +27,8 @@ use crate::common::{ActantError, Result, StoreConfig};
 pub(crate) struct LmdbStore {
     env: Arc<Env>,
     default_db: Database<Str, Bytes>,
+    /// 打开时配置的 mmap 上限，仅用于错误信息与容量告警。
+    map_size: usize,
 }
 
 /// store 格式版本 meta key。独立于任何业务键前缀（`orch:` / `event:` /
@@ -33,6 +36,108 @@ pub(crate) struct LmdbStore {
 const STORE_FMT_VERSION_KEY: &str = "meta:fmt_version";
 /// 当前 store 持久化格式版本。破坏性布局变更（如 rkyv 结构体字段增删）时递增。
 const STORE_FMT_VERSION: u64 = 2;
+
+/// LMDB 读事务槽位上限。
+///
+/// 与 Tokio blocking 池的默认上限（512）对齐：每个并发读事务占一个
+/// reader 槽位，默认 126 在突发并发读下会触发 `MDB_READERS_FULL`。
+const MAX_READERS: u32 = 512;
+
+/// map_size 使用率告警阈值。
+const MAP_USAGE_WARN_RATIO: f64 = 0.75;
+
+/// LMDB 默认最大键长（字节）。heed 未启用 `longer-keys` feature。
+const MAX_KEY_BYTES: usize = 511;
+
+/// 将 heed 错误映射为语义化 [`ActantError`]。
+///
+/// `MapFull` / `ReadersFull` 是长期运行最可能遇到的容量错误，直接透传
+/// 会让运维看到裸 LMDB 错误而无法判断处置方式，故显式转换为带建议的
+/// `Storage` 错误。
+fn map_storage_error(err: heed::Error, map_size: usize) -> ActantError {
+    match err {
+        heed::Error::Mdb(heed::MdbError::MapFull) => {
+            crate::metrics::record_store_capacity_error();
+            ActantError::Storage(format!(
+                "LMDB map is full (map_size = {map_size} bytes); \
+                 raise store.map_size and restart the node"
+            ))
+        }
+        heed::Error::Mdb(heed::MdbError::ReadersFull) => {
+            crate::metrics::record_store_capacity_error();
+            ActantError::Storage(
+                "LMDB reader slots are exhausted; reduce concurrent reads or clear stale readers"
+                    .into(),
+            )
+        }
+        other => ActantError::Heed(other),
+    }
+}
+
+/// 读取一次容量快照。统计失败由调用方决定是否降级处理。
+fn read_storage_stats(env: &Env, db: &Database<Str, Bytes>) -> Result<StorageStats> {
+    let info = env.info();
+    let stat = env.stat();
+    let used_bytes = env
+        .non_free_pages_size()
+        .map_err(|e| map_storage_error(e, info.map_size))?;
+    let file_bytes = (info.last_page_number as u64).saturating_mul(stat.page_size as u64);
+    let rtxn = env
+        .read_txn()
+        .map_err(|e| map_storage_error(e, info.map_size))?;
+    let db_entries = db
+        .stat(&rtxn)
+        .map_err(|e| map_storage_error(e, info.map_size))?
+        .entries;
+    Ok(StorageStats {
+        map_size: info.map_size as u64,
+        used_bytes,
+        file_bytes,
+        entries: db_entries,
+        readers: info.number_of_readers,
+        max_readers: info.maximum_number_of_readers,
+    })
+}
+
+fn record_storage_metrics(stats: &StorageStats) {
+    crate::metrics::set_store_stats(
+        stats.map_size,
+        stats.used_bytes,
+        stats.file_bytes,
+        stats.readers as u64,
+        stats.max_readers as u64,
+    );
+}
+
+/// 在进入 LMDB 前校验 key 长度，避免底层返回难以理解的 `BadValSize`。
+fn validate_key(key: &str) -> Result<()> {
+    if key.is_empty() {
+        return Err(ActantError::Storage("store key must not be empty".into()));
+    }
+    if key.len() > MAX_KEY_BYTES {
+        return Err(ActantError::Storage(format!(
+            "store key is {} bytes, exceeding LMDB's {MAX_KEY_BYTES}-byte limit",
+            key.len()
+        )));
+    }
+    Ok(())
+}
+
+/// 计算按键序紧邻前缀之后的最小字符串。
+///
+/// 将所有以 `prefix` 开头的键都小于该上界：从末尾向前找到第一个
+/// 小于 `0xFF` 的字节并加一，丢弃其后的字节。前缀全是 `0xFF`
+/// 或加一后不是合法 UTF-8 时返回 `None`，调用方退回线性扫描。
+fn prefix_upper_bound(prefix: &str) -> Option<String> {
+    let mut bytes = prefix.as_bytes().to_vec();
+    while let Some(last) = bytes.pop() {
+        if last < u8::MAX {
+            bytes.push(last + 1);
+            return String::from_utf8(bytes).ok();
+        }
+    }
+    None
+}
 
 /// 校验（或首次创建时写入）store 格式版本 meta 条目。
 ///
@@ -101,12 +206,29 @@ impl LmdbStore {
         // （调用方需周期调用 `Store::sync` 显式刷盘）。
         let env = unsafe {
             let mut opts = EnvOpenOptions::new();
-            opts.max_dbs(config.max_dbs).map_size(config.map_size);
+            opts.max_dbs(config.max_dbs)
+                .map_size(config.map_size)
+                .max_readers(MAX_READERS);
             if matches!(config.sync_mode, crate::common::SyncMode::NoSync) {
                 opts.flags(heed::EnvFlags::NO_SYNC);
             }
             opts.open(path)?
         };
+
+        // 清理上次进程异常退出遗留的 reader 槽位，避免其被长期占用后
+        // 触发 MDB_READERS_FULL。失败仅告警：reader 表清理不是打开的必要条件。
+        match env.clear_stale_readers() {
+            Ok(0) => {}
+            Ok(cleared) => {
+                tracing::warn!(
+                    cleared,
+                    "cleared stale LMDB reader slots left by a previous process"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to clear stale LMDB readers");
+            }
+        }
 
         let mut wtxn = env.write_txn()?;
         let default_db = env.create_database(&mut wtxn, Some("default"))?;
@@ -121,49 +243,99 @@ impl LmdbStore {
         restrict_file_permissions(&path.join("data.mdb"))?;
         restrict_file_permissions(&path.join("lock.mdb"))?;
 
-        tracing::info!(
-            "Store opened at {:?} with process-level locking enabled, sync_mode = {:?}",
-            path,
-            config.sync_mode
-        );
+        // 容量水位：last_page_number 是已使用的最高页号，乘以页大小即
+        // 当前数据文件实际占用的上限。LMDB 写满后只会返回 MapFull，
+        // 提前告警给运维留出停机扩容窗口。
+        match read_storage_stats(&env, &default_db) {
+            Ok(stats) => {
+                tracing::info!(
+                    path = ?path,
+                    map_size = stats.map_size,
+                    used_bytes = stats.used_bytes,
+                    file_bytes = stats.file_bytes,
+                    util = stats.utilization(),
+                    readers = stats.readers,
+                    max_readers = stats.max_readers,
+                    entries = stats.entries,
+                    sync_mode = ?config.sync_mode,
+                    "Store opened with process-level locking enabled"
+                );
+                record_storage_metrics(&stats);
+                if stats.utilization() >= MAP_USAGE_WARN_RATIO {
+                    tracing::warn!(
+                        path = ?path,
+                        map_size = stats.map_size,
+                        file_bytes = stats.file_bytes,
+                        util = stats.utilization(),
+                        "LMDB map usage is above the warning threshold; \
+                         raise store.map_size before writes start failing"
+                    );
+                }
+            }
+            Err(e) => {
+                // 统计失败不阻止打开：容量数据只是运维辅助信息。
+                tracing::warn!(path = ?path, error = %e, "failed to read store capacity stats");
+            }
+        }
 
         Ok(Self {
             env: Arc::new(env),
             default_db,
+            map_size: config.map_size,
         })
+    }
+
+    /// 将 heed 错误转换为带容量处置建议的 [`ActantError`]。
+    fn storage_error(&self, err: heed::Error) -> ActantError {
+        map_storage_error(err, self.map_size)
     }
 
     #[tracing::instrument(level = "trace", skip(self, value), fields(len = value.len()))]
     pub fn put(&self, key: &str, value: &[u8]) -> Result<()> {
-        let mut wtxn = self.env.write_txn()?;
-        self.default_db.put(&mut wtxn, key, value)?;
-        wtxn.commit()?;
+        validate_key(key)?;
+        let mut wtxn = self.env.write_txn().map_err(|e| self.storage_error(e))?;
+        self.default_db
+            .put(&mut wtxn, key, value)
+            .map_err(|e| self.storage_error(e))?;
+        wtxn.commit().map_err(|e| self.storage_error(e))?;
         Ok(())
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
     pub fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        let rtxn = self.env.read_txn()?;
-        let result = self.default_db.get(&rtxn, key)?;
+        validate_key(key)?;
+        let rtxn = self.env.read_txn().map_err(|e| self.storage_error(e))?;
+        let result = self
+            .default_db
+            .get(&rtxn, key)
+            .map_err(|e| self.storage_error(e))?;
         Ok(result.map(|b| b.to_vec()))
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
     pub fn delete(&self, key: &str) -> Result<bool> {
-        let mut wtxn = self.env.write_txn()?;
-        let existed = self.default_db.delete(&mut wtxn, key)?;
-        wtxn.commit()?;
+        validate_key(key)?;
+        let mut wtxn = self.env.write_txn().map_err(|e| self.storage_error(e))?;
+        let existed = self
+            .default_db
+            .delete(&mut wtxn, key)
+            .map_err(|e| self.storage_error(e))?;
+        wtxn.commit().map_err(|e| self.storage_error(e))?;
         Ok(existed)
     }
 
     #[tracing::instrument(level = "trace", skip(self, entries), fields(count = entries.len()))]
     pub fn put_batch(&self, entries: &[(String, Vec<u8>)]) -> Result<()> {
-        let mut wtxn = self.env.write_txn()?;
+        for (key, _) in entries {
+            validate_key(key)?;
+        }
+        let mut wtxn = self.env.write_txn().map_err(|e| self.storage_error(e))?;
         for (key, value) in entries {
             self.default_db
-                .put(&mut wtxn, key.as_str(), value.as_slice())?;
+                .put(&mut wtxn, key.as_str(), value.as_slice())
+                .map_err(|e| self.storage_error(e))?;
         }
-        wtxn.commit()?;
+        wtxn.commit().map_err(|e| self.storage_error(e))?;
         Ok(())
     }
 
@@ -178,9 +350,67 @@ impl LmdbStore {
         Ok(results)
     }
 
+    /// 分页扫描前缀：最多返回 `limit` 条，从 `start_after` 之后继续。
+    ///
+    /// 与 [`Self::scan_prefix`] 的区别是一次读事务只覆盖一页，调用方
+    /// 循环读取即可避免长读事务与全量内存物化。
+    pub fn scan_prefix_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let rtxn = self.env.read_txn()?;
+        let start = match start_after {
+            Some(key) => Bound::Excluded(key),
+            None => Bound::Included(prefix),
+        };
+        let upper = prefix_upper_bound(prefix);
+        let end = match upper.as_deref() {
+            Some(upper) => Bound::Excluded(upper),
+            None => Bound::Unbounded,
+        };
+
+        let mut results = Vec::with_capacity(limit.min(256));
+        for item in self.default_db.range(&rtxn, &(start, end))? {
+            let (key, value) = item?;
+            if !key.starts_with(prefix) {
+                // 上界无法构造时（前缀全为 0xFF）退化为无界扫描：
+                // 键有序，一旦越过前缀区间即可停止。
+                if upper.is_none() && key > prefix {
+                    break;
+                }
+                continue;
+            }
+            results.push((key.to_string(), value.to_vec()));
+            if results.len() >= limit {
+                break;
+            }
+        }
+        Ok(results)
+    }
+
     /// 仅返回按键序匹配前缀的最后一条记录。
+    ///
+    /// 通过前缀上界 + 反向 range 直接定位最后一条，避免遍历整段前缀。
     pub fn scan_prefix_last(&self, prefix: &str) -> Result<Option<(String, Vec<u8>)>> {
         let rtxn = self.env.read_txn()?;
+        if let Some(upper) = prefix_upper_bound(prefix) {
+            let bounds = (Bound::Included(prefix), Bound::Excluded(upper.as_str()));
+            let mut iter = self.default_db.rev_range(&rtxn, &bounds)?;
+            return match iter.next() {
+                Some(item) => {
+                    let (key, value) = item?;
+                    Ok(Some((key.to_string(), value.to_vec())))
+                }
+                None => Ok(None),
+            };
+        }
+
+        // 无法构造上界的极端前缀（全部字节为 0xFF）：回退到前向遍历。
         let iter = self.default_db.prefix_iter(&rtxn, prefix)?;
         let mut last = None;
         for item in iter {
@@ -188,6 +418,62 @@ impl LmdbStore {
             last = Some((key.to_string(), value.to_vec()));
         }
         Ok(last)
+    }
+
+    /// 在单个写事务内删除闭区间 `[start, end_inclusive]` 的所有键。
+    ///
+    /// 用于事件日志裁剪：逐 key 删除会为每条记录触发一次事务与 fsync，
+    /// 批量区间删除只提交一次。
+    pub fn delete_range(&self, start: &str, end_inclusive: &str) -> Result<usize> {
+        let mut wtxn = self.env.write_txn().map_err(|e| self.storage_error(e))?;
+        let bounds = (Bound::Included(start), Bound::Included(end_inclusive));
+        let removed = self
+            .default_db
+            .delete_range(&mut wtxn, &bounds)
+            .map_err(|e| self.storage_error(e))?;
+        wtxn.commit().map_err(|e| self.storage_error(e))?;
+        Ok(removed)
+    }
+
+    /// 当前存储容量与使用情况快照。
+    ///
+    /// `used_bytes` 是不含空闲页的实际数据占用；`file_bytes` 是数据文件
+    /// 高水位（含尚可复用的空闲页）。容量判断应使用 `file_bytes / map_size`，
+    /// 因为 LMDB 写满取决于高水位而非逻辑数据量。
+    pub fn storage_stats(&self) -> Result<StorageStats> {
+        let stats = read_storage_stats(&self.env, &self.default_db)?;
+        record_storage_metrics(&stats);
+        if stats.utilization() >= MAP_USAGE_WARN_RATIO {
+            tracing::warn!(
+                map_size = stats.map_size,
+                file_bytes = stats.file_bytes,
+                util = stats.utilization(),
+                "LMDB map usage is above the warning threshold; \
+                 raise store.map_size before writes start failing"
+            );
+        }
+        Ok(stats)
+    }
+
+    /// 在线热备份到指定文件。
+    ///
+    /// 启用 compaction：备份会重建 B-tree，顺带回收长期运行积累的空闲页。
+    /// 返回备份文件字节数。
+    pub fn backup_to(&self, path: &Path) -> Result<u64> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| {
+                ActantError::Storage(format!("failed to create backup directory: {e}"))
+            })?;
+        }
+        let file = self
+            .env
+            .copy_to_path(path, heed::CompactionOption::Enabled)
+            .map_err(|e| self.storage_error(e))?;
+        let size = file
+            .metadata()
+            .map_err(|e| ActantError::Storage(format!("failed to stat backup file: {e}")))?
+            .len();
+        Ok(size)
     }
 
     /// 启动 LMDB 环境的优雅关闭。
@@ -234,6 +520,7 @@ impl Clone for LmdbStore {
         Self {
             env: self.env.clone(),
             default_db: self.default_db,
+            map_size: self.map_size,
         }
     }
 }
@@ -436,21 +723,25 @@ impl WriteBatcher {
         if buf.is_empty() {
             return Ok(());
         }
-        let mut wtxn = store.env.write_txn()?;
+        let mut wtxn = store.env.write_txn().map_err(|e| store.storage_error(e))?;
         for entry in buf.iter() {
             match entry {
                 BatchEntry::Put { key, value } => {
                     store
                         .default_db
-                        .put(&mut wtxn, key.as_str(), value.as_slice())?;
+                        .put(&mut wtxn, key.as_str(), value.as_slice())
+                        .map_err(|e| store.storage_error(e))?;
                 }
                 BatchEntry::Delete { key } => {
                     // 仅忽略 bool（存在性结果），传播 heed::Error。
-                    let _existed = store.default_db.delete(&mut wtxn, key.as_str())?;
+                    let _existed = store
+                        .default_db
+                        .delete(&mut wtxn, key.as_str())
+                        .map_err(|e| store.storage_error(e))?;
                 }
             }
         }
-        wtxn.commit()?;
+        wtxn.commit().map_err(|e| store.storage_error(e))?;
         committed.advance(buf.len());
         buf.clear();
         Ok(())
@@ -536,6 +827,31 @@ impl Drop for WriteBatcher {
                 "WriteBatcher final flush did not finish within drain timeout; \
                  buffered entries may be lost if the process exits now"
             );
+        }
+    }
+}
+
+/// 存储容量与使用情况快照。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageStats {
+    /// 配置的 mmap 上限（虚拟地址预留）。
+    pub map_size: u64,
+    /// 不含空闲页的实际数据占用。
+    pub used_bytes: u64,
+    /// 数据文件高水位（含可复用空闲页），写满判断以此为准。
+    pub file_bytes: u64,
+    pub entries: usize,
+    pub readers: u32,
+    pub max_readers: u32,
+}
+
+impl StorageStats {
+    /// 数据文件高水位占 mmap 上限的比例。
+    pub fn utilization(&self) -> f64 {
+        if self.map_size == 0 {
+            0.0
+        } else {
+            self.file_bytes as f64 / self.map_size as f64
         }
     }
 }
@@ -690,6 +1006,56 @@ impl Store {
             .map_err(|e| {
                 ActantError::Storage(format!("store scan_prefix_last task panicked: {e}"))
             })?
+    }
+
+    /// 分页读取前缀匹配的键值，最多 `limit` 条，从 `start_after` 之后继续。
+    pub async fn scan_prefix_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        let store = self.inner.clone();
+        let prefix = prefix.to_string();
+        let start_after = start_after.map(str::to_string);
+        tokio::task::spawn_blocking(move || {
+            store.scan_prefix_page(&prefix, start_after.as_deref(), limit)
+        })
+        .await
+        .map_err(|e| ActantError::Storage(format!("store scan_prefix_page task panicked: {e}")))?
+    }
+
+    /// 在单个写事务内删除闭区间 `[start, end_inclusive]` 的所有键。
+    pub async fn delete_range(&self, start: &str, end_inclusive: &str) -> Result<usize> {
+        let store = self.inner.clone();
+        let start = start.to_string();
+        let end_inclusive = end_inclusive.to_string();
+        tokio::task::spawn_blocking(move || store.delete_range(&start, &end_inclusive))
+            .await
+            .map_err(|e| ActantError::Storage(format!("store delete_range task panicked: {e}")))?
+    }
+
+    /// 读取当前存储容量与使用情况，并刷新存储指标。
+    ///
+    /// 长期运行节点可周期性调用本方法刷新
+    /// `actant.store.*` 指标；每次调用会打开一次短读事务。
+    pub async fn storage_stats(&self) -> Result<StorageStats> {
+        let store = self.inner.clone();
+        tokio::task::spawn_blocking(move || store.storage_stats())
+            .await
+            .map_err(|e| ActantError::Storage(format!("store storage_stats task panicked: {e}")))?
+    }
+
+    /// 在线热备份到指定文件，返回备份文件字节数。
+    ///
+    /// 备份启用 compaction，会重建 B-tree 并回收长期运行积累的空闲页。
+    /// 恢复时停止节点，用备份文件替换目标环境的 `data.mdb` 后重启。
+    pub async fn backup_to(&self, path: impl AsRef<Path>) -> Result<u64> {
+        let store = self.inner.clone();
+        let path = path.as_ref().to_path_buf();
+        tokio::task::spawn_blocking(move || store.backup_to(&path))
+            .await
+            .map_err(|e| ActantError::Storage(format!("store backup task panicked: {e}")))?
     }
 
     /// 强制持久化：在 GroupCommit 模式下等待所有已入队写入完成 flush。

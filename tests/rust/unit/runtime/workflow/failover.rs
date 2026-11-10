@@ -2,9 +2,11 @@
 //! Compiled via `#[path]` attribute — retains `super::` access to private items.
 
 use super::*;
-use crate::common::{NodeHeartbeat, NodeId, WorkflowId};
+use crate::common::{NodeHeartbeat, NodeId, StoreConfig, SyncMode, WorkflowId};
 use crate::runtime::actor::ActorSystem;
+use crate::runtime::state::LmdbStore;
 use crate::test_support::MockTransport;
+use tempfile::tempdir;
 
 fn make_fm(node_id: &str) -> FailoverManager {
     let network: Arc<dyn crate::runtime::network::Transport> =
@@ -23,6 +25,7 @@ fn hb(node_id: &str, ts_ms: u64, workflows: &[&str]) -> NodeHeartbeat {
     NodeHeartbeat {
         signature: None,
         labels: BTreeMap::new(),
+        available_quotas: BTreeMap::new(),
         platform: None,
         node_id: NodeId::from(node_id.to_string()),
         active_workflows: workflows
@@ -33,6 +36,8 @@ fn hb(node_id: &str, ts_ms: u64, workflows: &[&str]) -> NodeHeartbeat {
         available_slots: 4,
         max_slots: 8,
         endpoint_addr: Some(format!("peer-{}", node_id)),
+        role: crate::common::NodeRole::Both,
+        draining: false,
     }
 }
 
@@ -102,7 +107,10 @@ fn with_node_metadata_advertises_labels_and_platform() {
     .with_node_metadata(Some(PlatformInfo::detect()), labels);
 
     // 广播心跳后，peer 侧应能看到本节点的 labels/platform（结构体直读验证）。
-    assert_eq!(fm.labels.get("role").map(|s| s.as_str()), Some("worker"));
+    assert_eq!(
+        fm.labels.read().get("role").map(|s| s.as_str()),
+        Some("worker")
+    );
     assert!(fm.platform.is_some());
 }
 
@@ -122,7 +130,10 @@ fn with_node_metadata_drops_oversized_labels() {
     )
     .with_node_metadata(None, labels);
 
-    assert!(fm.labels.is_empty(), "oversized labels must be dropped");
+    assert!(
+        fm.labels.read().is_empty(),
+        "oversized labels must be dropped"
+    );
 }
 
 // ───────────────────────── 身份与信任：心跳签名与成员校验 ─────────────────────────
@@ -690,6 +701,28 @@ async fn active_leases_returns_correct_format() {
 // ───────────────────────── claim_workflow ─────────────────────────
 
 #[tokio::test]
+async fn worker_role_never_claims_workflows() {
+    let fm = make_fm("node-A").with_role(crate::common::NodeRole::Worker);
+    assert_eq!(fm.role(), crate::common::NodeRole::Worker);
+
+    // 直接 claim 是 no-op（不落 lease，也不要求 actor system）。
+    let wf = WorkflowId("wf-worker-claim".to_string());
+    fm.claim_workflow(&wf)
+        .await
+        .expect("worker claim must be a no-op");
+
+    // 即使存在失联 peer 的孤儿 workflow，worker 也不接管。
+    let timeout = fm.failure_timeout_ms();
+    fm.handle_heartbeat(&hb(
+        "node-B",
+        crate::common::epoch_millis().saturating_sub(timeout + 10_000),
+        &["wf-orphan"],
+    ));
+    fm.detect_and_claim_failed_nodes().await;
+    assert!(fm.active_leases().is_empty());
+}
+
+#[tokio::test]
 async fn claim_workflow_returns_error_without_actor_system() {
     // 未注册 workflow actor，claim_workflow 调用 adopt_workflow 会失败。
     let fm = make_fm("node-A");
@@ -801,6 +834,9 @@ impl Actor for StubWorkflowActor {
             }),
             "reschedule_running_tasks" => {
                 let tasks = vec![TaskDefinition {
+                    tags: Vec::new(),
+                    quota: None,
+                    pinned_target: false,
                     id: crate::common::TaskId::from("t-rescheduled".to_string()),
                     name: "rescheduled".to_string(),
                     payload: vec![],
@@ -814,6 +850,7 @@ impl Actor for StubWorkflowActor {
                     enqueued_at_ms: 0,
                     target_endpoint_addr: None,
                     origin_endpoint_addr: None,
+                    lease_deadline_ms: 0,
                 }];
                 Ok(ActorMessageResult {
                     message_id: msg.id,
@@ -1338,6 +1375,29 @@ async fn make_fm_short_lease_with_bus_and_transport(
     (fm, event_bus, transport)
 }
 
+/// 构造一条直提任务的完整定义，供 `record_outbound` 的租约重投路径使用。
+fn standalone_task(task_id: &str, workflow_id: Option<&str>, task_name: &str) -> TaskDefinition {
+    TaskDefinition {
+        tags: Vec::new(),
+        quota: None,
+        pinned_target: false,
+        id: TaskId::from(task_id.to_string()),
+        name: task_name.to_string(),
+        payload: Vec::new(),
+        workflow_id: workflow_id.map(|wf| WorkflowId(wf.to_string())),
+        target_node: None,
+        origin_node: None,
+        retry_policy: None,
+        priority: 0,
+        timeout_ms: None,
+        attempt: 0,
+        enqueued_at_ms: 0,
+        target_endpoint_addr: None,
+        origin_endpoint_addr: None,
+        lease_deadline_ms: 0,
+    }
+}
+
 /// 纯执行器失联（`active_workflows` 为空，旧守卫在此 `continue`）时，
 /// 转发到它身上的在途任务必须被终结为 `TaskFailed`；其他节点的任务不受牵连。
 #[tokio::test]
@@ -1346,18 +1406,14 @@ async fn node_lost_settles_inflight_forwarded_tasks() {
     let mut rx = event_bus.subscribe(crate::runtime::event_bus::Topic::TaskFailed);
 
     fm.record_outbound(
-        &TaskId::from("task-lost".to_string()),
+        &standalone_task("task-lost", Some("wf-x"), "slow_task"),
         &NodeId::from("node-B".to_string()),
         None,
-        WorkflowId("wf-x".to_string()),
-        "slow_task",
     );
     fm.record_outbound(
-        &TaskId::from("task-other".to_string()),
+        &standalone_task("task-other", None, "other_task"),
         &NodeId::from("node-C".to_string()),
         None,
-        WorkflowId(String::new()),
-        "other_task",
     );
     assert_eq!(fm.outbound_len(), 2);
 
@@ -1389,18 +1445,16 @@ async fn node_lost_settles_inflight_forwarded_tasks() {
     }
 }
 
-/// `error` 串必须带 `worker` kind 前缀——Python 侧据此还原异常子类。
+/// 编排任务的 `error` 串必须带 `worker` kind 前缀——Python 侧据此还原异常子类。
 #[tokio::test]
 async fn node_lost_error_carries_kind_prefix() {
     let (fm, event_bus) = make_fm_short_lease_with_bus("node-A").await;
     let mut rx = event_bus.subscribe(crate::runtime::event_bus::Topic::TaskFailed);
 
     fm.record_outbound(
-        &TaskId::from("task-k".to_string()),
+        &standalone_task("task-k", Some("wf-k"), "t"),
         &NodeId::from("node-B".to_string()),
         None,
-        WorkflowId(String::new()),
-        "t",
     );
     register_and_age_peer(&fm, "node-B", &[]).await;
     fm.detect_and_claim_failed_nodes().await;
@@ -1424,11 +1478,9 @@ async fn cleared_outbound_entry_is_not_settled() {
     let mut rx = event_bus.subscribe(crate::runtime::event_bus::Topic::TaskFailed);
 
     fm.record_outbound(
-        &TaskId::from("task-done".to_string()),
+        &standalone_task("task-done", None, "t"),
         &NodeId::from("node-B".to_string()),
         None,
-        WorkflowId(String::new()),
-        "t",
     );
     fm.clear_outbound("task-done");
     assert_eq!(fm.outbound_len(), 0);
@@ -1442,6 +1494,116 @@ async fn cleared_outbound_entry_is_not_settled() {
     );
 }
 
+/// 执行器失联时直提任务不得就地失败：标记为立即到期，由 origin 的租约检查点
+/// 递增 attempt 后重新派发。
+#[tokio::test]
+async fn node_lost_queues_standalone_task_for_lease_redispatch() {
+    let (fm, event_bus) = make_fm_short_lease_with_bus("node-A").await;
+    let mut rx = event_bus.subscribe(crate::runtime::event_bus::Topic::TaskFailed);
+
+    fm.record_outbound(
+        &standalone_task("task-s", None, "standalone"),
+        &NodeId::from("node-B".to_string()),
+        None,
+    );
+    register_and_age_peer(&fm, "node-B", &[]).await;
+    fm.detect_and_claim_failed_nodes().await;
+
+    assert!(
+        rx.try_recv().is_err(),
+        "standalone tasks must not be failed on node loss"
+    );
+    assert_eq!(
+        fm.outbound_len(),
+        1,
+        "the entry must stay so the origin can re-dispatch it"
+    );
+    let expired = fm.take_expired_standalone(crate::common::epoch_millis());
+    assert_eq!(expired.len(), 1);
+    assert_eq!(expired[0].0, "task-s");
+    assert_eq!(
+        expired[0].1.task.attempt, 0,
+        "attempt is bumped by the origin when re-enqueueing"
+    );
+}
+
+/// 租约未到期的直提任务不能重投；编排任务即使到期也不参与。
+#[tokio::test]
+async fn take_expired_standalone_respects_deadline_and_workflow_tasks() {
+    let fm = make_fm("node-A");
+    let target = NodeId::from("node-B".to_string());
+    let mut future = standalone_task("task-future", None, "t");
+    future.lease_deadline_ms = crate::common::epoch_millis() + 60_000;
+    fm.record_outbound(&future, &target, None);
+    let orchestrated = standalone_task("task-wf", Some("wf-1"), "t");
+    fm.record_outbound(&orchestrated, &target, None);
+
+    assert!(
+        fm.take_expired_standalone(crate::common::epoch_millis())
+            .is_empty(),
+        "future leases and orchestrated tasks must stay in flight"
+    );
+    assert_eq!(fm.outbound_len(), 2);
+}
+
+/// 放弃租约（`lease_deadline_ms` 归零）等价于立刻到期。
+///
+/// 失联处置把直提任务交还 origin 时不会重写截止时刻，只调
+/// `relinquish_lease`；若「无有效租约」被解释成「没有租约因而永不判定」，
+/// 被交还的任务就要等到原截止时刻才会被重投，重投延迟被拉长到整个
+/// `task_timeout + failure_timeout`。
+#[tokio::test]
+async fn relinquished_lease_is_immediately_expired() {
+    let fm = make_fm("node-A");
+    let target = NodeId::from("node-B".to_string());
+    let mut task = standalone_task("task-relinquished", None, "t");
+    task.lease_deadline_ms = crate::common::epoch_millis() + 3_600_000;
+    task.relinquish_lease();
+    fm.record_outbound(&task, &target, None);
+
+    let expired = fm.take_expired_standalone(crate::common::epoch_millis());
+    assert_eq!(expired.len(), 1, "relinquished lease must be claimable now");
+    assert_eq!(expired[0].0, "task-relinquished");
+}
+
+/// 结果 fencing：比登记更旧的 attempt 被拒绝且不解除登记；
+/// 与登记相同或更新的 attempt 被接受。
+///
+/// 「更新」这一支是必需的：执行节点本地崩溃转移会自行把 attempt 推进一位
+/// 并在同节点重投，origin 的登记仍停在转发时的值。若要求精确相等，自愈后
+/// 的结果会被误判为陈旧丢弃，origin 还会按租约再执行一次。
+#[tokio::test]
+async fn take_outbound_if_not_stale_rejects_only_older_attempt() {
+    let fm = make_fm("node-A");
+    let mut task = standalone_task("task-f", None, "t");
+    task.attempt = 2;
+    fm.record_outbound(&task, &NodeId::from("node-B".to_string()), None);
+
+    assert!(fm.take_outbound_if_not_stale("task-f", 1).is_none());
+    assert_eq!(
+        fm.outbound_len(),
+        1,
+        "older result must not clear the live entry"
+    );
+    assert!(fm.take_outbound_if_not_stale("task-f", 2).is_some());
+    assert_eq!(fm.outbound_len(), 0);
+}
+
+/// 执行节点崩溃自愈推进 attempt 后，结果必须被接受（回归：
+/// `test_worker_crash_is_rerouted_and_task_recovers` 副作用三次）。
+#[tokio::test]
+async fn take_outbound_if_not_stale_accepts_attempt_advanced_by_executor() {
+    let fm = make_fm("node-A");
+    let task = standalone_task("task-g", None, "t"); // attempt = 0
+    fm.record_outbound(&task, &NodeId::from("node-B".to_string()), None);
+
+    assert!(
+        fm.take_outbound_if_not_stale("task-g", 1).is_some(),
+        "executor-side crash failover advanced attempt; result is current"
+    );
+    assert_eq!(fm.outbound_len(), 0);
+}
+
 /// 心跳盲区：目标节点的第一个可观测心跳都没来得及发出就失联（`peers` 里
 /// 完全没有它），必须靠主动探测判定——探测无应答则终结在途任务。
 #[tokio::test]
@@ -1452,11 +1614,9 @@ async fn probe_settles_tasks_of_ghost_target() {
     assert!(transport.direct_request_response.lock().is_none());
 
     fm.record_outbound(
-        &TaskId::from("task-ghost".to_string()),
+        &standalone_task("task-ghost", Some("wf-ghost"), "ghost_task"),
         &NodeId::from("node-ghost".to_string()),
         Some("peer-node-ghost"),
-        WorkflowId(String::new()),
-        "ghost_task",
     );
 
     fm.detect_and_claim_failed_nodes().await;
@@ -1481,11 +1641,9 @@ async fn probe_keeps_tasks_of_live_target() {
     transport.with_direct_request_response(crate::runtime::network::DirectResponse::Pong);
 
     fm.record_outbound(
-        &TaskId::from("task-live".to_string()),
+        &standalone_task("task-live", None, "live_task"),
         &NodeId::from("node-live".to_string()),
         Some("peer-node-live"),
-        WorkflowId(String::new()),
-        "live_task",
     );
 
     fm.detect_and_claim_failed_nodes().await;
@@ -1498,5 +1656,123 @@ async fn probe_keeps_tasks_of_live_target() {
     assert!(
         rx.try_recv().is_err(),
         "no TaskFailed may be published for a live target"
+    );
+}
+
+// ─────────────── 配额视图（M4） ───────────────
+
+/// `send_heartbeat` 广播的节点记录必须携带本节点剩余配额。
+#[tokio::test]
+async fn heartbeat_broadcasts_remaining_quotas() {
+    use crate::runtime::quota::QuotaTracker;
+
+    let (fm, _bus, transport) = make_fm_short_lease_with_bus_and_transport("node-A").await;
+    let mut capacities = BTreeMap::new();
+    capacities.insert("gpu".to_string(), 2u32);
+    let tracker = Arc::new(QuotaTracker::new(capacities));
+    let _guard = tracker
+        .try_acquire(Some("gpu"))
+        .expect("declared quota")
+        .expect("capacity available");
+    fm.set_quota_tracker(tracker);
+
+    fm.send_heartbeat().await.expect("heartbeat broadcast");
+    let (_, payload) = transport.last_broadcast().expect("broadcast recorded");
+    let (message, _) = crate::common::WireEnvelope::decode(&payload).expect("decode heartbeat");
+    let crate::common::WireMessage::NodeHeartbeat(heartbeat) = message else {
+        panic!("expected NodeHeartbeat");
+    };
+    assert_eq!(
+        heartbeat.available_quotas.get("gpu"),
+        Some(&1),
+        "heartbeat must advertise remaining capacity after one acquisition"
+    );
+}
+
+/// 收到心跳后 peer 视图同步刷新配额余量，供路由过滤。
+#[test]
+fn handle_heartbeat_updates_peer_available_quotas() {
+    let fm = make_fm("node-A");
+    let mut heartbeat = hb("node-B", crate::common::epoch_millis(), &[]);
+    heartbeat.available_quotas.insert("gpu".to_string(), 0);
+    fm.handle_heartbeat(&heartbeat);
+
+    let peer = fm
+        .peers()
+        .into_iter()
+        .find(|p| p.node_id.as_str() == "node-B")
+        .expect("peer must be visible");
+    assert_eq!(peer.available_quotas.get("gpu"), Some(&0));
+}
+
+/// 构造带真实 LMDB store 的 manager，与 `RuntimeBuilder` 的生产装配一致。
+async fn make_fm_with_store(node_id: &str, store: LmdbStore) -> FailoverManager {
+    let network: Arc<dyn crate::runtime::network::Transport> =
+        Arc::new(MockTransport::new(node_id));
+    let actor_system = Arc::new(ActorSystem::new());
+    let wf_id = ActorId::workflow(&NodeId::from(node_id.to_string()));
+    actor_system
+        .spawn(wf_id.clone(), StubWorkflowActor)
+        .await
+        .unwrap();
+    FailoverManager::with_config(
+        NodeId::from(node_id.to_string()),
+        network,
+        actor_system,
+        wf_id,
+        FailoverConfig {
+            heartbeat_interval_ms: 1,
+            failure_timeout_ms: 5,
+            lease_duration_ms: 10,
+            lease_expiry_check_interval_secs: 1,
+        },
+        Some(store),
+    )
+}
+
+/// 租约必须真正落盘：重建 manager（等价进程重启）后未过期租约仍可见，
+/// 过期租约条目在恢复时被删除而不是永远留在库里。
+#[tokio::test]
+async fn leases_survive_manager_rebuild_from_store() {
+    let dir = tempdir().unwrap();
+    let store_config = StoreConfig {
+        data_dir: None,
+        sync_mode: SyncMode::NoSync,
+        ..Default::default()
+    };
+    let store = LmdbStore::open_with_config(dir.path(), &store_config).unwrap();
+
+    let fm = make_fm_with_store("node-L", store.clone()).await;
+    let now = crate::common::epoch_millis();
+    fm.handle_claim(&OrchestratorClaim {
+        node_id: NodeId::from("node-L".to_string()),
+        workflow_id: WorkflowId("wf-live".to_string()),
+        timestamp_ms: now,
+    })
+    .await;
+    // 时间戳回拨 10s、租期仅 10ms：落盘后即已过期。
+    fm.handle_claim(&OrchestratorClaim {
+        node_id: NodeId::from("node-L".to_string()),
+        workflow_id: WorkflowId("wf-stale".to_string()),
+        timestamp_ms: now.saturating_sub(10_000),
+    })
+    .await;
+    assert_eq!(fm.active_leases().len(), 2, "两条租约都应先生效");
+    drop(fm);
+
+    let rebuilt = make_fm_with_store("node-L", store.clone()).await;
+    let leases = rebuilt.active_leases();
+    assert_eq!(
+        leases.len(),
+        1,
+        "重启后只应恢复未过期租约，实际: {leases:?}"
+    );
+    assert_eq!(leases[0].0, "wf-live");
+
+    // 过期条目应已被删除，而不是留在库里等待下次启动再判一次。
+    let leftovers = store.scan_prefix(STORE_KEY_LEASE).unwrap();
+    assert!(
+        leftovers.iter().all(|(k, _)| !k.contains("wf-stale")),
+        "过期租约键必须被清理，实际残留: {leftovers:?}"
     );
 }

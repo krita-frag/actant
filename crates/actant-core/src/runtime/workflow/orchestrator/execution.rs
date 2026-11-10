@@ -1,22 +1,34 @@
 //! Orchestrator 的 `execution` 职责子模块。
 //!
-//! 负责工作流提交（整图与增量）、启动、任务完成处理、条件边求值、
+//! 负责工作流提交（整图与增量）、启动、任务完成与失败处理、
 //! 取消、重试（orchestrator 单层化）与调度。
 
 use std::collections::HashMap;
 
 use crate::common::serialization::serialize_rkyv;
-use crate::common::wire::TOPIC_CANCEL;
-use crate::common::{Result, TaskDefinition, TaskId, WorkflowId};
-use crate::runtime::network::{NetworkEvent, NetworkMessage};
+use crate::common::{Result, RetryPolicy, TaskDefinition, TaskId, WorkflowId, WorkflowInvocation};
 use crate::runtime::workflow::{Dag, DagNode, FailureScope, Phase, Terminal, WorkflowExecution};
 
 use super::{keys::*, types::*, Orchestrator};
 
+mod timeout;
+
+/// 第 `retry_index` 次重试（0 基）的等待时长。
+///
+/// 公式：`delay_ms * backoff_multiplier^retry_index`，被 `max_delay_ms` 钳制。
+/// `backoff_multiplier` 小于 1（含 NaN）时按 1 处理，保证延迟不递减；
+/// 浮点转整数使用饱和转换，不会因极端配置溢出。
+fn retry_delay_ms(policy: &RetryPolicy, retry_index: u32) -> u64 {
+    let base = policy.delay_ms as f64;
+    let factor = policy.backoff_multiplier.max(1.0).powi(retry_index as i32);
+    let capped = (base * factor).min(policy.max_delay_ms as f64);
+    capped.max(0.0) as u64
+}
+
 /// flow 增量提交的节点指纹比对（重放 fail-fast 的实现核心）。
 ///
 /// 比对范围覆盖决定任务行为的全部字段（name / payload / timeout / priority /
-/// retry_policy）与依赖边集合：重放体的第 n 次提交必须与历史中同序位节点
+/// retry_policy / tags / quota）与依赖边集合：重放体的第 n 次提交必须与历史中同序位节点
 /// 完全一致，任何漂移（如上游结果差异、提交序列错位）都判为指纹不一致。
 fn flow_node_matches(existing: &DagNode, incoming: &DagNode, dag: &Dag, deps: &[TaskId]) -> bool {
     if existing.name != incoming.name
@@ -24,6 +36,8 @@ fn flow_node_matches(existing: &DagNode, incoming: &DagNode, dag: &Dag, deps: &[
         || existing.timeout_ms != incoming.timeout_ms
         || existing.priority != incoming.priority
         || existing.retry_policy != incoming.retry_policy
+        || existing.tags != incoming.tags
+        || existing.quota != incoming.quota
     {
         return false;
     }
@@ -49,6 +63,20 @@ impl Orchestrator {
     /// workflow 再次创建外壳，节点与历史归既存工作流所有，按幂等 no-op 处理。
     #[tracing::instrument(level = "debug", skip(self, dag), fields(workflow = %workflow_id, nodes = dag.nodes().count()))]
     pub async fn submit(&self, workflow_id: WorkflowId, dag: Dag) -> Result<()> {
+        self.submit_with_invocation(workflow_id, dag, None).await
+    }
+
+    /// 与 [`Self::submit`] 相同，但把调用描述写入 `Submitted` 事件。
+    ///
+    /// `invocation` 是 journal 的一部分：恢复后的任意节点都能据此重建
+    /// “这是什么工作流、哪版定义、带什么入参”，不依赖提交进程内存。
+    #[tracing::instrument(level = "debug", skip(self, dag, invocation), fields(workflow = %workflow_id, nodes = dag.nodes().count()))]
+    pub async fn submit_with_invocation(
+        &self,
+        workflow_id: WorkflowId,
+        dag: Dag,
+        invocation: Option<WorkflowInvocation>,
+    ) -> Result<()> {
         // 已就绪的工作流不允许重复提交；占位符允许覆盖（adopt 后本地重新提交）。
         if self.state.is_ready(&workflow_id) {
             if dag.node_count() == 0 {
@@ -92,8 +120,9 @@ impl Orchestrator {
         self.state
             .insert_workflow(workflow_id.clone(), dag, execution, pending);
 
-        self.log_event(WorkflowEventPayload::Submitted {
+        self.log_event(JournalEvent::Submitted {
             workflow_id: workflow_id.clone(),
+            invocation,
         });
         // 节点新增事件。当前节点唯一变更点是整图提交；增量提交后
         // 每个节点在其写入点单独追加。携带完整节点定义使历史可重建 DAG。
@@ -101,7 +130,7 @@ impl Orchestrator {
             let slot = self.state.slots.get(&workflow_id);
             if let Some(slot) = slot {
                 for node in slot.dag.nodes() {
-                    self.log_event(WorkflowEventPayload::NodeAdded {
+                    self.log_event(JournalEvent::NodeAdded {
                         workflow_id: workflow_id.clone(),
                         node: node.clone(),
                     });
@@ -120,7 +149,20 @@ impl Orchestrator {
         dag: Dag,
         timeout_ms: u64,
     ) -> Result<()> {
-        self.submit(workflow_id.clone(), dag).await?;
+        self.submit_with_timeout_and_invocation(workflow_id, dag, timeout_ms, None)
+            .await
+    }
+
+    /// 带工作流级 deadline 与 invocation 描述的提交。
+    pub async fn submit_with_timeout_and_invocation(
+        &self,
+        workflow_id: WorkflowId,
+        dag: Dag,
+        timeout_ms: u64,
+        invocation: Option<WorkflowInvocation>,
+    ) -> Result<()> {
+        self.submit_with_invocation(workflow_id.clone(), dag, invocation)
+            .await?;
         if let Some(mut slot) = self.state.slots.get_mut(&workflow_id) {
             slot.execution.set_deadline_ms(timeout_ms);
         }
@@ -256,14 +298,14 @@ impl Orchestrator {
                 .get(workflow_id)
                 .and_then(|slot| slot.dag.get_node(&task_id).cloned());
             if let Some(node) = node {
-                self.log_event(WorkflowEventPayload::NodeAdded {
+                self.log_event(JournalEvent::NodeAdded {
                     workflow_id: workflow_id.clone(),
                     node,
                 });
             }
         }
         if auto_started {
-            self.log_event(WorkflowEventPayload::Started {
+            self.log_event(JournalEvent::Started {
                 workflow_id: workflow_id.clone(),
             });
         }
@@ -384,7 +426,7 @@ impl Orchestrator {
                         .map(|t| t.retry_count())
                         .unwrap_or(0);
                     if count < policy.max_retries {
-                        (true, policy.delay_ms)
+                        (true, retry_delay_ms(&policy, count))
                     } else {
                         (false, 0)
                     }
@@ -428,6 +470,56 @@ impl Orchestrator {
         Ok(None)
     }
 
+    /// 由 DAG 节点构造待派发的任务定义。
+    ///
+    /// 从节点派生的字段（名称 / 载荷 / 重试策略 / 优先级 / 超时 / 放置诉求）
+    /// 集中在此转换：派发点若各自抄写字面量，新增字段（如 tags/quota）会
+    /// 在某个出口被静默丢弃。
+    fn task_definition(
+        &self,
+        dag: &Dag,
+        node: &DagNode,
+        workflow_id: Option<WorkflowId>,
+        payload: Vec<u8>,
+        attempt: u32,
+    ) -> TaskDefinition {
+        // 远端执行完的节点结果要直连回到编排节点。node_id 是逻辑名（Python
+        // 嵌入下即 Runtime.name），不能当作网络地址使用；这里带上本节点可
+        // 连接的 endpoint addr，远端 completion 才能完成直连投递。
+        let origin_endpoint_addr =
+            self.network
+                .as_ref()
+                .and_then(|network| match network.listen_addresses() {
+                    Ok(addresses) => Some(addresses.endpoint_addr),
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "workflow task origin endpoint address unavailable"
+                        );
+                        None
+                    }
+                });
+        TaskDefinition {
+            id: node.task_id.clone(),
+            name: node.name.clone(),
+            payload,
+            workflow_id,
+            target_node: None,
+            origin_node: self.node_id.clone(),
+            retry_policy: dag.effective_retry_policy(&node.task_id),
+            priority: node.priority,
+            timeout_ms: node.timeout_ms,
+            attempt,
+            lease_deadline_ms: 0,
+            enqueued_at_ms: 0,
+            target_endpoint_addr: None,
+            origin_endpoint_addr,
+            tags: node.tags.clone(),
+            quota: node.quota.clone(),
+            pinned_target: false,
+        }
+    }
+
     /// Starts a workflow by marking it Running and returning root tasks.
     pub fn start(&self, workflow_id: &WorkflowId) -> Result<Vec<TaskDefinition>> {
         let roots = {
@@ -445,40 +537,22 @@ impl Orchestrator {
             }
             slot.execution.mark_running();
 
-            let origin_node = self.node_id.clone();
-            slot.dag
+            // 根任务与后继任务走同一构造入口：payload 必须在派发前签名，
+            // 否则 `require_payload_signing` 节点会以“unsigned payload”拒绝
+            // 整个工作流的首批任务。
+            let root_ids: Vec<TaskId> = slot
+                .dag
                 .roots()
                 .into_iter()
-                .map(|node| {
-                    let attempt = slot
-                        .execution
-                        .tasks
-                        .get(&node.task_id)
-                        .map(|t| t.attempt())
-                        .unwrap_or(0);
-                    TaskDefinition {
-                        id: node.task_id.clone(),
-                        name: node.name.clone(),
-                        payload: node.payload.clone(),
-                        workflow_id: Some(workflow_id.clone()),
-                        target_node: None,
-                        origin_node: origin_node.clone(),
-                        retry_policy: slot.dag.effective_retry_policy(&node.task_id),
-                        priority: node.priority,
-                        timeout_ms: node.timeout_ms,
-                        attempt,
-                        enqueued_at_ms: 0,
-                        target_endpoint_addr: None,
-                        origin_endpoint_addr: None,
-                    }
-                })
-                .collect()
+                .map(|node| node.task_id.clone())
+                .collect();
+            self.build_ready_tasks_from_slot(&slot, workflow_id, &root_ids)?
         };
 
         // Non-terminal: defer persistence to background flush
         self.state.mark_dirty(workflow_id);
 
-        self.log_event(WorkflowEventPayload::Started {
+        self.log_event(JournalEvent::Started {
             workflow_id: workflow_id.clone(),
         });
 
@@ -505,21 +579,16 @@ impl Orchestrator {
     /// Handles a task completion, decrements dependent task counters, and
     /// returns any successor tasks that have become ready.
     ///
-    /// 若 `condition_evaluator` 已设置，条件边在 Rust 核心内直接求值并处理，
-    /// 返回空的 `conditional_edges`；否则将条件边返回给调用方（如 Python 编排
-    /// 循环）外部评估。
-    ///
-    /// 返回值第三个元素 `workflow_terminal` 是显式的终态标志，**不应**通过
-    /// `ready.is_empty() && conditional_edges.is_empty()` 推断——条件求值器
-    /// 全部跳过条件后继也会产生空列表，但工作流未必进入终态（其他分支可能
-    /// 仍在运行）。调用方（如 `WorkflowActor`）必须使用此标志判断是否触发
-    /// 终态通知。
+    /// 返回值为 `(ready_successors, workflow_terminal)`。第二个元素是显式的
+    /// 终态标志，**不应**通过 `ready_successors.is_empty()` 推断——末任务完成
+    /// 或封口收尾同样返回空列表，是否终态只有执行快照知道。调用方
+    /// （如 `WorkflowActor`）必须使用此标志判断是否触发终态通知。
     pub async fn on_task_completed(
         &self,
         workflow_id: &WorkflowId,
         task_id: &TaskId,
         result: Vec<u8>,
-    ) -> Result<(Vec<TaskDefinition>, Vec<(TaskId, String)>, bool)> {
+    ) -> Result<(Vec<TaskDefinition>, bool)> {
         // 结果通路（WireTaskResult / WireDagStateUpdate / COMPLETE_TASK actor
         // 载荷）尚未携带派发代数（wire.rs 本批次冻结），传 `None` 放行 attempt
         // fencing；待协议扩展后由调用方传入结果的 attempt 即接入 fencing。
@@ -527,339 +596,10 @@ impl Orchestrator {
             .complete_task(workflow_id, task_id, result, None)
             .await?;
 
-        // 阶段 2：将 ready_successors 转换为 TaskDefinition。
-        let mut ready = self.build_ready_tasks_for(workflow_id, &info.ready_successors)?;
+        // 将 ready_successors 转换为 TaskDefinition。
+        let ready = self.build_ready_tasks_for(workflow_id, &info.ready_successors)?;
 
-        // 阶段 3：处理条件边——内部求值（若有 evaluator）或返回给调用方外部评估。
-        let conditional_edges = self
-            .process_conditional_edges(workflow_id, task_id, info.conditional_edges, &mut ready)
-            .await?;
-
-        Ok((ready, conditional_edges, info.workflow_terminal))
-    }
-
-    /// 处理条件边：内部求值或返回给调用方。
-    ///
-    /// 若 `condition_evaluator` 已设置，对每条条件边求值：
-    /// - 激活 → 减少后继 pending 计数，可能加入 ready
-    /// - 不激活 → 级联跳过该后继分支，可能产生新的 ready
-    /// - 求值出错 → 记录 warn 日志，该边**原样保留**并返回给调用方外部评估。
-    ///   已就绪任务照常返回，保证单条边的求值失败不会让整个完成事件失败、
-    ///   也不会丢弃已 ready 的后继（否则重试同一完成消息会因任务已终态
-    ///   被守卫拒绝而永久卡死）。
-    ///
-    /// 全部边求值成功后返回空列表（所有条件边已在内部处理）。
-    ///
-    /// 若未设置 evaluator，原样返回条件边列表，由调用方（如 Python 编排循环）外部评估。
-    ///
-    /// 此方法是 `on_task_completed` 的"阶段 3"，提取自原函数以隔离条件求值逻辑。
-    async fn process_conditional_edges(
-        &self,
-        workflow_id: &WorkflowId,
-        task_id: &TaskId,
-        conditional_edges: Vec<(TaskId, String)>,
-        ready: &mut Vec<TaskDefinition>,
-    ) -> Result<Vec<(TaskId, String)>> {
-        let mut conditional_edges = conditional_edges;
-        if let Some(evaluator) = self.condition_evaluator.as_ref() {
-            let mut deferred: Vec<(TaskId, String)> = Vec::new();
-            for (succ_id, condition) in &conditional_edges {
-                match evaluator.evaluate(workflow_id, task_id, condition).await {
-                    Ok(true) => {
-                        if let Some(task) =
-                            self.activate_conditional_successor(workflow_id, succ_id)?
-                        {
-                            ready.push(task);
-                        }
-                    }
-                    Ok(false) => {
-                        let cascade_ready =
-                            self.skip_conditional_branch(workflow_id, succ_id).await?;
-                        ready.extend(cascade_ready);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            workflow = %workflow_id.as_str(),
-                            task = %task_id.as_str(),
-                            successor = %succ_id.as_str(),
-                            error = %e,
-                            "condition evaluation failed, deferring edge to caller"
-                        );
-                        deferred.push((succ_id.clone(), condition.clone()));
-                    }
-                }
-            }
-            conditional_edges = deferred;
-        }
-        Ok(conditional_edges)
-    }
-
-    /// Activate a conditional successor after Python evaluates the condition.
-    /// Decrements the pending count and returns the task definition if it
-    /// becomes ready (pending count reaches zero).
-    pub fn activate_conditional_successor(
-        &self,
-        workflow_id: &WorkflowId,
-        task_id: &TaskId,
-    ) -> Result<Option<TaskDefinition>> {
-        let ready = {
-            let mut slot = self.state.slots.get_mut(workflow_id).ok_or_else(|| {
-                crate::common::ActantError::NotFound(format!(
-                    "workflow {} not found",
-                    workflow_id.as_str()
-                ))
-            })?;
-            let count = slot.pending.get_mut(task_id).ok_or_else(|| {
-                crate::common::ActantError::Internal(format!(
-                    "pending count not found for task {}",
-                    task_id.as_str()
-                ))
-            })?;
-            if *count == 0 {
-                return Ok(None);
-            }
-            *count -= 1;
-            if *count == 0 {
-                Some(task_id.clone())
-            } else {
-                None
-            }
-        };
-        match ready {
-            Some(tid) => {
-                let tasks = self.build_ready_tasks_for(workflow_id, &[tid])?;
-                Ok(tasks.into_iter().next())
-            }
-            None => Ok(None),
-        }
-    }
-
-    /// Skip a conditional branch that was not taken.
-    ///
-    /// 条件前驱完成且条件不激活时，减少 `task_id` 的 pending 计数（对应条件前驱）。
-    /// 根据剩余 pending 决定后续行为：
-    /// - pending > 0：仍有其他未完成前驱，**不跳过** task_id，仅减少 pending
-    /// - pending == 0 且有已完成前驱：task_id 变为 ready（返回）
-    /// - pending == 0 且无已完成前驱：标记 task_id 为 Skipped，级联跳过其非条件后继
-    ///
-    /// 级联跳过后继的逻辑：
-    ///   - 后继 pending 归零且有已完成前驱 → ready（返回）
-    ///   - 后继 pending 归零且所有前驱均被跳过 → 级联跳过
-    ///
-    /// 此方法防止 BranchRef consumer 依赖两个分支但只有一个执行时死锁。
-    pub async fn skip_conditional_branch(
-        &self,
-        workflow_id: &WorkflowId,
-        task_id: &TaskId,
-    ) -> Result<Vec<TaskDefinition>> {
-        // 阶段 0：减少条件前驱对应的 pending 计数，决定是否应跳过 task_id。
-        // compute_ready_successors 跳过条件后继的 pending 减少，延迟到此处处理。
-        match self.decrement_conditional_pending(workflow_id, task_id)? {
-            ConditionalSkipDecision::PendingRemaining => {
-                // 仍有其他未完成前驱，不跳过 task_id。
-                self.state.mark_dirty(workflow_id);
-                return Ok(Vec::new());
-            }
-            ConditionalSkipDecision::Ready => {
-                // pending 归零且有已完成前驱 → task_id 变为 ready。
-                self.state.mark_dirty(workflow_id);
-                // build_ready_tasks_for 接受 &[TaskId]（owned），无法用 from_ref 消除 clone。
-                #[allow(clippy::cloned_ref_to_slice_refs)]
-                return self.build_ready_tasks_for(workflow_id, &[task_id.clone()]);
-            }
-            ConditionalSkipDecision::Skip => {
-                // pending 归零且无已完成前驱 → 跳过 task_id，继续级联逻辑。
-            }
-        }
-
-        // 阶段 1：标记被跳过的任务。若工作流直接进入终态，立即收尾。
-        if let Some(execution) = self.mark_skipped_and_check_terminal(workflow_id, task_id)? {
-            self.complete_terminal(workflow_id, Some(task_id), &execution)
-                .await?;
-            return Ok(Vec::new());
-        }
-
-        // 阶段 2：级联跳过——沿非条件后继边递归减少 pending，收集 ready 与新增跳过任务。
-        let ready_ids = self.cascade_skip(workflow_id, task_id).await?;
-
-        // 阶段 3：级联后若工作流进入终态，完成收尾。
-        if let Some(execution) = self.execution_if_terminal(workflow_id)? {
-            self.complete_terminal(workflow_id, Some(task_id), &execution)
-                .await?;
-            return Ok(Vec::new());
-        }
-
-        self.state.mark_dirty(workflow_id);
-        let ready = self.build_ready_tasks_for(workflow_id, &ready_ids)?;
-        Ok(ready)
-    }
-
-    /// 减少条件前驱对应的 pending 计数，并决定后续行为。
-    ///
-    /// `compute_ready_successors` 完成前驱时不减少条件后继的 pending（条件边需求值后才处理）。
-    /// 此方法在条件求值返回 false 时调用，减少 pending 一次，对应已完成的条件前驱。
-    ///
-    /// 决策逻辑：
-    /// - 减少后 pending > 0 → `PendingRemaining`（仍有其他前驱未完成）
-    /// - 减少后 pending == 0 且有已完成前驱 → `Ready`
-    /// - 减少后 pending == 0 且无已完成前驱 → `Skip`
-    fn decrement_conditional_pending(
-        &self,
-        workflow_id: &WorkflowId,
-        task_id: &TaskId,
-    ) -> Result<ConditionalSkipDecision> {
-        let mut slot = self.state.slots.get_mut(workflow_id).ok_or_else(|| {
-            crate::common::ActantError::NotFound(format!(
-                "workflow {} not found",
-                workflow_id.as_str()
-            ))
-        })?;
-
-        let count = slot.pending.get_mut(task_id).ok_or_else(|| {
-            crate::common::ActantError::Internal(format!(
-                "pending count not found for task {}",
-                task_id.as_str()
-            ))
-        })?;
-        if *count > 0 {
-            *count -= 1;
-        }
-        if *count > 0 {
-            return Ok(ConditionalSkipDecision::PendingRemaining);
-        }
-
-        // pending 归零：检查是否有任意前驱产生了结果。
-        let has_result = slot.dag.predecessors_of(task_id).iter().any(|pred| {
-            slot.execution
-                .tasks
-                .get(&pred.task_id)
-                .and_then(|t| t.result.as_ref())
-                .is_some()
-        });
-        if has_result {
-            Ok(ConditionalSkipDecision::Ready)
-        } else {
-            Ok(ConditionalSkipDecision::Skip)
-        }
-    }
-
-    /// 标记 `task_id` 为 `Skipped`。
-    ///
-    /// 返回 `Some(execution)` 表示工作流因此次标记直接进入终态（如该任务是唯一未完成任务），
-    /// 调用方应执行终态收尾。返回 `None` 表示工作流仍在运行，需继续级联跳过逻辑。
-    ///
-    /// 此方法是 `skip_conditional_branch` 的"阶段 1"，提取自原函数以隔离状态修改与终态判定。
-    fn mark_skipped_and_check_terminal(
-        &self,
-        workflow_id: &WorkflowId,
-        task_id: &TaskId,
-    ) -> Result<Option<WorkflowExecution>> {
-        let mut slot = self.state.slots.get_mut(workflow_id).ok_or_else(|| {
-            crate::common::ActantError::NotFound(format!(
-                "workflow {} not found",
-                workflow_id.as_str()
-            ))
-        })?;
-        slot.execution.mark_task_skipped(task_id);
-        if slot.execution.is_terminal() {
-            Ok(Some(slot.execution.clone()))
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// 沿非条件后继边递归减少 pending 计数，处理级联跳过。
-    ///
-    /// 起点是 `task_id`（已由 `mark_skipped_and_check_terminal` 标记为 Skipped）。
-    /// 对每个起点的非条件后继：
-    /// - pending 归零且有已完成前驱 → 加入 ready 列表（返回给调用方调度）
-    /// - pending 归零且所有前驱均被跳过 → 级联标记为 Skipped，加入 worklist 继续传播
-    ///
-    /// 返回所有因级联而变为 ready 的任务 ID。
-    ///
-    /// 此方法是 `skip_conditional_branch` 的"阶段 2"。
-    async fn cascade_skip(
-        &self,
-        workflow_id: &WorkflowId,
-        task_id: &TaskId,
-    ) -> Result<Vec<TaskId>> {
-        let mut worklist: Vec<TaskId> = vec![task_id.clone()];
-        let mut ready_ids: Vec<TaskId> = Vec::new();
-
-        while let Some(skipped_id) = worklist.pop() {
-            let (newly_ready, mut newly_skipped) = {
-                let mut slot = self.state.slots.get_mut(workflow_id).ok_or_else(|| {
-                    crate::common::ActantError::NotFound(format!(
-                        "workflow {} not found",
-                        workflow_id.as_str()
-                    ))
-                })?;
-                let successors: Vec<TaskId> = slot.dag.successor_ids(&skipped_id);
-                let conditional: Vec<TaskId> = slot
-                    .dag
-                    .conditional_edges_from(&skipped_id)
-                    .into_iter()
-                    .map(|(id, _)| id)
-                    .collect();
-
-                let mut ready = Vec::new();
-                let mut cascade = Vec::new();
-                for succ_id in &successors {
-                    // 条件后继由单独逻辑处理，跳过。
-                    if conditional.iter().any(|id| id == succ_id) {
-                        continue;
-                    }
-                    let count = match slot.pending.get_mut(succ_id) {
-                        Some(c) if *c > 0 => {
-                            *c -= 1;
-                            *c
-                        }
-                        _ => continue,
-                    };
-                    if count != 0 {
-                        continue;
-                    }
-                    // pending 归零：检查是否有任意前驱产生了结果。
-                    let has_result = slot.dag.predecessors_of(succ_id).iter().any(|pred| {
-                        slot.execution
-                            .tasks
-                            .get(&pred.task_id)
-                            .and_then(|t| t.result.as_ref())
-                            .is_some()
-                    });
-                    if has_result {
-                        ready.push(succ_id.clone());
-                    } else {
-                        // 所有前驱均被跳过 → 级联跳过此任务。
-                        slot.execution.mark_task_skipped(succ_id);
-                        cascade.push(succ_id.clone());
-                    }
-                }
-                (ready, cascade)
-            };
-            ready_ids.extend(newly_ready);
-            worklist.append(&mut newly_skipped);
-        }
-
-        Ok(ready_ids)
-    }
-
-    /// 返回 `Some(execution)` 若工作流当前处于终态，否则 `None`。
-    ///
-    /// 此方法是 `skip_conditional_branch` 的"阶段 3"的一部分，
-    /// 隔离终态判定与终态收尾逻辑，避免在每个调用点重复 NotFound 检查。
-    fn execution_if_terminal(&self, workflow_id: &WorkflowId) -> Result<Option<WorkflowExecution>> {
-        let slot = self.state.slots.get(workflow_id).ok_or_else(|| {
-            crate::common::ActantError::NotFound(format!(
-                "workflow {} not found",
-                workflow_id.as_str()
-            ))
-        })?;
-        if slot.execution.is_terminal() {
-            Ok(Some(slot.execution.clone()))
-        } else {
-            Ok(None)
-        }
+        Ok((ready, info.workflow_terminal))
     }
 
     /// 取消整个工作流并置为 `Cancelled` 终态。
@@ -915,7 +655,7 @@ impl Orchestrator {
         };
 
         if cancelled {
-            self.log_event(WorkflowEventPayload::TaskCancelled {
+            self.log_event(JournalEvent::TaskCancelled {
                 workflow_id: workflow_id.clone(),
                 task_id: task_id.clone(),
             });
@@ -933,197 +673,6 @@ impl Orchestrator {
             }
         }
         Ok(cancelled)
-    }
-
-    /// Spawns a background task that periodically checks for expired workflows
-    /// and marks them failed. Returns a watch sender for shutdown signaling.
-    ///
-    /// 当 `network` 已注入时，超时处理路径会主动广播 `CancelBroadcast`
-    /// 给所有正在运行的任务，触发本地与远端 Worker 协作式取消。这确保
-    /// 即使任务自身没有超时（per-task timeout），工作流级硬超时也能及时
-    /// 释放资源。未注入 `network` 时（如单元测试）仅标记状态，不广播取消。
-    pub fn start_timeout_watcher(&self) -> tokio::sync::watch::Sender<bool> {
-        let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
-        let state = self.state.clone();
-        let store = self.store.clone();
-        let network = self.network.clone();
-        let event_log = self.event_log.clone();
-        // 等待点到期扫描（`poll_expired_timers`）需要一条不依赖 `&self`
-        // 的调用入口——spawn 闭包有 `'static` 约束，无法借用 `self`。这里整体克隆
-        // 一个 `Orchestrator` 句柄带进闭包：其字段全是 `Arc`/轻量值（`Store`、
-        // `Transport`、`EventLog`、`OrchestratorState` 均为共享句柄），克隆成本可忽略；
-        // 好处是**复用已测试的同一方法实现**，避免在闭包内重写一份判定逻辑造成行为漂移。
-        let orchestrator = self.clone();
-        let poll_interval =
-            std::time::Duration::from_millis(self.config.workflow.state_poll_interval_ms);
-
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(poll_interval);
-            loop {
-                tokio::select! {
-                    _ = cancel_rx.changed() => break,
-                    _ = interval.tick() => {
-                        let expired: Vec<WorkflowId> = state.expired_workflow_ids();
-                        // 收集本轮所有超时 workflow 的 exec 快照，统一一次 put_batch 提交，
-                        // 避免在 expired 列表较长时产生 N 次独立 LMDB 事务。
-                        let mut persist_batch: Vec<(String, Vec<u8>)> = Vec::new();
-                        let mut to_fire: Vec<WorkflowId> = Vec::new();
-                        // 收集 (workflow_id, task_id) 对，统一在持久化后广播取消。
-                        // 先收集再 mark_workflow_failed，因为 mark 会将 Running 状态
-                        // 改为 Failed，导致 running_task_ids 在后续读取时为空。
-                        let mut cancels_to_broadcast: Vec<(WorkflowId, TaskId)> = Vec::new();
-                        for wf_id in &expired {
-                            if let Some(slot) = state.slots.get(wf_id) {
-                                if !slot.execution.is_terminal() {
-                                    for task_id in slot.execution.tasks.keys() {
-                                        if slot.execution.tasks.get(task_id)
-                                            .map(|ts| ts.state == Phase::Running)
-                                            .unwrap_or(false)
-                                        {
-                                            cancels_to_broadcast.push((wf_id.clone(), task_id.clone()));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        for wf_id in expired {
-                            if let Some(mut slot) = state.slots.get_mut(&wf_id) {
-                                if !slot.execution.is_terminal() {
-                                    slot.execution.mark_workflow_failed("workflow timeout exceeded".into());
-                                    crate::metrics::inc_workflow_timeouts();
-                                    crate::metrics::inc_workflows_failed();
-                                    crate::metrics::dec_active_workflows();
-                                    tracing::warn!("workflow {} timed out, marked as failed", wf_id.as_str());
-
-                                    match serialize_rkyv(&slot.execution) {
-                                        Ok(exec_bytes) => {
-                                            persist_batch.push((exec_key(&wf_id), exec_bytes));
-                                        }
-                                        Err(e) => {
-                                            // 序列化失败不得静默丢弃：记录 error 并重新标记脏，
-                                            // 让后台 flush 在下一轮重试落盘。
-                                            tracing::error!(
-                                                workflow = %wf_id.as_str(),
-                                                error = %e,
-                                                "failed to serialize timed-out workflow execution"
-                                            );
-                                            state.mark_dirty(&wf_id);
-                                        }
-                                    }
-
-                                    // 对齐 fail_task 路径：超时失败的工作流写入 Failed 事件，
-                                    // 供订阅者观测（事件写入失败不阻断状态推进）。
-                                    if let Some(id) = super::persistence::append_event(
-                                        event_log.as_ref(),
-                                        WorkflowEventPayload::Failed {
-                                            workflow_id: wf_id.clone(),
-                                            error: "workflow timeout exceeded".into(),
-                                        },
-                                    ) {
-                                        state.record_event_seq(&wf_id, id);
-                                    }
-
-                                    to_fire.push(wf_id);
-                                }
-                            }
-                        }
-                        if let Some(ref store) = store {
-                            if !persist_batch.is_empty() {
-                                if let Err(e) = store.put_batch(&persist_batch).await {
-                                    tracing::error!("failed to persist timed-out workflows: {}", e);
-                                }
-                            }
-                        }
-                        // 广播取消消息。即使持久化失败也要尝试取消，否则运行中的
-                        // 任务会继续占用 Worker 槽位直到自身完成或超时。
-                        //
-                        // 注意这里有**两条腿**，缺一不可：
-                        // - `broadcast` 走 gossip，只到邻居——管远端执行的任务；
-                        // - `inject_local_event` 把同一份字节投回本节点事件通道，
-                        //   管本节点自己执行的任务。gossip **不会**把消息发回发送者，
-                        //   所以只广播不做自投递时，本节点在途任务不会被取消：工作流
-                        //   已标 Failed，而阻塞在任务等待上的 flow 体永久挂起（实测
-                        //   本地句柄 10s 观察窗内始终 running）。
-                        // 自投递复用 `NetworkEventRouter` 的 `TopicRoute::Cancel`
-                        // 分支，与远端收到广播后的处理**完全同路**，避免本地/远端
-                        // 行为漂移。
-                        if let Some(ref network) = network {
-                            for (wf_id, task_id) in &cancels_to_broadcast {
-                                let msg = crate::common::wire::CancelBroadcast {
-                                    task_id: task_id.clone(),
-                                    workflow_id: wf_id.clone(),
-                                };
-                                let bytes = match postcard::to_allocvec(&msg) {
-                                    Ok(bytes) => bytes,
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            workflow_id = %wf_id,
-                                            task_id = %task_id,
-                                            error = %e,
-                                            "failed to encode CancelBroadcast for timed-out workflow task"
-                                        );
-                                        continue;
-                                    }
-                                };
-                                if let Err(e) =
-                                    network.broadcast(TOPIC_CANCEL, bytes.clone()).await
-                                {
-                                    tracing::warn!(
-                                        workflow_id = %wf_id,
-                                        task_id = %task_id,
-                                        error = %e,
-                                        "failed to broadcast cancel for timed-out workflow task"
-                                    );
-                                }
-                                if !network.inject_local_event(NetworkEvent::Message(
-                                    NetworkMessage {
-                                        topic: TOPIC_CANCEL.to_string(),
-                                        data: bytes,
-                                    },
-                                )) {
-                                    tracing::warn!(
-                                        workflow_id = %wf_id,
-                                        task_id = %task_id,
-                                        "failed to self-deliver cancel for timed-out workflow task; \
-                                         a locally running task may not be released"
-                                    );
-                                }
-                            }
-                        }
-                        for wf_id in to_fire {
-                            state.fire_terminal_oneshot(&wf_id);
-                        }
-
-                        // 扫描到期的 `Timer` 等待点。
-                        //
-                        // Timer 类等待点必须自动到期：生产路径若无定时任务调用
-                        // `poll_expired_timers`，等待点**永不自动到期**，
-                        // 在等待点 park 的 flow 线程永久挂起。这里复用超时 watcher 已有
-                        // 的轮询周期（`state_poll_interval_ms`），故：
-                        //   **等待点唤醒延迟上界 = state_poll_interval_ms（默认 500ms）**。
-                        // 到期即追加 `TimerFired` 事件（进统一历史）、标记脏（随快照落盘）
-                        // 并唤醒 oneshot 等待者；重复调用幂等（已 Signaled 不再触发）。
-                        match orchestrator.poll_expired_timers().await {
-                            Ok(fired) if !fired.is_empty() => {
-                                tracing::debug!(
-                                    count = fired.len(),
-                                    "fired expired timer wait points"
-                                );
-                            }
-                            Ok(_) => {}
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    "failed to scan expired wait points"
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
-        cancel_tx
     }
 
     fn build_ready_tasks_from_slot(
@@ -1156,21 +705,13 @@ impl Orchestrator {
                 .map(|t| t.attempt())
                 .unwrap_or(0);
 
-            ready.push(TaskDefinition {
-                id: succ_id.clone(),
-                name: node.name.clone(),
+            ready.push(self.task_definition(
+                &slot.dag,
+                node,
+                Some(workflow_id.clone()),
                 payload,
-                workflow_id: Some(workflow_id.clone()),
-                target_node: None,
-                origin_node: self.node_id.clone(),
-                retry_policy: slot.dag.effective_retry_policy(&node.task_id),
-                priority: node.priority,
-                timeout_ms: node.timeout_ms,
                 attempt,
-                enqueued_at_ms: 0,
-                target_endpoint_addr: None,
-                origin_endpoint_addr: None,
-            });
+            ));
         }
 
         Ok(ready)
@@ -1217,28 +758,19 @@ impl Orchestrator {
             &node.payload,
             &self.config.payload_signing_key,
         )?;
-        Ok(Some(TaskDefinition {
-            id: node.task_id.clone(),
-            name: node.name.clone(),
+        Ok(Some(self.task_definition(
+            &slot.dag,
+            node,
+            Some(workflow_id.clone()),
             payload,
-            workflow_id: Some(workflow_id.clone()),
-            target_node: None,
-            origin_node: self.node_id.clone(),
-            retry_policy: slot.dag.effective_retry_policy(&node.task_id),
-            priority: node.priority,
-            timeout_ms: node.timeout_ms,
             attempt,
-            enqueued_at_ms: 0,
-            target_endpoint_addr: None,
-            origin_endpoint_addr: None,
-        }))
+        )))
     }
 
     /// 将任务推进到 `Running`（本地派发 / 远端 gossip 同路径）。
     ///
     /// 终态吸收：工作流已终态或任务已终态时不推进——迟到的 `Running` 不得把
-    /// `Cancelled` / `Failed` 任务"复活"，与 `mark_task_completed` /
-    /// `mark_task_skipped` 的守卫语义一致。
+    /// `Cancelled` / `Failed` 任务"复活"，与 `mark_task_completed` 的守卫语义一致。
     pub fn mark_task_running(&self, workflow_id: &WorkflowId, task_id: &TaskId) -> Result<()> {
         let mut slot = self.state.slots.get_mut(workflow_id).ok_or_else(|| {
             crate::common::ActantError::NotFound(format!(
@@ -1250,7 +782,7 @@ impl Orchestrator {
             return Ok(());
         }
         slot.execution.mark_task_running(task_id);
-        self.log_event(WorkflowEventPayload::TaskRunning {
+        self.log_event(JournalEvent::TaskRunning {
             workflow_id: workflow_id.clone(),
             task_id: task_id.clone(),
         });
@@ -1293,7 +825,7 @@ impl Orchestrator {
         };
 
         if accepted {
-            self.log_event(WorkflowEventPayload::TaskFailed {
+            self.log_event(JournalEvent::TaskFailed {
                 workflow_id: workflow_id.clone(),
                 task_id: task_id.clone(),
                 error: error_for_event,
@@ -1317,7 +849,7 @@ impl Orchestrator {
                     .put_batch(&[(exec_key(workflow_id), exec_bytes)])
                     .await?;
             }
-            self.log_event(WorkflowEventPayload::Failed {
+            self.log_event(JournalEvent::Failed {
                 workflow_id: workflow_id.clone(),
                 error: format!("workflow failed at task {}", task_id.as_str()),
             });
@@ -1372,7 +904,7 @@ impl Orchestrator {
                 // 任务完成事件在终态判定之前追加：末任务完成使工作流进入
                 // 终态时，complete_terminal 早退路径不得吞掉 per-task 事件，
                 // 否则历史缺失 TaskCompleted（重放/审计无法重建任务终态）。
-                self.log_event(WorkflowEventPayload::TaskCompleted {
+                self.log_event(JournalEvent::TaskCompleted {
                     workflow_id: workflow_id.clone(),
                     task_id: task_id.clone(),
                     result: result.clone(),
@@ -1385,7 +917,6 @@ impl Orchestrator {
             return Ok(CompletionInfo {
                 workflow_terminal: false,
                 ready_successors: vec![],
-                conditional_edges: vec![],
             });
         }
 
@@ -1411,15 +942,14 @@ impl Orchestrator {
 
         Ok(CompletionInfo {
             workflow_terminal: false,
-            ready_successors: ready_ids.ready,
-            conditional_edges: ready_ids.conditional,
+            ready_successors: ready_ids,
         })
     }
 
     /// 工作流终态收尾的唯一实现点：持久化终态快照（Completed 附带聚合结果）、
     /// 追加终态事件（Completed / Cancelled / Failed 三选一）、更新指标并唤醒
-    /// 等待者。四条触发路径共用：末任务完成（`complete_task`）、条件分支级联
-    /// 跳过（`skip_conditional_branch`）、封口时已全部终态（`seal_workflow`）、
+    /// 等待者。三条触发路径共用：末任务完成（`complete_task`）、
+    /// 封口时已全部终态（`seal_workflow`）、
     /// 取消使最后在途节点终态（`cancel_task`）。
     async fn complete_terminal(
         &self,
@@ -1450,7 +980,7 @@ impl Orchestrator {
 
         match exec_snapshot.state {
             Phase::Completed => {
-                self.log_event(WorkflowEventPayload::Completed {
+                self.log_event(JournalEvent::Completed {
                     workflow_id: workflow_id.clone(),
                 });
                 crate::metrics::inc_workflows_completed();
@@ -1458,7 +988,7 @@ impl Orchestrator {
             Phase::Cancelled => {
                 // 取消收尾（末节点被取消 / 工作流级 cancel）：单独成支，不得
                 // 复用 Failed 事件——消费方据事件类型区分「取消」与「失败」。
-                self.log_event(WorkflowEventPayload::Cancelled {
+                self.log_event(JournalEvent::Cancelled {
                     workflow_id: workflow_id.clone(),
                 });
                 crate::metrics::inc_workflows_cancelled();
@@ -1473,7 +1003,7 @@ impl Orchestrator {
                         .clone()
                         .unwrap_or_else(|| "workflow failed".into()),
                 };
-                self.log_event(WorkflowEventPayload::Failed {
+                self.log_event(JournalEvent::Failed {
                     workflow_id: workflow_id.clone(),
                     error,
                 });
@@ -1486,7 +1016,6 @@ impl Orchestrator {
         Ok(CompletionInfo {
             workflow_terminal: true,
             ready_successors: vec![],
-            conditional_edges: vec![],
         })
     }
 
@@ -1505,7 +1034,6 @@ impl Orchestrator {
     /// 三个终态入口（`fail_task` / `complete_terminal` / `mark_workflow_failed`）
     /// 共用本方法，故在此单点释放即可。
     fn notify_terminal(&self, workflow_id: &WorkflowId) {
-        self.state.fire_terminal_oneshot(workflow_id);
         self.state.release_wait_waiters(workflow_id);
     }
 
@@ -1513,7 +1041,7 @@ impl Orchestrator {
         &self,
         workflow_id: &WorkflowId,
         task_id: &TaskId,
-    ) -> Result<ReadyResult> {
+    ) -> Result<Vec<TaskId>> {
         let mut slot = self.state.slots.get_mut(workflow_id).ok_or_else(|| {
             crate::common::ActantError::NotFound(format!(
                 "workflow {} not found",
@@ -1522,14 +1050,9 @@ impl Orchestrator {
         })?;
 
         let successors: Vec<TaskId> = slot.dag.successor_ids(task_id);
-        let conditional_edges: Vec<(TaskId, String)> = slot.dag.conditional_edges_from(task_id);
 
         let mut ready_ids: Vec<TaskId> = Vec::new();
         for succ_id in &successors {
-            // 跳过条件后继 — 它们由单独逻辑处理
-            if conditional_edges.iter().any(|(id, _)| id == succ_id) {
-                continue;
-            }
             let count = slot.pending.get_mut(succ_id).ok_or_else(|| {
                 crate::common::ActantError::Internal(format!(
                     "pending count not found for task {}",
@@ -1544,10 +1067,7 @@ impl Orchestrator {
                 ready_ids.push(succ_id.clone());
             }
         }
-        Ok(ReadyResult {
-            ready: ready_ids,
-            conditional: conditional_edges,
-        })
+        Ok(ready_ids)
     }
 
     pub async fn mark_workflow_failed(
@@ -1603,7 +1123,7 @@ impl Orchestrator {
     ///
     /// 状态过滤不可省略——`Orchestrator::recover`（`orchestrator/persistence.rs`）
     /// 会把非终态工作流的 Running 任务重置为 Pending，而 Completed/Failed/
-    /// Cancelled/Skipped 任务保持原状态；仅按 `pending == 0` 过滤会把已完成
+    /// Cancelled 任务保持原状态；仅按 `pending == 0` 过滤会把已完成
     /// 任务也重建派发，导致副作用重复执行（根任务的 pending 恒为 0）。
     ///
     /// ## 接线约定

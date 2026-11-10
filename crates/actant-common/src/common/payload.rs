@@ -1,20 +1,9 @@
 //! 任务 payload 编解码与完整性保护。
 //!
-//! ## 设计原则
+//! Rust 核心不感知宿主语言的参数语义：本模块只提供不透明字节的基础打包
+//! （`pack_group` 由 Python 侧调用），payload 序列化后签名、反序列化前验证。
 //!
-//! Rust 核心层**不感知** Python 的参数语义（args/kwargs/TaskRef 位置等）。
-//! 本模块提供基础打包：`pack_group` — 由 Python 侧调用构建
-//! 任务 payload，Rust 视为不透明字节。
-//!
-//! ## Payload 格式
-//!
-//! Python 侧定义自己的 tag 系统（TAG_SINGLE/TAG_GROUP/TAG_GENERIC/TAG_POSITIONAL 等），
-//! Rust 不需要知道这些 tag 的含义。
-//!
-//! ## Payload 完整性保护
-//!
-//! 所有任务 payload 在序列化后签名，反序列化前验证。
-//! 防止被攻破的节点向集群投递恶意 cloudpickle payload。
+//! 载荷布局、tag 边界与完整性策略见 `docs/architecture/framework-contract.md`。
 
 use serde::{Deserialize, Serialize};
 

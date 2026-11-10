@@ -5,7 +5,7 @@
 //! - `_RuntimeCore`：对 `runtime::Runtime` 的薄 PyO3 包装，供 Python 层持有
 
 use super::error::actant_error_to_pyerr;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, OnceLock};
 
 use parking_lot::Mutex;
@@ -13,14 +13,15 @@ use parking_lot::Mutex;
 use pyo3::prelude::*;
 
 use actant_core::common::{
-    decode_blob_ref, encode_blob_ref, ActantConfig, ActantError, BlobRef, NodeId, RetryPolicy,
-    TaskCompletion, TaskDefinition, TaskId, WorkflowId,
+    decode_blob_ref, encode_blob_ref, ActantConfig, ActantError, BlobRef, JournalRecord, NodeId,
+    NodeStateUpdate, RetryPolicy, TaskCompletion, TaskDefinition, TaskId, WorkflowId,
+    WorkflowInvocation,
 };
 use actant_core::runtime::builder::RuntimeBuilder;
 use actant_core::runtime::event_bus::{BusEvent, Topic as BusTopic};
 use actant_core::runtime::workflow::actor::TaskResultOutcome;
 use actant_core::runtime::workflow::messaging::{decode, encode};
-use actant_core::runtime::workflow::orchestrator::types::WorkflowEventPayload;
+use actant_core::runtime::workflow::orchestrator::types::JournalEvent;
 use actant_core::runtime::workflow::orchestrator::DagSnapshot;
 use actant_core::runtime::workflow::{
     workflow_methods, AddNodeOutcome, Dag, DagNode, FailureStrategy, WaitCondition,
@@ -29,7 +30,8 @@ use actant_core::runtime::workflow::{
 
 use super::capability::PyCapabilityRuntime;
 use super::config::PyRetryPolicy;
-use super::types::{future_into_py_iter, FutureResultToPy, PyTaskCompletion};
+use super::route_policy::PyRoutePolicy;
+use super::types::{future_into_py_iter, FutureResultToPy, PyStoreStats, PyTaskCompletion};
 
 /// 进程级共享 tokio runtime。
 ///
@@ -52,6 +54,72 @@ fn shared_tokio_runtime() -> PyResult<Arc<tokio::runtime::Runtime>> {
         .clone()
         .map_err(ActantError::Internal)
         .map_err(actant_error_to_pyerr)
+}
+
+/// 取本节点 FailoverManager（故障注入钩子入口）。
+///
+/// 返回 `Result` 的 PyO3 方法不能直接返回 `Arc<FailoverManager>`（非 Python 对象），
+/// 故以自由函数形式在内部使用。
+fn fault_injection_target(
+    runtime: Option<&Arc<actant_core::runtime::Runtime>>,
+) -> PyResult<Arc<actant_core::runtime::workflow::failover::FailoverManager>> {
+    runtime
+        .and_then(|rt| rt.failover_manager())
+        .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime has no failover manager"))
+}
+
+/// 按名称解析内置远端路由策略。
+///
+/// `None` / `"default"` 使用 Worker 内置 [`DefaultRoutePolicy`]；
+/// `"label_affinity"` 使用 [`LabelAffinityRoutePolicy`]（本地满足诉求即本地执行，
+/// 否则转发标签匹配且槽位最多的 peer）。未知名称在启动时拒绝，避免静默回退。
+fn route_policy_by_name(
+    name: Option<&str>,
+) -> PyResult<Option<Arc<dyn actant_core::runtime::workflow::RoutePolicy>>> {
+    use actant_core::runtime::workflow::LabelAffinityRoutePolicy;
+
+    match name {
+        None | Some("") | Some("default") => Ok(None),
+        Some("label_affinity") => Ok(Some(Arc::new(LabelAffinityRoutePolicy))),
+        Some(other) => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "unknown route_policy '{other}': expected 'default' or 'label_affinity'"
+        ))),
+    }
+}
+
+/// 解析 `route_policy` 参数：字符串走内置策略名，callable 走 Python 桥。
+///
+/// 两者都不匹配时报 `TypeError` 而不是静默回退——静默回退会让用户的策略
+/// 「看起来生效了但实际没跑」，是路由问题里最难排查的一类。
+fn resolve_route_policy(
+    py: Python<'_>,
+    value: Option<Py<PyAny>>,
+) -> PyResult<Option<Arc<dyn actant_core::runtime::workflow::RoutePolicy>>> {
+    use actant_core::runtime::workflow::DefaultRoutePolicy;
+
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let bound = value.bind(py);
+    if bound.is_none() {
+        return Ok(None);
+    }
+    if let Ok(name) = bound.extract::<String>() {
+        return route_policy_by_name(Some(&name));
+    }
+    if bound.is_callable() {
+        // 回退策略与「不注入」时 Worker 使用的内置默认一致。
+        let fallback: Arc<dyn actant_core::runtime::workflow::RoutePolicy> =
+            Arc::new(DefaultRoutePolicy);
+        return Ok(Some(Arc::new(PyRoutePolicy::new(
+            value.clone_ref(py),
+            fallback,
+        ))));
+    }
+    Err(pyo3::exceptions::PyTypeError::new_err(
+        "route_policy must be a string ('default' / 'label_affinity') \
+         or a callable (ctx, candidates) -> decision",
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -79,29 +147,37 @@ pub struct PyNode {
     pub priority: Option<i32>,
     #[pyo3(get, set)]
     pub metadata: Option<HashMap<String, String>>,
+    /// 任务放置诉求（标签选择器），映射到 `DagNode::tags`。
+    #[pyo3(get, set)]
+    pub tags: Vec<String>,
+    /// 任务所需的命名配额（单维），映射到 `DagNode::quota`。
+    #[pyo3(get, set)]
+    pub quota: Option<String>,
 }
 
 #[pymethods]
 impl PyNode {
     #[new]
-    #[pyo3(signature = (task_id, name, payload, retry=None, timeout_ms=None, priority=None, metadata=None))]
+    #[pyo3(signature = (task_id, name, payload, timeout_ms=None, priority=None, tags=None, quota=None))]
     fn new(
         task_id: String,
         name: String,
         payload: Vec<u8>,
-        retry: Option<PyRetryPolicy>,
         timeout_ms: Option<u64>,
         priority: Option<i32>,
-        metadata: Option<HashMap<String, String>>,
+        tags: Option<Vec<String>>,
+        quota: Option<String>,
     ) -> Self {
         Self {
             task_id,
             name,
             payload,
-            retry,
+            retry: None,
             timeout_ms,
             priority,
-            metadata,
+            metadata: None,
+            tags: tags.unwrap_or_default(),
+            quota,
         }
     }
 
@@ -128,13 +204,28 @@ pub struct PyTask {
     pub target_endpoint_addr: Option<String>,
     #[pyo3(get, set)]
     pub timeout_ms: Option<u64>,
+    /// 任务放置诉求（标签选择器），映射到 `TaskDefinition::tags`。
+    #[pyo3(get, set)]
+    pub tags: Vec<String>,
+    /// 任务所需的命名配额（单维），映射到 `TaskDefinition::quota`。
+    #[pyo3(get, set)]
+    pub quota: Option<String>,
+    /// 任务优先级（越大越优先），映射到 `TaskDefinition::priority`。
+    #[pyo3(get, set)]
+    pub priority: i32,
+    /// `target_node` 是否为调用方的持久指定（`submit_to` 路径）。
+    ///
+    /// 构造时由 `target_node` 推断，只读：运行期修改 `target_node`
+    /// （如路由器选择）不应改变调用方的放置语义。
+    #[pyo3(get)]
+    pub pinned_target: bool,
     pub retry_policy: Option<RetryPolicy>,
 }
 
 #[pymethods]
 impl PyTask {
     #[new]
-    #[pyo3(signature = (task_id, name, payload, workflow_id=None, target_node=None, target_endpoint_addr=None, timeout_ms=None, retry_policy=None))]
+    #[pyo3(signature = (task_id, name, payload, workflow_id=None, target_node=None, target_endpoint_addr=None, timeout_ms=None, tags=None, quota=None, priority=None, retry_policy=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         task_id: String,
@@ -144,8 +235,15 @@ impl PyTask {
         target_node: Option<String>,
         target_endpoint_addr: Option<String>,
         timeout_ms: Option<u64>,
+        tags: Option<Vec<String>>,
+        quota: Option<String>,
+        priority: Option<i32>,
         retry_policy: Option<PyRetryPolicy>,
     ) -> Self {
+        // Python 层传入的 `target_node` 只来自 `Task.submit_to` / 显式
+        // `target_node` 参数，语义是调用方持久指定；路由器选择的目标不经过
+        // 此构造器。
+        let pinned_target = target_node.is_some();
         Self {
             task_id,
             name,
@@ -154,6 +252,10 @@ impl PyTask {
             target_node,
             target_endpoint_addr,
             timeout_ms,
+            tags: tags.unwrap_or_default(),
+            quota,
+            priority: priority.unwrap_or(0),
+            pinned_target,
             retry_policy: retry_policy.map(RetryPolicy::from),
         }
     }
@@ -242,6 +344,19 @@ pub struct PyRuntimeCore {
     /// 共享的 GIL worker 线程，用于把异步结果设置到 Python awaitable/Future。
     /// 在 `_RuntimeCore` 生命周期内保持存活，避免每次跨语言调用都重新竞争 GIL。
     gil_thread: super::gil_thread::GilThread,
+    /// payload 签名密钥（来自 `ActantConfig::payload_signing_key`）。
+    ///
+    /// 直接 `@task` 提交不经过 orchestrator，须在此处签名，否则
+    /// `ProcessTaskDispatcher` 在启用签名时会拒绝未签名载荷。
+    payload_signing_key: Vec<u8>,
+}
+
+/// 按配置的共享密钥签名任务 payload。
+///
+/// 空密钥时 `sign` 原样返回（禁用签名，开发/测试场景）。
+fn sign_payload(key: &[u8], payload: Vec<u8>) -> PyResult<Vec<u8>> {
+    actant_core::common::payload::sign(key, &payload)
+        .map_err(|e| actant_error_to_pyerr(ActantError::Internal(format!("payload sign: {e}"))))
 }
 
 #[pymethods]
@@ -253,12 +368,13 @@ impl PyRuntimeCore {
     /// - `data_dir`: 持久化目录，省略时使用系统临时目录下的随机子目录。
     /// - `config`: 配置对象（`PyActantConfig`），省略时使用默认配置。
     #[new]
-    #[pyo3(signature = (name=None, data_dir=None, config=None))]
+    #[pyo3(signature = (name=None, data_dir=None, config=None, route_policy=None))]
     fn new(
         py: Python<'_>,
         name: Option<String>,
         data_dir: Option<String>,
         config: Option<super::config::PyActantConfig>,
+        route_policy: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         let t0 = std::time::Instant::now();
         tracing::info!("PyRuntimeCore::new: start");
@@ -292,7 +408,12 @@ impl PyRuntimeCore {
             elapsed_ms = t0.elapsed().as_millis() as u64,
             "config resolved"
         );
-        let data_dir = data_dir.unwrap_or_else(|| {
+        let route_policy = resolve_route_policy(py, route_policy)?;
+        let payload_signing_key = rust_config.payload_signing_key.clone();
+        // 解析优先级：显式 `data_dir` 参数 > `config.store.data_dir` > 临时目录。
+        // 前者是 Runtime 级覆盖，后者让 `_StoreConfig` 可独立承载持久化目录。
+        let config_data_dir = rust_config.store.data_dir.clone();
+        let data_dir = data_dir.or(config_data_dir).unwrap_or_else(|| {
             std::env::temp_dir()
                 .join(format!(
                     "actant-{}-{}-runtime",
@@ -312,10 +433,12 @@ impl PyRuntimeCore {
         let runtime = py
             .detach(move || {
                 tokio_for_build.block_on(async {
-                    RuntimeBuilder::new(node_id, rust_config)
-                        .with_data_dir(data_dir)
-                        .build()
-                        .await
+                    let mut builder =
+                        RuntimeBuilder::new(node_id, rust_config).with_data_dir(data_dir);
+                    if let Some(policy) = route_policy {
+                        builder = builder.with_route_policy(policy);
+                    }
+                    builder.build().await
                 })
             })
             .map_err(actant_error_to_pyerr)?;
@@ -336,6 +459,7 @@ impl PyRuntimeCore {
             submit_batch_handle: Mutex::new(None),
             task_result_callback_handles: Mutex::new(Vec::new()),
             gil_thread: super::gil_thread::GilThread::new(),
+            payload_signing_key,
         })
     }
 
@@ -388,6 +512,43 @@ impl PyRuntimeCore {
         Ok(PyListenAddresses::from(addrs))
     }
 
+    /// 返回本地存储容量与使用情况快照。
+    ///
+    /// 供运维周期性采样；启动时已同步上报一次 ``actant.store.*`` 指标。
+    fn storage_stats(&self, py: Python<'_>) -> PyResult<PyStoreStats> {
+        let runtime = self.runtime.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("runtime already shut down")
+        })?;
+        let tokio = self
+            .tokio
+            .lock()
+            .clone()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime shut down"))?;
+        let store = runtime.store().clone();
+        let stats = py
+            .detach(move || tokio.block_on(store.storage_stats()))
+            .map_err(actant_error_to_pyerr)?;
+        Ok(PyStoreStats::from(stats))
+    }
+
+    /// 在线热备份本地存储到指定文件，返回备份文件字节数。
+    ///
+    /// 备份启用 compaction，会顺带回收空闲页；可在运行中调用。
+    fn backup_to(&self, py: Python<'_>, path: String) -> PyResult<u64> {
+        let runtime = self.runtime.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("runtime already shut down")
+        })?;
+        let tokio = self
+            .tokio
+            .lock()
+            .clone()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime shut down"))?;
+        let store = runtime.store().clone();
+        let path = std::path::PathBuf::from(path);
+        py.detach(move || tokio.block_on(store.backup_to(path)))
+            .map_err(actant_error_to_pyerr)
+    }
+
     /// 拨号远端节点建立直连，并自动将其加入 gossip 网络。
     ///
     /// ``addr`` 为对端 ``listen_addresses()["endpoint_addr"]`` 返回的 hex 字符串。
@@ -408,31 +569,6 @@ impl PyRuntimeCore {
                 .map_err(actant_error_to_pyerr)
         })?;
         Ok(())
-    }
-
-    /// ``dial`` 的异步版本，返回 ``asyncio.Future``，可在 Python ``async`` 函数中 ``await``。
-    ///
-    /// 避免在 Python 事件循环中阻塞主线程——网络 I/O 在 tokio 后台执行，
-    /// 完成后通过 GIL worker 线程设置 Future 结果。
-    #[pyo3(signature = (addr,))]
-    fn dial_async(&self, py: Python<'_>, addr: String) -> PyResult<Py<PyAny>> {
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))?;
-        let tokio = self.tokio.lock().clone().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("tokio runtime unavailable")
-        })?;
-        let network = runtime.network().clone();
-        let gil_thread = self.gil_thread.clone();
-
-        future_into_py_iter(py, tokio.handle().clone(), &gil_thread, async move {
-            match network.dial(&addr).await {
-                Ok(()) => Python::attach(|py| FutureResultToPy::Value(py.None())),
-                Err(e) => Python::attach(|_py| FutureResultToPy::Err(actant_error_to_pyerr(e))),
-            }
-        })
-        .map(|b| b.unbind())
     }
 
     /// 将远端节点加入 gossip 网络（仅 peer_id，不建立直连）。
@@ -457,28 +593,6 @@ impl PyRuntimeCore {
         Ok(())
     }
 
-    /// ``add_gossip_peer`` 的异步版本，返回 ``asyncio.Future``。
-    #[pyo3(signature = (peer_id,))]
-    fn add_gossip_peer_async(&self, py: Python<'_>, peer_id: String) -> PyResult<Py<PyAny>> {
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))?;
-        let tokio = self.tokio.lock().clone().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("tokio runtime unavailable")
-        })?;
-        let network = runtime.network().clone();
-        let gil_thread = self.gil_thread.clone();
-
-        future_into_py_iter(py, tokio.handle().clone(), &gil_thread, async move {
-            match network.add_gossip_peer(&peer_id).await {
-                Ok(()) => Python::attach(|py| FutureResultToPy::Value(py.None())),
-                Err(e) => Python::attach(|_py| FutureResultToPy::Err(actant_error_to_pyerr(e))),
-            }
-        })
-        .map(|b| b.unbind())
-    }
-
     /// 返回当前已知对等节点列表（已建立 gossip 邻居关系的节点）。
     fn discover_peers(&self, py: Python<'_>) -> PyResult<Vec<String>> {
         let runtime = self
@@ -495,34 +609,6 @@ impl PyRuntimeCore {
                 .map(|peers| peers.into_iter().map(|p| p.0.to_string()).collect())
                 .map_err(actant_error_to_pyerr)
         })
-    }
-
-    /// ``discover_peers`` 的异步版本，返回 ``asyncio.Future``，await 后得到 ``list[str]``。
-    fn discover_peers_async(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))?;
-        let tokio = self.tokio.lock().clone().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("tokio runtime unavailable")
-        })?;
-        let network = runtime.network().clone();
-        let gil_thread = self.gil_thread.clone();
-
-        future_into_py_iter(py, tokio.handle().clone(), &gil_thread, async move {
-            match network.discover_peers().await {
-                Ok(peers) => Python::attach(|py| {
-                    let list: Vec<String> = peers.into_iter().map(|p| p.0.to_string()).collect();
-                    // into_pyobject 在内存耗尽等极端情况返回 PyErr；
-                    match list.into_pyobject(py) {
-                        Ok(bound) => FutureResultToPy::Value(bound.into_any().unbind()),
-                        Err(e) => FutureResultToPy::Err(e),
-                    }
-                }),
-                Err(e) => Python::attach(|_py| FutureResultToPy::Err(actant_error_to_pyerr(e))),
-            }
-        })
-        .map(|b| b.unbind())
     }
 
     /// 广播跨节点任务取消消息（P2P 取消广播发送端）。
@@ -590,6 +676,32 @@ impl PyRuntimeCore {
             .worker()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("worker not initialized"))?;
         Ok(worker.cancel_task(&task_id))
+    }
+
+    /// 运行时更新节点状态：标签 / 配额容量 / draining。
+    ///
+    /// 任一参数为 ``None`` 表示保持当前值。标签随下一次心跳广播给集群；
+    /// ``draining=True`` 停止接纳新任务并让远端路由跳过本节点，在途任务
+    /// 继续完成；``draining=False`` 恢复。
+    #[pyo3(signature = (labels=None, quotas=None, draining=None))]
+    fn update_node_state(
+        &self,
+        labels: Option<BTreeMap<String, String>>,
+        quotas: Option<BTreeMap<String, u32>>,
+        draining: Option<bool>,
+    ) -> PyResult<()> {
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))?;
+        let update = NodeStateUpdate {
+            labels,
+            quotas,
+            draining,
+        };
+        runtime
+            .update_node_state(&update)
+            .map_err(actant_error_to_pyerr)
     }
 
     /// 运行时调整 Worker 最大并发任务数（仅支持扩容）。
@@ -720,21 +832,28 @@ impl PyRuntimeCore {
 
         // endpoint_addr lazy 缓存：节点启动后 iroh endpoint 不会变。
         let endpoint_addr = self.local_endpoint_addr(py)?;
+        // 直接任务提交不经过 orchestrator，签名必须在此完成，
+        // 否则启用 payload 签名的 Worker 会拒绝未签名载荷。
+        let payload = sign_payload(&self.payload_signing_key, task.payload)?;
 
         let task_def = TaskDefinition {
             id: TaskId::new(task.task_id),
             name: task.name,
-            payload: task.payload,
+            payload,
             workflow_id: task.workflow_id.map(WorkflowId::from),
             target_node: task.target_node.map(NodeId::new),
             origin_node: Some(node_id),
             retry_policy: task.retry_policy,
-            priority: 0,
+            priority: task.priority,
             timeout_ms: task.timeout_ms,
             attempt: 0,
+            lease_deadline_ms: 0,
             enqueued_at_ms: 0,
             target_endpoint_addr: task.target_endpoint_addr,
             origin_endpoint_addr: Some(endpoint_addr),
+            tags: task.tags,
+            quota: task.quota,
+            pinned_target: task.pinned_target,
         };
 
         // 通过 unbounded channel 投递给后台 task，避免 block_on 跨 GIL 同步阻塞。
@@ -781,22 +900,29 @@ impl PyRuntimeCore {
         let endpoint_addr = self.local_endpoint_addr(py)?;
         let task_defs: Vec<TaskDefinition> = tasks
             .into_iter()
-            .map(|t| TaskDefinition {
-                id: TaskId::new(t.task_id),
-                name: t.name,
-                payload: t.payload,
-                workflow_id: t.workflow_id.map(WorkflowId::from),
-                target_node: t.target_node.map(NodeId::new),
-                origin_node: Some(node_id.clone()),
-                retry_policy: t.retry_policy,
-                priority: 0,
-                timeout_ms: t.timeout_ms,
-                attempt: 0,
-                enqueued_at_ms: 0,
-                target_endpoint_addr: t.target_endpoint_addr,
-                origin_endpoint_addr: Some(endpoint_addr.clone()),
+            .map(|t| {
+                Ok(TaskDefinition {
+                    id: TaskId::new(t.task_id),
+                    name: t.name,
+                    // 与单条提交一致：直接任务载荷在 PyO3 边界签名。
+                    payload: sign_payload(&self.payload_signing_key, t.payload)?,
+                    workflow_id: t.workflow_id.map(WorkflowId::from),
+                    target_node: t.target_node.map(NodeId::new),
+                    origin_node: Some(node_id.clone()),
+                    retry_policy: t.retry_policy,
+                    priority: t.priority,
+                    timeout_ms: t.timeout_ms,
+                    attempt: 0,
+                    lease_deadline_ms: 0,
+                    enqueued_at_ms: 0,
+                    target_endpoint_addr: t.target_endpoint_addr,
+                    origin_endpoint_addr: Some(endpoint_addr.clone()),
+                    tags: t.tags,
+                    quota: t.quota,
+                    pinned_target: t.pinned_target,
+                })
             })
-            .collect();
+            .collect::<PyResult<Vec<TaskDefinition>>>()?;
         // 通过 channel 投递给后台 task，避免 block_on 跨 GIL 同步阻塞。
         // 后台 task 在 serve() 中 spawn，调用 `scheduler.enqueue_batch().await`。
         let tx_guard = self.submit_batch_tx.lock();
@@ -827,7 +953,8 @@ impl PyRuntimeCore {
     /// 工作流，后续节点经 [`Self::add_workflow_node`] 增量加入。
     /// ``timeout_ms > 0`` 时经 `submit_with_timeout` 设置工作流级 deadline。
     /// ``failure_strategy`` 为 ``"fail_fast"``（默认）或 ``"continue"``。
-    #[pyo3(signature = (workflow_id, failure_strategy=None, timeout_ms=0))]
+    #[pyo3(signature = (workflow_id, failure_strategy=None, timeout_ms=0, name=None, version=0, args=None))]
+    #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(
         name = "py.submit_workflow",
         level = "info",
@@ -840,6 +967,9 @@ impl PyRuntimeCore {
         workflow_id: String,
         failure_strategy: Option<String>,
         timeout_ms: u64,
+        name: Option<String>,
+        version: u32,
+        args: Option<Vec<u8>>,
     ) -> PyResult<()> {
         let mut dag = Dag::new();
         dag.failure_strategy = match failure_strategy.as_deref() {
@@ -852,11 +982,20 @@ impl PyRuntimeCore {
         };
         let wf = WorkflowId::from(workflow_id);
         actant_core::metrics::inc_workflows_submitted();
+        // 只有 flow 提交路径会给出 name；其余路径留空，journal 仍记录
+        // “没有调用描述”，而不是伪造一个。
+        let invocation = name.map(|name| WorkflowInvocation {
+            workflow_id: wf.clone(),
+            name,
+            version,
+            args: args.unwrap_or_default(),
+        });
         if timeout_ms > 0 {
-            let payload = encode(&(wf, dag, timeout_ms)).map_err(actant_error_to_pyerr)?;
+            let payload =
+                encode(&(wf, dag, timeout_ms, invocation)).map_err(actant_error_to_pyerr)?;
             self.call_workflow_actor::<()>(py, workflow_methods::SUBMIT_WITH_TIMEOUT, payload)?;
         } else {
-            let payload = encode(&(wf, dag)).map_err(actant_error_to_pyerr)?;
+            let payload = encode(&(wf, dag, invocation)).map_err(actant_error_to_pyerr)?;
             self.call_workflow_actor::<()>(py, workflow_methods::SUBMIT, payload)?;
         }
         Ok(())
@@ -898,6 +1037,8 @@ impl PyRuntimeCore {
             timeout_ms: node.timeout_ms,
             priority: node.priority.unwrap_or(0),
             metadata: node.metadata.unwrap_or_default(),
+            tags: node.tags,
+            quota: node.quota,
         };
         let deps: Vec<TaskId> = deps.into_iter().map(TaskId::new).collect();
         let payload = encode(&(WorkflowId::from(workflow_id), dag_node, deps))
@@ -978,7 +1119,8 @@ impl PyRuntimeCore {
     /// Args:
     ///     workflow_id: 工作流标识。
     ///     wait_key: 等待点注册表键（同一工作流内唯一）。
-    ///     kind: ``"signal"``（外部信号触发）或 ``"timer"``（定时到期）。
+    ///     kind: ``"signal"``（外部信号触发）、``"timer"``（定时到期）或
+    ///         ``"suspend"``（等待 ``resume_suspended``）。
     ///     name: ``kind="signal"`` 时的信号语义名；``None`` 时退化为 ``wait_key``。
     ///     deadline_ms: ``kind="timer"`` 时的**绝对** epoch 毫秒到期时刻，必须 > 0。
     ///
@@ -1039,9 +1181,14 @@ impl PyRuntimeCore {
     /// **返回值**
     ///
     /// - ``bytes``：本次递交**唤醒了一个等待点**（或该等待点此前已唤醒）。
-    ///   重放体"已收到 → 直接返回"由此路径实现，重复 signal 幂等。
+    ///   返回的是该等待点记录的 payload（首次递交胜出）；重放体"已收到 →
+    ///   直接返回"由此路径实现，重复 signal 幂等。
     /// - ``None``：此刻**没有等待点可被唤醒**，信号已入缓冲——将来注册同一
     ///   ``wait_key`` 的等待点会**立即生成为已唤醒态**，无需递交方重试。
+    ///
+    /// ``payload`` 是可选字节串（默认空），原样随 ``SignalReceived`` 进入工作流
+    /// 历史：重放、跨重启恢复与等待点缓冲命中都返回同一份字节。业务语义
+    /// （JSON / pickle）由第 2 层解释，核心不解析。
     ///
     /// **抛出**
     ///
@@ -1058,18 +1205,24 @@ impl PyRuntimeCore {
     #[tracing::instrument(
         name = "py.signal_wait_point",
         level = "debug",
-        skip(self, py),
+        skip(self, py, payload),
         fields(workflow_id = %workflow_id, wait_key = %wait_key)
     )]
+    #[pyo3(signature = (workflow_id, wait_key, payload=None))]
     fn signal_wait_point(
         &self,
         py: Python<'_>,
         workflow_id: String,
         wait_key: String,
+        payload: Option<Vec<u8>>,
     ) -> PyResult<Option<Vec<u8>>> {
-        let payload =
-            encode(&(WorkflowId::from(workflow_id), wait_key)).map_err(actant_error_to_pyerr)?;
-        self.call_workflow_actor(py, workflow_methods::SIGNAL_WAIT_POINT, payload)
+        let frame = encode(&(
+            WorkflowId::from(workflow_id),
+            wait_key,
+            payload.unwrap_or_default(),
+        ))
+        .map_err(actant_error_to_pyerr)?;
+        self.call_workflow_actor(py, workflow_methods::SIGNAL_WAIT_POINT, frame)
     }
 
     /// 恢复挂起：唤醒该工作流所有 `kind="suspend"` 且仍在等待的等待点。
@@ -1092,6 +1245,69 @@ impl PyRuntimeCore {
     fn resume_suspended(&self, py: Python<'_>, workflow_id: String) -> PyResult<usize> {
         let payload = encode(&WorkflowId::from(workflow_id)).map_err(actant_error_to_pyerr)?;
         self.call_workflow_actor(py, workflow_methods::RESUME_SUSPENDED, payload)
+    }
+
+    /// 解析（首次记录 / 重放命中）确定性上下文值。
+    ///
+    /// Args:
+    ///     workflow_id: 工作流标识。
+    ///     key: 上下文值键（由 flow 体的调用序号决定，如 ``ctx-1``）。
+    ///     kind: 值种类（``"now_ms"`` / ``"uuid"`` / ``"random"``）。
+    ///     candidate: 首次执行时生成的候选值（重放时被忽略）。
+    ///
+    /// Returns:
+    ///     记录值：首次执行等于 ``candidate``，重放时等于历史值。
+    ///
+    /// Raises:
+    ///     FlowReplayError: 同 ``key`` 的历史记录是另一种 ``kind``——flow 体的
+    ///         调用序列已漂移。
+    #[pyo3(signature = (workflow_id, key, kind, candidate))]
+    #[tracing::instrument(
+        name = "py.resolve_context_value",
+        level = "debug",
+        skip(self, py, candidate),
+        fields(workflow_id = %workflow_id, key = %key, kind = %kind)
+    )]
+    fn resolve_context_value(
+        &self,
+        py: Python<'_>,
+        workflow_id: String,
+        key: String,
+        kind: String,
+        candidate: Vec<u8>,
+    ) -> PyResult<Vec<u8>> {
+        let payload = encode(&(WorkflowId::from(workflow_id), key, kind, candidate))
+            .map_err(actant_error_to_pyerr)?;
+        self.call_workflow_actor(py, workflow_methods::RESOLVE_CONTEXT_VALUE, payload)
+    }
+
+    /// 只读查询工作流已记录的确定性上下文值。
+    ///
+    /// 与 ``resolve_context_value`` 的区别：未记录时返回 ``None`` 且**不写
+    /// 历史**。用于探测"续跑携带参数"等可能不存在的记录。
+    ///
+    /// Args:
+    ///     workflow_id: 工作流标识。
+    ///     key: 上下文值键。
+    ///
+    /// Returns:
+    ///     记录值字节串；未记录返回 ``None``。
+    #[pyo3(signature = (workflow_id, key))]
+    #[tracing::instrument(
+        name = "py.get_context_value",
+        level = "debug",
+        skip(self, py),
+        fields(workflow_id = %workflow_id, key = %key)
+    )]
+    fn get_context_value(
+        &self,
+        py: Python<'_>,
+        workflow_id: String,
+        key: String,
+    ) -> PyResult<Option<Vec<u8>>> {
+        let payload =
+            encode(&(WorkflowId::from(workflow_id), key)).map_err(actant_error_to_pyerr)?;
+        self.call_workflow_actor(py, workflow_methods::GET_CONTEXT_VALUE, payload)
     }
 
     /// 阻塞等待等待点条件满足（flow 体 park 原语）。
@@ -1159,6 +1375,74 @@ impl PyRuntimeCore {
             })
         });
         Ok(outcome)
+    }
+
+    /// 非阻塞等待等待点条件满足（asyncio 版本）。
+    ///
+    /// 语义与 :meth:`wait_wait_point` 一致，但返回 ``asyncio.Future``（无 running
+    /// loop 时回退为自定义 awaitable），等待期间不占用调用线程、不阻塞 event
+    /// loop。等待者仍在 actor 之外注册，故不会拖停其他工作流。
+    ///
+    /// Args:
+    ///     workflow_id: 工作流标识。
+    ///     wait_key: 等待点注册表键。
+    ///     timeout_ms: 等待上界；``0`` 表示无限等待。
+    ///
+    /// Returns:
+    ///     解析为 ``bytes``（条件满足）或 ``None``（超时 / 等待者被释放 /
+    ///     编排器未注入）的 awaitable。
+    #[pyo3(signature = (workflow_id, wait_key, timeout_ms=0))]
+    #[tracing::instrument(
+        name = "py.wait_wait_point_async",
+        level = "debug",
+        skip(self, py),
+        fields(workflow_id = %workflow_id, wait_key = %wait_key, timeout_ms)
+    )]
+    fn wait_wait_point_async<'py>(
+        &self,
+        py: Python<'py>,
+        workflow_id: String,
+        wait_key: String,
+        timeout_ms: u64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))?;
+        let tokio = self.tokio.lock().clone().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("tokio runtime unavailable")
+        })?;
+        let handle = tokio.handle().clone();
+        let Some(orchestrator) = runtime.orchestrator_handle().cloned() else {
+            return future_into_py_iter(
+                py,
+                handle,
+                &self.gil_thread,
+                std::future::ready(FutureResultToPy::Value(py.None())),
+            );
+        };
+        let wf = WorkflowId::from(workflow_id);
+        let rx = orchestrator.register_wait_point_waiter(wf, &wait_key);
+        let fut = async move {
+            let payload = if timeout_ms == 0 {
+                rx.await.ok()
+            } else {
+                match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), rx).await {
+                    Ok(Ok(payload)) => Some(payload),
+                    // 超时，或等待者被移除（sender 提前 drop）→ 无可交付结果。
+                    _ => None,
+                }
+            };
+            match payload {
+                Some(bytes) => Python::attach(|py| {
+                    FutureResultToPy::Value(
+                        pyo3::types::PyBytes::new(py, &bytes).unbind().into_any(),
+                    )
+                }),
+                None => Python::attach(|py| FutureResultToPy::Value(py.None())),
+            }
+        };
+        future_into_py_iter(py, handle, &self.gil_thread, fut)
     }
 
     /// 封口工作流节点集（flow 函数体返回信号）。
@@ -1288,7 +1572,7 @@ impl PyRuntimeCore {
     /// ``workflow_id`` / ``failure_strategy`` / ``default_retry_policy`` /
     /// ``nodes`` / ``edges``。``nodes`` 每项为
     /// ``{task_id, name, deps, timeout_ms, priority, metadata, retry_policy}``；
-    /// ``edges`` 每项为 ``{from, to, condition}``。
+    /// ``edges`` 每项为 ``{from, to}``。
     ///
     /// **不含 payload**：任务载荷是签名的 cloudpickle 字节，对 Rust 不透明且可能
     /// 很大。需要任务**结果**用 :func:`get_workflow_state` 的 ``tasks[*].result``。
@@ -1335,7 +1619,6 @@ impl PyRuntimeCore {
             let edge = pyo3::types::PyDict::new(py);
             edge.set_item("from", &e.from)?;
             edge.set_item("to", &e.to)?;
-            edge.set_item("condition", e.condition.clone())?;
             edges.append(edge)?;
         }
         dict.set_item("edges", edges)?;
@@ -1383,7 +1666,7 @@ impl PyRuntimeCore {
             item.set_item("sequence", id.sequence)?;
             item.set_item("timestamp_ms", id.timestamp.wall_time())?;
             item.set_item("payload", pyo3::types::PyBytes::new(py, raw))?;
-            match postcard::from_bytes::<WorkflowEventPayload>(raw) {
+            match postcard::from_bytes::<JournalEvent>(raw) {
                 Ok(ev) => {
                     item.set_item("kind", event_payload_kind(&ev))?;
                     item.set_item("task_id", event_payload_task_id(&ev).map(|t| t.to_string()))?;
@@ -1399,6 +1682,99 @@ impl PyRuntimeCore {
             list.append(item)?;
         }
         Ok(list.into_any().unbind())
+    }
+
+    /// 返回工作流的稳定 journal（跨语言消费面）。
+    ///
+    /// 每项固定含 ``seq`` / ``timestamp_ms`` / ``kind`` / ``workflow_id`` /
+    /// ``task_id`` / ``wait_key`` / ``error`` / ``payload``，并按事件类型附带
+    /// ``condition``（等待点）与 ``invocation``（提交描述）。
+    ///
+    /// - ``kind`` 是稳定的小写事件名（与 Python 侧 lifecycle 事件的 ``kind``
+    ///   一致，如 ``"submitted"`` / ``"task_completed"``）；
+    /// - ``payload`` 是该事件携带的不透明字节（节点定义入参、任务结果、
+    ///   信号载荷、上下文值），可直接 JSON base64 导出；
+    /// - 无法解码的历史条目以 ``kind="undecodable"`` 保留位置并带解码错误，
+    ///   不静默跳过。
+    fn get_workflow_journal(&self, py: Python<'_>, workflow_id: String) -> PyResult<Py<PyAny>> {
+        use actant_core::runtime::state::event_log::EventId;
+
+        let payload = encode(&(WorkflowId::from(workflow_id), None::<EventId>))
+            .map_err(actant_error_to_pyerr)?;
+        let entries: Vec<(EventId, Vec<u8>)> =
+            self.call_workflow_actor(py, workflow_methods::GET_HISTORY, payload)?;
+
+        let list = pyo3::types::PyList::new(py, [] as [Py<PyAny>; 0])?;
+        for (id, raw) in &entries {
+            let item = pyo3::types::PyDict::new(py);
+            item.set_item("seq", id.sequence)?;
+            item.set_item("timestamp_ms", id.timestamp.wall_time())?;
+            match postcard::from_bytes::<JournalEvent>(raw) {
+                Ok(ev) => {
+                    let record = JournalRecord {
+                        seq: id.sequence,
+                        timestamp_ms: id.timestamp.wall_time(),
+                        event: ev,
+                    };
+                    let ev = &record.event;
+                    item.set_item("kind", ev.kind())?;
+                    item.set_item("workflow_id", ev.workflow_id().as_str())?;
+                    item.set_item("task_id", event_payload_task_id(ev))?;
+                    item.set_item("wait_key", event_payload_wait_key(ev))?;
+                    item.set_item("error", event_payload_error(ev))?;
+                    item.set_item(
+                        "payload",
+                        event_payload_bytes(ev).map(|b| pyo3::types::PyBytes::new(py, b)),
+                    )?;
+                    item.set_item(
+                        "condition",
+                        event_payload_condition(ev).map(wait_condition_label),
+                    )?;
+                    match ev {
+                        JournalEvent::Submitted {
+                            invocation: Some(inv),
+                            ..
+                        } => item.set_item("invocation", invocation_to_py(py, inv)?)?,
+                        _ => item.set_item("invocation", py.None())?,
+                    }
+                }
+                Err(e) => {
+                    // 历史格式变更时保留位置但标记不可解码，避免静默跳过。
+                    item.set_item("kind", "undecodable")?;
+                    item.set_item("workflow_id", py.None())?;
+                    item.set_item("task_id", py.None())?;
+                    item.set_item("wait_key", py.None())?;
+                    item.set_item("error", e.to_string())?;
+                    item.set_item("payload", py.None())?;
+                    item.set_item("condition", py.None())?;
+                    item.set_item("invocation", py.None())?;
+                }
+            }
+            list.append(item)?;
+        }
+        Ok(list.into_any().unbind())
+    }
+
+    /// 返回工作流的提交描述（`JournalEvent::Submitted` 中的 invocation）。
+    ///
+    /// 无 invocation（旧记录或非 flow 提交）时返回 ``None``。
+    fn get_workflow_invocation(&self, py: Python<'_>, workflow_id: String) -> PyResult<Py<PyAny>> {
+        use actant_core::runtime::state::event_log::EventId;
+
+        let payload = encode(&(WorkflowId::from(workflow_id), None::<EventId>))
+            .map_err(actant_error_to_pyerr)?;
+        let entries: Vec<(EventId, Vec<u8>)> =
+            self.call_workflow_actor(py, workflow_methods::GET_HISTORY, payload)?;
+        for (_, raw) in &entries {
+            if let Ok(JournalEvent::Submitted {
+                invocation: Some(inv),
+                ..
+            }) = postcard::from_bytes::<JournalEvent>(raw)
+            {
+                return invocation_to_py(py, &inv);
+            }
+        }
+        Ok(py.None())
     }
 
     /// 返回当前在内存中活跃（已提交未淘汰）的工作流 ID 列表。
@@ -1463,6 +1839,119 @@ impl PyRuntimeCore {
             out.push(dict.into_any().unbind());
         }
         Ok(out)
+    }
+
+    /// 故障注入：模拟本节点到 `target` 的单向网络分区（忽略其心跳并移出视图）。
+    fn close_peer(&self, target: String) -> PyResult<()> {
+        let failover = fault_injection_target(self.runtime.as_ref())?;
+        failover.block_peer(&actant_core::common::NodeId::from(target));
+        Ok(())
+    }
+
+    /// 故障注入：解除对 `target` 的分区模拟。
+    fn reopen_peer(&self, target: String) -> PyResult<()> {
+        let failover = fault_injection_target(self.runtime.as_ref())?;
+        failover.unblock_peer(&actant_core::common::NodeId::from(target));
+        Ok(())
+    }
+
+    /// 故障注入：在接下来 `ms` 毫秒内不广播心跳（0 立即恢复）。
+    fn delay_heartbeat(&self, ms: u64) -> PyResult<()> {
+        fault_injection_target(self.runtime.as_ref())?.pause_heartbeat_for_ms(ms);
+        Ok(())
+    }
+
+    /// 故障注入：给本节点 HLC 施加时钟偏移（毫秒，可正可负），0 恢复。
+    fn inject_hlc_drift(&self, ms: i64) -> PyResult<()> {
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))?;
+        runtime.inject_hlc_drift_ms(ms);
+        Ok(())
+    }
+
+    /// 注册一个 batch/array job，返回初始进度快照。
+    ///
+    /// `batch_id` 由调用方生成（Python 层用 uuid）；`task_ids` 为该批任务的
+    /// 提交 id。同一 id 重复注册累加成员；终态由 Python 结果泵在解析 payload
+    /// 后经 `record_batch_terminal` 上报——Rust EventBus 无法区分「协议成功」
+    /// 与「业务失败」，不能自行结算。
+    fn register_batch(
+        &self,
+        py: Python<'_>,
+        batch_id: String,
+        task_ids: Vec<String>,
+    ) -> PyResult<Py<PyAny>> {
+        let worker = self
+            .runtime
+            .as_ref()
+            .and_then(|rt| rt.worker())
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))?;
+        let progress = worker
+            .batch_tracker()
+            .register(&batch_id, task_ids.into_iter().map(TaskId::from));
+        batch_progress_to_py(py, &progress)
+    }
+
+    /// 查询 batch 进度；未注册返回 `None`。
+    fn batch_progress(&self, py: Python<'_>, batch_id: String) -> PyResult<Option<Py<PyAny>>> {
+        let worker = self
+            .runtime
+            .as_ref()
+            .and_then(|rt| rt.worker())
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))?;
+        match worker.batch_tracker().progress(&batch_id) {
+            Some(progress) => Ok(Some(batch_progress_to_py(py, &progress)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// 记录一个 batch 成员的终态（由 Python 结果泵在解析 payload 后调用）。
+    ///
+    /// Rust EventBus 无法区分「协议成功」与「业务失败」（worker 结果正文不透明），
+    /// 因此 batch 终态由唯一能解析 payload 的 Python 侧上报；返回更新后的进度快照，
+    /// 非 batch 成员或重复上报返回 `None`。
+    fn record_batch_terminal(
+        &self,
+        py: Python<'_>,
+        task_id: String,
+        state: String,
+    ) -> PyResult<Option<Py<PyAny>>> {
+        use actant_core::runtime::batch::BatchItemState;
+
+        let worker = self
+            .runtime
+            .as_ref()
+            .and_then(|rt| rt.worker())
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))?;
+        let state = match state.to_ascii_lowercase().as_str() {
+            "completed" => BatchItemState::Completed,
+            "failed" => BatchItemState::Failed,
+            "cancelled" => BatchItemState::Cancelled,
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "unknown batch terminal state '{other}'"
+                )))
+            }
+        };
+        match worker
+            .batch_tracker()
+            .record_terminal(&TaskId::from(task_id), state)
+        {
+            Some(progress) => Ok(Some(batch_progress_to_py(py, &progress)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// 移除 batch 注册与成员索引。
+    fn remove_batch(&self, batch_id: String) -> PyResult<bool> {
+        let worker = self
+            .runtime
+            .as_ref()
+            .and_then(|rt| rt.worker())
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))?;
+        Ok(worker.batch_tracker().remove(&batch_id))
     }
 
     /// 注册 Python 任务结果回调。
@@ -1548,16 +2037,22 @@ impl PyRuntimeCore {
 
     /// 注册任务日志回调。
     ///
-    /// 订阅 event_bus 的 ``TaskLog`` 话题（worker 子进程经 stderr 边带上报的
-    /// 任务日志，tap 语义 best-effort 可丢），收到事件时调用
-    /// ``callback(dict)``，dict 为 ``{task_id, level, message}``。
+    /// worker 子进程经 stderr 边带上报的任务日志（tap 语义 best-effort 可丢），
+    /// 收到事件时调用 ``callback(dict)``，dict 为 ``{task_id, level, message}``。
+    /// 指定 ``task_id`` 时走 `EventBus` 的逐任务通道，只接收该任务的日志；
+    /// 省略时订阅全局 ``TaskLog`` 话题，接收所有任务日志。
     /// 回调在 tokio 后台线程执行，通过 ``Python::attach`` 获取 GIL。
     #[tracing::instrument(
         name = "py.register_task_log_callback",
         level = "info",
         skip(self, callback)
     )]
-    fn register_task_log_callback(&self, callback: Py<PyAny>) -> PyResult<()> {
+    #[pyo3(signature = (callback, task_id=None))]
+    fn register_task_log_callback(
+        &self,
+        callback: Py<PyAny>,
+        task_id: Option<String>,
+    ) -> PyResult<()> {
         let runtime = self
             .runtime
             .as_ref()
@@ -1567,7 +2062,10 @@ impl PyRuntimeCore {
         })?;
         let event_bus = runtime.event_bus().clone();
         let callback = Arc::new(callback);
-        let mut rx_log = event_bus.subscribe(BusTopic::TaskLog);
+        let mut rx_log = match task_id {
+            Some(task_id) => event_bus.subscribe_task_logs(TaskId::from(task_id)),
+            None => event_bus.subscribe(BusTopic::TaskLog),
+        };
 
         let handle = tokio.spawn(async move {
             loop {
@@ -1674,6 +2172,13 @@ impl PyRuntimeCore {
     /// 若 worker 未初始化则返回错误。
     #[tracing::instrument(name = "py.serve", level = "info", skip(self, py))]
     fn serve(&self, py: Python<'_>) -> PyResult<()> {
+        // 幂等：每次调用都会 spawn 一个新的 `worker.run()`，两个循环并行消费同一
+        // 队列既抢任务又互相覆盖句柄。以「句柄在册」作为已启动判据，`shutdown`
+        // 会清空它，因此 stop → start 仍可重新拉起。
+        if self.worker_handle.lock().is_some() {
+            tracing::debug!("serve() ignored: worker daemon loop already running");
+            return Ok(());
+        }
         let runtime = self
             .runtime
             .as_ref()
@@ -1866,6 +2371,9 @@ impl PyRuntimeCore {
                 tracing::info!("shared tokio runtime still in use by other instances, skipping shutdown_timeout");
             }
         }
+        // 清空 serve 的在册句柄：Runtime::shutdown 已等待 worker 进入 Stopped，
+        // 该任务不会再被 join；留着会阻止后续 serve() 重新拉起（幂等判据）。
+        let _ = self.worker_handle.lock().take();
         tracing::info!(
             shutdown_ms = t0.elapsed().as_millis() as u64,
             "PyRuntimeCore::shutdown done"
@@ -1946,42 +2454,92 @@ impl Drop for PyRuntimeCore {
 }
 
 /// Actor 返回错误时转换为对应的 `ActantError` 异常。
-/// `WorkflowEventPayload` 的观测访问器在 core 内按 `python` 特性门控
+/// `JournalEvent` 的观测访问器在 core 内按 `python` 特性门控
 /// （纯框架构建零 dead_code），绑定壳在此自行实现（enum 变体字段天然可见）。
-fn event_payload_task_id(ev: &WorkflowEventPayload) -> Option<&str> {
+fn event_payload_task_id(ev: &JournalEvent) -> Option<&str> {
     match ev {
-        WorkflowEventPayload::TaskDispatched { task_id, .. }
-        | WorkflowEventPayload::TaskRunning { task_id, .. }
-        | WorkflowEventPayload::TaskCompleted { task_id, .. }
-        | WorkflowEventPayload::TaskFailed { task_id, .. }
-        | WorkflowEventPayload::TaskCancelled { task_id, .. } => Some(task_id.as_str()),
+        JournalEvent::TaskDispatched { task_id, .. }
+        | JournalEvent::TaskRunning { task_id, .. }
+        | JournalEvent::TaskCompleted { task_id, .. }
+        | JournalEvent::TaskFailed { task_id, .. }
+        | JournalEvent::TaskCancelled { task_id, .. } => Some(task_id.as_str()),
         _ => None,
     }
 }
-fn event_payload_error(ev: &WorkflowEventPayload) -> Option<&str> {
+fn event_payload_error(ev: &JournalEvent) -> Option<&str> {
     match ev {
-        WorkflowEventPayload::Failed { error, .. }
-        | WorkflowEventPayload::TaskFailed { error, .. } => Some(error.as_str()),
+        JournalEvent::Failed { error, .. } | JournalEvent::TaskFailed { error, .. } => {
+            Some(error.as_str())
+        }
         _ => None,
     }
 }
-fn event_payload_kind(ev: &WorkflowEventPayload) -> &'static str {
+fn event_payload_wait_key(ev: &JournalEvent) -> Option<&str> {
     match ev {
-        WorkflowEventPayload::Submitted { .. } => "Submitted",
-        WorkflowEventPayload::NodeAdded { .. } => "NodeAdded",
-        WorkflowEventPayload::TaskDispatched { .. } => "TaskDispatched",
-        WorkflowEventPayload::Started { .. } => "Started",
-        WorkflowEventPayload::TaskRunning { .. } => "TaskRunning",
-        WorkflowEventPayload::TaskCompleted { .. } => "TaskCompleted",
-        WorkflowEventPayload::TaskFailed { .. } => "TaskFailed",
-        WorkflowEventPayload::TaskCancelled { .. } => "TaskCancelled",
-        WorkflowEventPayload::Completed { .. } => "Completed",
-        WorkflowEventPayload::Failed { .. } => "Failed",
-        WorkflowEventPayload::Cancelled { .. } => "Cancelled",
-        WorkflowEventPayload::WaitPointRegistered { .. } => "WaitPointRegistered",
-        WorkflowEventPayload::SignalReceived { .. } => "SignalReceived",
-        WorkflowEventPayload::TimerFired { .. } => "TimerFired",
-        WorkflowEventPayload::Recovered { .. } => "Recovered",
+        JournalEvent::WaitPointRegistered { wait_key, .. }
+        | JournalEvent::SignalReceived { wait_key, .. }
+        | JournalEvent::TimerFired { wait_key, .. } => Some(wait_key.as_str()),
+        _ => None,
+    }
+}
+/// 事件携带的不透明业务字节：节点入参、任务结果、信号载荷、上下文值。
+/// 重放与导出都需要它们，故 journal 视为可消费数据而非仅元数据。
+fn event_payload_bytes(ev: &JournalEvent) -> Option<&[u8]> {
+    match ev {
+        JournalEvent::Submitted {
+            invocation: Some(inv),
+            ..
+        } => Some(&inv.args),
+        JournalEvent::NodeAdded { node, .. } => Some(&node.payload),
+        JournalEvent::TaskCompleted { result, .. } => Some(result),
+        JournalEvent::SignalReceived { payload, .. } => Some(payload),
+        JournalEvent::ContextValue { value, .. } => Some(value),
+        _ => None,
+    }
+}
+fn event_payload_condition(ev: &JournalEvent) -> Option<&WaitCondition> {
+    match ev {
+        JournalEvent::WaitPointRegistered { condition, .. } => Some(condition),
+        _ => None,
+    }
+}
+/// 等待条件的稳定字符串标签（``signal:<name>`` / ``timer:<deadline_ms>`` /
+/// ``suspend``），供导出面跨语言消费；完整条件以 ``JournalEvent`` 为准。
+fn wait_condition_label(condition: &WaitCondition) -> String {
+    match condition {
+        WaitCondition::Signal { name } => format!("signal:{name}"),
+        WaitCondition::Timer { deadline_ms } => format!("timer:{deadline_ms}"),
+        WaitCondition::Suspend => "suspend".to_string(),
+        // 枚举 non_exhaustive：未来变体在旧消费端以显式标签暴露而非静默丢失。
+        other => format!("unknown:{other:?}"),
+    }
+}
+fn invocation_to_py(py: Python<'_>, inv: &WorkflowInvocation) -> PyResult<Py<PyAny>> {
+    let item = pyo3::types::PyDict::new(py);
+    item.set_item("workflow_id", inv.workflow_id.as_str())?;
+    item.set_item("name", &inv.name)?;
+    item.set_item("version", inv.version)?;
+    item.set_item("args", pyo3::types::PyBytes::new(py, &inv.args))?;
+    Ok(item.into_any().unbind())
+}
+fn event_payload_kind(ev: &JournalEvent) -> &'static str {
+    match ev {
+        JournalEvent::Submitted { .. } => "Submitted",
+        JournalEvent::NodeAdded { .. } => "NodeAdded",
+        JournalEvent::TaskDispatched { .. } => "TaskDispatched",
+        JournalEvent::Started { .. } => "Started",
+        JournalEvent::TaskRunning { .. } => "TaskRunning",
+        JournalEvent::TaskCompleted { .. } => "TaskCompleted",
+        JournalEvent::TaskFailed { .. } => "TaskFailed",
+        JournalEvent::TaskCancelled { .. } => "TaskCancelled",
+        JournalEvent::Completed { .. } => "Completed",
+        JournalEvent::Failed { .. } => "Failed",
+        JournalEvent::Cancelled { .. } => "Cancelled",
+        JournalEvent::WaitPointRegistered { .. } => "WaitPointRegistered",
+        JournalEvent::SignalReceived { .. } => "SignalReceived",
+        JournalEvent::TimerFired { .. } => "TimerFired",
+        JournalEvent::ContextValue { .. } => "ContextValue",
+        JournalEvent::Recovered { .. } => "Recovered",
     }
 }
 /// "同一结构两处构造"漂移。
@@ -1994,6 +2552,21 @@ fn retry_policy_to_py(py: Python<'_>, policy: Option<&RetryPolicy>) -> PyResult<
     d.set_item("delay_ms", p.delay_ms)?;
     d.set_item("backoff_multiplier", p.backoff_multiplier)?;
     d.set_item("max_delay_ms", p.max_delay_ms)?;
+    Ok(d.into_any().unbind())
+}
+
+fn batch_progress_to_py(
+    py: Python<'_>,
+    progress: &actant_core::runtime::batch::BatchProgress,
+) -> PyResult<Py<PyAny>> {
+    let d = pyo3::types::PyDict::new(py);
+    d.set_item("batch_id", &progress.batch_id)?;
+    d.set_item("total", progress.total)?;
+    d.set_item("completed", progress.completed)?;
+    d.set_item("failed", progress.failed)?;
+    d.set_item("cancelled", progress.cancelled)?;
+    d.set_item("pending", progress.pending)?;
+    d.set_item("finished", progress.finished())?;
     Ok(d.into_any().unbind())
 }
 
@@ -2043,20 +2616,6 @@ fn task_completion_to_py(completion: &TaskCompletion) -> PyTaskCompletion {
             error: None,
             target_node: target_node.as_ref().map(|n| n.as_str().to_string()),
         },
-        TaskCompletion::Skipped {
-            workflow_id,
-            task_id,
-            task_name,
-            target_node,
-        } => PyTaskCompletion {
-            workflow_id: workflow_id.as_str().to_string(),
-            task_id: task_id.as_str().to_string(),
-            task_name: task_name.clone(),
-            state: "Skipped".to_string(),
-            result: None,
-            error: None,
-            target_node: target_node.as_ref().map(|n| n.as_str().to_string()),
-        },
     }
 }
 
@@ -2066,7 +2625,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTask>()?;
     m.add_class::<PyListenAddresses>()?;
     m.add_class::<PyRuntimeCore>()?;
-    m.add_function(pyo3::wrap_pyfunction!(prometheus_text, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(metrics_text, m)?)?;
     Ok(())
 }
 
@@ -2076,6 +2635,6 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 /// 用户在自己的 HTTP 服务器中直接暴露。若未调用 `metrics::init()`
 /// （如纯 Python 测试场景），返回空字符串。
 #[pyfunction]
-fn prometheus_text() -> String {
+fn metrics_text() -> String {
     actant_core::metrics::prometheus_text()
 }

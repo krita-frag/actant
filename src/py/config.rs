@@ -5,7 +5,8 @@ use pyo3::prelude::*;
 use pyo3::types::PyType;
 
 use actant_core::common::{
-    ActantConfig, DiscoveryMode, FailoverConfig, GossipConfig, NetworkConfig, RetryPolicy,
+    ActantConfig, DiscoveryMode, FailoverConfig, GossipConfig, NetworkConfig, NodeRole,
+    RetryPolicy, StoreConfig,
 };
 use actant_core::runtime::workflow::Phase;
 
@@ -17,7 +18,6 @@ pub enum PyWorkflowState {
     Completed,
     Failed,
     Cancelled,
-    Skipped,
 }
 
 #[pymethods]
@@ -32,8 +32,6 @@ impl PyWorkflowState {
     const FAILED: PyWorkflowState = PyWorkflowState::Failed;
     #[classattr]
     const CANCELLED: PyWorkflowState = PyWorkflowState::Cancelled;
-    #[classattr]
-    const SKIPPED: PyWorkflowState = PyWorkflowState::Skipped;
 
     fn __repr__(&self) -> &'static str {
         match self {
@@ -42,7 +40,6 @@ impl PyWorkflowState {
             PyWorkflowState::Completed => "_WorkflowState.COMPLETED",
             PyWorkflowState::Failed => "_WorkflowState.FAILED",
             PyWorkflowState::Cancelled => "_WorkflowState.CANCELLED",
-            PyWorkflowState::Skipped => "_WorkflowState.SKIPPED",
         }
     }
 }
@@ -55,7 +52,6 @@ impl From<Phase> for PyWorkflowState {
             Phase::Completed => PyWorkflowState::Completed,
             Phase::Failed => PyWorkflowState::Failed,
             Phase::Cancelled => PyWorkflowState::Cancelled,
-            Phase::Skipped => PyWorkflowState::Skipped,
         }
     }
 }
@@ -68,17 +64,17 @@ impl From<PyWorkflowState> for Phase {
             PyWorkflowState::Completed => Phase::Completed,
             PyWorkflowState::Failed => Phase::Failed,
             PyWorkflowState::Cancelled => Phase::Cancelled,
-            PyWorkflowState::Skipped => Phase::Skipped,
         }
     }
 }
 
 /// 将用户提供的网络 preset 字符串解析为内部 `DiscoveryMode`。
 ///
-/// 此处接受任何非空字符串；discovery 注册表在启动时通过
-/// [`actant_core::common::DiscoveryMode::validate`] 验证名称，
-/// 并以 `Config` 错误拒绝未知名称（无静默回退）。
-/// 这允许 Python 层在 runtime 启动前注册自定义发现策略。
+/// 此处接受任何非空字符串；启动时由
+/// [`actant_core::common::DiscoveryMode::validate`] 验证，未知名称以
+/// `Config` 错误拒绝（无静默回退）。可选名称是 `none` / `local` / `dns`
+/// 的封闭白名单——自定义发现策略只能经 Rust `Discovery` trait 注入
+/// （`RuntimeBuilder::with_discovery`），Python 侧没有注册入口。
 ///
 /// # 环境变量覆盖
 ///
@@ -198,8 +194,6 @@ pub struct PyNetworkConfig {
     #[pyo3(get)]
     pub listen_ip: String,
     #[pyo3(get)]
-    pub capability_gossip_interval_ms: u64,
-    #[pyo3(get)]
     pub event_channel_capacity: usize,
     /// 自定义 DNS 起源域，仅当 `preset = "dns"` 时生效。
     /// 空字符串表示使用 n0 默认 `iroh.link`。
@@ -217,7 +211,7 @@ pub struct PyNetworkConfig {
 impl PyNetworkConfig {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (preset=None, bootstrap_nodes=None, hlc_max_drift_ms=actant_core::common::NetworkConfig::DEFAULT_HLC_MAX_DRIFT_MS, max_pending_direct_requests=actant_core::common::NetworkConfig::DEFAULT_MAX_PENDING_DIRECT_REQUESTS, gossip_bootstrap_peers=None, max_message_size=actant_core::common::NetworkConfig::DEFAULT_MAX_MESSAGE_SIZE, allowed_peer_ids=None, direct_request_timeout_ms=actant_core::common::NetworkConfig::DEFAULT_DIRECT_REQUEST_TIMEOUT_MS, listen_port=0, listen_ip="", capability_gossip_interval_ms=actant_core::common::NetworkConfig::DEFAULT_CAPABILITY_GOSSIP_INTERVAL_MS, event_channel_capacity=actant_core::common::NetworkConfig::DEFAULT_EVENT_CHANNEL_CAPACITY, dns_origin_domain="", relay_endpoints=None, require_signed_records=false))]
+    #[pyo3(signature = (preset=None, bootstrap_nodes=None, hlc_max_drift_ms=actant_core::common::NetworkConfig::DEFAULT_HLC_MAX_DRIFT_MS, max_pending_direct_requests=actant_core::common::NetworkConfig::DEFAULT_MAX_PENDING_DIRECT_REQUESTS, gossip_bootstrap_peers=None, max_message_size=actant_core::common::NetworkConfig::DEFAULT_MAX_MESSAGE_SIZE, allowed_peer_ids=None, direct_request_timeout_ms=actant_core::common::NetworkConfig::DEFAULT_DIRECT_REQUEST_TIMEOUT_MS, listen_port=0, listen_ip="", event_channel_capacity=actant_core::common::NetworkConfig::DEFAULT_EVENT_CHANNEL_CAPACITY, dns_origin_domain="", relay_endpoints=None, require_signed_records=false))]
     fn new(
         preset: Option<String>,
         bootstrap_nodes: Option<Vec<String>>,
@@ -229,7 +223,6 @@ impl PyNetworkConfig {
         direct_request_timeout_ms: u64,
         listen_port: u16,
         listen_ip: &str,
-        capability_gossip_interval_ms: u64,
         event_channel_capacity: usize,
         dns_origin_domain: &str,
         relay_endpoints: Option<Vec<String>>,
@@ -246,7 +239,6 @@ impl PyNetworkConfig {
             direct_request_timeout_ms,
             listen_port,
             listen_ip: listen_ip.to_string(),
-            capability_gossip_interval_ms,
             event_channel_capacity,
             dns_origin_domain: dns_origin_domain.to_string(),
             relay_endpoints: relay_endpoints.unwrap_or_default(),
@@ -270,8 +262,6 @@ impl Default for PyNetworkConfig {
                 actant_core::common::NetworkConfig::DEFAULT_DIRECT_REQUEST_TIMEOUT_MS,
             listen_port: 0,
             listen_ip: String::new(),
-            capability_gossip_interval_ms:
-                actant_core::common::NetworkConfig::DEFAULT_CAPABILITY_GOSSIP_INTERVAL_MS,
             event_channel_capacity:
                 actant_core::common::NetworkConfig::DEFAULT_EVENT_CHANNEL_CAPACITY,
             dns_origin_domain: String::new(),
@@ -296,7 +286,6 @@ impl TryFrom<&PyNetworkConfig> for NetworkConfig {
             direct_request_timeout_ms: c.direct_request_timeout_ms,
             listen_port: c.listen_port,
             listen_ip: c.listen_ip.clone(),
-            capability_gossip_interval_ms: c.capability_gossip_interval_ms,
             event_channel_capacity: c.event_channel_capacity,
             dns_origin_domain: c.dns_origin_domain.clone(),
             relay_endpoints: c.relay_endpoints.clone(),
@@ -427,6 +416,78 @@ impl From<PyGossipConfig> for GossipConfig {
     }
 }
 
+/// 持久化存储配置（PyO3 视图，对应 Rust `StoreConfig`）。
+///
+/// 这些参数只影响本节点的 LMDB 环境，与网络、Worker、工作流配置无关，
+/// 因此不再以 `store_*` 扁平字段散落在 `_ActantConfig` 上。
+#[pyclass(name = "_StoreConfig", from_py_object)]
+#[derive(Clone)]
+pub struct PyStoreConfig {
+    /// 持久化目录。`None` 表示由 `Runtime` 解析（显式 `data_dir` 参数优先）。
+    #[pyo3(get)]
+    pub data_dir: Option<String>,
+    /// LMDB mmap 上限（字节），是虚拟地址预留而非磁盘预分配。
+    #[pyo3(get)]
+    pub map_size: usize,
+    /// LMDB 最大子数据库数。
+    #[pyo3(get)]
+    pub max_dbs: u32,
+    /// 落盘同步策略：``"sync"`` / ``"group_commit"`` / ``"no_sync"``。
+    #[pyo3(get)]
+    pub sync_mode: String,
+    /// `group_commit` 模式的合并提交间隔（毫秒）。
+    #[pyo3(get)]
+    pub flush_interval_ms: u64,
+}
+
+#[pymethods]
+impl PyStoreConfig {
+    #[new]
+    #[pyo3(signature = (data_dir=None, map_size=None, max_dbs=None, sync_mode=None, flush_interval_ms=None))]
+    fn new(
+        data_dir: Option<String>,
+        map_size: Option<usize>,
+        max_dbs: Option<u32>,
+        sync_mode: Option<String>,
+        flush_interval_ms: Option<u64>,
+    ) -> Self {
+        let default = StoreConfig::default();
+        Self {
+            data_dir,
+            map_size: map_size.unwrap_or(default.map_size),
+            max_dbs: max_dbs.unwrap_or(default.max_dbs),
+            sync_mode: sync_mode.unwrap_or_else(|| default_sync_mode_name().to_string()),
+            flush_interval_ms: flush_interval_ms.unwrap_or_else(default_group_commit_ms),
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "_StoreConfig(data_dir={:?}, map_size={}, max_dbs={}, sync_mode={:?}, \
+             flush_interval_ms={})",
+            self.data_dir, self.map_size, self.max_dbs, self.sync_mode, self.flush_interval_ms
+        )
+    }
+}
+
+impl Default for PyStoreConfig {
+    fn default() -> Self {
+        Self::new(None, None, None, None, None)
+    }
+}
+
+impl PyStoreConfig {
+    /// 转换为 Rust `StoreConfig`；`sync_mode` 非法时返回 `ValueError`。
+    fn to_rust(&self) -> PyResult<StoreConfig> {
+        Ok(StoreConfig {
+            data_dir: self.data_dir.clone(),
+            map_size: self.map_size,
+            max_dbs: self.max_dbs,
+            sync_mode: sync_mode_from_str(&self.sync_mode, self.flush_interval_ms)?,
+        })
+    }
+}
+
 /// 将用户提供的 scheduler kind 字符串解析为内部 `SchedulerKind`。
 ///
 /// 此处接受任何非空字符串；scheduler 注册表在启动时通过
@@ -457,11 +518,16 @@ pub struct PyActantConfig {
     #[pyo3(get)]
     pub default_task_timeout_ms: u64,
     #[pyo3(get)]
-    pub data_dir: Option<String>,
-    #[pyo3(get)]
     pub drain_timeout_secs: u64,
     #[pyo3(get)]
     pub remote_fallback_delay_ms: u64,
+    /// 任务无匹配节点（`Defer`）时的最长等待毫秒数，超时转 Failed；
+    /// `0` 表示不设上限（任务持续等待配额归还或匹配节点出现）。
+    #[pyo3(get)]
+    pub starvation_timeout_ms: u64,
+    /// 本节点声明的命名配额容量（如 `{"gpu": 2}`）。任务 `quota` 在本地扣减。
+    #[pyo3(get)]
+    pub node_quotas: BTreeMap<String, u32>,
     #[pyo3(get)]
     pub scheduler: String,
     /// Payload 签名密钥（必填）。所有任务 payload 使用 BLAKE3 keyed hash 签名。
@@ -487,19 +553,15 @@ pub struct PyActantConfig {
     /// 用户自定义节点标签，随心跳广播给集群。超 4KB 整体丢弃。
     #[pyo3(get)]
     pub node_labels: BTreeMap<String, String>,
+    /// 节点拓扑角色：`"both"`（默认）/ `"orchestrator"` / `"worker"`。
+    ///
+    /// orchestrator 不执行本地任务；worker 不 claim workflow、不驱动 flow host。
+    #[pyo3(get)]
+    pub role: String,
     // ---- 高级调优字段（默认值全部取自 Rust 侧默认值）----
-    /// Store mmap 上限（字节）。默认 2 GiB。
+    /// 本地持久化配置（目录、mmap 上限、同步策略）。
     #[pyo3(get)]
-    pub store_map_size: usize,
-    /// Store 最大子数据库数。默认 16。
-    #[pyo3(get)]
-    pub store_max_dbs: u32,
-    /// 落盘同步策略：``"sync"`` / ``"group_commit"`` / ``"no_sync"``。默认 ``"sync"``。
-    #[pyo3(get)]
-    pub store_sync_mode: String,
-    /// `group_commit` 模式的合并提交间隔（毫秒）。默认 2ms。
-    #[pyo3(get)]
-    pub store_flush_interval_ms: u64,
+    pub store: PyStoreConfig,
     /// Worker 主循环批量 prefetch 的最小/最大批量。默认 16/64。
     #[pyo3(get)]
     pub prefetch_min: usize,
@@ -514,6 +576,12 @@ pub struct PyActantConfig {
     /// 已完成工作流的自动淘汰保留数（0 = 不淘汰）。默认 1000。
     #[pyo3(get)]
     pub completed_retention_count: usize,
+    /// 每个工作流保留的事件历史上限（0 = 不裁剪）。默认 0。
+    ///
+    /// 对应 Rust `WorkflowConfig::event_log_max_events_per_workflow`：只裁剪
+    /// 已被快照吸收（水位之前）的事件，水位之后的增量永不裁剪。
+    #[pyo3(get)]
+    pub max_history_events: usize,
     /// 工作流状态后台落盘刷新间隔（毫秒）。默认 200。
     #[pyo3(get)]
     pub persist_flush_interval_ms: u64,
@@ -534,8 +602,10 @@ impl PyActantConfig {
     ///   （含首次）。`None`（默认）= Rust `WorkerConfig::default` 的 3。
     /// - `workflow_default_timeout_ms`：工作流默认超时（毫秒）。`None`（默认）
     ///   = Rust `WorkflowConfig::default` 的 3_600_000。
+    /// - `store`：本地持久化配置（目录 / mmap 上限 / 同步策略）。`None`（默认）
+    ///   = Rust `StoreConfig::default`。
     #[new]
-    #[pyo3(signature = (payload_signing_key, network=None, failover=None, gossip=None, max_concurrent_tasks=None, default_task_timeout_ms=None, data_dir=None, drain_timeout_secs=None, remote_fallback_delay_ms=None, scheduler=None, require_payload_signing=false, num_worker_processes=None, crash_failover_max_attempts=None, workflow_default_timeout_ms=None, node_labels=None, *, store_map_size=None, store_max_dbs=None, store_sync_mode=None, store_flush_interval_ms=None, prefetch_min=None, prefetch_max=None, worker_cancel_grace_ms=None, pending_result_channel_capacity=None, completed_retention_count=None, persist_flush_interval_ms=None, state_poll_interval_ms=None))]
+    #[pyo3(signature = (payload_signing_key, network=None, failover=None, gossip=None, max_concurrent_tasks=None, default_task_timeout_ms=None, drain_timeout_secs=None, remote_fallback_delay_ms=None, scheduler=None, require_payload_signing=false, num_worker_processes=None, crash_failover_max_attempts=None, workflow_default_timeout_ms=None, node_labels=None, *, store=None, prefetch_min=None, prefetch_max=None, worker_cancel_grace_ms=None, pending_result_channel_capacity=None, completed_retention_count=None, max_history_events=None, persist_flush_interval_ms=None, state_poll_interval_ms=None, starvation_timeout_ms=None, node_quotas=None, role=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         payload_signing_key: String,
@@ -544,7 +614,6 @@ impl PyActantConfig {
         gossip: Option<PyGossipConfig>,
         max_concurrent_tasks: Option<usize>,
         default_task_timeout_ms: Option<u64>,
-        data_dir: Option<String>,
         drain_timeout_secs: Option<u64>,
         remote_fallback_delay_ms: Option<u64>,
         scheduler: Option<String>,
@@ -553,20 +622,20 @@ impl PyActantConfig {
         crash_failover_max_attempts: Option<u32>,
         workflow_default_timeout_ms: Option<u64>,
         node_labels: Option<BTreeMap<String, String>>,
-        store_map_size: Option<usize>,
-        store_max_dbs: Option<u32>,
-        store_sync_mode: Option<String>,
-        store_flush_interval_ms: Option<u64>,
+        store: Option<PyStoreConfig>,
         prefetch_min: Option<usize>,
         prefetch_max: Option<usize>,
         worker_cancel_grace_ms: Option<u64>,
         pending_result_channel_capacity: Option<usize>,
         completed_retention_count: Option<usize>,
+        max_history_events: Option<usize>,
         persist_flush_interval_ms: Option<u64>,
         state_poll_interval_ms: Option<u64>,
+        starvation_timeout_ms: Option<u64>,
+        node_quotas: Option<BTreeMap<String, u32>>,
+        role: Option<String>,
     ) -> Self {
         let default_worker = actant_core::common::WorkerConfig::default();
-        let default_store = actant_core::common::StoreConfig::default();
         let default_workflow = actant_core::common::WorkflowConfig::default();
         // 默认并发度 = num_cpus：多数 Python 任务为 IO-bound，
         // 用户可显式传 max_concurrent_tasks 覆盖。
@@ -579,10 +648,11 @@ impl PyActantConfig {
             max_concurrent_tasks: max_concurrent,
             default_task_timeout_ms: default_task_timeout_ms
                 .unwrap_or(default_worker.default_task_timeout_ms),
-            data_dir,
             drain_timeout_secs: drain_timeout_secs.unwrap_or(default_worker.drain_timeout_secs),
             remote_fallback_delay_ms: remote_fallback_delay_ms
                 .unwrap_or(default_worker.remote_fallback_delay_ms),
+            starvation_timeout_ms: starvation_timeout_ms
+                .unwrap_or(default_worker.starvation_timeout_ms),
             scheduler: scheduler.unwrap_or_else(|| "priority".to_string()),
             require_payload_signing,
             // 默认跟随 max_concurrent_tasks：进程池模型中并发信号量须与
@@ -595,11 +665,9 @@ impl PyActantConfig {
             workflow_default_timeout_ms: workflow_default_timeout_ms
                 .unwrap_or(actant_core::common::WorkflowConfig::default().default_timeout_ms),
             node_labels: node_labels.unwrap_or_default(),
-            store_map_size: store_map_size.unwrap_or(default_store.map_size),
-            store_max_dbs: store_max_dbs.unwrap_or(default_store.max_dbs),
-            store_sync_mode: store_sync_mode
-                .unwrap_or_else(|| default_sync_mode_name().to_string()),
-            store_flush_interval_ms: store_flush_interval_ms.unwrap_or(default_group_commit_ms()),
+            role: role.unwrap_or_else(|| NodeRole::default().as_str().to_string()),
+            node_quotas: node_quotas.unwrap_or_default(),
+            store: store.unwrap_or_default(),
             prefetch_min: prefetch_min.unwrap_or(default_worker.prefetch_min),
             prefetch_max: prefetch_max.unwrap_or(default_worker.prefetch_max),
             worker_cancel_grace_ms: worker_cancel_grace_ms
@@ -608,6 +676,8 @@ impl PyActantConfig {
                 .unwrap_or(default_worker.pending_result_channel_capacity),
             completed_retention_count: completed_retention_count
                 .unwrap_or(default_workflow.completed_retention_count),
+            max_history_events: max_history_events
+                .unwrap_or(default_workflow.event_log_max_events_per_workflow),
             persist_flush_interval_ms: persist_flush_interval_ms
                 .unwrap_or(default_workflow.persist_flush_interval_ms),
             state_poll_interval_ms: state_poll_interval_ms
@@ -654,9 +724,9 @@ impl Default for PyActantConfig {
             gossip: PyGossipConfig::default(),
             max_concurrent_tasks: max_concurrent,
             default_task_timeout_ms: default_worker.default_task_timeout_ms,
-            data_dir: None,
             drain_timeout_secs: default_worker.drain_timeout_secs,
             remote_fallback_delay_ms: default_worker.remote_fallback_delay_ms,
+            starvation_timeout_ms: default_worker.starvation_timeout_ms,
             scheduler: "priority".to_string(),
             require_payload_signing: false,
             num_worker_processes: max_concurrent,
@@ -664,16 +734,17 @@ impl Default for PyActantConfig {
             workflow_default_timeout_ms: actant_core::common::WorkflowConfig::default()
                 .default_timeout_ms,
             node_labels: BTreeMap::new(),
-            store_map_size: actant_core::common::StoreConfig::default().map_size,
-            store_max_dbs: actant_core::common::StoreConfig::default().max_dbs,
-            store_sync_mode: "sync".to_string(),
-            store_flush_interval_ms: 2,
+            role: NodeRole::default().as_str().to_string(),
+            node_quotas: BTreeMap::new(),
+            store: PyStoreConfig::default(),
             prefetch_min: default_worker.prefetch_min,
             prefetch_max: default_worker.prefetch_max,
             worker_cancel_grace_ms: default_worker.worker_cancel_grace_ms,
             pending_result_channel_capacity: default_worker.pending_result_channel_capacity,
             completed_retention_count: actant_core::common::WorkflowConfig::default()
                 .completed_retention_count,
+            max_history_events: actant_core::common::WorkflowConfig::default()
+                .event_log_max_events_per_workflow,
             persist_flush_interval_ms: actant_core::common::WorkflowConfig::default()
                 .persist_flush_interval_ms,
             state_poll_interval_ms: actant_core::common::WorkflowConfig::default()
@@ -700,11 +771,14 @@ impl TryFrom<&PyActantConfig> for ActantConfig {
                 // Python 语义在绑定层拼装：解释器 + 模块入口 + 模块搜索路径。
                 // 核心只认「可执行文件 + 参数 + 环境变量」三要素。
                 worker_program: python_executable(),
-                worker_args: vec!["-m".into(), "actant.task._worker".into()],
+                worker_args: vec!["-m".into(), "actant._internal.tasks.worker".into()],
                 worker_env: worker_python_env(),
                 default_task_timeout_ms: c.default_task_timeout_ms,
                 drain_timeout_secs: c.drain_timeout_secs,
                 remote_fallback_delay_ms: c.remote_fallback_delay_ms,
+                starvation_timeout_ms: c.starvation_timeout_ms,
+                node_quotas: c.node_quotas.clone(),
+                role: NodeRole::parse(&c.role).map_err(actant_error_to_pyerr)?,
                 scheduler_kind: scheduler_kind_from_str(&c.scheduler)?,
                 crash_failover_max_attempts: c.crash_failover_max_attempts,
                 prefetch_min: c.prefetch_min,
@@ -713,18 +787,13 @@ impl TryFrom<&PyActantConfig> for ActantConfig {
                 pending_result_channel_capacity: c.pending_result_channel_capacity,
                 ..default.worker
             },
-            store: actant_core::common::StoreConfig {
-                data_dir: c.data_dir.clone(),
-                map_size: c.store_map_size,
-                max_dbs: c.store_max_dbs,
-                sync_mode: sync_mode_from_str(&c.store_sync_mode, c.store_flush_interval_ms)?,
-            },
+            store: c.store.to_rust()?,
             workflow: actant_core::common::WorkflowConfig {
                 default_timeout_ms: c.workflow_default_timeout_ms,
                 completed_retention_count: c.completed_retention_count,
+                event_log_max_events_per_workflow: c.max_history_events,
                 persist_flush_interval_ms: c.persist_flush_interval_ms,
                 state_poll_interval_ms: c.state_poll_interval_ms,
-                ..default.workflow
             },
             payload_signing_key: c.payload_signing_key.as_bytes().to_vec(),
             require_payload_signing: c.require_payload_signing,
@@ -835,7 +904,7 @@ fn sync_mode_from_str(
         )),
         "no_sync" => Ok(actant_core::common::SyncMode::NoSync),
         other => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "invalid store_sync_mode '{}': expected \"sync\", \"group_commit\" or \"no_sync\"",
+            "invalid store sync_mode '{}': expected \"sync\", \"group_commit\" or \"no_sync\"",
             other
         ))),
     }
@@ -871,6 +940,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyNetworkConfig>()?;
     m.add_class::<PyFailoverConfig>()?;
     m.add_class::<PyGossipConfig>()?;
+    m.add_class::<PyStoreConfig>()?;
     m.add_class::<PyActantConfig>()?;
     Ok(())
 }

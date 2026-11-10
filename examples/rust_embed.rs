@@ -15,7 +15,7 @@
 //! （本示例不触碰 py 模块，在默认 feature 下同样可编译运行；但验收门禁以
 //! no-default-features 构建为准——那是"核心不依赖 PyO3"的证明）。
 //!
-//! 契约文档见 `docs/FRAMEWORK.md`。
+//! 契约文档见 `docs/architecture/framework-contract.md`。
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -107,6 +107,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             timeout_ms: None,
             priority: 0,
             metadata: Default::default(),
+            tags: Vec::new(),
+            quota: None,
         })?;
     }
     dag.add_edge(TaskId::from("a".to_string()), TaskId::from("b".to_string()))?;

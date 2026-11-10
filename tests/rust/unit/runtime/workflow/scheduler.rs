@@ -8,6 +8,9 @@ use crate::runtime::workflow::SchedulerActor;
 
 fn make_task(name: &str, priority: i32) -> TaskDefinition {
     TaskDefinition {
+        tags: Vec::new(),
+        quota: None,
+        pinned_target: false,
         id: TaskId::generate(),
         name: name.to_string(),
         payload: Vec::new(),
@@ -21,6 +24,7 @@ fn make_task(name: &str, priority: i32) -> TaskDefinition {
         enqueued_at_ms: 0,
         target_endpoint_addr: None,
         origin_endpoint_addr: None,
+        lease_deadline_ms: 0,
     }
 }
 

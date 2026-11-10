@@ -44,7 +44,6 @@ pub struct DagNodeSnapshot {
 pub struct DagEdgeSnapshot {
     pub from: String,
     pub to: String,
-    pub condition: Option<String>,
 }
 
 impl Orchestrator {
@@ -91,7 +90,6 @@ impl Orchestrator {
                 .map(|e| DagEdgeSnapshot {
                     from: e.from.as_str().to_string(),
                     to: e.to.as_str().to_string(),
-                    condition: e.condition.clone(),
                 })
                 .collect(),
         })
@@ -100,7 +98,7 @@ impl Orchestrator {
     /// 读取工作流的事件历史（审计出口）。
     ///
     /// `after = None` 表示从头读取。事件载荷是 postcard 编码的
-    /// `WorkflowEventPayload`；调用方（PyO3 边界）负责解码出"过滤用字段"
+    /// `JournalEvent`；调用方（PyO3 边界）负责解码出"过滤用字段"
     /// （kind / task_id / error），`payload` 本身对 Python 保持不透明
     ///（`payload` 对 Python 保持不透明，Rust 枚举字段增减不致破坏跨语言契约）。
     ///
@@ -322,24 +320,5 @@ impl Orchestrator {
             Ok(items) => Some(items),
             Err(_) => Some(vec![raw]),
         }
-    }
-
-    pub fn get_retry_info(
-        &self,
-        workflow_id: &WorkflowId,
-        task_id: &TaskId,
-    ) -> Option<(u32, crate::common::RetryPolicy, u64)> {
-        let slot = self.state.slots.get(workflow_id)?;
-        let policy = slot.dag.effective_retry_policy(task_id)?;
-        let task_state = slot.execution.tasks.get(task_id)?;
-        let retry_count = task_state.retry_count();
-        let delay_ms = Self::compute_retry_delay(retry_count, &policy);
-        Some((retry_count, policy.clone(), delay_ms))
-    }
-
-    fn compute_retry_delay(retry_count: u32, policy: &crate::common::RetryPolicy) -> u64 {
-        let base = policy.delay_ms as f64;
-        let multiplier = policy.backoff_multiplier.powi(retry_count as i32);
-        (base * multiplier).min(policy.max_delay_ms as f64) as u64
     }
 }

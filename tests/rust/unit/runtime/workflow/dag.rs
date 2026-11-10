@@ -13,6 +13,8 @@ fn make_node(id: &str, name: &str) -> DagNode {
         timeout_ms: None,
         priority: 0,
         metadata: HashMap::new(),
+        tags: Vec::new(),
+        quota: None,
     }
 }
 
@@ -35,7 +37,6 @@ fn phase_as_str_returns_canonical_constants() {
     assert_eq!(Phase::Completed.as_str(), phase_str::COMPLETED);
     assert_eq!(Phase::Failed.as_str(), phase_str::FAILED);
     assert_eq!(Phase::Cancelled.as_str(), phase_str::CANCELLED);
-    assert_eq!(Phase::Skipped.as_str(), phase_str::SKIPPED);
 }
 
 #[test]
@@ -46,7 +47,6 @@ fn phase_parse_roundtrips_all_variants() {
         Phase::Completed,
         Phase::Failed,
         Phase::Cancelled,
-        Phase::Skipped,
     ] {
         let s = p.as_str();
         assert_eq!(Phase::parse(s), Some(p), "roundtrip failed for {s}");
@@ -127,18 +127,6 @@ fn mark_task_completed_triggers_workflow_completion() {
     wf.mark_running();
     wf.seal_nodes();
     wf.mark_task_completed(&TaskId::from("a"), b"ok".to_vec(), None);
-    assert_eq!(wf.state, Phase::Completed);
-}
-
-#[test]
-fn mark_task_skipped_triggers_workflow_completion() {
-    let mut wf = WorkflowExecution::new(
-        WorkflowId::from("wf-1".to_string()),
-        vec![TaskId::from("a".to_string())],
-    );
-    wf.mark_running();
-    wf.seal_nodes();
-    wf.mark_task_skipped(&TaskId::from("a"));
     assert_eq!(wf.state, Phase::Completed);
 }
 
@@ -310,10 +298,11 @@ fn cancel_task_cancels_running_task_only() {
 /// 回归：fail-fast（默认）策略下「全部节点被取消」必须使工作流进入
 /// `Cancelled` 终态。
 ///
-/// 终态判定不能只按 `succeeded + skipped == total` 走 Completed、且仅 continue
-/// 策略才检查「全部节点终态」：全取消（succeeded=0）既不满足和式、又不进
-/// continue 分支，工作流永久停在 `Running`——flow 的终态轮询
-/// （`_wait_terminal_and_emit`）因此永不返回，表现为测试挂起。
+/// 终态判定按「全部节点终态 + 类别优先级（Failed > Cancelled > Completed）」
+/// 收敛（`check_workflow_completion`）：只看「成功数等于总数」会让全取消
+/// （succeeded=0）既不满足 Completed、也没有 Failed 分支可走，工作流永久停在
+/// `Running`——flow 的终态轮询（`_wait_terminal_and_emit`）因此永不返回，
+/// 表现为测试挂起。
 #[test]
 fn all_cancelled_failfast_workflow_terminates_cancelled() {
     let mut wf = WorkflowExecution::new(
@@ -412,15 +401,7 @@ fn assert_terminal(variants: &[Phase], expected: bool) {
 
 #[test]
 fn terminal_states_are_terminal() {
-    assert_terminal(
-        &[
-            Phase::Completed,
-            Phase::Failed,
-            Phase::Cancelled,
-            Phase::Skipped,
-        ],
-        true,
-    );
+    assert_terminal(&[Phase::Completed, Phase::Failed, Phase::Cancelled], true);
     assert_terminal(&[Phase::Pending, Phase::Running], false);
 }
 
@@ -490,76 +471,6 @@ fn add_edge_rejects_cycle() {
         err,
         crate::common::ActantError::Workflow(ref m) if m.contains("cycle")
     ));
-}
-
-#[test]
-fn add_conditional_edge_stores_condition() {
-    let mut dag = Dag::new();
-    dag.add_node(make_node("a", "task_a")).unwrap();
-    dag.add_node(make_node("b", "task_b")).unwrap();
-    dag.add_conditional_edge(TaskId::from("a"), TaskId::from("b"), "cond_x".into())
-        .unwrap();
-    let conds = dag.conditional_edges_from(&TaskId::from("a"));
-    assert_eq!(conds.len(), 1);
-    assert_eq!(conds[0].0, TaskId::from("b"));
-    assert_eq!(conds[0].1, "cond_x");
-}
-
-#[test]
-fn add_conditional_edge_rejects_missing_node() {
-    let mut dag = Dag::new();
-    dag.add_node(make_node("a", "task_a")).unwrap();
-    let err = dag
-        .add_conditional_edge(TaskId::from("a"), TaskId::from("missing"), "cond".into())
-        .unwrap_err();
-    assert!(matches!(err, crate::common::ActantError::Workflow(_)));
-}
-
-#[test]
-fn add_conditional_edge_rejects_self_loop() {
-    let mut dag = Dag::new();
-    dag.add_node(make_node("a", "task_a")).unwrap();
-    let err = dag
-        .add_conditional_edge(TaskId::from("a"), TaskId::from("a"), "cond".into())
-        .unwrap_err();
-    assert!(
-        matches!(err, crate::common::ActantError::Workflow(ref m) if m.contains("cycle")),
-        "self-loop conditional edge should be rejected as a cycle, got {:?}",
-        err
-    );
-}
-
-#[test]
-fn add_conditional_edge_detects_cycle() {
-    let mut dag = Dag::new();
-    dag.add_node(make_node("a", "task_a")).unwrap();
-    dag.add_node(make_node("b", "task_b")).unwrap();
-    dag.add_conditional_edge(TaskId::from("a"), TaskId::from("b"), "cond".into())
-        .unwrap();
-    let err = dag
-        .add_edge(TaskId::from("b"), TaskId::from("a"))
-        .unwrap_err();
-    assert!(
-        matches!(err, crate::common::ActantError::Workflow(ref m) if m.contains("cycle")),
-        "reverse edge forming a cycle should be rejected, got {:?}",
-        err
-    );
-}
-
-#[test]
-fn add_conditional_edge_rejects_cycle_against_existing_path() {
-    let mut dag = Dag::new();
-    dag.add_node(make_node("a", "task_a")).unwrap();
-    dag.add_node(make_node("b", "task_b")).unwrap();
-    dag.add_edge(TaskId::from("a"), TaskId::from("b")).unwrap();
-    let err = dag
-        .add_conditional_edge(TaskId::from("b"), TaskId::from("a"), "cond".into())
-        .unwrap_err();
-    assert!(
-        matches!(err, crate::common::ActantError::Workflow(ref m) if m.contains("cycle")),
-        "conditional edge forming a cycle should be rejected, got {:?}",
-        err
-    );
 }
 
 #[test]
@@ -870,4 +781,29 @@ fn stale_attempt_failure_report_is_dropped() {
     let task = wf.tasks.get(&TaskId::from("a".to_string())).unwrap();
     assert_eq!(task.state, Phase::Failed);
     assert_eq!(task.error.as_deref(), Some("fresh boom"));
+}
+
+#[test]
+fn is_expired_treats_u64_max_deadline_as_never_expiring() {
+    let mut wf =
+        WorkflowExecution::new(WorkflowId("wf".into()), vec![TaskId::from("a".to_string())]);
+    wf.started_at_ms = Some(1_000);
+    wf.set_deadline_ms(u64::MAX);
+    assert!(
+        !wf.is_expired(),
+        "u64::MAX deadline must not overflow into an immediate expiry"
+    );
+}
+
+#[test]
+fn is_expired_detects_elapsed_deadline() {
+    let mut wf =
+        WorkflowExecution::new(WorkflowId("wf".into()), vec![TaskId::from("a".to_string())]);
+    // 起始时间取当前时刻之前，deadline 为 0 时应当立即过期。
+    wf.started_at_ms = Some(crate::common::epoch_millis().saturating_sub(1));
+    wf.set_deadline_ms(0);
+    assert!(wf.is_expired(), "already-elapsed deadline must expire");
+
+    wf.set_deadline_ms(u64::MAX / 2);
+    assert!(!wf.is_expired(), "future deadline must not expire");
 }

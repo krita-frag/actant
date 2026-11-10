@@ -7,15 +7,15 @@ use std::sync::{atomic, OnceLock};
 
 use pyo3::exceptions::PyStopIteration;
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyBytes, PyDict};
 
 use crate::py::gil_thread::GilThread;
-use actant_core::common::{NodeId, TaskId, WorkflowId};
+use actant_core::common::{TaskId, WorkflowId};
 use actant_core::runtime::capability::{
-    NodeEvent, NodeLifecycle, Serialization, SerializationReq, Store, StoreReq, TaskEvent,
-    TaskLifecycle, WorkflowEvent, WorkflowLifecycle,
+    Store, StoreReq, TaskEvent, TaskLifecycle, WorkflowEvent, WorkflowLifecycle,
 };
 use actant_core::runtime::dispatcher::CancelFlag;
+use actant_core::runtime::state::StorageStats;
 
 /// `ask` effect 的 PyO3 编解码 trait。
 ///
@@ -94,15 +94,6 @@ where
     ob.getattr(intern_attr(py, name))?.extract()
 }
 
-fn get_u64<'py, D>(ob: D, name: &str) -> PyResult<u64>
-where
-    D: AsRef<Bound<'py, PyAny>>,
-{
-    let ob = ob.as_ref();
-    let py = ob.py();
-    ob.getattr(intern_attr(py, name))?.extract()
-}
-
 fn get_bytes<'py, D>(ob: D, name: &str) -> PyResult<Vec<u8>>
 where
     D: AsRef<Bound<'py, PyAny>>,
@@ -110,14 +101,6 @@ where
     let ob = ob.as_ref();
     let py = ob.py();
     ob.getattr(intern_attr(py, name))?.extract()
-}
-
-fn node_id<'py, D>(ob: D, name: &str) -> PyResult<NodeId>
-where
-    D: AsRef<Bound<'py, PyAny>>,
-{
-    let s: String = get_string(&ob, name)?;
-    Ok(NodeId::from(s))
 }
 
 fn task_id<'py, D>(ob: D, name: &str) -> PyResult<TaskId>
@@ -136,56 +119,8 @@ where
     Ok(WorkflowId::from(s))
 }
 
-// 策略型 capability（Routing / Scheduling / RetryPolicy）由 Python 编排循环实现，
-// Rust 核心不提供这些 marker 类型及其 codec。
-
-pub struct SerializationCodec;
-
-impl PyPerformCodec<Serialization> for SerializationCodec {
-    fn decode_request(ob: &Bound<'_, PyAny>) -> PyResult<SerializationReq> {
-        extract_serializationreq(ob)
-    }
-
-    fn encode_response(
-        py: Python<'_>,
-        resp: Result<Vec<u8>, String>,
-    ) -> PyResult<Bound<'_, PyAny>> {
-        match resp {
-            Ok(data) => bytes_response(py, data),
-            Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e)),
-        }
-    }
-}
-
-impl PyHandlerPerformCodec<Serialization> for SerializationCodec {
-    fn encode_request<'py>(py: Python<'py>, req: &SerializationReq) -> PyResult<Bound<'py, PyAny>> {
-        let dict = dict_response(py);
-        match req {
-            SerializationReq::Dump { payload } => {
-                dict.set_item("op", "dump")?;
-                dict.set_item("data", bytes_response(py, payload)?)?;
-            }
-            SerializationReq::Load { data } => {
-                dict.set_item("op", "load")?;
-                dict.set_item("data", bytes_response(py, data)?)?;
-            }
-        }
-        Ok(dict.into_any())
-    }
-
-    fn decode_response<'py>(
-        _py: Python<'py>,
-        obj: &Bound<'py, PyAny>,
-    ) -> PyResult<Result<Vec<u8>, String>> {
-        if obj.is_none() {
-            return Ok(Ok(Vec::new()));
-        }
-        match obj.extract::<Vec<u8>>() {
-            Ok(data) => Ok(Ok(data)),
-            Err(e) => Ok(Err(e.to_string())),
-        }
-    }
-}
+// 放置类策略（路由/调度/重试）由 Rust RoutePolicy/Scheduler 或第 3 层外部
+// 调度器承担；Rust 核心不提供对应 Python 编排循环的 marker 类型及其 codec。
 
 pub struct StoreCodec;
 
@@ -226,6 +161,14 @@ impl PyHandlerPerformCodec<Store> for StoreCodec {
             StoreReq::Delete { key } => {
                 dict.set_item("op", "delete")?;
                 dict.set_item("key", bytes_response(py, key)?)?;
+            }
+            StoreReq::PutBatch { entries } => {
+                dict.set_item("op", "put_batch")?;
+                let pairs: Vec<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)> = entries
+                    .iter()
+                    .map(|(k, v)| (PyBytes::new(py, k), PyBytes::new(py, v)))
+                    .collect();
+                dict.set_item("entries", pairs)?;
             }
         }
         Ok(dict.into_any())
@@ -386,69 +329,6 @@ impl PyHandlerEmitCodec<WorkflowLifecycle> for WorkflowLifecycleCodec {
     }
 }
 
-pub struct NodeLifecycleCodec;
-
-impl PyEmitCodec<NodeLifecycle> for NodeLifecycleCodec {
-    fn decode_request(ob: &Bound<'_, PyAny>) -> PyResult<NodeEvent> {
-        let kind: String = get_string(ob, "kind")?;
-        match kind.as_str() {
-            "started" => Ok(NodeEvent::Started {
-                node_id: node_id(ob, "node_id")?,
-            }),
-            "stopped" => Ok(NodeEvent::Stopped {
-                node_id: node_id(ob, "node_id")?,
-            }),
-            "peer_joined" => Ok(NodeEvent::PeerJoined {
-                peer_id: node_id(ob, "peer_id")?,
-            }),
-            "peer_left" => Ok(NodeEvent::PeerLeft {
-                peer_id: node_id(ob, "peer_id")?,
-            }),
-            "heartbeat" => Ok(NodeEvent::Heartbeat {
-                node_id: node_id(ob, "node_id")?,
-                timestamp_ms: get_u64(ob, "timestamp_ms")?,
-            }),
-            _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "unknown NodeEvent kind: {}",
-                kind
-            ))),
-        }
-    }
-}
-
-impl PyHandlerEmitCodec<NodeLifecycle> for NodeLifecycleCodec {
-    fn encode_request<'py>(py: Python<'py>, req: &NodeEvent) -> PyResult<Bound<'py, PyAny>> {
-        let dict = dict_response(py);
-        match req {
-            NodeEvent::Started { node_id } => {
-                dict.set_item("kind", "started")?;
-                dict.set_item("node_id", node_id.to_string())?;
-            }
-            NodeEvent::Stopped { node_id } => {
-                dict.set_item("kind", "stopped")?;
-                dict.set_item("node_id", node_id.to_string())?;
-            }
-            NodeEvent::PeerJoined { peer_id } => {
-                dict.set_item("kind", "peer_joined")?;
-                dict.set_item("peer_id", peer_id.to_string())?;
-            }
-            NodeEvent::PeerLeft { peer_id } => {
-                dict.set_item("kind", "peer_left")?;
-                dict.set_item("peer_id", peer_id.to_string())?;
-            }
-            NodeEvent::Heartbeat {
-                node_id,
-                timestamp_ms,
-            } => {
-                dict.set_item("kind", "heartbeat")?;
-                dict.set_item("node_id", node_id.to_string())?;
-                dict.set_item("timestamp_ms", timestamp_ms)?;
-            }
-        }
-        Ok(dict.into_any())
-    }
-}
-
 pub fn bytes_response<'py>(py: Python<'py>, data: impl AsRef<[u8]>) -> PyResult<Bound<'py, PyAny>> {
     use pyo3::types::PyBytes;
     Ok(PyBytes::new(py, data.as_ref()).into_any())
@@ -468,24 +348,6 @@ pub fn dict_response<'py>(py: Python<'py>) -> Bound<'py, PyDict> {
 
 /// 孤儿规则禁止跨 crate 实现 `FromPyObject`——由 codec 的
 /// `decode_request` 直接调用本函数替代 trait 实现。
-fn extract_serializationreq(ob: &Bound<'_, PyAny>) -> PyResult<SerializationReq> {
-    let op: String = get_string(ob, "op")?;
-    match op.as_str() {
-        "dump" => Ok(SerializationReq::Dump {
-            payload: get_bytes(ob, "data")?,
-        }),
-        "load" => Ok(SerializationReq::Load {
-            data: get_bytes(ob, "data")?,
-        }),
-        _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "unknown SerializationReq op: {}",
-            op
-        ))),
-    }
-}
-
-/// 孤儿规则禁止跨 crate 实现 `FromPyObject`——由 codec 的
-/// `decode_request` 直接调用本函数替代 trait 实现。
 fn extract_storereq(ob: &Bound<'_, PyAny>) -> PyResult<StoreReq> {
     let op: String = get_string(ob, "op")?;
     match op.as_str() {
@@ -499,6 +361,10 @@ fn extract_storereq(ob: &Bound<'_, PyAny>) -> PyResult<StoreReq> {
         "delete" => Ok(StoreReq::Delete {
             key: get_bytes(ob, "key")?,
         }),
+        "put_batch" => {
+            let entries: Vec<(Vec<u8>, Vec<u8>)> = ob.getattr("entries")?.extract()?;
+            Ok(StoreReq::PutBatch { entries })
+        }
         _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
             "unknown StoreReq op: {}",
             op
@@ -1077,11 +943,76 @@ macro_rules! capability_registry {
     };
 }
 
+/// 本地存储容量快照（PyO3 视图，对应 Rust `StorageStats`）。
+///
+/// 由 `_RuntimeCore.storage_stats()` 返回，供运维监控与容量规划使用。
+#[pyclass(name = "_StoreStats", frozen, module = "actant.actant")]
+pub struct PyStoreStats {
+    /// 配置的 mmap 上限（虚拟地址预留，不是磁盘预分配）。
+    #[pyo3(get)]
+    pub map_size: u64,
+    /// 不含空闲页的实际数据占用。
+    #[pyo3(get)]
+    pub used_bytes: u64,
+    /// 数据文件高水位（含可复用空闲页）；写满判断以此为准。
+    #[pyo3(get)]
+    pub file_bytes: u64,
+    /// 默认子数据库中的条目数。
+    #[pyo3(get)]
+    pub entries: usize,
+    /// 当前活跃读事务槽位数。
+    #[pyo3(get)]
+    pub readers: u32,
+    /// 读事务槽位上限。
+    #[pyo3(get)]
+    pub max_readers: u32,
+}
+
+#[pymethods]
+impl PyStoreStats {
+    /// 数据文件高水位占 mmap 上限的比例（`file_bytes / map_size`）。
+    #[getter]
+    fn utilization_ratio(&self) -> f64 {
+        if self.map_size == 0 {
+            0.0
+        } else {
+            self.file_bytes as f64 / self.map_size as f64
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "_StoreStats(map_size={}, used_bytes={}, file_bytes={}, entries={}, \
+             readers={}/{})",
+            self.map_size,
+            self.used_bytes,
+            self.file_bytes,
+            self.entries,
+            self.readers,
+            self.max_readers
+        )
+    }
+}
+
+impl From<StorageStats> for PyStoreStats {
+    fn from(s: StorageStats) -> Self {
+        Self {
+            map_size: s.map_size,
+            used_bytes: s.used_bytes,
+            file_bytes: s.file_bytes,
+            entries: s.entries,
+            readers: s.readers,
+            max_readers: s.max_readers,
+        }
+    }
+}
+
 /// 在 Python 模块上注册 `types.rs` 中所有 PyO3 类型。
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyAsyncAwaitable>()?;
     m.add_class::<PyCancelToken>()?;
     m.add_class::<PyEvent>()?;
+    m.add_class::<PyStoreStats>()?;
     m.add_class::<PyTaskCompletion>()?;
     Ok(())
 }

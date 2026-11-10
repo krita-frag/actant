@@ -16,6 +16,7 @@
 //! - [`event_bus`] 在运行时内部广播生命周期、网络和 workflow 事件。
 
 pub mod actor;
+pub mod batch;
 pub mod blobs;
 pub mod builder;
 pub mod capability;
@@ -23,6 +24,7 @@ pub mod context;
 pub mod dispatcher;
 pub mod event_bus;
 pub mod network;
+pub mod quota;
 pub mod state;
 pub mod workflow;
 

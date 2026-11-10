@@ -23,6 +23,8 @@ fn dag_node(i: usize) -> DagNode {
         timeout_ms: None,
         priority: 0,
         metadata: Default::default(),
+        tags: Vec::new(),
+        quota: None,
     }
 }
 

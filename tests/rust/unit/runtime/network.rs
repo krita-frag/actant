@@ -278,6 +278,7 @@ fn direct_request_task_result_serialization_roundtrip() {
         task_name: "serial_test".to_string(),
         outcome: WireTaskOutcome::Completed(vec![1, 2]),
         worker_node: NodeId::from("node-A"),
+        attempt: 0,
     };
     let bytes = postcard::to_allocvec(&req).expect("serialize");
     let decoded: DirectRequest = postcard::from_bytes(&bytes).expect("deserialize");
@@ -288,6 +289,7 @@ fn direct_request_task_result_serialization_roundtrip() {
             task_name,
             outcome,
             worker_node,
+            ..
         } => {
             assert_eq!(workflow_id.as_str(), "wf-ser");
             assert_eq!(task_id.as_str(), "t-ser");
@@ -305,6 +307,9 @@ fn direct_request_task_result_serialization_roundtrip() {
 #[test]
 fn direct_request_dispatch_task_serialization_roundtrip() {
     let task = crate::common::TaskDefinition {
+        tags: Vec::new(),
+        quota: None,
+        pinned_target: false,
         id: TaskId::from("t-disp"),
         name: "dispatch_test".to_string(),
         payload: vec![1, 2, 3],
@@ -318,6 +323,7 @@ fn direct_request_dispatch_task_serialization_roundtrip() {
         enqueued_at_ms: 12345,
         target_endpoint_addr: None,
         origin_endpoint_addr: None,
+        lease_deadline_ms: 0,
     };
     let req = DirectRequest::DispatchTask { task };
     let bytes = postcard::to_allocvec(&req).expect("serialize");

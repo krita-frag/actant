@@ -31,15 +31,14 @@ fn make_entry(ts: u64, prio: u8) -> SeenEntry {
 #[test]
 fn state_priority_orders_terminal_above_running() {
     assert_eq!(state_priority(&WireTaskState::Running), 1);
-    assert_eq!(state_priority(&WireTaskState::Skipped), 2);
-    assert_eq!(state_priority(&WireTaskState::Cancelled), 3);
+    assert_eq!(state_priority(&WireTaskState::Cancelled), 2);
     assert_eq!(
         state_priority(&WireTaskState::Failed { error: "e".into() }),
-        4
+        3
     );
     assert_eq!(
         state_priority(&WireTaskState::Completed { result: Vec::new() }),
-        5
+        4
     );
 }
 
@@ -198,7 +197,7 @@ fn apply_remote_update_drops_stale_lower_hlc() {
     assert_eq!(g.seen_count(), 1);
     // 保留旧值不被覆盖
     let entry = g.seen.get(&key).unwrap();
-    assert_eq!(entry.state_priority, 5);
+    assert_eq!(entry.state_priority, 4);
 }
 
 #[test]
@@ -257,7 +256,7 @@ async fn broadcast_state_update_translates_completion_to_wire_state() {
     // 验证 seen 表中记录的是 Completed (priority 5)
     let key = SeenKey(wf, task);
     let entry = g.seen.get(&key).expect("entry should exist");
-    assert_eq!(entry.state_priority, 5); // Completed = 5
+    assert_eq!(entry.state_priority, 4); // Completed = 4
 }
 
 #[tokio::test]
@@ -279,7 +278,7 @@ async fn broadcast_state_update_translates_failed_completion() {
 
     let key = SeenKey(wf, task);
     let entry = g.seen.get(&key).expect("entry should exist");
-    assert_eq!(entry.state_priority, 4); // Failed = 4
+    assert_eq!(entry.state_priority, 3); // Failed = 3
 }
 
 #[tokio::test]
@@ -300,28 +299,7 @@ async fn broadcast_state_update_translates_cancelled_completion() {
 
     let key = SeenKey(wf, task);
     let entry = g.seen.get(&key).expect("entry should exist");
-    assert_eq!(entry.state_priority, 3); // Cancelled = 3
-}
-
-#[tokio::test]
-async fn broadcast_state_update_translates_skipped_completion() {
-    let g = make_gossip("node-A", GossipConfig::default());
-    let wf = WorkflowId("wf-b5".to_string());
-    let task = TaskId::from("t-b5".to_string());
-    let completion = crate::common::TaskCompletion::Skipped {
-        workflow_id: wf.clone(),
-        task_id: task.clone(),
-        task_name: "test".to_string(),
-        target_node: None,
-    };
-
-    g.broadcast_state_update(&wf, &task, &completion)
-        .await
-        .expect("broadcast should succeed");
-
-    let key = SeenKey(wf, task);
-    let entry = g.seen.get(&key).expect("entry should exist");
-    assert_eq!(entry.state_priority, 2); // Skipped = 2
+    assert_eq!(entry.state_priority, 2); // Cancelled = 2
 }
 
 #[tokio::test]
@@ -382,7 +360,7 @@ async fn broadcast_update_same_key_supersedes_with_higher_hlc() {
         .expect("second broadcast");
     let entry = g.seen.get(&key).unwrap();
     assert!(entry.hlc_timestamp > first_ts);
-    assert_eq!(entry.state_priority, 5);
+    assert_eq!(entry.state_priority, 4);
 }
 
 // ───────────────────────── apply_remote_update ─────────────────────────
@@ -419,7 +397,7 @@ async fn apply_remote_update_drops_stale_update() {
         SeenEntry {
             inserted_at: std::time::Instant::now(),
             hlc_timestamp: HlcTimestamp::from_parts(100, 5),
-            state_priority: 5, // Completed
+            state_priority: 4, // Completed
         },
     );
     assert_eq!(g.seen_count(), 1);
@@ -440,7 +418,7 @@ async fn apply_remote_update_drops_stale_update() {
     // seen 表不变
     assert_eq!(g.seen_count(), 1);
     let entry = g.seen.get(&key).unwrap();
-    assert_eq!(entry.state_priority, 5); // 保留旧值
+    assert_eq!(entry.state_priority, 4); // 保留旧值
 }
 
 #[tokio::test]
@@ -474,7 +452,7 @@ async fn apply_remote_update_accepts_higher_hlc() {
 
     // seen 表应被更新
     let entry = g.seen.get(&key).unwrap();
-    assert_eq!(entry.state_priority, 5); // 现在是 Completed
+    assert_eq!(entry.state_priority, 4); // 现在是 Completed
     assert_eq!(entry.hlc_timestamp, HlcTimestamp::from_parts(200, 0));
 }
 
@@ -870,21 +848,6 @@ async fn apply_remote_update_cancelled_for_unknown_workflow_returns_ok() {
         workflow_id: WorkflowId("unknown-wf".to_string()),
         task_id: TaskId::from("t-1".to_string()),
         task_state: WireTaskState::Cancelled,
-        hlc_timestamp: HlcTimestamp::from_parts(10, 0),
-        origin_node: NodeId::from("node-B".to_string()),
-    };
-
-    let result = g.apply_remote_update(update).await;
-    assert!(result.is_ok(), "NotFound should be silently ignored");
-}
-
-#[tokio::test]
-async fn apply_remote_update_skipped_for_unknown_workflow_returns_ok() {
-    let g = make_gossip_with_actor("node-nf-5", GossipConfig::default());
-    let update = WireDagStateUpdate {
-        workflow_id: WorkflowId("unknown-wf".to_string()),
-        task_id: TaskId::from("t-1".to_string()),
-        task_state: WireTaskState::Skipped,
         hlc_timestamp: HlcTimestamp::from_parts(10, 0),
         origin_node: NodeId::from("node-B".to_string()),
     };

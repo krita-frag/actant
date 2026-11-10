@@ -342,9 +342,8 @@ impl OrchestratorBridge {
                 }
                 Ok(Vec::new())
             }
-            // Cancelled / Skipped：编排侧由 cancel 路径与条件边处理收敛，
-            // 事件结算即可。
-            TaskCompletion::Cancelled { .. } | TaskCompletion::Skipped { .. } => Ok(Vec::new()),
+            // Cancelled：编排侧由 cancel 路径收敛，事件结算即可。
+            TaskCompletion::Cancelled { .. } => Ok(Vec::new()),
         }
     }
 
@@ -418,6 +417,7 @@ pub(super) async fn publish_task_completion(
                 task_name: wire_result.task_name.clone(),
                 outcome: wire_result.outcome.clone(),
                 worker_node: node_id.clone(),
+                attempt: task.attempt,
             };
             // 尝试一次；失败则入队异步重试
             match network
@@ -530,7 +530,6 @@ pub(super) async fn publish_task_completion(
         let bus_event = match completion {
             TaskCompletion::Failed { .. } => BusEvent::TaskFailed(completion),
             TaskCompletion::Cancelled { .. } => BusEvent::TaskCancelled(completion),
-            TaskCompletion::Skipped { .. } => BusEvent::TaskSkipped(completion),
             TaskCompletion::Completed { .. } => BusEvent::TaskCompleted(completion),
         };
         event_bus.publish(bus_event);

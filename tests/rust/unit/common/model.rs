@@ -253,19 +253,4 @@ fn test_task_completion_to_wire_result_all_variants() {
             ..
         }
     ));
-
-    let skipped = TaskCompletion::Skipped {
-        workflow_id: wf.clone(),
-        task_id: task.clone(),
-        task_name: "ts".to_string(),
-        target_node: None,
-    };
-    let wire = skipped.to_wire_result(wf.clone());
-    assert!(matches!(
-        wire,
-        WireTaskResult {
-            outcome: WireTaskOutcome::Skipped,
-            ..
-        }
-    ));
 }

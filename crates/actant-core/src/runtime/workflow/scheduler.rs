@@ -1,20 +1,9 @@
-//! 任务调度抽象与 Actor 化调度客户端。
+//! 任务调度器的抽象与 Actor 实现。
 //!
-//! [`Scheduler`] 定义 Worker 与调度策略之间的最小契约。实际生产路径使用
-//! [`SchedulerActor`] 持有队列状态，
-//! [`ActorScheduler`] 作为客户端通过 Actor 消息调用它。
-//!
-//! ## 阻塞语义
-//!
-//! `dequeue()` 在队列为空时可以等待任务；`try_dequeue()` 必须立即返回。
-//! Worker 主循环通过 `TaskEnqueued` 专用 `Notify` 信号驱动 `try_dequeue()`，
-//! 而非 sleep 轮询——SchedulerActor 在 `enqueue` 后触发 `notify_task_enqueued()`，Worker 立即被唤醒。
-//!
-//! ## 扩展点
-//!
-//! 外部 Rust 用户可以实现 [`Scheduler`] 替换调度策略。实现应保证 `close()` 后
-//! 拒绝新任务并唤醒等待中的消费者。
-//!
+//! [`Scheduler`] 定义 Worker 与调度策略之间的最小契约；生产路径由
+//! [`SchedulerActor`] 持有队列状态，[`ActorScheduler`] 作为客户端转发。
+//! 阻塞 / 关闭语义、enqueue 快路径与扩展方式见 `docs/architecture/scheduler.md`。
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 

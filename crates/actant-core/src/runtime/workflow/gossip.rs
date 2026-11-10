@@ -191,7 +191,6 @@ impl DagGossip {
                 error: error.clone(),
             },
             TaskCompletion::Cancelled { .. } => WireTaskState::Cancelled,
-            TaskCompletion::Skipped { .. } => WireTaskState::Skipped,
         };
 
         self.broadcast_update(workflow_id, task_id, task_state)
@@ -220,7 +219,6 @@ impl DagGossip {
             WireTaskState::Completed { .. }
                 | WireTaskState::Failed { .. }
                 | WireTaskState::Cancelled
-                | WireTaskState::Skipped
         );
         tracing::trace!(
             wf = ?workflow_id,
@@ -416,23 +414,6 @@ impl DagGossip {
                     }
                     tracing::debug!(
                         "ignoring gossip Cancelled for unknown workflow {}",
-                        update.workflow_id.as_str()
-                    );
-                }
-            }
-            WireTaskState::Skipped => {
-                if let Err(e) = self
-                    .call_workflow_void(
-                        workflow_methods::SKIP_CONDITIONAL_BRANCH,
-                        (&update.workflow_id, &update.task_id),
-                    )
-                    .await
-                {
-                    if !matches!(e, crate::common::ActantError::NotFound(_)) {
-                        return Err(e);
-                    }
-                    tracing::debug!(
-                        "ignoring gossip Skipped for unknown workflow {}",
                         update.workflow_id.as_str()
                     );
                 }
@@ -662,13 +643,12 @@ impl DagGossip {
 
 /// 任务状态优先级。
 /// 当 HLC 时间戳相同时，值较高的状态优先。
-/// 终端状态（Completed、Failed、Cancelled、Skipped）始终覆盖 Running 状态，确保终端状态不会被过期更新覆盖。
+/// 终端状态（Completed、Failed、Cancelled）始终覆盖 Running 状态，确保终端状态不会被过期更新覆盖。
 fn state_priority(state: &WireTaskState) -> u8 {
     match state {
-        WireTaskState::Completed { .. } => 5,
-        WireTaskState::Failed { .. } => 4,
-        WireTaskState::Cancelled => 3,
-        WireTaskState::Skipped => 2,
+        WireTaskState::Completed { .. } => 4,
+        WireTaskState::Failed { .. } => 3,
+        WireTaskState::Cancelled => 2,
         WireTaskState::Running => 1,
     }
 }

@@ -1,4 +1,6 @@
 use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
@@ -232,6 +234,20 @@ pub struct TaskDefinition {
     pub priority: i32,
     pub timeout_ms: Option<u64>,
     pub attempt: u32,
+    /// 任务执行租约截止时刻（epoch ms）；`0` 表示**无有效租约**。
+    ///
+    /// 只有一种含义：值非 0 时表示 origin 授予的租约覆盖到该时刻；值为
+    /// [`TaskDefinition::NO_LEASE`] 时表示当前没有任何租约覆盖该任务（从未
+    /// 租出，或已被 origin 主动放弃）——两种情况对租约检查点等效，均可立即
+    /// 取回重投。写入必须经 [`TaskDefinition::relinquish_lease`] 或转发前的
+    /// 授予点，判定必须经 [`TaskDefinition::lease_expired_at`]，不要各自
+    /// 比较字面量。
+    ///
+    /// 仅独立任务在转发到远端时由 origin 设置：到期仍未收到结果即重新入队
+    /// （`attempt` 递增，旧结果按 attempt fencing 拒绝）。工作流任务不使用
+    /// 该字段——编排器已有自己的超时与重试语义。
+    #[serde(default)]
+    pub lease_deadline_ms: u64,
     /// 任务入队到调度器的时间戳（epoch ms）。用于测量调度延迟。
     #[serde(default)]
     pub enqueued_at_ms: u64,
@@ -241,6 +257,52 @@ pub struct TaskDefinition {
     /// 源节点的 Iroh endpoint 地址，用于直连结果投递。
     #[serde(default)]
     pub origin_endpoint_addr: Option<String>,
+    /// 任务放置诉求：标签选择器。
+    ///
+    /// 每项为 `key`（要求节点具备该标签键）或 `key=value`（要求键值精确匹配）。
+    /// 语义中性——核心只做字符串比较，不解释标签的业务含义。空表示无诉求。
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// 任务执行所需的命名配额（单维）。
+    ///
+    /// 执行节点按 `ActantConfig.node_quotas` 声明的容量在本地原子扣减；
+    /// 耗尽时延后重入队（配额归还时提前唤醒等待者），超过
+    /// `starvation_timeout_ms` 仍未获得则转 Failed。`None` 表示不占用配额。
+    /// 多维资源不进核心。
+    #[serde(default)]
+    pub quota: Option<String>,
+    /// `target_node` 是否为调用方的持久指定（如 `Task.submit_to`）。
+    ///
+    /// `false` 表示 `target_node` 可能是路由器的一次性放置决策：配额等节点级
+    /// 资源暂不可用时任务可清空目标重新参与路由。`true` 时配额延后不会覆盖
+    /// 目标（由本地 starvation 语义兜底）；worker 崩溃等基础设施故障转移仍按
+    /// 全局重路由规则处理。
+    #[serde(default)]
+    pub pinned_target: bool,
+}
+
+impl TaskDefinition {
+    /// `lease_deadline_ms` 的「无有效租约」取值。
+    ///
+    /// 选 0 而非 `Option<u64>`：字段随 wire 与 rkyv 归档一起编码，改类型会
+    /// 同时破坏线上格式与已落盘快照，而 0 在 epoch ms 语义下本就不可能成为
+    /// 合法截止时刻，作为哨兵没有歧义。
+    pub const NO_LEASE: u64 = 0;
+
+    /// 放弃当前租约，使任务可被 origin 立即取回。
+    ///
+    /// 调用方：origin 的失联处置（目标节点死亡，转租约重投）与租约检查点
+    /// 自身（重新入队前先解除旧租约，避免下一次判定重复命中）。
+    pub fn relinquish_lease(&mut self) {
+        self.lease_deadline_ms = Self::NO_LEASE;
+    }
+
+    /// 租约在 `now_ms` 时刻是否已失效（可被 origin 取回重投）。
+    ///
+    /// 无有效租约（[`Self::NO_LEASE`]）恒为已失效——0 早于任何真实时刻。
+    pub fn lease_expired_at(&self, now_ms: u64) -> bool {
+        now_ms >= self.lease_deadline_ms
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -309,12 +371,6 @@ pub enum TaskCompletion {
         task_name: String,
         target_node: Option<NodeId>,
     },
-    Skipped {
-        workflow_id: WorkflowId,
-        task_id: TaskId,
-        task_name: String,
-        target_node: Option<NodeId>,
-    },
 }
 
 impl TaskCompletion {
@@ -324,7 +380,6 @@ impl TaskCompletion {
             TaskCompletion::Completed { .. } => "Completed",
             TaskCompletion::Failed { .. } => "Failed",
             TaskCompletion::Cancelled { .. } => "Cancelled",
-            TaskCompletion::Skipped { .. } => "Skipped",
         }
     }
 
@@ -332,8 +387,7 @@ impl TaskCompletion {
         match self {
             TaskCompletion::Completed { workflow_id, .. }
             | TaskCompletion::Failed { workflow_id, .. }
-            | TaskCompletion::Cancelled { workflow_id, .. }
-            | TaskCompletion::Skipped { workflow_id, .. } => workflow_id,
+            | TaskCompletion::Cancelled { workflow_id, .. } => workflow_id,
         }
     }
 
@@ -341,8 +395,7 @@ impl TaskCompletion {
         match self {
             TaskCompletion::Completed { task_id, .. }
             | TaskCompletion::Failed { task_id, .. }
-            | TaskCompletion::Cancelled { task_id, .. }
-            | TaskCompletion::Skipped { task_id, .. } => task_id,
+            | TaskCompletion::Cancelled { task_id, .. } => task_id,
         }
     }
 
@@ -350,8 +403,7 @@ impl TaskCompletion {
         match self {
             TaskCompletion::Completed { task_name, .. }
             | TaskCompletion::Failed { task_name, .. }
-            | TaskCompletion::Cancelled { task_name, .. }
-            | TaskCompletion::Skipped { task_name, .. } => task_name,
+            | TaskCompletion::Cancelled { task_name, .. } => task_name,
         }
     }
 
@@ -359,8 +411,7 @@ impl TaskCompletion {
         match self {
             TaskCompletion::Completed { target_node, .. }
             | TaskCompletion::Failed { target_node, .. }
-            | TaskCompletion::Cancelled { target_node, .. }
-            | TaskCompletion::Skipped { target_node, .. } => target_node.as_ref(),
+            | TaskCompletion::Cancelled { target_node, .. } => target_node.as_ref(),
         }
     }
 
@@ -396,14 +447,6 @@ impl TaskCompletion {
                 task_id: task_id.clone(),
                 task_name: task_name.clone(),
                 outcome: crate::common::WireTaskOutcome::Cancelled,
-            },
-            TaskCompletion::Skipped {
-                task_id, task_name, ..
-            } => crate::common::WireTaskResult {
-                workflow_id,
-                task_id: task_id.clone(),
-                task_name: task_name.clone(),
-                outcome: crate::common::WireTaskOutcome::Skipped,
             },
         }
     }
@@ -586,6 +629,20 @@ pub fn node_labels_within_limit(labels: &std::collections::BTreeMap<String, Stri
     labels.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>() <= NODE_LABELS_MAX_BYTES
 }
 
+/// 运行时可变节点状态更新。
+///
+/// 每个字段 `None` 表示保持不变；`Some` 覆盖当前值。标签与配额随下一次
+/// 心跳广播给集群，`draining` 同时让本地路由与远端候选跳过本节点。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeStateUpdate {
+    /// 新的标签集（整表覆盖）。
+    pub labels: Option<std::collections::BTreeMap<String, String>>,
+    /// 新的命名配额容量（整表覆盖；在用量按差值保留）。
+    pub quotas: Option<std::collections::BTreeMap<String, u32>>,
+    /// `true` 停止接纳新任务并让远端路由跳过；`false` 恢复。
+    pub draining: Option<bool>,
+}
+
 /// 混合逻辑时钟时间戳（wire 协议依赖此类型）。
 #[derive(
     Debug,
@@ -645,6 +702,9 @@ impl Ord for HlcTimestamp {
 pub struct HybridLogicalClock {
     inner: Mutex<Inner>,
     max_drift_nanos: u64,
+    /// 故障注入：人为施加到物理时钟的偏移（纳秒，可正可负）。
+    /// 仅用于测试台模拟时钟漂移，生产默认 0。
+    injected_drift_nanos: AtomicI64,
 }
 
 struct Inner {
@@ -664,7 +724,24 @@ impl HybridLogicalClock {
                 logical: 0,
             }),
             max_drift_nanos: max_drift_ms.saturating_mul(1_000_000),
+            injected_drift_nanos: AtomicI64::new(0),
         }
+    }
+
+    /// 注入物理时钟偏移（毫秒，可正可负）。传 0 恢复正常时钟。
+    ///
+    /// 仅影响本时钟后续 `tick`/`merge` 使用的物理时间，用于测试台模拟
+    /// 节点时钟漂移；HLC 单调性与 drift 上限语义不变。
+    pub fn inject_drift_ms(&self, ms: i64) {
+        self.injected_drift_nanos
+            .store(ms.saturating_mul(1_000_000), AtomicOrdering::Relaxed);
+    }
+
+    /// 应用注入偏移后的物理时间（纳秒）。
+    fn physical_now_with_drift(&self) -> u64 {
+        let base = Self::physical_now() as i128;
+        let offset = i128::from(self.injected_drift_nanos.load(AtomicOrdering::Relaxed));
+        u64::try_from((base + offset).max(0)).unwrap_or(u64::MAX)
     }
 
     fn physical_now() -> u64 {
@@ -676,7 +753,7 @@ impl HybridLogicalClock {
 
     pub fn tick(&self) -> HlcTimestamp {
         let mut inner = self.inner.lock();
-        let physical = Self::physical_now();
+        let physical = self.physical_now_with_drift();
 
         if physical > inner.last_time {
             inner.last_time = physical;
@@ -705,7 +782,7 @@ impl HybridLogicalClock {
     /// 远端超出 drift 上限时按 `(cap, m.c)` 参与比较，单调性不受影响。
     pub fn merge(&self, remote: &HlcTimestamp) -> HlcTimestamp {
         let mut inner = self.inner.lock();
-        let physical = Self::physical_now();
+        let physical = self.physical_now_with_drift();
         let max_drift = self.max_drift_nanos;
 
         let capped_wall_time = if remote.wall_time() > physical.saturating_add(max_drift) {
@@ -752,6 +829,71 @@ impl Default for HybridLogicalClock {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// 等待点条件（持久化等待点原语）。
+///
+/// 纯数据结构，不解释条件语义、不触发唤醒；唤醒由 `Orchestrator` 的
+/// 等待点 API 追加事件后推进状态机。定义在 common 是因为它同时属于
+/// journal 的稳定事件载荷（`JournalEvent::WaitPointRegistered`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum WaitCondition {
+    /// 外部信号触发（经 Signals capability 递交）。
+    Signal {
+        /// 信号名。与 wait_key 相互独立：wait_key 是注册表键，name 是信号语义名。
+        name: String,
+    },
+    /// 定时到期唤醒。`deadline_ms` 为绝对 epoch 毫秒。
+    Timer { deadline_ms: u64 },
+    /// 挂起等待显式恢复：由 `Orchestrator::resume_suspended` 唤醒。
+    ///
+    /// 与 [`WaitCondition::Signal`] 的区别是**语义来源**——`Signal` 等待一个具名
+    /// 业务事件，`Suspend` 等待操作员的恢复指令。二者共用
+    /// `JournalEvent::SignalReceived` 作为唤醒事件，由本字段区分来源。
+    Suspend,
+}
+
+/// DAG 节点定义：提交与 journal 共用的稳定结构。
+///
+/// `payload` 是不透明的业务载荷字节，Rust 不解析其语义。
+#[derive(Debug, Clone, Serialize, Deserialize, Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[rkyv(bytecheck())]
+pub struct DagNode {
+    pub task_id: TaskId,
+    pub name: String,
+    pub payload: Vec<u8>,
+    pub retry_policy: Option<RetryPolicy>,
+    pub timeout_ms: Option<u64>,
+    /// 任务优先级（有符号整数）。数值越高越紧急。
+    #[serde(default)]
+    pub priority: i32,
+    /// 任务元数据键值对，由上层添加。Rust 视为不透明数据，不解释它。
+    #[serde(default)]
+    pub metadata: HashMap<String, String>,
+    /// 任务放置诉求：标签选择器，随节点派发为 `TaskDefinition::tags`。
+    ///
+    /// 每项为 `key` 或 `key=value`，与执行节点的 `node_labels` 匹配后才允许放置。
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// 任务执行所需的命名配额（单维），随节点派发为 `TaskDefinition::quota`。
+    #[serde(default)]
+    pub quota: Option<String>,
+}
+
+/// 工作流提交的不可变描述（`JournalEvent::Submitted` 载荷）。
+///
+/// 任意节点都能据此判断“这是什么工作流、用哪版定义、带什么入参提交”，
+/// 而不依赖提交进程的内存状态。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowInvocation {
+    pub workflow_id: WorkflowId,
+    /// flow 定义名；未通过定义注册提交时为空串。
+    pub name: String,
+    /// flow 定义版本；`0` 表示未声明。
+    pub version: u32,
+    /// 调用参数的序列化字节（上层序列化，Rust 不解析）。
+    pub args: Vec<u8>,
 }
 
 #[cfg(test)]

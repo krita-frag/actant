@@ -16,7 +16,7 @@ use super::{types::*, Orchestrator};
 impl Orchestrator {
     /// 注册等待点（幂等：同 `wait_key` 已注册则直接返回 `Ok(())`）。
     ///
-    /// 注册即追加 [`WorkflowEventPayload::WaitPointRegistered`] 事件进入
+    /// 注册即追加 [`JournalEvent::WaitPointRegistered`] 事件进入
     /// 工作流历史，并标记工作流脏（等待点随下一次 flush 并入快照）。
     pub fn register_wait_point(
         &self,
@@ -60,7 +60,7 @@ impl Orchestrator {
             // 缓冲已出队（若有）不回填：已注册的等待点按其自身状态为准。
             return Ok(());
         }
-        self.log_event(WorkflowEventPayload::WaitPointRegistered {
+        self.log_event(JournalEvent::WaitPointRegistered {
             workflow_id: workflow_id.clone(),
             wait_key: wait_key.to_string(),
             condition: condition.clone(),
@@ -86,10 +86,11 @@ impl Orchestrator {
     ///
     /// - 无该 `wait_key` 的等待点 → `Ok(None)`；
     /// - 已被唤醒 → `Ok(Some(payload))`（重放体幂等：历史中已收到 → 直接返回）；
-    /// - 等待中 → 追加 [`WorkflowEventPayload::SignalReceived`] 事件、标记
+    /// - 等待中 → 追加 [`JournalEvent::SignalReceived`] 事件、标记
     ///   Signaled、唤醒 oneshot 等待者，返回 `Ok(Some(payload))`。
     ///
-    /// payload 当前为空（预留 Signals capability 携带信号数据）。
+    /// `payload` 是递交方携带的任意字节（业务数据由第 2 层解释）；它随
+    /// `SignalReceived` 进入工作流历史，重放与跨重启恢复返回**同一份**字节。
     ///
     /// 契约：**信号缓冲**。返回值含义：
     ///
@@ -99,18 +100,18 @@ impl Orchestrator {
     /// - `Err(NotFound)` / `Err(InvalidState)`：工作流不存在 / 已终态——
     ///   递交错误，信号无处可去（不再静默返回 `None`）。
     ///
-    /// 缓冲是**闩锁**：同一 `wait_key` 已有缓冲时重复递交不再追加事件、不覆盖
-    /// （当前 payload 恒为空，重复递交不携带新信息），这让"按返回值重试"变安全。
+    /// 缓冲是**闩锁**：同一 `wait_key` 已有缓冲或已唤醒时重复递交不追加事件、
+    /// **不覆盖已有 payload**（首次递交胜出），这让"按返回值重试"变安全。
     ///
     /// **持久性边界**：缓冲写 event_log（独立 `SignalReceived` 历史条目）+ 内存表，
     /// 缓冲与等待点同批落盘（`orch:sigbuf:` 与 `orch:wait:`），故**跨重启存活**；
     /// 重放路径同样会缓冲"先到的信号"（`apply_replayed_event` 的 `SignalReceived`
     /// 分支），两条路互为纵深防御。唯一会丢的窗口是"缓冲写入后、尚未落盘就崩溃"。
-    /// 信号缓冲与等待点同批落盘，故跨重启存活；唯一丢失窗口是落盘前的崩溃。
     pub fn signal_wait_point(
         &self,
         workflow_id: &WorkflowId,
         wait_key: &str,
+        payload: Vec<u8>,
     ) -> Result<Option<Vec<u8>>> {
         // 递交错误的显式路径：让"递错 id"与"递给已结束的工作流"
         // 不再与"缓冲成功"同形于 `None`。
@@ -129,7 +130,7 @@ impl Orchestrator {
         // 想保证的"重试安全"（终态不拒绝递交，缓冲边界由随工作流移除清除承担）。
         // 缓冲的边界改由"随工作流移除而清除"承担，不靠拒绝递交。
 
-        // 已缓冲：闩锁，不重复入历史。
+        // 已缓冲：闩锁，不重复入历史、不覆盖首次 payload。
         if let Some(buf) = self.state.pending_signals.get(workflow_id) {
             if buf.contains_key(wait_key) {
                 return Ok(None);
@@ -142,28 +143,28 @@ impl Orchestrator {
         // `buffer_signal` 只碰 `pending_signals`（另一张表），故持着本表 guard
         // 调用它不会死锁。
         let Some(table) = self.state.waitpoints.get(workflow_id) else {
-            return self.buffer_signal(workflow_id, wait_key);
+            return self.buffer_signal(workflow_id, wait_key, payload);
         };
         let Some(mut wp) = table.get_mut(wait_key) else {
-            return self.buffer_signal(workflow_id, wait_key);
+            return self.buffer_signal(workflow_id, wait_key, payload);
         };
         match &wp.state {
-            // 重放体幂等：历史中已收到 → 直接返回 payload。
+            // 重放体幂等：历史中已收到 → 直接返回 payload（首次递交胜出）。
             WaitPointState::Signaled { payload } => Ok(Some(payload.clone())),
             WaitPointState::Waiting => {
-                let payload = Vec::new();
                 wp.state = WaitPointState::Signaled {
                     payload: payload.clone(),
                 };
                 drop(wp);
-                self.log_event(WorkflowEventPayload::SignalReceived {
+                self.log_event(JournalEvent::SignalReceived {
                     workflow_id: workflow_id.clone(),
                     wait_key: wait_key.to_string(),
                     payload: payload.clone(),
                 });
                 self.state.mark_dirty(workflow_id);
-                self.state.fire_wait_waiter(workflow_id, wait_key, payload);
-                Ok(Some(Vec::new()))
+                self.state
+                    .fire_wait_waiter(workflow_id, wait_key, payload.clone());
+                Ok(Some(payload))
             }
         }
     }
@@ -175,9 +176,13 @@ impl Orchestrator {
     /// 缓冲表供 `register_wait_point` 命中。
     ///
     /// 调用方保证：工作流存在且非终态，且同 `wait_key` 尚无缓冲。
-    fn buffer_signal(&self, workflow_id: &WorkflowId, wait_key: &str) -> Result<Option<Vec<u8>>> {
-        let payload = Vec::new();
-        self.log_event(WorkflowEventPayload::SignalReceived {
+    fn buffer_signal(
+        &self,
+        workflow_id: &WorkflowId,
+        wait_key: &str,
+        payload: Vec<u8>,
+    ) -> Result<Option<Vec<u8>>> {
+        self.log_event(JournalEvent::SignalReceived {
             workflow_id: workflow_id.clone(),
             wait_key: wait_key.to_string(),
             payload: payload.clone(),
@@ -198,7 +203,7 @@ impl Orchestrator {
     /// 扫描并触发所有到期的 `Timer` 等待点（复用超时 watcher 的轮询模式；
     /// 生产环境由定时任务周期调用）。
     ///
-    /// 到期的等待点追加 [`WorkflowEventPayload::TimerFired`] 事件并标记
+    /// 到期的等待点追加 [`JournalEvent::TimerFired`] 事件并标记
     /// Signaled。返回本轮触发的 `(workflow_id, wait_key)` 列表；重复调用
     /// 幂等（已 Signaled 的等待点不会再次触发）。
     pub async fn poll_expired_timers(&self) -> Result<Vec<(WorkflowId, String)>> {
@@ -227,7 +232,7 @@ impl Orchestrator {
                     payload: Vec::new(),
                 };
                 drop(wp);
-                self.log_event(WorkflowEventPayload::TimerFired {
+                self.log_event(JournalEvent::TimerFired {
                     workflow_id: workflow_id.clone(),
                     wait_key: wait_key.clone(),
                 });
@@ -247,7 +252,7 @@ impl Orchestrator {
     ///
     /// **只匹配 `Suspend` 条件**，不触碰 `Signal` / `Timer`：`resume` 是操作员的
     /// 恢复指令，不得冒名顶替一个业务信号。
-    /// 唤醒事件复用 [`WorkflowEventPayload::SignalReceived`]——其载荷语义本就是
+    /// 唤醒事件复用 [`JournalEvent::SignalReceived`]——其载荷语义本就是
     /// "等待点被外部满足"，由 `condition` 字段区分是 signal 还是 resume，故
     /// 不新增事件变体、重放路径零改动。
     ///
@@ -278,7 +283,7 @@ impl Orchestrator {
                 payload: Vec::new(),
             };
             drop(wp);
-            self.log_event(WorkflowEventPayload::SignalReceived {
+            self.log_event(JournalEvent::SignalReceived {
                 workflow_id: workflow_id.clone(),
                 wait_key: wait_key.clone(),
                 payload: Vec::new(),
@@ -303,8 +308,8 @@ impl Orchestrator {
 
     /// 注册等待点唤醒句柄（oneshot），条件满足时收到 payload。
     ///
-    /// 扩展 [`TerminalWaiterRegistry`] 模式，供 flow 线程在等待点 park：
-    /// 先注册后检查——若等待点已 Signaled，句柄立即被触发，关闭竞态窗口。
+    /// 供 flow 线程在等待点 park：先注册后检查——若等待点已 Signaled，
+    /// 句柄立即被触发，关闭竞态窗口。
     pub fn register_wait_point_waiter(
         &self,
         workflow_id: WorkflowId,

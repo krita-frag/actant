@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::common::{
     ActantError, ActorMessage, ActorMessageResult, FailoverConfig, GossipConfig, NodeId,
-    OrchestratorClaim, Result, TaskDefinition, TaskId, WorkflowId,
+    OrchestratorClaim, Result, TaskDefinition, TaskId, WorkflowId, WorkflowInvocation,
 };
 use crate::runtime::actor::Actor;
 use crate::runtime::event_bus::{BusEvent, EventBus};
@@ -35,7 +35,6 @@ use crate::runtime::workflow::{
 pub struct TaskCompletionResponse {
     pub workflow_terminal: bool,
     pub ready_successors: Vec<TaskDefinition>,
-    pub conditional_edges: Vec<(TaskId, String)>,
 }
 
 pub const WORKFLOW_ACTOR_TYPE: &str = "WorkflowActor";
@@ -84,8 +83,6 @@ pub mod workflow_methods {
     pub const SUBMIT_WITH_TIMEOUT: &str = "submit_with_timeout";
     pub const START: &str = "start";
     pub const COMPLETE_TASK: &str = "complete_task";
-    pub const ACTIVATE_CONDITIONAL: &str = "activate_conditional";
-    pub const SKIP_CONDITIONAL_BRANCH: &str = "skip_conditional_branch";
     pub const FAIL_TASK: &str = "fail_task";
     pub const CANCEL_TASK: &str = "cancel_task";
     /// 增量加入单个节点（flow 提交路径）。
@@ -119,6 +116,10 @@ pub mod workflow_methods {
     pub const SIGNAL_WAIT_POINT: &str = "signal_wait_point";
     /// 恢复挂起：唤醒该工作流所有 `Suspend` 等待点（单入口）。
     pub const RESUME_SUSPENDED: &str = "resume_suspended";
+    /// 解析（首次记录 / 重放命中）确定性上下文值。
+    pub const RESOLVE_CONTEXT_VALUE: &str = "resolve_context_value";
+    /// 只读查询已记录的上下文值（`None` = 未记录，不写历史）。
+    pub const GET_CONTEXT_VALUE: &str = "get_context_value";
 }
 
 /// 封装 `Orchestrator` 的 Actor，负责 DAG 提交、执行推进与状态查询。
@@ -196,14 +197,13 @@ impl WorkflowActor {
         }
         match outcome {
             TaskResultOutcome::Completed(result) => {
-                let (ready, conditional, workflow_terminal) = self
+                let (ready, workflow_terminal) = self
                     .orchestrator
                     .on_task_completed(workflow_id, task_id, result)
                     .await?;
                 Ok(TaskResultIngest::Completed(TaskCompletionResponse {
                     workflow_terminal,
                     ready_successors: ready,
-                    conditional_edges: conditional,
                 }))
             }
             TaskResultOutcome::Failed(error) => {
@@ -270,14 +270,22 @@ impl Actor for WorkflowActor {
         let msg_id = msg.id.clone();
         match msg.method.as_str() {
             workflow_methods::SUBMIT => {
-                let (workflow_id, dag): (WorkflowId, Dag) = decode(&msg.payload)?;
-                self.orchestrator.submit(workflow_id, dag).await?;
+                let (workflow_id, dag, invocation): (WorkflowId, Dag, Option<WorkflowInvocation>) =
+                    decode(&msg.payload)?;
+                self.orchestrator
+                    .submit_with_invocation(workflow_id, dag, invocation)
+                    .await?;
                 Ok(ok_result(msg_id))
             }
             workflow_methods::SUBMIT_WITH_TIMEOUT => {
-                let (workflow_id, dag, timeout_ms): (WorkflowId, Dag, u64) = decode(&msg.payload)?;
+                let (workflow_id, dag, timeout_ms, invocation): (
+                    WorkflowId,
+                    Dag,
+                    u64,
+                    Option<WorkflowInvocation>,
+                ) = decode(&msg.payload)?;
                 self.orchestrator
-                    .submit_with_timeout(workflow_id, dag, timeout_ms)
+                    .submit_with_timeout_and_invocation(workflow_id, dag, timeout_ms, invocation)
                     .await?;
                 Ok(ok_result(msg_id))
             }
@@ -305,7 +313,6 @@ impl Actor for WorkflowActor {
                     _ => TaskCompletionResponse {
                         workflow_terminal: false,
                         ready_successors: vec![],
-                        conditional_edges: vec![],
                     },
                 };
                 Ok(payload_result(msg_id, encode(&response)?))
@@ -325,21 +332,6 @@ impl Actor for WorkflowActor {
                 let workflow_id: WorkflowId = decode(&msg.payload)?;
                 self.orchestrator.seal_workflow(&workflow_id).await?;
                 Ok(ok_result(msg_id))
-            }
-            workflow_methods::ACTIVATE_CONDITIONAL => {
-                let (workflow_id, task_id): (WorkflowId, TaskId) = decode(&msg.payload)?;
-                let task = self
-                    .orchestrator
-                    .activate_conditional_successor(&workflow_id, &task_id)?;
-                Ok(payload_result(msg_id, encode(&task)?))
-            }
-            workflow_methods::SKIP_CONDITIONAL_BRANCH => {
-                let (workflow_id, task_id): (WorkflowId, TaskId) = decode(&msg.payload)?;
-                let ready = self
-                    .orchestrator
-                    .skip_conditional_branch(&workflow_id, &task_id)
-                    .await?;
-                Ok(payload_result(msg_id, encode(&ready)?))
             }
             workflow_methods::FAIL_TASK => {
                 // `scope` 字段仅为 wire 兼容保留（py complete_workflow 载荷）；
@@ -481,12 +473,14 @@ impl Actor for WorkflowActor {
                 Ok(ok_result(msg_id))
             }
             workflow_methods::SIGNAL_WAIT_POINT => {
-                // 返回 `Option<Vec<u8>>`：`None` = 无该等待点；`Some(payload)` =
-                // 已唤醒（含"重放体已收到 → 直接返回"的幂等路径）。
-                let (workflow_id, wait_key): (WorkflowId, String) = decode(&msg.payload)?;
-                let delivered = self
-                    .orchestrator
-                    .signal_wait_point(&workflow_id, &wait_key)?;
+                // 返回 `Option<Vec<u8>>`：`None` = 无该等待点（信号已入缓冲）；
+                // `Some(payload)` = 已唤醒（含"重放体已收到 → 直接返回"的幂等路径）。
+                // payload 由递交方提供，随 SignalReceived 进入工作流历史。
+                let (workflow_id, wait_key, payload): (WorkflowId, String, Vec<u8>) =
+                    decode(&msg.payload)?;
+                let delivered =
+                    self.orchestrator
+                        .signal_wait_point(&workflow_id, &wait_key, payload)?;
                 Ok(payload_result(msg_id, encode(&delivered)?))
             }
             workflow_methods::RESUME_SUSPENDED => {
@@ -495,6 +489,26 @@ impl Actor for WorkflowActor {
                 let workflow_id: WorkflowId = decode(&msg.payload)?;
                 let resumed = self.orchestrator.resume_suspended(&workflow_id)?;
                 Ok(payload_result(msg_id, encode(&resumed)?))
+            }
+            workflow_methods::RESOLVE_CONTEXT_VALUE => {
+                // 返回**记录值**：首次执行等于候选值，重放时等于历史值。
+                // 同 key 不同 kind 由 orchestrator 判为 Replay 错误。
+                let (workflow_id, key, kind, candidate): (WorkflowId, String, String, Vec<u8>) =
+                    decode(&msg.payload)?;
+                let value = self.orchestrator.resolve_context_value(
+                    &workflow_id,
+                    &key,
+                    &kind,
+                    candidate,
+                )?;
+                Ok(payload_result(msg_id, encode(&value)?))
+            }
+            workflow_methods::GET_CONTEXT_VALUE => {
+                // 只读：未记录返回 `None`，绝不追加事件（调用方可能是"探测
+                // 是否存在续跑携带参数"的重放路径）。
+                let (workflow_id, key): (WorkflowId, String) = decode(&msg.payload)?;
+                let value = self.orchestrator.get_context_value(&workflow_id, &key)?;
+                Ok(payload_result(msg_id, encode(&value)?))
             }
             other => Err(ActantError::Actor(format!(
                 "WorkflowActor: unknown method {}",

@@ -94,7 +94,6 @@ async fn make_wiring(node_id_str: &str) -> TestWiring {
         actor_system: Some(actor_system),
         workflow_actor_id: None,
         dag_gossip_actor_id: Some(dag_gossip_actor_id),
-        capability_gossip: None,
         failover: Some(failover.clone()),
         cancel_flags: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
@@ -115,12 +114,15 @@ async fn inbound_heartbeat_creates_peer_with_capacity() {
         signature: None,
         labels: std::collections::BTreeMap::new(),
         platform: None,
+        available_quotas: std::collections::BTreeMap::new(),
         node_id: NodeId::from("node-wire-B".to_string()),
         active_workflows: vec![],
         timestamp_ms: crate::common::epoch_millis(),
         available_slots: 3,
         max_slots: 8,
         endpoint_addr: Some("peer-wire-B".to_string()),
+        role: crate::common::NodeRole::Both,
+        draining: false,
     };
     let envelope =
         crate::common::WireEnvelope::wrap(crate::common::WireMessage::NodeHeartbeat(hb.clone()));

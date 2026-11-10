@@ -9,8 +9,7 @@
 //!
 //! - `Pending` 表示任务尚未满足依赖或尚未被调度。
 //! - `Running` 表示任务已经被 Worker 接收。
-//! - `Completed`、`Failed`、`Cancelled`、`Skipped` 是终态。
-//! - 条件分支未被激活时使用 `Skipped`，避免把未执行分支误判为失败。
+//! - `Completed`、`Failed`、`Cancelled` 是终态。
 //!
 //! ## 设计边界
 //!
@@ -24,6 +23,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::common::{Result, RetryPolicy, TaskId, WorkflowId};
 
+// journal 载荷与 DAG 结构共用同一份语言无关定义。
+pub use crate::common::{DagNode, WaitCondition};
+
 /// [`Phase`] 变体的稳定字符串标识符。
 ///
 /// Rust↔Python 状态映射的唯一真实来源。[`Phase::as_str`] 和 Python 端的
@@ -34,7 +36,6 @@ pub mod phase_str {
     pub const COMPLETED: &str = "Completed";
     pub const FAILED: &str = "Failed";
     pub const CANCELLED: &str = "Cancelled";
-    pub const SKIPPED: &str = "Skipped";
 }
 
 /// 工作流和任务的统一生命周期阶段。
@@ -66,8 +67,6 @@ pub enum Phase {
     Completed,
     Failed,
     Cancelled,
-    /// 工作流或任务未执行是因为其条件分支未被取。
-    Skipped,
 }
 
 impl Phase {
@@ -81,7 +80,6 @@ impl Phase {
             Phase::Completed => phase_str::COMPLETED,
             Phase::Failed => phase_str::FAILED,
             Phase::Cancelled => phase_str::CANCELLED,
-            Phase::Skipped => phase_str::SKIPPED,
         }
     }
 
@@ -102,8 +100,6 @@ impl Phase {
             Some(Phase::Failed)
         } else if ok(phase_str::CANCELLED) {
             Some(Phase::Cancelled)
-        } else if ok(phase_str::SKIPPED) {
-            Some(Phase::Skipped)
         } else {
             None
         }
@@ -120,10 +116,7 @@ pub trait Terminal {
 
 impl Terminal for Phase {
     fn is_terminal(&self) -> bool {
-        matches!(
-            self,
-            Phase::Completed | Phase::Failed | Phase::Cancelled | Phase::Skipped
-        )
+        matches!(self, Phase::Completed | Phase::Failed | Phase::Cancelled)
     }
 }
 
@@ -242,8 +235,6 @@ pub struct WorkflowExecution {
     pub tasks: HashMap<TaskId, TaskState>,
     /// 已成功完成的任务数量。
     succeeded_count: usize,
-    /// 由于条件分支而跳过任务数量。
-    skipped_count: usize,
     total_count: usize,
     deadline_ms: Option<u64>,
     started_at_ms: Option<u64>,
@@ -319,7 +310,6 @@ impl WorkflowExecution {
             state: Phase::Pending,
             tasks,
             succeeded_count: 0,
-            skipped_count: 0,
             total_count: total,
             deadline_ms: None,
             started_at_ms: None,
@@ -380,7 +370,9 @@ impl WorkflowExecution {
     pub fn is_expired(&self) -> bool {
         if let (Some(deadline), Some(started)) = (self.deadline_ms, self.started_at_ms) {
             let now_ms = crate::common::epoch_millis();
-            now_ms > started + deadline
+            // 用饱和减法避免 `started + deadline` 溢出：超大 timeout_ms 下原先会
+            // 在 debug 构建里 panic、release 构建里回绕成「立即过期」。
+            now_ms.saturating_sub(started) > deadline
         } else {
             false
         }
@@ -480,19 +472,6 @@ impl WorkflowExecution {
             .is_some_and(|t| !t.state.is_terminal())
     }
 
-    /// 标记任务为已跳过（条件分支未被取）。
-    pub fn mark_task_skipped(&mut self, task_id: &TaskId) {
-        if let Some(task) = self.tasks.get_mut(task_id) {
-            // 幂等性：已处于终态则跳过
-            if task.state.is_terminal() {
-                return;
-            }
-            task.state = Phase::Skipped;
-            self.skipped_count += 1;
-        }
-        self.check_workflow_completion();
-    }
-
     /// 检查工作流是否已到达终态。
     ///
     /// 判定口径：封口后**全部节点终态**即工作流终态；终态类别按优先级
@@ -502,9 +481,9 @@ impl WorkflowExecution {
     ///   此分支覆盖 continue 策略与 `TaskOnly` 重试耗尽后的收尾。
     /// - `Cancelled`：无失败但存在被取消节点——工作流被取消，结果不全不得当
     ///   作成功。
-    /// - `Completed`：全部节点为 Completed/Skipped。
+    /// - `Completed`：全部节点为 Completed。
     ///
-    /// 终态判定**不能只按 `succeeded + skipped == total` 走 Completed**：
+    /// 终态判定**不能只按 `succeeded == total` 走 Completed**：
     /// fail-fast（默认）下「全部节点被取消」（succeeded=0）既不满足和式、又不进
     /// `Continue` 分支，工作流会永久停在 `Running`——flow 的终态轮询
     /// （`_wait_terminal_and_emit`）因此永不返回。故「无失败但存在被取消节点」
@@ -748,33 +727,6 @@ impl Terminal for WorkflowExecution {
     }
 }
 
-/// 等待点条件（持久化等待点原语）。
-///
-/// 纯数据结构，与 [`Dag`]/[`Phase`] 同层：不解释条件语义、不触发唤醒，
-/// 唤醒由 `Orchestrator` 的等待点 API 追加事件后推进状态机。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub enum WaitCondition {
-    /// 外部信号触发（经 Signals capability 递交）。
-    Signal {
-        /// 信号名。与 wait_key 相互独立：wait_key 是注册表键，name 是信号语义名。
-        name: String,
-    },
-    /// 定时到期唤醒。`deadline_ms` 为绝对 epoch 毫秒，与工作流级超时
-    /// watcher（`is_expired` / `epoch_millis`）使用同一时钟基准。
-    Timer { deadline_ms: u64 },
-    /// 挂起等待显式恢复：由 `Orchestrator::resume_suspended` 唤醒。
-    ///
-    /// 与 [`WaitCondition::Signal`] 的区别是**语义来源**——`Signal` 等待一个具名
-    /// 业务事件，`Suspend` 等待操作员的恢复指令。二者共用
-    /// `WorkflowEventPayload::SignalReceived` 作为唤醒事件（其载荷语义本就是
-    /// "等待点被外部满足"），由本字段区分是 signal 还是 resume，故新语义不新增
-    /// 事件变体（resume 复用 `SignalReceived` 唤醒事件，不新增变体）。
-    ///
-    /// 新变体追加在末尾：postcard 的变体判别按声明顺序，追加不改变既有值的编码。
-    Suspend,
-}
-
 /// 等待点当前状态。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -798,33 +750,10 @@ pub struct WaitPoint {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Archive, rkyv::Serialize, rkyv::Deserialize)]
 #[rkyv(bytecheck())]
-pub struct DagNode {
-    pub task_id: TaskId,
-    pub name: String,
-    pub payload: Vec<u8>,
-    pub retry_policy: Option<RetryPolicy>,
-    pub timeout_ms: Option<u64>,
-    /// 任务优先级（有符号整数）。数值越高越紧急。
-    #[serde(default)]
-    pub priority: i32,
-    /// 任务元数据键值对，由 Python 层添加。
-    /// Rust 视为不透明数据，不解释它。
-    /// 用于标签、路由提示或任何 Python定义的属性。
-    #[serde(default)]
-    pub metadata: HashMap<String, String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Archive, rkyv::Serialize, rkyv::Deserialize)]
-#[rkyv(bytecheck())]
 /// 与 [`DagNode`] 同为 DAG 的结构元素，故同等可见：`Dag::edges()` 需要它。
 pub struct DagEdge {
     pub from: TaskId,
     pub to: TaskId,
-    /// 条件标签，用于条件分支。
-    /// 当存在时，仅当条件为 true 时激活此边。
-    /// Python 调度循环在运行时评估条件式。
-    #[serde(default)]
-    pub condition: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -885,49 +814,6 @@ impl Dag {
         self.edges.push(DagEdge {
             from: from.clone(),
             to: to.clone(),
-            condition: None,
-        });
-        self.successors
-            .entry(from.clone())
-            .or_default()
-            .push(to.clone());
-        self.predecessors.entry(to).or_default().push(from);
-
-        Ok(())
-    }
-
-    /// 添加条件分支边。
-    /// 当存在时，仅当条件为 true 时激活此边。
-    /// Python 调度循环在运行时评估条件式。
-    pub fn add_conditional_edge(
-        &mut self,
-        from: TaskId,
-        to: TaskId,
-        condition: String,
-    ) -> Result<()> {
-        if !self.nodes.contains_key(&from) {
-            return Err(crate::common::ActantError::Workflow(format!(
-                "node {} not found",
-                from.as_str()
-            )));
-        }
-        if !self.nodes.contains_key(&to) {
-            return Err(crate::common::ActantError::Workflow(format!(
-                "node {} not found",
-                to.as_str()
-            )));
-        }
-
-        if from == to || self.path_exists(&to, &from) {
-            return Err(crate::common::ActantError::Workflow(
-                "adding conditional edge would create a cycle".into(),
-            ));
-        }
-
-        self.edges.push(DagEdge {
-            from: from.clone(),
-            to: to.clone(),
-            condition: Some(condition),
         });
         self.successors
             .entry(from.clone())
@@ -985,16 +871,6 @@ impl Dag {
 
     pub fn successor_ids(&self, id: &TaskId) -> Vec<TaskId> {
         self.successors.get(id).cloned().unwrap_or_default()
-    }
-
-    /// 返回从给定任务出发的条件分支边。
-    /// 每个条目为 (后继任务 ID,条件标签)。
-    pub fn conditional_edges_from(&self, id: &TaskId) -> Vec<(TaskId, String)> {
-        self.edges
-            .iter()
-            .filter(|e| &e.from == id)
-            .filter_map(|e| e.condition.as_ref().map(|c| (e.to.clone(), c.clone())))
-            .collect()
     }
 
     pub fn successors_of(&self, id: &TaskId) -> Vec<&DagNode> {
@@ -1074,8 +950,8 @@ impl Dag {
         self.nodes.values()
     }
 
-    /// 全部有向边（含条件标签）。与 [`Self::nodes`] 对称，供结构暴露面使用
-    /// ——`successor_ids` 只能给出邻接关系，拿不到边的 `condition`。
+    /// 全部有向边。与 [`Self::nodes`] 对称，供结构暴露面使用——
+    /// `successor_ids` 只能给出邻接关系，拿不到结构体的完整字段。
     pub fn edges(&self) -> impl Iterator<Item = &DagEdge> {
         self.edges.iter()
     }

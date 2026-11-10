@@ -370,6 +370,8 @@ pub enum DirectRequest {
         task_name: String,
         outcome: WireTaskOutcome,
         worker_node: NodeId,
+        /// 执行该任务的 attempt，用于直提任务的结果 fencing。
+        attempt: u32,
     },
     /// 直接将任务分发给特定工作节点。
     DispatchTask {

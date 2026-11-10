@@ -37,6 +37,8 @@ fn build_chain_dag(n: usize) -> Dag {
             timeout_ms: Some(30_000),
             priority: 0,
             metadata: std::collections::HashMap::new(),
+            tags: Vec::new(),
+            quota: None,
         })
         .unwrap();
     }
@@ -65,6 +67,7 @@ fn make_task(idx: usize) -> TaskDefinition {
         enqueued_at_ms: 0,
         target_endpoint_addr: None,
         origin_endpoint_addr: None,
+        lease_deadline_ms: 0,
     }
 }
 

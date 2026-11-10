@@ -5,10 +5,9 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
 use crate::common::scheduler_kind;
-use crate::common::{ActantConfig, ActantError, ActorId, NodeId, Topic};
+use crate::common::{ActantConfig, ActantError, ActorId, NodeId};
 use crate::runtime::actor::ActorSystem;
 use crate::runtime::dispatcher::{ProcessTaskDispatcher, TaskDispatcher, WorkerLaunchSpec};
 use crate::runtime::event_bus::EventBus;
@@ -202,6 +201,10 @@ pub struct WorkerInitParams<'a> {
     pub node_id: &'a NodeId,
     pub network: &'a Arc<dyn Transport>,
     pub event_bus: EventBus,
+    /// 本地节点标签，注入 Worker 用于放置适配校验。
+    pub node_labels: &'a std::collections::BTreeMap<String, String>,
+    /// 预构造远端路由策略。`None` 使用内置 `DefaultRoutePolicy`。
+    pub route_policy: Option<Arc<dyn crate::runtime::workflow::RoutePolicy>>,
     /// 预构造调度器（注入）。`Some` 时忽略 `scheduler_kind` 字符串——
     /// 直接以该实现 spawn（包为 SchedulerActor）。
     pub scheduler: Option<Arc<dyn crate::runtime::workflow::Scheduler>>,
@@ -217,8 +220,6 @@ pub struct WorkerInitParams<'a> {
     pub workflow_actor_id: Option<crate::common::ActorId>,
     /// 本地 DagGossipActor 的 id。用于处理工作流状态请求/响应主题。
     pub dag_gossip_actor_id: Option<crate::common::ActorId>,
-    /// Capability gossip 处理器。用于接收 `TOPIC_CAPABILITY_GOSSIP` 上的远端 capability 广播。
-    pub capability_gossip: Option<Arc<crate::runtime::capability::gossip::CapabilityGossipActor>>,
 }
 
 /// 初始化 worker runtime。
@@ -291,8 +292,9 @@ pub async fn init_worker(params: WorkerInitParams<'_>) -> Result<Worker, ActantE
         Some(id) => worker.with_dag_gossip_actor_id(id),
         None => worker,
     };
-    let worker = match params.capability_gossip {
-        Some(g) => worker.with_capability_gossip(g),
+    let worker = worker.with_local_labels(params.node_labels.clone());
+    let worker = match params.route_policy {
+        Some(policy) => worker.with_route_policy(policy),
         None => worker,
     };
     Ok(worker)
@@ -307,6 +309,7 @@ pub struct RuntimeBuilder {
     data_dir: Option<String>,
     // ── 注入缝：缺省走内置实现，行为不变 ──
     scheduler: Option<Arc<dyn crate::runtime::workflow::Scheduler>>,
+    route_policy: Option<Arc<dyn crate::runtime::workflow::RoutePolicy>>,
     task_dispatcher: Option<Arc<dyn TaskDispatcher>>,
     transport: Option<Arc<dyn Transport>>,
     discovery: Option<Arc<dyn crate::runtime::network::Discovery>>,
@@ -315,6 +318,40 @@ pub struct RuntimeBuilder {
     /// **默认关闭**——Python 绑定层由事件泵承担同职责，双重回灌会产生
     /// 重试裁决竞态；仅 Rust 嵌入方（无事件泵）应显式开启。
     orchestrator_ingest: bool,
+    /// 覆盖配置中的拓扑角色。`None` 时用 `config.worker.role`。
+    role: Option<crate::common::NodeRole>,
+}
+
+/// 构建期 wire 密钥租约。
+///
+/// 密钥存放在进程级注册表（[`crate::common::register_wire_signing_key`]）。
+/// 注册之后 `build` 仍有网络、存储、进程池等可失败步骤；提前返回时由 `Drop`
+/// 注销本节点条目，避免失败的构建污染同进程后续 Runtime。成功返回前
+/// [`WireKeyLease::disarm`]，注销职责移交 `Runtime::shutdown`。
+struct WireKeyLease {
+    node_id: NodeId,
+    armed: bool,
+}
+
+impl WireKeyLease {
+    fn new(node_id: &NodeId) -> Self {
+        Self {
+            node_id: node_id.clone(),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for WireKeyLease {
+    fn drop(&mut self) {
+        if self.armed {
+            crate::common::register_wire_signing_key(&self.node_id, Vec::new());
+        }
+    }
 }
 
 impl RuntimeBuilder {
@@ -324,12 +361,25 @@ impl RuntimeBuilder {
             config,
             data_dir: None,
             scheduler: None,
+            route_policy: None,
             task_dispatcher: None,
             transport: None,
             discovery: None,
             event_log: None,
             orchestrator_ingest: false,
+            role: None,
         }
+    }
+
+    /// 覆盖节点拓扑角色，优先于 `config.worker.role`。
+    pub fn with_role(mut self, role: crate::common::NodeRole) -> Self {
+        self.role = Some(role);
+        self
+    }
+
+    /// 生效的拓扑角色：显式覆盖优先，否则取配置。
+    fn effective_role(&self) -> crate::common::NodeRole {
+        self.role.unwrap_or(self.config.worker.role)
     }
 
     /// 启用本地编排回灌桥。
@@ -352,6 +402,15 @@ impl RuntimeBuilder {
         scheduler: Arc<dyn crate::runtime::workflow::Scheduler>,
     ) -> Self {
         self.scheduler = Some(scheduler);
+        self
+    }
+
+    /// 注入自定义远端路由策略。替换内置 [`DefaultRoutePolicy`](crate::runtime::workflow::DefaultRoutePolicy)。
+    pub fn with_route_policy(
+        mut self,
+        policy: Arc<dyn crate::runtime::workflow::RoutePolicy>,
+    ) -> Self {
+        self.route_policy = Some(policy);
         self
     }
 
@@ -395,7 +454,6 @@ impl RuntimeBuilder {
     }
 
     pub async fn build(self) -> Result<Arc<crate::runtime::Runtime>, ActantError> {
-        use crate::runtime::capability::gossip::CapabilityGossipActor;
         use crate::runtime::capability::register_defaults;
         use crate::runtime::capability::register_store_handler;
         use crate::runtime::capability::CapabilityRuntime;
@@ -424,19 +482,6 @@ impl RuntimeBuilder {
             );
         }
 
-        // 将 payload 签名密钥同时作为 wire message 签名密钥。
-        // 设计：单一密钥承担双重职责（payload + wire），简化运维配置。
-        // 空密钥 = 禁用 wire 签名验证，向后兼容 0.2（无 mac 字段）。
-        // 非空密钥 = 集群内所有节点必须共享同一密钥；任一节点密钥不匹配
-        // 将导致其跨节点消息被对端丢弃，提供端到端集群身份认证。
-        // 按 node 注册——同进程多 Runtime 各自密钥互不覆盖，
-        // 出站签名按消息来源节点选择（wire 模块的调用点在冻结的
-        // workflow/ 子树中，密钥无法参数穿透，故保留进程级注册表）。
-        crate::common::register_wire_signing_key(
-            &self.node_id,
-            self.config.payload_signing_key.clone(),
-        );
-
         let data_dir = self
             .data_dir
             .clone()
@@ -449,6 +494,23 @@ impl RuntimeBuilder {
 
         // 节点身份：endpoint keypair 随 data_dir 持久化，endpoint id 跨重启稳定。
         let identity = load_or_create_identity(Path::new(&data_dir))?;
+
+        // 将 payload 签名密钥同时作为 wire message 签名密钥。
+        // 设计：单一密钥承担双重职责（payload + wire），简化运维配置。
+        // 空密钥 = 禁用 wire 签名验证，向后兼容 0.2（无 mac 字段）。
+        // 非空密钥 = 集群内所有节点必须共享同一密钥；任一节点密钥不匹配
+        // 将导致其跨节点消息被对端丢弃，提供端到端集群身份认证。
+        // 按 node 注册——同进程多 Runtime 各自密钥互不覆盖，
+        // 出站签名按消息来源节点选择（wire 模块的调用点在冻结的
+        // workflow/ 子树中，密钥无法参数穿透，故保留进程级注册表）。
+        //
+        // 注册放在配置与路径校验之后；此后仍有可失败步骤，故用租约保证
+        // 构建失败时撤销注册，避免污染同进程后续 Runtime（消息被误拒）。
+        crate::common::register_wire_signing_key(
+            &self.node_id,
+            self.config.payload_signing_key.clone(),
+        );
+        let mut wire_key_lease = WireKeyLease::new(&self.node_id);
 
         let network: Arc<dyn Transport> = match self.transport.clone() {
             // 使用方自带传输层（不经 discovery preset 构造）。
@@ -491,6 +553,15 @@ impl RuntimeBuilder {
         let lmdb_store = LmdbStore::open_with_config(&store_path, &self.config.store)
             .map_err(|e| ActantError::Storage(format!("failed to open store: {}", e)))?;
         let store = Store::new(lmdb_store.clone());
+        match store.storage_stats().await {
+            Ok(stats) => tracing::debug!(
+                entries = stats.entries,
+                util = stats.utilization(),
+                readers = stats.readers,
+                "store capacity snapshot"
+            ),
+            Err(e) => tracing::warn!(error = %e, "failed to read store capacity snapshot"),
+        }
 
         // 使用方自带分发器（进程内/shell/任意语言 worker）优先；
         // 缺省走内置进程池。任务日志边带出口须在构造时提供——
@@ -574,12 +645,17 @@ impl RuntimeBuilder {
         let mut platform = crate::common::PlatformInfo::detect();
         platform.host_runtime = self.config.node_host_runtime.clone();
         let failover = Arc::new(
-            FailoverManager::new(
+            FailoverManager::with_config(
                 self.node_id.clone(),
                 network.clone(),
                 actor_system.clone(),
                 workflow_actor_id.clone(),
+                self.config.failover.clone(),
+                // 租约的写盘 / 重启恢复 / 过期清理都以 store 为前提；缺省走
+                // `FailoverManager::new()` 会让这三条路径全部静默失效。
+                Some(lmdb_store.clone()),
             )
+            .with_role(self.effective_role())
             .with_node_metadata(Some(platform), self.config.node_labels.clone())
             // 身份与信任：心跳签名密钥 = endpoint keypair；require_signed_records
             // 开启时拒绝缺签/坏签心跳，allowlist 非空时同时校验成员资格。
@@ -632,33 +708,6 @@ impl RuntimeBuilder {
         runtime.subscribe_cancel().await?;
         failover.subscribe_topics().await?;
 
-        // ── CapabilityGossip ──────────────────────────────────────────
-        // 跨节点 capability 元信息扩散。直接启动后台广播循环，
-        // 不通过 ActorSystem（无需消息路由）。cancel handle 注册到 Runtime，
-        // 保证 shutdown 时停止。
-        // 必须先订阅 topic 再启动后台循环，确保 NetworkEventRouter
-        // 接收侧就绪后 gossip 消息才到达。
-        tracing::info!("build: capability gossip subscribe enter");
-        let cap_gossip_topic = Topic::from(crate::common::wire::constants::TOPIC_CAPABILITY_GOSSIP);
-        network
-            .subscribe(cap_gossip_topic.as_str())
-            .await
-            .map_err(|e| {
-                ActantError::Network(format!(
-                    "failed to subscribe to capability gossip topic: {}",
-                    e
-                ))
-            })?;
-        tracing::info!("build: capability gossip subscribed");
-        let cap_gossip = Arc::new(
-            CapabilityGossipActor::new(self.node_id.clone(), capability.clone(), network.clone())
-                .with_broadcast_interval(Duration::from_millis(
-                    self.config.network.capability_gossip_interval_ms,
-                )),
-        );
-        runtime.register_background_loop_cancel(cap_gossip.clone().start_background_loop());
-        tracing::info!("build: capability gossip started");
-
         // ── Worker（SchedulerActor + 任务消费循环）─────────────────────
         // 需要 failover 引用以便 capacity callback。tokio handle 取当前运行时。
         tracing::info!("build: init_worker enter");
@@ -668,6 +717,8 @@ impl RuntimeBuilder {
             network: &network,
             event_bus: event_bus.clone(),
             scheduler: self.scheduler.clone(),
+            node_labels: &self.config.node_labels,
+            route_policy: self.route_policy.clone(),
             orchestrator_ingest: self.orchestrator_ingest,
             scheduler_kind: self.config.worker.scheduler_kind.as_str(),
             worker_config: &self.config.worker,
@@ -677,12 +728,15 @@ impl RuntimeBuilder {
             tokio_handle,
             workflow_actor_id: Some(workflow_actor_id.clone()),
             dag_gossip_actor_id: Some(dag_gossip_actor_id.clone()),
-            capability_gossip: Some(cap_gossip.clone()),
         })
         .await?;
         tracing::info!("build: init_worker done");
+        // with_role 覆盖需同时作用于 Worker（Worker::new 只读配置默认值）。
+        let worker = worker.with_role(self.effective_role());
         // Worker 持有 Arc<dyn Scheduler>，让 failover 也能拿到 scheduler 引用。
         let worker = Arc::new(worker.with_failover_manager(failover.clone()));
+        // 心跳广播配额剩余容量：FailoverManager 与 Worker 共享同一 QuotaTracker。
+        failover.set_quota_tracker(worker.quota_tracker().clone());
         // 注入 worker 到 runtime。此处 runtime 仍是唯一 Arc 引用
         //（register_background_loop_cancel 只借用 &self，未 clone Arc），
         // 故 Arc::get_mut 可直接获取可变引用，无需克隆（克隆会
@@ -719,6 +773,8 @@ impl RuntimeBuilder {
         runtime.register_background_loop_cancel(failover.start_background_loops());
         tracing::info!("build: failover start_background_loops done");
 
+        // 构建成功：注销职责移交 Runtime::shutdown，租约不再兜底。
+        wire_key_lease.disarm();
         tracing::info!("build: returning runtime");
         Ok(runtime)
     }

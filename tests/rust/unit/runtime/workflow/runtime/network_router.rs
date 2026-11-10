@@ -224,7 +224,6 @@ fn make_router(
         actor_system,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
-        capability_gossip: None,
         failover: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -233,6 +232,9 @@ fn make_router(
 
 fn make_task(name: &str) -> TaskDefinition {
     TaskDefinition {
+        tags: Vec::new(),
+        quota: None,
+        pinned_target: false,
         id: TaskId::from(format!("task-{}", name)),
         name: name.to_string(),
         payload: Vec::new(),
@@ -246,6 +248,7 @@ fn make_task(name: &str) -> TaskDefinition {
         enqueued_at_ms: 0,
         target_endpoint_addr: None,
         origin_endpoint_addr: None,
+        lease_deadline_ms: 0,
     }
 }
 
@@ -313,7 +316,6 @@ async fn handle_direct_task_result_without_actor_publishes_event() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
-        capability_gossip: None,
         failover: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -329,6 +331,7 @@ async fn handle_direct_task_result_without_actor_publishes_event() {
                 task_name: "tn".to_string(),
                 outcome: WireTaskOutcome::Completed(vec![1, 2]),
                 worker_node: NodeId::from("node-B".to_string()),
+                attempt: 0,
             }),
             channel,
         })
@@ -357,7 +360,6 @@ async fn handle_peer_connected_publishes_event() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
-        capability_gossip: None,
         failover: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -396,7 +398,6 @@ async fn handle_cancel_broadcast_sets_cancel_flag_and_publishes_event() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
-        capability_gossip: None,
         failover: None,
         cancel_flags,
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -441,7 +442,6 @@ async fn handle_workflow_state_request_routes_to_dag_gossip_actor() {
         actor_system: Some(actor_system.clone()),
         workflow_actor_id: None,
         dag_gossip_actor_id: Some(dag_gossip_id.clone()),
-        capability_gossip: None,
         failover: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -482,7 +482,6 @@ async fn handle_direct_task_result_routes_to_workflow_actor() {
         actor_system: Some(actor_system.clone()),
         workflow_actor_id: Some(workflow_actor_id.clone()),
         dag_gossip_actor_id: None,
-        capability_gossip: None,
         failover: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -498,6 +497,7 @@ async fn handle_direct_task_result_routes_to_workflow_actor() {
                 task_name: "tn".to_string(),
                 outcome: WireTaskOutcome::Completed(vec![1, 2]),
                 worker_node: NodeId::from("node-B".to_string()),
+                attempt: 0,
             }),
             channel,
         })
@@ -524,7 +524,6 @@ async fn handle_peer_disconnected_publishes_event() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
-        capability_gossip: None,
         failover: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -576,7 +575,6 @@ async fn handle_dag_state_topic_dispatches_to_dag_gossip_actor() {
         actor_system: Some(actor_system),
         workflow_actor_id: None,
         dag_gossip_actor_id: Some(dag_gossip_id),
-        capability_gossip: None,
         failover: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -629,7 +627,6 @@ async fn handle_heartbeat_topic_dispatches_to_failover_manager() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
-        capability_gossip: None,
         failover: Some(failover.clone()),
         cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -639,12 +636,15 @@ async fn handle_heartbeat_topic_dispatches_to_failover_manager() {
         signature: None,
         labels: std::collections::BTreeMap::new(),
         platform: None,
+        available_quotas: std::collections::BTreeMap::new(),
         node_id: NodeId::from("node-B".to_string()),
         active_workflows: vec![WorkflowId::from("wf-1".to_string())],
         timestamp_ms: crate::common::epoch_millis(),
         available_slots: 4,
         max_slots: 8,
         endpoint_addr: None,
+        role: crate::common::NodeRole::Both,
+        draining: false,
     };
     let envelope = WireEnvelope::wrap(WireMessage::NodeHeartbeat(hb));
     let payload = postcard::to_allocvec(&envelope).unwrap();
@@ -685,7 +685,6 @@ async fn handle_failover_topic_dispatches_claim_to_failover_manager() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
-        capability_gossip: None,
         failover: Some(failover.clone()),
         cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -764,7 +763,6 @@ async fn handle_heads_topic_dispatches_exchange_to_dag_gossip_actor() {
         actor_system: Some(actor_system),
         workflow_actor_id: None,
         dag_gossip_actor_id: Some(dag_gossip_id),
-        capability_gossip: None,
         failover: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -811,7 +809,6 @@ async fn handle_direct_request_other_returns_error_response() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
-        capability_gossip: None,
         failover: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -852,7 +849,6 @@ async fn handle_task_result_failed_publishes_event() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
-        capability_gossip: None,
         failover: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -868,6 +864,7 @@ async fn handle_task_result_failed_publishes_event() {
                 task_name: "tn".to_string(),
                 outcome: WireTaskOutcome::Failed("boom".to_string()),
                 worker_node: NodeId::from("node-B".to_string()),
+                attempt: 0,
             }),
             channel,
         })
@@ -893,7 +890,6 @@ async fn handle_task_result_cancelled_publishes_event() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
-        capability_gossip: None,
         failover: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -909,6 +905,7 @@ async fn handle_task_result_cancelled_publishes_event() {
                 task_name: "tn".to_string(),
                 outcome: WireTaskOutcome::Cancelled,
                 worker_node: NodeId::from("node-B".to_string()),
+                attempt: 0,
             }),
             channel,
         })
@@ -919,53 +916,6 @@ async fn handle_task_result_cancelled_publishes_event() {
         .expect("event should be published")
         .expect("event bus should not be closed");
     assert!(matches!(event, BusEvent::TaskCancelled(_)));
-}
-
-#[tokio::test]
-async fn handle_task_result_skipped_returns_false() {
-    let transport = Arc::new(MockTransport::new("node-A", "peer-A"));
-    let scheduler: Arc<dyn Scheduler> = Arc::new(MockScheduler::new());
-    let actor_system = Arc::new(ActorSystem::new());
-    let workflow_actor_id = ActorId::from("workflow-node-A");
-    actor_system
-        .spawn(workflow_actor_id.clone(), EchoActor)
-        .await
-        .unwrap();
-
-    let router = NetworkEventRouter::new(NetworkEventRouterConfig {
-        network: transport.clone(),
-        event_bus: EventBus::new(),
-        scheduler,
-        actor_system: Some(actor_system.clone()),
-        workflow_actor_id: Some(workflow_actor_id.clone()),
-        dag_gossip_actor_id: None,
-        capability_gossip: None,
-        failover: None,
-        cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-        cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-    });
-
-    let channel = DirectResponseChannel::test_stub();
-    router
-        .handle(NetworkEvent::DirectRequest {
-            peer_id: "peer-B".to_string(),
-            request: Box::new(DirectRequest::TaskResult {
-                workflow_id: WorkflowId::from("wf-1".to_string()),
-                task_id: TaskId::from("t-1".to_string()),
-                task_name: "tn".to_string(),
-                outcome: WireTaskOutcome::Skipped,
-                worker_node: NodeId::from("node-B".to_string()),
-            }),
-            channel,
-        })
-        .await;
-
-    let responses = transport.take_responses();
-    assert_eq!(responses.len(), 1);
-    assert!(matches!(
-        responses[0].1,
-        DirectResponse::TaskResultAck { accepted: false }
-    ));
 }
 
 // ───────────────────── 直连存活探测（在途转发腿） ─────────────────────
@@ -983,7 +933,6 @@ async fn handle_direct_request_ping_responds_pong() {
         actor_system: None,
         workflow_actor_id: None,
         dag_gossip_actor_id: None,
-        capability_gossip: None,
         failover: None,
         cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),

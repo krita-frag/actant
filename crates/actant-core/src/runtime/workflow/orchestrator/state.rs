@@ -11,16 +11,13 @@ use crate::runtime::network::Transport;
 use crate::runtime::state::event_log::EventLog;
 use crate::runtime::state::{HybridLogicalClock, Store};
 
-use super::types::{ConditionEvaluator, OrchestratorState};
+use super::types::OrchestratorState;
 
 pub struct Orchestrator {
     pub(crate) state: Arc<OrchestratorState>,
     pub(crate) config: ActantConfig,
     pub(crate) store: Option<Store>,
     pub(crate) event_log: Option<Arc<dyn EventLog>>,
-    /// 条件分支求值器。`None` 时 `on_task_completed` 将条件边返回给调用方
-    ///（如 Python 编排循环）外部评估。
-    pub(crate) condition_evaluator: Option<Arc<dyn ConditionEvaluator>>,
     pub(crate) node_id: Option<NodeId>,
     pub(crate) hlc: Arc<HybridLogicalClock>,
     /// 网络传输层。`None` 时（如单元测试或无网络场景）超时监控仅标记工作流
@@ -40,6 +37,13 @@ pub struct Orchestrator {
     pub(crate) network: Option<Arc<dyn Transport>>,
 }
 
+impl Orchestrator {
+    /// 故障注入：给编排器 HLC 施加时钟偏移（毫秒，可正可负），0 恢复正常。
+    pub fn inject_hlc_drift_ms(&self, ms: i64) {
+        self.hlc.inject_drift_ms(ms);
+    }
+}
+
 impl Drop for Orchestrator {
     fn drop(&mut self) {
         tracing::debug!(
@@ -56,7 +60,6 @@ impl Clone for Orchestrator {
             config: self.config.clone(),
             store: self.store.clone(),
             event_log: self.event_log.clone(),
-            condition_evaluator: self.condition_evaluator.clone(),
             node_id: self.node_id.clone(),
             hlc: self.hlc.clone(),
             network: self.network.clone(),
@@ -71,7 +74,6 @@ impl Orchestrator {
             config: ActantConfig::default(),
             store: None,
             event_log: None,
-            condition_evaluator: None,
             node_id: None,
             hlc: Arc::new(HybridLogicalClock::new()),
             network: None,
@@ -103,11 +105,6 @@ impl Orchestrator {
 
     pub fn with_event_log(mut self, event_log: Arc<dyn EventLog>) -> Self {
         self.event_log = Some(event_log);
-        self
-    }
-
-    pub fn with_condition_evaluator(mut self, evaluator: Arc<dyn ConditionEvaluator>) -> Self {
-        self.condition_evaluator = Some(evaluator);
         self
     }
 

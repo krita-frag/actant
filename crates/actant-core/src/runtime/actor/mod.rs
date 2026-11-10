@@ -1,23 +1,9 @@
 //! Actor 运行时 — Rust 核心四盒之一。
 //!
-//! Actor 是统一执行引擎：DAG、状态机、事件溯源都是
-//! Actor 特例。本模块是 Actor 运行时的唯一入口，职责边界如下：
+//! Actor 是统一执行引擎：DAG、状态机、事件溯源都是 Actor 特例。
+//! 本模块只提供系统 Actor 的本地运行时，不做持久化。
 //!
-//! | 类型 | 职责 |
-//! |------|------|
-//! | `Actor` trait | 系统 Actor 实现的唯一抽象 |
-//! | `ActorContext` | Actor 实例生命周期上下文 |
-//! | `MailboxRegistry` | Actor 邮箱注册表（纯内存投递） |
-//! | `ActorSystem` | 对外 facade：spawn / send / call / stop |
-//!
-//! 子模块结构：
-//! - [`runtime`]：`Actor` trait + `ActorContext`
-//! - [`mailbox`]：`MailboxRegistry`
-//! - [`system`]：`ActorSystem` facade + `RunningActor` 私有循环
-//!
-//! 定位：**系统 actor 专用本地运行时**。本模块不做任何持久化——
-//! 工作流恢复由 orchestrator 的统一工作流历史唯一承载，
-//! 不存在 mailbox 重放等第二恢复路径。
+//! 类型职责表、子模块结构与定位约束见 `docs/architecture/overview.md`。
 
 pub mod mailbox;
 pub mod runtime;
