@@ -67,27 +67,6 @@ impl GilThread {
         }
     }
 
-    /// 非阻塞地向 GIL worker 投递闭包。
-    ///
-    /// 使用 `try_send` 而非 `send`：`send` 会在队列满时阻塞调用方，
-    /// 而 GIL worker 的调用方通常是 tokio worker 线程，阻塞会拖慢整个 runtime。
-    /// `try_send` 在队列满时立即返回 `Full` 错误，让调用方决定降级策略。
-    ///
-    /// 返回 `Err(TrySendError::Full(_))` 表示队列已满；返回
-    /// `Err(TrySendError::Disconnected(_))` 表示 worker 已退出。
-    /// 调用方应优先使用 [`Self::send_or_run`] 自动降级为同步执行。
-    #[allow(dead_code)] // 暴露给未来需要显式错误处理的调用方；当前内部仅用 send_or_run。
-    pub fn send<F>(&self, task: F) -> Result<(), channel::TrySendError<Task>>
-    where
-        F: FnOnce(Python<'_>) + Send + 'static,
-    {
-        let task: Task = Box::new(task);
-        match self.tx.lock().clone() {
-            Some(sender) => sender.try_send(task),
-            None => Err(channel::TrySendError::Disconnected(task)),
-        }
-    }
-
     /// 向 GIL worker 发送闭包；若队列已满或 worker 退出，则降级为
     /// **当前线程直接 `Python::attach` 同步执行**。
     ///
@@ -196,10 +175,9 @@ mod tests {
         let gw = GilThread::new();
 
         let (tx, rx) = channel::unbounded::<i32>();
-        gw.send(move |_py| {
+        gw.send_or_run(move |_py| {
             tx.send(42).ok();
-        })
-        .expect("send");
+        });
 
         assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(2)), Ok(42));
     }

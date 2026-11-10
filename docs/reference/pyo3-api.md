@@ -46,22 +46,6 @@ def metrics_text() -> str
 | `task_name` | `str \| None` |  |
 | `task_error` | `str \| None` |  |
 
-### `CancelToken`
-
-Cooperative cancellation flag shared between Rust and Python.
-
-**属性**
-
-| 属性 | 类型 | 说明 |
-| --- | --- | --- |
-| `cancelled` | `bool` |  |
-
-**方法**
-
-```python
-def is_cancelled(self) -> bool
-```
-
 ### `_WorkflowState`
 
 **属性**
@@ -244,15 +228,6 @@ Rust 内部 awaitable，由 ``future_into_py_iter`` 在无非 asyncio running lo
 Python 代码不应直接构造此对象——它仅作为 ``actant`` 模块中异步操作的
 返回值出现，用户通过 ``await`` 消费其结果。在 asyncio 事件循环中运行时，
 实际返回标准 ``asyncio.Future``；本类声明保留以便 mypy 类型推断。
-
-### `_Event`
-
-**属性**
-
-| 属性 | 类型 | 说明 |
-| --- | --- | --- |
-| `kind` | `str` |  |
-| `completion` | `_TaskCompletion \| None` |  |
 
 ### `_TaskCompletion`
 

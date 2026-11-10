@@ -36,13 +36,6 @@ class WorkflowCancelledError(ActantError): ...
 class FlowReplayError(ActantError): ...
 
 @final
-class CancelToken:
-    """Cooperative cancellation flag shared between Rust and Python."""
-    def is_cancelled(self) -> bool: ...
-    @property
-    def cancelled(self) -> bool: ...
-
-@final
 class _WorkflowState:
     PENDING: _WorkflowState
     RUNNING: _WorkflowState
@@ -310,13 +303,6 @@ class PyAsyncAwaitable:
     def __iter__(self) -> PyAsyncAwaitable: ...
     def __next__(self) -> Any | None: ...
 
-
-@final
-class _Event:
-    @property
-    def kind(self) -> str: ...  # "completion"
-    @property
-    def completion(self) -> _TaskCompletion | None: ...
 
 @final
 class _TaskCompletion:

@@ -2,19 +2,17 @@
 //! 为每个内置 capability 提供实现 `PyAskCodec` / `PyPerformCodec` / `PyEmitCodec`
 //! 的 marker 类型。`capability_registry!` 通过声明式映射完成分发。
 
-use std::sync::atomic::Ordering;
 use std::sync::{atomic, OnceLock};
 
 use pyo3::exceptions::PyStopIteration;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict};
+use pyo3::types::PyDict;
 
 use crate::py::gil_thread::GilThread;
 use actant_core::common::{TaskId, WorkflowId};
 use actant_core::runtime::capability::{
     Store, StoreReq, TaskEvent, TaskLifecycle, WorkflowEvent, WorkflowLifecycle,
 };
-use actant_core::runtime::dispatcher::CancelFlag;
 use actant_core::runtime::state::StorageStats;
 
 /// `ask` effect 的 PyO3 编解码 trait。
@@ -38,18 +36,6 @@ pub trait PyPerformCodec<C: actant_core::runtime::capability::Capability> {
 /// `emit` effect 的 PyO3 解码 trait（emit 无返回值）。
 pub trait PyEmitCodec<C: actant_core::runtime::capability::Capability> {
     fn decode_request(ob: &Bound<'_, PyAny>) -> PyResult<C::Request>;
-}
-
-/// 将 Rust 请求编码为 Python 对象，并把 Python handler 的返回值解码回 Rust 响应。
-///
-/// 用于把 Python callable 注册为 Rust `CapabilityRuntime` handler，实现单一路径分发。
-pub trait PyHandlerPerformCodec<C: actant_core::runtime::capability::Capability> {
-    fn encode_request<'py>(py: Python<'py>, req: &C::Request) -> PyResult<Bound<'py, PyAny>>;
-    fn decode_response<'py>(py: Python<'py>, obj: &Bound<'py, PyAny>) -> PyResult<C::Response>;
-}
-
-pub trait PyHandlerEmitCodec<C: actant_core::runtime::capability::Capability> {
-    fn encode_request<'py>(py: Python<'py>, req: &C::Request) -> PyResult<Bound<'py, PyAny>>;
 }
 
 /// 缓存高频属性名的 interned PyString，避免每次 getattr 都新建 Python 字符串对象。
@@ -145,49 +131,6 @@ impl PyPerformCodec<Store> for StoreCodec {
     }
 }
 
-impl PyHandlerPerformCodec<Store> for StoreCodec {
-    fn encode_request<'py>(py: Python<'py>, req: &StoreReq) -> PyResult<Bound<'py, PyAny>> {
-        let dict = dict_response(py);
-        match req {
-            StoreReq::Put { key, value } => {
-                dict.set_item("op", "put")?;
-                dict.set_item("key", bytes_response(py, key)?)?;
-                dict.set_item("value", bytes_response(py, value)?)?;
-            }
-            StoreReq::Get { key } => {
-                dict.set_item("op", "get")?;
-                dict.set_item("key", bytes_response(py, key)?)?;
-            }
-            StoreReq::Delete { key } => {
-                dict.set_item("op", "delete")?;
-                dict.set_item("key", bytes_response(py, key)?)?;
-            }
-            StoreReq::PutBatch { entries } => {
-                dict.set_item("op", "put_batch")?;
-                let pairs: Vec<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)> = entries
-                    .iter()
-                    .map(|(k, v)| (PyBytes::new(py, k), PyBytes::new(py, v)))
-                    .collect();
-                dict.set_item("entries", pairs)?;
-            }
-        }
-        Ok(dict.into_any())
-    }
-
-    fn decode_response<'py>(
-        _py: Python<'py>,
-        obj: &Bound<'py, PyAny>,
-    ) -> PyResult<Result<Option<Vec<u8>>, String>> {
-        if obj.is_none() {
-            return Ok(Ok(None));
-        }
-        match obj.extract::<Vec<u8>>() {
-            Ok(data) => Ok(Ok(Some(data))),
-            Err(e) => Ok(Err(e.to_string())),
-        }
-    }
-}
-
 pub struct TaskLifecycleCodec;
 
 impl PyEmitCodec<TaskLifecycle> for TaskLifecycleCodec {
@@ -222,53 +165,6 @@ impl PyEmitCodec<TaskLifecycle> for TaskLifecycleCodec {
     }
 }
 
-impl PyHandlerEmitCodec<TaskLifecycle> for TaskLifecycleCodec {
-    fn encode_request<'py>(py: Python<'py>, req: &TaskEvent) -> PyResult<Bound<'py, PyAny>> {
-        let dict = dict_response(py);
-        match req {
-            TaskEvent::Started {
-                task_id,
-                workflow_id,
-            } => {
-                dict.set_item("kind", "started")?;
-                dict.set_item("task_id", task_id.to_string())?;
-                dict.set_item("workflow_id", workflow_id.to_string())?;
-            }
-            TaskEvent::Completed {
-                task_id,
-                result_payload,
-            } => {
-                dict.set_item("kind", "completed")?;
-                dict.set_item("task_id", task_id.to_string())?;
-                dict.set_item("payload", bytes_response(py, result_payload)?)?;
-            }
-            TaskEvent::Failed {
-                task_id,
-                error,
-                attempt,
-            } => {
-                dict.set_item("kind", "failed")?;
-                dict.set_item("task_id", task_id.to_string())?;
-                dict.set_item("error", error)?;
-                dict.set_item("attempt", attempt)?;
-            }
-            TaskEvent::Retried {
-                task_id,
-                next_attempt,
-            } => {
-                dict.set_item("kind", "retried")?;
-                dict.set_item("task_id", task_id.to_string())?;
-                dict.set_item("next_attempt", next_attempt)?;
-            }
-            TaskEvent::Cancelled { task_id } => {
-                dict.set_item("kind", "cancelled")?;
-                dict.set_item("task_id", task_id.to_string())?;
-            }
-        }
-        Ok(dict.into_any())
-    }
-}
-
 pub struct WorkflowLifecycleCodec;
 
 impl PyEmitCodec<WorkflowLifecycle> for WorkflowLifecycleCodec {
@@ -296,36 +192,6 @@ impl PyEmitCodec<WorkflowLifecycle> for WorkflowLifecycleCodec {
                 kind
             ))),
         }
-    }
-}
-
-impl PyHandlerEmitCodec<WorkflowLifecycle> for WorkflowLifecycleCodec {
-    fn encode_request<'py>(py: Python<'py>, req: &WorkflowEvent) -> PyResult<Bound<'py, PyAny>> {
-        let dict = dict_response(py);
-        match req {
-            WorkflowEvent::Submitted { workflow_id } => {
-                dict.set_item("kind", "submitted")?;
-                dict.set_item("workflow_id", workflow_id.to_string())?;
-            }
-            WorkflowEvent::Started { workflow_id } => {
-                dict.set_item("kind", "started")?;
-                dict.set_item("workflow_id", workflow_id.to_string())?;
-            }
-            WorkflowEvent::Completed { workflow_id } => {
-                dict.set_item("kind", "completed")?;
-                dict.set_item("workflow_id", workflow_id.to_string())?;
-            }
-            WorkflowEvent::Failed { workflow_id, error } => {
-                dict.set_item("kind", "failed")?;
-                dict.set_item("workflow_id", workflow_id.to_string())?;
-                dict.set_item("error", error)?;
-            }
-            WorkflowEvent::Cancelled { workflow_id } => {
-                dict.set_item("kind", "cancelled")?;
-                dict.set_item("workflow_id", workflow_id.to_string())?;
-            }
-        }
-        Ok(dict.into_any())
     }
 }
 
@@ -554,48 +420,6 @@ where
     });
 
     Ok(py_fut.into_any().into_bound(py))
-}
-
-/// 在 Rust 和 Python 之间共享的协作式取消 flag。
-#[pyclass(frozen, name = "CancelToken", module = "actant")]
-pub struct PyCancelToken {
-    flag: CancelFlag,
-}
-
-impl PyCancelToken {
-    pub fn new(flag: CancelFlag) -> Self {
-        Self { flag }
-    }
-}
-
-#[pymethods]
-impl PyCancelToken {
-    fn is_cancelled(&self) -> bool {
-        self.flag.load(Ordering::Acquire)
-    }
-
-    #[getter]
-    fn cancelled(&self) -> bool {
-        self.is_cancelled()
-    }
-
-    fn __bool__(&self) -> bool {
-        self.is_cancelled()
-    }
-
-    fn __repr__(&self) -> String {
-        format!("CancelToken(cancelled={})", self.is_cancelled())
-    }
-}
-
-/// 通过事件总线交付给 Python 的统一事件类型。
-#[pyclass(name = "_Event", skip_from_py_object)]
-#[derive(Clone)]
-pub struct PyEvent {
-    #[pyo3(get)]
-    pub kind: String,
-    #[pyo3(get)]
-    pub completion: Option<PyTaskCompletion>,
 }
 
 #[pyclass(name = "_TaskCompletion", skip_from_py_object)]
@@ -1010,8 +834,6 @@ impl From<StorageStats> for PyStoreStats {
 /// 在 Python 模块上注册 `types.rs` 中所有 PyO3 类型。
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyAsyncAwaitable>()?;
-    m.add_class::<PyCancelToken>()?;
-    m.add_class::<PyEvent>()?;
     m.add_class::<PyStoreStats>()?;
     m.add_class::<PyTaskCompletion>()?;
     Ok(())

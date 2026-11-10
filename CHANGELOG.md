@@ -23,7 +23,7 @@
 - **任务重试遵循退避策略**：`RetryPolicy.backoff_multiplier` / `max_delay_ms`
   现在参与计算（`delay_ms * multiplier^retry`，上限 `max_delay_ms`）；此前固定
   使用 `delay_ms`。
-- **顶层 API 收敛（79→17，无兼容垫片）**：`actant.__all__` 只保留 17 个入口，
+- **顶层 API 收敛（79→18，无兼容垫片）**：`actant.__all__` 只保留 18 个入口，
   其余按下述路径下沉；旧写法（如 `from actant import Task`）直接 `ImportError`：
   - `actant.workflow`：`sleep_until` / `wait_signal` / `suspend` / `continue_as_new` /
     `patched` / `current_workflow_id` / `flow_ctx` / `FlowDefinition` /
@@ -36,7 +36,7 @@
   - `actant.capabilities`：`EffectKind`、请求 / 事件 dataclass 与 handler 协议；
   - `actant.exceptions`：全部具名异常（含 `ActantError`）与 `raise_for_kind` /
     `raise_for_state`；
-  - `actant.observability`：`metrics_text`。
+  - `actant`：`metrics_text`（观测入口）。
 
   **异步面独立命名空间**：删除 `async_flow` / `gather_async` / `ask_async` /
   `perform_async` / `perform_batch_async` 五个后缀名，统一为 `actant.aio` 下的
@@ -70,7 +70,7 @@
 - **私有实现收进 `actant/_internal/`**：`_runtime.py` / `_runtime_base.py` /
   `_flow.py` / `_flow_async.py` / `_persistence.py` 移入该包并去掉文件名前导下划线，
   顶层目录只保留公开模块（`aio` / `workflow` / `tasks` / `effects` / `capabilities` /
-  `exceptions` / `observability` / `testkit` / `driver` / `cli`）。私有路径导入
+  `exceptions` / `testkit` / `driver` / `cli`）。私有路径导入
   （如 `from actant._runtime import Runtime`）需改为
   `from actant._internal.runtime import Runtime`；公开 API 与语义不变。
 - **`flow()` 移除 `retries` / `retry_delay_ms` 参数**：二者一直是 no-op
@@ -205,6 +205,19 @@
 - **CRDT 模块移除（0.3.1 剪裁 T2）**：`src/runtime/state/crdt.rs`（ORSet/GCounter/LWWRegister）为死码，全仓零引用，整文件删除。DAG gossip 状态合并使用 HLC 比较语义，不受影响。
 
 - **Python-facing Actor API 移除（0.3.1 剪裁 T3/T4/T5/T6，capability 13 → 10）**：`_ActorCore`（`spawn_actor`/`call_method` 等全部方法，全仓零调用方）、`PythonActor`、`ActorMessaging`/`ActorSupervision`/`ActorLifecycle` 三个 capability 及其 ctx dataclass 与 Handler Protocol、`_Event.orchestration()`/`_Event.supervision()`（无构造路径）、`_RuntimeCore.retry_policy`/`set_retry_policy`（零调用）、`register_python_dispatch_handler`（no-op）全部删除；`_NetworkConfig.actor_router_strategy`/`actor_registry_gossip_interval_ms` 同步摘除。内置 capability 收敛为 10 个（策略型 Routing/Scheduling/RetryPolicy + Rust-backed Serialization/Transport/Store/Execute/TaskLifecycle/WorkflowLifecycle/NodeLifecycle）。本地 `ActorSystem`（spawn/mailbox/at-least-once/取消/持久化）保留，仍是四类系统 actor 的生产底座；`ActorError` 异常保留（本地 ActorSystem 仍产生 `actor` kind）。另删除 `observability::shutdown()` no-op 与未实现的 relay map 配置字段。
+
+- **PyO3 死导出清理**：`CancelToken`（Rust 侧从未构造，Python 用 `_WorkerCancelToken`）、
+  `_Event`（`_Event.orchestration()` 删除后再无构造路径）、`PyHandlerPerformCodec` /
+  `PyHandlerEmitCodec` 及其三个实现、`GilThread::send`（唯一调用方是 `send_or_run`，
+  且长期挂着 `#[allow(dead_code)]`）整体删除。这三者的消费者 `chain_python_handler`
+  已在更早的减法中移除，之后一直是纯声明。
+- **`actant.service` 移出核心包**：改为可选扩展 `extensions/act-service`
+  （模块名 `act_ext_service`，包名 `act-ext-service`）。核心 wheel 不再包含一个
+  无鉴权的 HTTP/JSON + SSE 服务；需要跨进程入口时安装该扩展。扩展只依赖公开面
+  （`actant` / `actant.workflow` / `actant.exceptions`），不引用 `actant._internal`。
+- **`actant.observability` 删除，`metrics_text` 升为顶层入口**：`from actant import
+  metrics_text`；`actant.__all__` 17 → 18，`actant.workflow.__all__` 增加 `FlowRegistry`
+  （14 → 15）。
 
 ### 新增（服务层与直提任务租约）
 

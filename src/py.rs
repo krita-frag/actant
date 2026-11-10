@@ -11,7 +11,7 @@ pub use config::{
     PyWorkflowState,
 };
 pub use runtime::{PyNode, PyRuntimeCore, PyTask};
-pub use types::{PyCancelToken, PyEvent, PyTaskCompletion};
+pub use types::PyTaskCompletion;
 
 use pyo3::prelude::*;
 
