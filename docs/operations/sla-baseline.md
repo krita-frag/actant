@@ -100,11 +100,10 @@
   - 恢复后节点吞吐：50 个快速任务 0.02s 收敛（~2400 ops/s），节点无降级。
   - 持续崩溃任务在有界尝试内到达终态失败，批次内其他任务不受影响
     （可执行断言见 `test_multi_node_reliability.py::TestWorkerKillIsolation`）。
-- **复跑记录**：可靠性矩阵（`tests/python/e2e/test_multi_node_reliability.py`）
-  在本机以 `--basetemp` 绕开 `tmp_path` 沙箱限制后**真实执行**——
-  `TestNodeKill` / `TestNodeRestartResume` / `TestWorkerKillIsolation` /
-  `TestOutOfOrderResults` 全部通过。其中
-  `test_node_kill_inflight_task_terminal_state` 仍为 **xfail**（见 §4 已知边界）。
+- **复跑记录**（2026-11-12，macOS arm64，整文件 5 例）：
+  可靠性矩阵（`tests/python/e2e/test_multi_node_reliability.py`）全部通过；
+  `test_node_kill_inflight_task_terminal_state` 在 36s 内到达终态并通过，
+  已不再是 xfail。整文件耗时约 41s。
 
 ### 3.5 取消结算与传播
 
