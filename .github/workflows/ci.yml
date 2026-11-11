@@ -86,6 +86,10 @@ jobs:
       - name: API surface 一致性检查
         run: uv run python scripts/api_surface.py --check
 
+      # 版本号只有一个权威源：Cargo.toml / pyproject.toml / workspace crate 必须一致。
+      - name: 版本一致性检查
+        run: uv run python scripts/check_release.py
+
       - name: 文档契约测试
         run: uv run pytest tests/python/unit/test_docs_contract.py -q
 

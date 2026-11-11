@@ -3,7 +3,7 @@ members = ["crates/actant-common", "crates/actant-core"]
 
 [package]
 name = "actant"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.91"
 description = "基于 Actor 模型的跨平台通用分布式任务编排引擎"

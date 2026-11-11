@@ -1,0 +1,104 @@
+# 发布：tag 触发。先校验 tag / 清单版本 / CHANGELOG 一致，再构建三平台原生
+# wheel 与 sdist，最后创建 GitHub Release。
+#
+# 说明：当前 wheel 覆盖 runner 自带解释器；CPython 3.10–3.13 完整矩阵待发布
+# 流程稳定后扩展。sdist 覆盖全部 Python 版本。
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: 版本与 CHANGELOG 校验
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # 只依赖标准库，不构建扩展，避免校验阶段被 Rust 编译阻塞。
+      - name: 校验 tag / 清单版本 / CHANGELOG
+        run: python3 scripts/check_release.py --tag "$GITHUB_REF_NAME" --released
+
+  wheels:
+    name: Wheel（${{ matrix.target }}）
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --out dist
+          target: ${{ matrix.target }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 7
+
+  sdist:
+    name: sdist
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: 创建 GitHub Release
+    needs: [wheels, sdist]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 生成 Release Notes
+        run: python3 scripts/check_release.py --notes > RELEASE_NOTES.md
+
+      - name: 创建 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file RELEASE_NOTES.md

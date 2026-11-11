@@ -18,7 +18,7 @@
 | Python | CPython 3.11.14 |
 | CPU | 10 核 |
 | 执行后端 | 进程池（worker 子进程，`python -m actant._internal.tasks.worker`），线程后端已移除 |
-| 版本 | 当前工作树（manifest 版本号 0.3.0） |
+| 版本 | 当前工作树（版本号以 `Cargo.toml` 为准） |
 | 发现模式 | `ACTANT_DISCOVERY=none`（测试离线约定，无 DNS/relay 干扰） |
 
 ## 2. 方法学

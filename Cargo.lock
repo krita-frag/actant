@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "actant"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "actant-common",
  "actant-core",
@@ -31,7 +31,7 @@ dependencies = [
 
 [[package]]
 name = "actant-common"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "blake3",
  "data-encoding",
@@ -55,7 +55,7 @@ dependencies = [
 
 [[package]]
 name = "actant-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "actant-common",
  "async-trait",

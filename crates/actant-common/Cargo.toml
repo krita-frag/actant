@@ -1,6 +1,6 @@
 [package]
 name = "actant-common"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.91"
 description = "Actant 共享类型层：协议、ID、配置、wire message 与错误类型"
