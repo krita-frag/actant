@@ -12,7 +12,6 @@
       "ask",
       "ask_async",
       "builtin_capabilities",
-      "capability_count",
       "emit",
       "new",
       "perform",
@@ -34,11 +33,16 @@
       "new"
     ],
     "PyRetryPolicy": [
-      "default",
       "new",
       "to_bytes"
     ],
     "PyRuntimeCore": [
+      "_record_capability_invocation",
+      "_record_capability_invocations",
+      "_test_close_peer",
+      "_test_delay_heartbeat",
+      "_test_inject_hlc_drift",
+      "_test_reopen_peer",
       "add_gossip_peer",
       "add_workflow_node",
       "backup_to",
@@ -47,8 +51,6 @@
       "cancel_task",
       "cancel_workflow",
       "capability_runtime",
-      "close_peer",
-      "delay_heartbeat",
       "delete_workflow",
       "dial",
       "discover_peers",
@@ -58,8 +60,6 @@
       "get_workflow_invocation",
       "get_workflow_journal",
       "get_workflow_state",
-      "inject_hlc_drift",
-      "list_all_workflows",
       "list_workflows",
       "listen_addresses",
       "max_concurrent_tasks",
@@ -74,7 +74,6 @@
       "register_wait_point",
       "register_worker_state_callback",
       "remove_batch",
-      "reopen_peer",
       "report_task_result",
       "resolve_context_value",
       "resume_suspended",
@@ -211,7 +210,6 @@
       "FLOW_REGISTRY",
       "FlowDefinition",
       "FlowHandle",
-      "FlowRegistry",
       "continue_as_new",
       "current_workflow_id",
       "flow",
@@ -223,6 +221,17 @@
       "suspend",
       "wait_signal"
     ]
+  },
+  "stability": {
+    "overrides": {
+      "python_namespaces:actant.testkit": "test-only"
+    },
+    "surfaces": {
+      "pyo3_classes": "advanced",
+      "python_all": "stable",
+      "python_namespaces": "stable",
+      "stub_classes": "advanced"
+    }
   },
   "stub_classes": {
     "ActantError": [
@@ -285,7 +294,6 @@
       "ask",
       "ask_async",
       "builtin_capabilities",
-      "capability_count",
       "emit",
       "perform",
       "perform_async",
@@ -341,7 +349,6 @@
     ],
     "_RetryPolicy": [
       "backoff_multiplier",
-      "default",
       "delay_ms",
       "max_delay_ms",
       "max_retries",
@@ -356,8 +363,6 @@
       "cancel_task",
       "cancel_workflow",
       "capability_runtime",
-      "close_peer",
-      "delay_heartbeat",
       "delete_workflow",
       "dial",
       "discover_peers",
@@ -367,8 +372,6 @@
       "get_workflow_invocation",
       "get_workflow_journal",
       "get_workflow_state",
-      "inject_hlc_drift",
-      "list_all_workflows",
       "list_workflows",
       "listen_addresses",
       "max_concurrent_tasks",
@@ -382,7 +385,6 @@
       "register_wait_point",
       "register_worker_state_callback",
       "remove_batch",
-      "reopen_peer",
       "report_task_result",
       "resolve_context_value",
       "resume_suspended",

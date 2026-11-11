@@ -1,19 +1,23 @@
-//! 测试辅助工具（仅 `#[cfg(test)]` 编译）。
+//! 测试辅助工具（仅测试构建或 `test-support` feature 编译）。
 //!
 //! 为多个模块的单测提供共享的 mock 基础设施，避免在每个测试模块内
 //! 重复实现 `Transport` / 容量跟踪等桩。遵循 AGENTS.md「生产代码禁止
-//! 桩函数与 Mock」——本文件只编译进 test 构建产物。
-
-#![cfg(test)]
+//! 桩函数与 Mock」——本文件只在 `cfg(test)` 或 `test-support` feature 下
+//! 编译，门禁在 `src/lib.rs`。
+//!
+//! 本文件同时导出可复用的**契约测试**（`assert_scheduler_contract` /
+//! `assert_transport_contract`）：第三方实现 `Scheduler` / `Transport` 时可直接
+//! 调用，把文档里的语义承诺跑成断言。
 
 use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use crate::common::{ActantError, NodeId, Result};
+use crate::common::{ActantError, NodeId, Result, TaskDefinition, TaskId};
 use crate::runtime::network::{
     DirectRequest, DirectResponse, DirectResponseChannel, ListenAddresses, NetworkEvent, Transport,
 };
+use crate::runtime::workflow::Scheduler;
 
 // Mock transport 广播记录类型。
 type BroadcastLog = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
@@ -229,4 +233,177 @@ impl crate::runtime::workflow::Scheduler for MockScheduler {
     fn is_closed(&self) -> bool {
         self.closed.load(std::sync::atomic::Ordering::Relaxed)
     }
+}
+
+// ── 可复用契约测试 ──
+
+/// 构造契约测试用任务。
+///
+/// `priority` 仅对 priority 调度器有意义；FIFO 调度器按入队顺序消费。
+pub fn contract_task(name: &str, priority: i32) -> TaskDefinition {
+    TaskDefinition {
+        tags: Vec::new(),
+        quota: None,
+        pinned_target: false,
+        id: TaskId::generate(),
+        name: name.to_string(),
+        payload: Vec::new(),
+        workflow_id: None,
+        target_node: None,
+        origin_node: None,
+        retry_policy: None,
+        priority,
+        timeout_ms: None,
+        attempt: 0,
+        enqueued_at_ms: 0,
+        target_endpoint_addr: None,
+        origin_endpoint_addr: None,
+        lease_deadline_ms: 0,
+    }
+}
+
+/// 断言调度器满足 `Scheduler` 的公共语义契约。
+///
+/// 覆盖文档承诺的五件事：计数自洽、出队语义、批量出队、只 drain 未路由任务、
+/// `close` 的幂等与 drain 行为。适用于生产实现（`ActorScheduler`）与第三方实现；
+/// `MockScheduler` 只是空桩，不满足本契约。
+///
+/// 调用前调度器必须为空且未关闭。
+pub async fn assert_scheduler_contract<S: Scheduler + ?Sized>(scheduler: &S) {
+    assert!(!scheduler.is_closed(), "scheduler must start open");
+    assert!(scheduler.is_empty().await, "scheduler must start empty");
+    assert_eq!(scheduler.len().await, 0, "empty scheduler len must be 0");
+
+    let Ok(()) = scheduler.enqueue(contract_task("contract-single", 0)).await else {
+        panic!("open scheduler must accept enqueue");
+    };
+    assert_eq!(scheduler.len().await, 1, "len must track enqueued tasks");
+    assert!(
+        !scheduler.is_empty().await,
+        "is_empty must track queue state"
+    );
+
+    let Some(first) = scheduler.try_dequeue().await else {
+        panic!("queued task must be dequeueable");
+    };
+    assert_eq!(first.name, "contract-single");
+    assert!(
+        scheduler.is_empty().await,
+        "queue must be empty after dequeue"
+    );
+
+    let Ok(()) = scheduler
+        .enqueue_batch(vec![
+            contract_task("contract-batch-a", 1),
+            contract_task("contract-batch-b", 2),
+        ])
+        .await
+    else {
+        panic!("open scheduler must accept enqueue_batch");
+    };
+    assert_eq!(scheduler.len().await, 2);
+    let batch = scheduler.dequeue_batch(10).await;
+    assert_eq!(batch.len(), 2, "dequeue_batch must return all queued tasks");
+    assert!(scheduler.is_empty().await);
+
+    let Ok(()) = scheduler
+        .enqueue(contract_task("contract-unrouted", 0))
+        .await
+    else {
+        panic!("open scheduler must accept enqueue");
+    };
+    let mut routed = contract_task("contract-routed", 0);
+    routed.target_node = Some(NodeId::from("contract-peer".to_string()));
+    let Ok(()) = scheduler.enqueue(routed).await else {
+        panic!("open scheduler must accept enqueue");
+    };
+    let drained = scheduler.drain_unrouted().await;
+    assert_eq!(drained.len(), 1, "drain_unrouted must skip routed tasks");
+    assert_eq!(drained[0].name, "contract-unrouted");
+    let Some(remaining) = scheduler.try_dequeue().await else {
+        panic!("routed task must remain queued after drain_unrouted");
+    };
+    assert_eq!(remaining.name, "contract-routed");
+
+    let Ok(()) = scheduler
+        .enqueue(contract_task("contract-retained", 0))
+        .await
+    else {
+        panic!("open scheduler must accept enqueue");
+    };
+    scheduler.close();
+    assert!(scheduler.is_closed(), "close must be visible immediately");
+    scheduler.close();
+    assert!(scheduler.is_closed(), "close must be idempotent");
+
+    assert!(
+        scheduler
+            .enqueue(contract_task("contract-rejected", 0))
+            .await
+            .is_err(),
+        "closed scheduler must reject enqueue"
+    );
+    assert!(
+        scheduler
+            .enqueue_batch(vec![contract_task("contract-rejected-batch", 0)])
+            .await
+            .is_err(),
+        "closed scheduler must reject enqueue_batch"
+    );
+
+    let Some(retained) = scheduler.try_dequeue().await else {
+        panic!("close must retain already queued tasks");
+    };
+    assert_eq!(retained.name, "contract-retained");
+    let closed_dequeue =
+        tokio::time::timeout(std::time::Duration::from_secs(2), scheduler.dequeue()).await;
+    assert!(closed_dequeue.is_ok(), "dequeue must wake after close");
+    assert!(
+        closed_dequeue.unwrap_or_default().is_none(),
+        "dequeue must return None once closed and drained"
+    );
+}
+
+/// 断言传输实现满足 `Transport` 的公共语义契约。
+///
+/// 覆盖身份、订阅幂等、广播、地址可见性、peer 查询与关闭幂等。测试替身
+/// （`MockTransport`）与自定义传输都应满足。
+pub async fn assert_transport_contract<T: Transport + ?Sized>(transport: &T, probe_topic: &str) {
+    assert!(
+        !transport.node_id().as_str().is_empty(),
+        "transport must expose a non-empty node id"
+    );
+    assert!(
+        !transport.local_peer_id().is_empty(),
+        "transport must expose a non-empty local peer id"
+    );
+
+    let Ok(()) = transport.subscribe(probe_topic).await else {
+        panic!("transport must accept subscribe");
+    };
+    let Ok(()) = transport.subscribe(probe_topic).await else {
+        panic!("repeated subscribe must be tolerated");
+    };
+    let Ok(()) = transport.broadcast(probe_topic, b"contract".to_vec()).await else {
+        panic!("transport must broadcast on a subscribed topic");
+    };
+
+    let Ok(addrs) = transport.listen_addresses() else {
+        panic!("transport must expose listen addresses");
+    };
+    assert!(
+        !addrs.endpoint_id.is_empty(),
+        "listen addresses must carry an endpoint id"
+    );
+
+    if transport.discover_peers().await.is_err() {
+        panic!("discover_peers must not fail for a healthy transport");
+    }
+
+    let Ok(()) = transport.shutdown().await else {
+        panic!("transport must shut down cleanly");
+    };
+    let Ok(()) = transport.shutdown().await else {
+        panic!("repeated shutdown must be tolerated");
+    };
 }

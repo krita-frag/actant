@@ -1777,20 +1777,37 @@ impl PyRuntimeCore {
         Ok(py.None())
     }
 
-    /// 返回当前在内存中活跃（已提交未淘汰）的工作流 ID 列表。
-    #[tracing::instrument(name = "py.list_workflows", level = "debug", skip(self, py))]
-    fn list_workflows(&self, py: Python<'_>) -> PyResult<Vec<String>> {
-        let ids: Vec<WorkflowId> =
-            self.call_workflow_actor(py, workflow_methods::ACTIVE_WORKFLOW_IDS, Vec::new())?;
-        Ok(ids.into_iter().map(|id| id.as_str().to_string()).collect())
+    /// 记录一次 capability effect 调用（Python 分发层内部指标埋点）。
+    ///
+    /// 仅统计 Python 侧 `actant.ask/perform/emit` 入口；`_` 前缀使其
+    /// 停留在 internal 稳定性级别，不进入公开参考页。
+    fn _record_capability_invocation(&self, capability: String, effect: String) {
+        actant_core::metrics::inc_capability_invocation(&capability, &effect);
     }
 
-    /// 枚举**全部**（含已完成/历史）工作流 ID——存储遍历（``STORE_KEY_DAG`` 前缀）
-    /// 与内存活跃集合的并集。
-    #[tracing::instrument(name = "py.list_all_workflows", level = "debug", skip(self, py))]
-    fn list_all_workflows(&self, py: Python<'_>) -> PyResult<Vec<String>> {
-        let ids: Vec<WorkflowId> =
-            self.call_workflow_actor(py, workflow_methods::ALL_WORKFLOW_IDS, Vec::new())?;
+    /// 批量记录 capability effect 调用（Python 分发层内部指标埋点）。
+    ///
+    /// 与 `_record_capability_invocation` 语义相同，但整批只发生一次
+    /// Python→Rust 边界穿越，供 `aio.perform_batch` 保持批量快路径的单次穿越特性。
+    fn _record_capability_invocations(&self, entries: Vec<(String, String)>) {
+        for (capability, effect) in entries {
+            actant_core::metrics::inc_capability_invocation(&capability, &effect);
+        }
+    }
+
+    /// 返回工作流 ID 列表。
+    ///
+    /// `include_archived=False` 仅返回内存中活跃（已提交未淘汰）的工作流；
+    /// `True` 额外遍历存储（``STORE_KEY_DAG`` 前缀），含已完成/历史工作流。
+    #[tracing::instrument(name = "py.list_workflows", level = "debug", skip(self, py))]
+    #[pyo3(signature = (include_archived = false))]
+    fn list_workflows(&self, py: Python<'_>, include_archived: bool) -> PyResult<Vec<String>> {
+        let method = if include_archived {
+            workflow_methods::ALL_WORKFLOW_IDS
+        } else {
+            workflow_methods::ACTIVE_WORKFLOW_IDS
+        };
+        let ids: Vec<WorkflowId> = self.call_workflow_actor(py, method, Vec::new())?;
         Ok(ids.into_iter().map(|id| id.as_str().to_string()).collect())
     }
 
@@ -1841,28 +1858,30 @@ impl PyRuntimeCore {
         Ok(out)
     }
 
-    /// 故障注入：模拟本节点到 `target` 的单向网络分区（忽略其心跳并移出视图）。
-    fn close_peer(&self, target: String) -> PyResult<()> {
+    /// 测试专用故障注入：模拟本节点到 `target` 的单向网络分区。
+    ///
+    /// 仅供 `actant.testkit` 使用；以 `_test_` 前缀从公开 API 面隔离。
+    fn _test_close_peer(&self, target: String) -> PyResult<()> {
         let failover = fault_injection_target(self.runtime.as_ref())?;
         failover.block_peer(&actant_core::common::NodeId::from(target));
         Ok(())
     }
 
-    /// 故障注入：解除对 `target` 的分区模拟。
-    fn reopen_peer(&self, target: String) -> PyResult<()> {
+    /// 测试专用故障注入：解除对 `target` 的分区模拟。
+    fn _test_reopen_peer(&self, target: String) -> PyResult<()> {
         let failover = fault_injection_target(self.runtime.as_ref())?;
         failover.unblock_peer(&actant_core::common::NodeId::from(target));
         Ok(())
     }
 
-    /// 故障注入：在接下来 `ms` 毫秒内不广播心跳（0 立即恢复）。
-    fn delay_heartbeat(&self, ms: u64) -> PyResult<()> {
+    /// 测试专用故障注入：在接下来 `ms` 毫秒内不广播心跳（0 立即恢复）。
+    fn _test_delay_heartbeat(&self, ms: u64) -> PyResult<()> {
         fault_injection_target(self.runtime.as_ref())?.pause_heartbeat_for_ms(ms);
         Ok(())
     }
 
-    /// 故障注入：给本节点 HLC 施加时钟偏移（毫秒，可正可负），0 恢复。
-    fn inject_hlc_drift(&self, ms: i64) -> PyResult<()> {
+    /// 测试专用故障注入：给本节点 HLC 施加时钟偏移（毫秒，可正可负），0 恢复。
+    fn _test_inject_hlc_drift(&self, ms: i64) -> PyResult<()> {
         let runtime = self
             .runtime
             .as_ref()
@@ -2141,7 +2160,7 @@ impl PyRuntimeCore {
                 let state = state.to_string();
                 let node_id = node_id.clone();
                 let cb = callback.clone();
-                tokio::task::spawn_blocking(move || {
+                let task = tokio::task::spawn_blocking(move || {
                     Python::attach(|py| {
                         let t0 = std::time::Instant::now();
                         let dict = pyo3::types::PyDict::new(py);
@@ -2159,6 +2178,12 @@ impl PyRuntimeCore {
                         );
                     });
                 });
+                // 生命周期回调必须按事件顺序送达：广播通道本身保序，但每个事件
+                // 各起一个 spawn_blocking 后回调会并发执行，可能出现 stopped
+                // 先于 drained 的乱序。这里串行等待，代价是低频事件各等一次。
+                if let Err(e) = task.await {
+                    tracing::warn!("worker state callback task failed: {}", e);
+                }
             }
         });
         self.task_result_callback_handles.lock().push(handle);
@@ -2304,29 +2329,9 @@ impl PyRuntimeCore {
                 });
             }
         }
-        // 清理 register_task_result_callback spawn 的事件消费 task：
-        // abort 让 select! 立即退出，短超时 await 确保任务真正结束（释放
-        // callback Arc 引用）。timeout 防止回调中阻塞的 spawn_blocking 拖住 shutdown。
-        let callback_handles: Vec<_> = self.task_result_callback_handles.lock().drain(..).collect();
-        if !callback_handles.is_empty() {
-            let tokio_opt = self.tokio.lock().clone();
-            if let Some(tokio) = tokio_opt {
-                tokio.block_on(async {
-                    let join_all = futures::future::join_all(
-                        callback_handles
-                            .into_iter()
-                            .map(|h| async move {
-                                h.abort();
-                                let _ =
-                                    tokio::time::timeout(std::time::Duration::from_millis(500), h)
-                                        .await;
-                            })
-                            .collect::<Vec<_>>(),
-                    );
-                    join_all.await;
-                });
-            }
-        }
+        // 清理 register_task_result_callback spawn 的事件消费 task 放到
+        // Runtime::shutdown() 之后执行：shutdown 会发布 WorkerStopped 等终态
+        // 事件，提前 abort 订阅循环会让这批事件永远送不到 Python 回调。
         let mut guard = self.tokio.lock();
         if let Some(tokio) = guard.take() {
             // 1. 在 tokio runtime 上执行 ActantRuntime::shutdown()：停止 Actor
@@ -2357,6 +2362,29 @@ impl PyRuntimeCore {
                             tokio::time::timeout(std::time::Duration::from_secs(15), rt.shutdown())
                                 .await;
                     });
+                });
+            }
+            // 清理 register_task_result_callback spawn 的事件消费 task：
+            // abort 让 select! 立即退出，短超时 await 确保任务真正结束（释放
+            // callback Arc 引用）。timeout 防止回调中阻塞的 spawn_blocking 拖住 shutdown。
+            // 放在 Runtime::shutdown() 之后，使 shutdown 期间发布的终态事件
+            // （如 WorkerStopped）先送达 Python 回调再停止订阅循环。
+            let callback_handles: Vec<_> =
+                self.task_result_callback_handles.lock().drain(..).collect();
+            if !callback_handles.is_empty() {
+                tokio.block_on(async {
+                    futures::future::join_all(
+                        callback_handles
+                            .into_iter()
+                            .map(|h| async move {
+                                h.abort();
+                                let _ =
+                                    tokio::time::timeout(std::time::Duration::from_millis(500), h)
+                                        .await;
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .await;
                 });
             }
             drop(guard);

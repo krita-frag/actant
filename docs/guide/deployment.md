@@ -25,6 +25,12 @@
   `actant.store.readers`、`actant.store.max_readers`、
   `actant.store.capacity_errors`。运维侧可周期性调用 `Store::storage_stats()`
   刷新快照。
+- Capability 指标：`actant.capability.invocations`（Prometheus 名为
+  `actant_capability_invocations_total`）按 `capability` / `effect`
+  （`ask` / `perform` / `emit`）统计公共 effect 入口的调用次数，用于定位
+  高频业务 capability 与异常重试。Rust 内部分派、以及框架内部经 Store /
+  ValueStore 的持久化与 payload offload 读写都不计入，避免内部流量淹没业务
+  计数。
 - 备份：调用 `Store::backup_to(path)` 做在线热备份；备份带 compaction，会回收
   长期运行积累的空闲页。恢复时停止节点，用备份文件替换目标环境的 `data.mdb`
   后重新启动。

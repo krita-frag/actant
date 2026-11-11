@@ -9,8 +9,8 @@ from actant import Runtime
 
 def _register(rt: Runtime, workflow_ids: list[str], key: str = "go") -> None:
     for workflow_id in workflow_ids:
-        rt.submit_workflow(workflow_id)
-        rt.register_wait_point(workflow_id, key, kind="signal", name=key)
+        rt._submit_workflow(workflow_id)
+        rt._register_wait_point(workflow_id, key, kind="signal", name=key)
 
 
 def test_awaited_wait_point_resolves_from_signal() -> None:
@@ -20,7 +20,7 @@ def test_awaited_wait_point_resolves_from_signal() -> None:
 
         async def _main() -> bytes | None:
             waiter = asyncio.ensure_future(
-                rt.wait_wait_point_async(workflow_id, "go", timeout_ms=10_000)
+                rt._wait_wait_point_async(workflow_id, "go", timeout_ms=10_000)
             )
             # 若绑定阻塞调用线程，这一行在信号到达前不会执行。
             await asyncio.sleep(0.05)
@@ -38,7 +38,7 @@ def test_signal_delivered_before_await_is_not_lost() -> None:
         assert rt.signal_wait_point(workflow_id, "go", b"early") == b"early"
 
         async def _main() -> bytes | None:
-            return await rt.wait_wait_point_async(workflow_id, "go", timeout_ms=5_000)
+            return await rt._wait_wait_point_async(workflow_id, "go", timeout_ms=5_000)
 
         assert asyncio.run(_main()) == b"early"
 
@@ -49,7 +49,7 @@ def test_timeout_resolves_to_none() -> None:
         _register(rt, [workflow_id])
 
         async def _main() -> bytes | None:
-            return await rt.wait_wait_point_async(workflow_id, "go", timeout_ms=50)
+            return await rt._wait_wait_point_async(workflow_id, "go", timeout_ms=50)
 
         assert asyncio.run(_main()) is None
 
@@ -61,7 +61,7 @@ def test_many_waiters_resolve_concurrently() -> None:
 
         async def _main() -> list[bytes | None]:
             waiters = [
-                asyncio.ensure_future(rt.wait_wait_point_async(workflow_id, "go"))
+                asyncio.ensure_future(rt._wait_wait_point_async(workflow_id, "go"))
                 for workflow_id in workflow_ids
             ]
             await asyncio.sleep(0.05)

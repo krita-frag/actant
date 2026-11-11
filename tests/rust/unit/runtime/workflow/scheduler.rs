@@ -186,3 +186,46 @@ fn scheduler_trait_default_methods_return_expected_values() {
     s.close(); // default no-op
     assert!(!s.is_closed());
 }
+
+#[tokio::test]
+async fn slow_path_scheduler_rejects_enqueue_after_close() {
+    let actor_system = Arc::new(ActorSystem::new());
+    let actor_id = ActorId::new("scheduler-slow-close".to_string());
+    actor_system
+        .spawn(actor_id.clone(), SchedulerActor::fifo())
+        .await
+        .unwrap();
+
+    let client = ActorScheduler::new(actor_id, actor_system);
+    client.close();
+
+    assert!(client.enqueue(make_task("late", 0)).await.is_err());
+    assert!(client
+        .enqueue_batch(vec![make_task("late-batch", 0)])
+        .await
+        .is_err());
+}
+
+// --- Scheduler 契约测试（供第三方实现复用） ---
+
+#[tokio::test]
+async fn priority_scheduler_satisfies_contract() {
+    let actor_system = Arc::new(ActorSystem::new());
+    let actor_id = ActorId::new("scheduler-contract-priority".to_string());
+    let scheduler = spawn_fast_path_scheduler(actor_id, actor_system, SchedulerActor::priority())
+        .await
+        .expect("fast-path priority scheduler must spawn");
+
+    crate::test_support::assert_scheduler_contract(&scheduler).await;
+}
+
+#[tokio::test]
+async fn fifo_scheduler_satisfies_contract() {
+    let actor_system = Arc::new(ActorSystem::new());
+    let actor_id = ActorId::new("scheduler-contract-fifo".to_string());
+    let scheduler = spawn_fast_path_scheduler(actor_id, actor_system, SchedulerActor::fifo())
+        .await
+        .expect("fast-path fifo scheduler must spawn");
+
+    crate::test_support::assert_scheduler_contract(&scheduler).await;
+}

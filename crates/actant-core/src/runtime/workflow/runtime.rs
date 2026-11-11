@@ -954,8 +954,7 @@ impl Worker {
                 self.publish_lifecycle(BusEvent::WorkerDrained {
                     node_id: self.node_id.clone(),
                 });
-                // state_sender.send_replace 返回旧值无意义。
-                let _ = state_sender.send_replace(WorkerState::Stopped);
+                self.mark_stopped();
                 return Ok(());
             }
 
@@ -1035,8 +1034,7 @@ impl Worker {
                         self.publish_lifecycle(BusEvent::WorkerDrained {
                             node_id: self.node_id.clone(),
                         });
-                        // state_sender.send_replace 返回旧值无意义。
-                        let _ = state_sender.send_replace(WorkerState::Stopped);
+                        self.mark_stopped();
                         return Ok(());
                     }
                     batch = prefetch_tasks(&self.scheduler, self.fast_scheduler.as_ref(), task_enqueued_notify, prefetch_limit) => Some(batch),
@@ -1770,8 +1768,20 @@ impl Worker {
     /// 用于 `worker.run()` 异常退出（如 subscribe_topics 被 cancel）后，
     /// 确保 `Runtime::shutdown()` 中等待 `WorkerState::Stopped` 不会超时。
     pub fn notify_stopped(&self) {
-        // state_sender.send_replace 返回旧值无意义。
-        let _ = self.state.send_replace(WorkerState::Stopped);
+        self.mark_stopped();
+    }
+
+    /// 将状态置为 `Stopped`，首次进入时发布 `WorkerStopped`。
+    ///
+    /// 执行循环自然退出与 `notify_stopped` 兜底都可能到达此处，故以
+    /// `send_replace` 返回的旧值判定是否为首次进入，避免重复发布生命周期事件。
+    fn mark_stopped(&self) {
+        let previous = self.state.send_replace(WorkerState::Stopped);
+        if previous != WorkerState::Stopped {
+            self.publish_lifecycle(BusEvent::WorkerStopped {
+                node_id: self.node_id.clone(),
+            });
+        }
     }
 
     pub fn drain(&self) {

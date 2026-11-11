@@ -512,18 +512,18 @@ class TestTaskRegistry:
         with Runtime() as rt:
             handle = _echo.submit(1)
             # 任务完成前应在注册表中；完成后会移除（孤儿回收）
-            task_ids = rt.list_tasks()
+            task_ids = rt._list_tasks()
             assert handle.task_id in task_ids
             handle.result(timeout=30)
 
     def test_get_task_returns_handle(self):
         with Runtime() as rt:
             handle = _echo.submit(1)
-            assert rt.get_task(handle.task_id) is handle
+            assert rt._get_task(handle.task_id) is handle
 
     def test_get_task_returns_none_for_unknown(self):
         with Runtime() as rt:
-            assert rt.get_task("nonexistent") is None
+            assert rt._get_task("nonexistent") is None
 
     def test_cancel_queued_task(self):
         # 使用 max_concurrent_tasks=1：blocker 占用唯一 worker，第二个任务排队等待，
@@ -547,10 +547,10 @@ class TestTaskRegistry:
             # 以 get_task() 为等待条件：unregister_task 先清标记、后删句柄，
             # 故句柄消失 ⇒ 标记必已清除，断言无竞态。
             deadline = time.monotonic() + 5.0
-            while rt.get_task(handle.task_id) is not None and time.monotonic() < deadline:
+            while rt._get_task(handle.task_id) is not None and time.monotonic() < deadline:
                 time.sleep(0.01)
-            assert rt.get_task(handle.task_id) is None
-            assert rt.is_cancelled(handle.task_id) is False
+            assert rt._get_task(handle.task_id) is None
+            assert rt._is_cancelled(handle.task_id) is False
 
     def test_cancel_unknown_task_returns_false(self):
         with Runtime() as rt:
@@ -587,7 +587,7 @@ class TestTaskRegistry:
 
     def test_submit_failure_cleans_up_registration(self):
         with Runtime() as rt:
-            baseline = set(rt.list_tasks())
+            baseline = set(rt._list_tasks())
             original_core = rt._rust_core
             rt._rust_core = _FailingSubmitCore()
             try:
@@ -595,7 +595,7 @@ class TestTaskRegistry:
                     _echo.submit(1)
             finally:
                 rt._rust_core = original_core
-            assert set(rt.list_tasks()) == baseline
+            assert set(rt._list_tasks()) == baseline
 
 
 # ============================================================================
@@ -722,10 +722,10 @@ class TestCancellation:
             # result() 返回时 state=completed，但 unregister_task 在同一回调中
             # 稍后执行（不同线程）。轮询等待注册表清理完成，避免竞态。
             deadline = time.monotonic() + 5.0
-            while rt.get_task(handle.task_id) is not None and time.monotonic() < deadline:
+            while rt._get_task(handle.task_id) is not None and time.monotonic() < deadline:
                 time.sleep(0.01)
-            assert rt.get_task(handle.task_id) is None
-            assert handle.task_id not in rt.list_tasks()
+            assert rt._get_task(handle.task_id) is None
+            assert handle.task_id not in rt._list_tasks()
 
 
 # ============================================================================

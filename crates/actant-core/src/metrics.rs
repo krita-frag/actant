@@ -43,6 +43,8 @@ struct Instruments {
     workflow_timeouts: Counter<u64>,
     workflows_recovered_corrupt: Counter<u64>,
     retry_scheduled: Counter<u64>,
+    /// 各 capability 的 effect 调用次数，带 `capability` / `effect` 标签。
+    capability_invocations: Counter<u64>,
 
     // -- Gossip 计数器 --
     gossip_updates_sent: Counter<u64>,
@@ -163,6 +165,10 @@ impl Instruments {
             retry_scheduled: meter
                 .u64_counter("actant.retry.scheduled")
                 .with_description("Retry tasks scheduled")
+                .build(),
+            capability_invocations: meter
+                .u64_counter("actant.capability.invocations")
+                .with_description("Capability effect invocations by capability and effect kind")
                 .build(),
 
             // -- Gossip 计数器 --
@@ -537,6 +543,20 @@ pub fn inc_workflows_recovered_corrupt() {
 
 pub fn inc_retry_scheduled() {
     instruments().retry_scheduled.add(1, &[]);
+}
+
+/// 记录一次 capability effect 调用。
+///
+/// `effect` 为 `ask` / `perform` / `emit`；标签基数由用户注册的 capability
+/// 数量决定。该计数覆盖 Python 侧 `actant.ask/perform/emit` 与
+/// `actant.aio.*` 公共入口；Rust 内部分派（如 Worker 执行任务）以及框架内部
+/// 的 Store / ValueStore 读写都不经此处。
+pub fn inc_capability_invocation(capability: &str, effect: &str) {
+    let labels = [
+        KeyValue::new("capability", capability.to_string()),
+        KeyValue::new("effect", effect.to_string()),
+    ];
+    instruments().capability_invocations.add(1, &labels);
 }
 
 pub fn inc_gossip_updates_sent() {

@@ -15,7 +15,6 @@ from actant._internal.flow import (
     FLOW_REGISTRY,
     FlowDefinition,
     FlowHandle,
-    FlowRegistry,
     continue_as_new,
     current_workflow_id,
     flow,
@@ -26,13 +25,17 @@ from actant._internal.flow import (
     suspend,
     wait_signal,
 )
+from actant._internal.flow import (
+    # 扩展层（act-service）仍需要类型与构造入口；不进 __all__、文档与稳定性
+    # 分级，因此不构成公开契约。显式同名别名避免被当作未使用导入。
+    FlowRegistry as FlowRegistry,
+)
 from actant._internal.flow import ctx as flow_ctx
 
 __all__ = [
     "FLOW_REGISTRY",
     "FlowDefinition",
     "FlowHandle",
-    "FlowRegistry",
     "continue_as_new",
     "current_workflow_id",
     "flow",

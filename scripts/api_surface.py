@@ -50,6 +50,8 @@ NAMESPACE_MODULES: dict[str, Path] = {
     "actant.testkit": ROOT / "actant" / "testkit.py",
 }
 
+#: 命名空间规模预算。**已冻结，不再上调**：新增公开名必须先在同类接口中合并
+#: 或删除同等数量（净零规则），否则 ``--check`` 失败。预算只降不升。
 NAMESPACE_BUDGETS: dict[str, int] = {
     "actant.tasks": 11,
     "actant.workflow": 15,
@@ -59,6 +61,43 @@ NAMESPACE_BUDGETS: dict[str, int] = {
     "actant.exceptions": 23,
     "actant.testkit": 5,
 }
+
+#: 稳定性分级。公开面新增时必须落入其中一级；分级决定文档生成与兼容承诺。
+#: - ``stable``：跨 0.x 尽量不破坏的正式入口；
+#: - ``advanced``：可用的底层能力，随内部实现调整；
+#: - ``test-only``：仅测试使用，进入生产可能破坏集群状态；
+#: - ``internal``：``_`` 前缀私有实现，不承诺兼容。
+STABILITY_TIERS = ("stable", "advanced", "test-only", "internal")
+
+#: 每个公开面的默认级别。新增公开面必须先在此登记，否则 ``--check`` 失败。
+SURFACE_TIERS: dict[str, str] = {
+    "python_all": "stable",
+    "python_namespaces": "stable",
+    "stub_classes": "advanced",
+    "pyo3_classes": "advanced",
+}
+
+#: 按 ``<surface>:<owner>`` 覆盖整组名字的级别（成员级 ``_test_`` 前缀优先）。
+MEMBER_TIER_OVERRIDES: dict[str, str] = {
+    "python_namespaces:actant.testkit": "test-only",
+}
+
+
+def member_tier(surface: str, owner: str, member: str) -> str:
+    """返回一个公开名字的稳定性级别。
+
+    成员名前缀优先于整组覆盖：``_test_*`` 一律 test-only，其余 ``_`` 前缀为
+    internal。未登记的表面回退到 ``internal``（新增表面须先登记）。
+    """
+    override = MEMBER_TIER_OVERRIDES.get(f"{surface}:{owner}")
+    if override is not None:
+        return override
+    if member.startswith("_test_"):
+        return "test-only"
+    if member.startswith("_"):
+        return "internal"
+    return SURFACE_TIERS.get(surface, "internal")
+
 
 
 def _module_all(path: Path) -> list[str]:
@@ -151,7 +190,48 @@ def build_snapshot() -> dict[str, object]:
         },
         "stub_classes": _stub_surface(),
         "pyo3_classes": _pyo3_surface(),
+        "stability": {
+            "surfaces": SURFACE_TIERS,
+            "overrides": MEMBER_TIER_OVERRIDES,
+        },
     }
+
+
+def _validate_stability(snapshot: dict[str, object]) -> list[str]:
+    """校验稳定性分级登记完整，且 test-only 名字未混入稳定公开面。"""
+    errors: list[str] = []
+    # 反向检查：快照里出现的公开面必须已登记，否则新面会静默回退为 internal。
+    for surface in snapshot:
+        if surface != "stability" and surface not in SURFACE_TIERS:
+            errors.append(f"快照包含未登记的公开面 {surface}")
+
+    for surface, tier in SURFACE_TIERS.items():
+        if tier not in STABILITY_TIERS:
+            errors.append(f"公开面 {surface} 的级别 {tier!r} 非法")
+        if surface not in snapshot:
+            errors.append(f"SURFACE_TIERS 登记了不存在的公开面 {surface}")
+
+    for key, tier in MEMBER_TIER_OVERRIDES.items():
+        surface, _, owner = key.partition(":")
+        if tier not in STABILITY_TIERS:
+            errors.append(f"{key} 的级别 {tier!r} 非法")
+        members = snapshot.get(surface)
+        if not isinstance(members, dict) or owner not in members:
+            errors.append(f"{key} 指向不存在的公开面所有者")
+
+    for member in snapshot["python_all"]:
+        if member_tier("python_all", "actant", member) == "test-only":
+            errors.append(f"actant.__all__ 含 test-only 名字 {member!r}")
+
+    namespaces = snapshot["python_namespaces"]
+    assert isinstance(namespaces, dict)
+    for module, members in namespaces.items():
+        for member in members:
+            if member_tier("python_namespaces", module, member) == "test-only":
+                override = MEMBER_TIER_OVERRIDES.get(f"python_namespaces:{module}")
+                if override != "test-only":
+                    errors.append(f"{module}.__all__ 含 test-only 名字 {member!r}")
+    return errors
 
 
 def _diff(old: object, new: object, path: str) -> list[str]:
@@ -214,6 +294,18 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
+
+    stability_errors = _validate_stability(snapshot)
+    if stability_errors:
+        print("稳定性分级校验失败：", file=sys.stderr)
+        for error in stability_errors:
+            print(f"  - {error}", file=sys.stderr)
+        print(
+            "请在 scripts/api_surface.py 的 SURFACE_TIERS / MEMBER_TIER_OVERRIDES "
+            "中登记公开面的稳定性级别。",
+            file=sys.stderr,
+        )
+        return 1
 
     rendered = json.dumps(snapshot, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     if not args.check:

@@ -46,6 +46,9 @@ pub fn actant(m: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 /// 返回包版本号。
+///
+/// Python 公开入口是 ``actant.__version__``；本函数属于 advanced 低层接口，
+/// 仅在需要从 PyO3 模块直接读取版本时使用。
 #[pyfunction]
 fn get_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()

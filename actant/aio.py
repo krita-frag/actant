@@ -50,6 +50,7 @@ async def ask(name: str, request: Any) -> Any | None:
         KeyError: capability 未注册。
     """
     runtime = _resolve_by_kind(name, "ask", "aio.ask")
+    runtime._record_effect(name, "ask")
     return await runtime._dispatch_ask_async(name, request)
 
 
@@ -62,6 +63,7 @@ async def perform(name: str, request: Any) -> Any:
         KeyError: capability 未注册。
     """
     runtime = _resolve_by_kind(name, "perform", "aio.perform")
+    runtime._record_effect(name, "perform")
     return await runtime._dispatch_perform_async(name, request)
 
 
@@ -93,6 +95,7 @@ async def perform_batch(items: list[tuple[str, Any]]) -> list[Any]:
                 f"aio.perform_batch: items[{i}] must be a (name, request) tuple, "
                 f"got {type(item).__name__}"
             )
+    runtime._record_effects([(name, "perform") for name, _ in items])
     # 快照：调度与执行之间调用方仍可能修改原列表。
     results: list[Any] = await runtime._dispatch_perform_batch_async(list(items))
     return results

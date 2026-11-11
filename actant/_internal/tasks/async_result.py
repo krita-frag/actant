@@ -350,10 +350,10 @@ class AsyncResult:
         if propagate and self._workflow_id:
             runtime = get_current_runtime()
             if runtime is not None:
-                for tid in runtime.list_tasks():
+                for tid in runtime._list_tasks():
                     if tid == self.task_id:
                         continue
-                    other = runtime.get_task(tid)
+                    other = runtime._get_task(tid)
                     if other is not None and other.workflow_id == self._workflow_id:
                         runtime.cancel_task(tid)
 

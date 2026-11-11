@@ -170,13 +170,13 @@ class TestPatchedReplay:
 
             # 记录值优先于候选值：重放（以及任何再次解析）拿到的都是 True。
             assert (
-                rt_b.resolve_workflow_context_value(
+                rt_b._resolve_workflow_context_value(
                     wf_id, "patch:branch", "patched", b"\x00"
                 )
                 == b"\x01"
             )
             # 版本随工作流持久化。
-            raw_version = rt_b.resolve_workflow_context_value(
+            raw_version = rt_b._resolve_workflow_context_value(
                 wf_id, "@flow_version", "workflow_version", struct.pack(">q", 0)
             )
             assert struct.unpack(">q", raw_version)[0] == 3
@@ -199,13 +199,13 @@ class TestVersionMismatch:
         try:
             wf_id = "ver-mismatch-deadbeef"
             # 模拟"由 version=5 的代码提交、且 invocation 已落盘"的工作流。
-            rt.submit_workflow(
+            rt._submit_workflow(
                 wf_id,
                 name="ver-mismatch",
                 version=5,
                 args=cloudpickle.dumps((("/tmp/unused",), {})),
             )
-            rt.resolve_workflow_context_value(
+            rt._resolve_workflow_context_value(
                 wf_id, "@flow_version", "workflow_version", struct.pack(">q", 5)
             )
             # 当前代码回滚到 version=1：无法消费历史里的分支决策。

@@ -46,12 +46,12 @@ def close_peer(runtime: Runtime, target: str) -> None:
     立即将 ``target`` 移出本节点 peer 视图，并忽略其后续心跳，直到
     :func:`reopen_peer`。用于测试失联判定与副本接管。
     """
-    _core(runtime).close_peer(target)
+    _core(runtime)._test_close_peer(target)
 
 
 def reopen_peer(runtime: Runtime, target: str) -> None:
     """解除 :func:`close_peer` 施加的分区模拟。"""
-    _core(runtime).reopen_peer(target)
+    _core(runtime)._test_reopen_peer(target)
 
 
 def delay_heartbeat(runtime: Runtime, ms: int) -> None:
@@ -59,12 +59,12 @@ def delay_heartbeat(runtime: Runtime, ms: int) -> None:
 
     模拟网络抖动/心跳延迟；对端会按 ``failure_timeout`` 判定失联。
     """
-    _core(runtime).delay_heartbeat(ms)
+    _core(runtime)._test_delay_heartbeat(ms)
 
 
 def inject_hlc_drift(runtime: Runtime, ms: int) -> None:
     """给本节点 HLC 施加时钟偏移（毫秒，可正可负），``0`` 恢复。"""
-    _core(runtime).inject_hlc_drift(ms)
+    _core(runtime)._test_inject_hlc_drift(ms)
 
 
 def kill_node(runtime: Runtime) -> None:

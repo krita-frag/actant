@@ -377,7 +377,7 @@ class Task:
             task_id, context=task_ctx, workflow_id=workflow_id,
         )
         # 注册到 Runtime 任务表，供 list_tasks/get_task/cancel_task 查询。
-        runtime.register_task(task_id, handle)
+        runtime._register_task(task_id, handle)
 
         # 构造 _TaskDef 并提交到 Rust Worker 调度器。
         from actant.actant import _TaskDef
@@ -512,7 +512,7 @@ class Task:
         except Exception:
             # 序列化失败：清理已注册的 task_id。
             for tid in registered_ids:
-                runtime.unregister_task(tid)
+                runtime._unregister_task(tid)
             raise
 
         # 一次性提交到 Rust scheduler。
@@ -525,7 +525,7 @@ class Task:
             core.submit_tasks_batch(task_defs)
         except Exception:
             for tid in registered_ids:
-                runtime.unregister_task(tid)
+                runtime._unregister_task(tid)
             if batch_id is not None:
                 core.remove_batch(batch_id)
             raise

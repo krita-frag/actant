@@ -42,13 +42,15 @@ class TestCapabilityMetadata:
         assert "Scheduling" not in names
         assert "RetryPolicy" not in names
 
-    def test_capability_count_without_runtime_core(self, cap_rt: _CapabilityRuntime) -> None:
+    def test_registered_capabilities_without_runtime_core(
+        self, cap_rt: _CapabilityRuntime
+    ) -> None:
         """`register_defaults` 为每个内置 capability 建 layer entry（无 handler）。
 
         无参构造不经过 `RuntimeBuilder`，因此 `StoreHandler` 未注册，且未绑定
-        ActorSystem；count 等于内置 capability 数量。
+        ActorSystem；注册集合等于内置 capability 集合。
         """
-        assert cap_rt.capability_count == 3
+        assert len(cap_rt.registered_capabilities()) == 3
 
     def test_registered_capabilities_lists_builtins(
         self, cap_rt: _CapabilityRuntime

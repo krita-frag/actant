@@ -29,7 +29,6 @@ from actant.capabilities import (
     PYTHON_ONLY_CAPABILITIES,
     RUST_BACKED_CAPABILITIES,
     VALUE_STORE,
-    WIRED_CAPABILITIES,
     ValueStoreReq,
 )
 from actant.exceptions import ActantTimeoutError, InvalidStateError
@@ -47,7 +46,6 @@ def test_value_store_capability_declared() -> None:
     assert BUILTIN_CAPABILITIES[VALUE_STORE].kind == "perform"
     assert VALUE_STORE in PYTHON_ONLY_CAPABILITIES
     assert VALUE_STORE not in RUST_BACKED_CAPABILITIES
-    assert len(BUILTIN_CAPABILITIES) == len(WIRED_CAPABILITIES)
 
 
 def test_value_store_roundtrip_via_rust_bridge() -> None:

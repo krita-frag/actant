@@ -20,10 +20,10 @@ class _FakeRuntime:
         self._rust_core = _CapturingCore()
         self.registered: dict[str, AsyncResult] = {}
 
-    def register_task(self, task_id: str, handle: AsyncResult) -> None:
+    def _register_task(self, task_id: str, handle: AsyncResult) -> None:
         self.registered[task_id] = handle
 
-    def unregister_task(self, task_id: str) -> None:
+    def _unregister_task(self, task_id: str) -> None:
         self.registered.pop(task_id, None)
 
 
@@ -136,6 +136,16 @@ def test_task_submit_uses_registered_backend() -> None:
     assert isinstance(handle, AsyncResult)
     assert handle.task_id == "remote-task"
     assert recorder.calls == [((1, 2), {}, "k1")]
+
+
+def test_submit_backend_stays_internal() -> None:
+    """``SubmitBackend`` 是实现接缝，不进入包级公开面。"""
+    import actant
+    from actant._internal.tasks import backend
+
+    assert "SubmitBackend" not in actant.__all__
+    assert not hasattr(actant, "SubmitBackend")
+    assert backend.SubmitBackend.__module__.startswith("actant._internal")
 
 
 def test_task_options_preserved() -> None:

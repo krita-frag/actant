@@ -66,6 +66,8 @@ Worker 行为由 `actant.actant._ActantConfig` 控制。高层 `Runtime` 暴露 
 
 `num_worker_processes`、`crash_failover_max_attempts`、`starvation_timeout_ms`、`node_quotas` 仅可通过 `_ActantConfig` 配置。
 
+**配置面结论**：`_ActantConfig` / `_NetworkConfig` / `_GossipConfig` / `_FailoverConfig` / `_StoreConfig` 的属性访问器是扁平数据搬运，不引入行为分派；当前规模（约 59 个）不再拆分或抽象，新增配置项必须同时提供默认值、docstring 与 `actant.pyi` 声明，并按 `advanced` 级别进入 API 快照。
+
 任务超时、重试、崩溃故障转移、远程回退由 Worker 与 `FailoverActor`、`SchedulerActor` 协同处理；重试语义由 Rust 侧配置（`retries` / `retry_delay_ms`）驱动。
 
 **执行行为不能**通过 Python 层 `Execute` capability 覆盖。`Runtime.layer(...).chain(handler)` 只登记在 Python 侧，不参与 Rust 内部 dispatch；要改执行行为须走 Rust 侧 `RuntimeBuilder`。

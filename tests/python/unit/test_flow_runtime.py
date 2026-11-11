@@ -160,13 +160,13 @@ def _spy_submit_workflow(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """spy 工作流外壳创建（提交路径第一步），记录随外壳传递的参数。"""
-    orig = rt.submit_workflow
+    orig = rt._submit_workflow
 
     def spy(workflow_id: str, **kw: object) -> None:
         captured.update(kw)
         orig(workflow_id, **kw)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(rt, "submit_workflow", spy)
+    monkeypatch.setattr(rt, "_submit_workflow", spy)
 
 
 def test_flow_failure_strategy_default_unchanged(

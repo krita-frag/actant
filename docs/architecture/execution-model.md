@@ -66,8 +66,8 @@ Python 侧的 `host_flows` 默认仍是**串行阻塞驱动**（`BlockingDriver`
   `close()`（或使用 `with AsyncDriver() as driver:`）。
 - 线程数与内存随并发数线性增长，千级是线程模型的实际上界；万级并发使用 `AsyncDriver`。
 
-绑定层另提供 `Runtime.wait_wait_point_async`：返回 asyncio awaitable，等待点唤醒时
-通过 `call_soon_threadsafe` 完成 Future，语义与阻塞版 `wait_wait_point` 相同。它复用
+绑定层另提供 `Runtime._wait_wait_point_async`：返回 asyncio awaitable，等待点唤醒时
+通过 `call_soon_threadsafe` 完成 Future，语义与阻塞版 `_wait_wait_point` 相同。它复用
 现有等待点注册与 oneshot，不新增 journal 或状态机原语；async flow API 在此基础上构建。
 
 该限制位于驱动层，不是 kernel 的语义限制。

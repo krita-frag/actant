@@ -267,8 +267,8 @@ class TestFlowOrchestration:
         with Runtime() as rt:
             assert rt.get_dag("no-such-workflow") is None
 
-    def test_get_workflow_history_exposes_event_stream(self) -> None:
-        """``get_workflow_history`` 暴露事件流（审计出口）。
+    def test_get_workflow_journal_raw_exposes_event_stream(self) -> None:
+        """``get_workflow_journal(raw=True)`` 暴露事件流（审计出口）。
 
         历史是**事实源**：``recover`` = 快照 + 其后事件重放，等待点与信号也进同一
         历史。本方法是它的对外读取出口。
@@ -286,7 +286,7 @@ class TestFlowOrchestration:
 
         with Runtime() as rt:
             assert pipeline(5) == "stored[5]"
-            history = rt.get_workflow_history(seen[0])
+            history = rt.get_workflow_journal(seen[0], raw=True)
 
         kinds = [e["kind"] for e in history]
         # 提交 → 节点 → 启动 → 完成 → 工作流终态。
@@ -310,10 +310,10 @@ class TestFlowOrchestration:
             pass
         tail_history: list[dict] = []
         with Runtime() as rt2:
-            tail_history = rt2.get_workflow_history(seen[0], after=cursor)
+            tail_history = rt2.get_workflow_journal(seen[0], raw=True, after=cursor)
         assert len(tail_history) < len(history)
 
-    def test_get_workflow_history_returns_empty_for_unknown_workflow(self) -> None:
+    def test_get_workflow_journal_raw_returns_empty_for_unknown_workflow(self) -> None:
         """未知工作流 → 空列表（历史是**可选**观测面，缺失不构成错误）。"""
         with Runtime() as rt:
-            assert rt.get_workflow_history("no-such-workflow") == []
+            assert rt.get_workflow_journal("no-such-workflow", raw=True) == []

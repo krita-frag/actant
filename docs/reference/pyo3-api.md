@@ -4,6 +4,8 @@
 
 本页覆盖 Python 可直接导入的 `actant.actant` 接口。纯 Python 公共 API 见 [Python API](python-api.md)，配置摘要见 [配置项](configuration.md)，命令行见 [CLI](cli.md)。
 
+稳定性分级：`stable`（跨 0.x 尽量不破坏）/ `advanced`（可用，随内部实现调整）/ `test-only`（仅测试使用）/ `internal`（私有，不承诺兼容）。本页不列出 test-only 与 internal 成员，分级规则见 `scripts/api_surface.py`。
+
 ## 函数
 
 ```python
@@ -76,10 +78,6 @@ _RetryPolicy(max_retries: int = 3, delay_ms: int = 1000, backoff_multiplier: flo
 | `max_delay_ms` | `int` |  |
 
 **方法**
-
-```python
-def default(cls) -> _RetryPolicy
-```
 
 ```python
 def to_bytes(self) -> bytes
@@ -317,12 +315,6 @@ handler。普通用户直接使用 `actant.Runtime()` 即可。
 _CapabilityRuntime()
 ```
 
-**属性**
-
-| 属性 | 类型 | 说明 |
-| --- | --- | --- |
-| `capability_count` | `int` |  |
-
 **方法**
 
 ```python
@@ -451,22 +443,6 @@ def add_gossip_peer(self, peer_id: str) -> None
 
 ```python
 def discover_peers(self) -> list[str]
-```
-
-```python
-def close_peer(self, target: str) -> None
-```
-
-```python
-def reopen_peer(self, target: str) -> None
-```
-
-```python
-def delay_heartbeat(self, ms: int) -> None
-```
-
-```python
-def inject_hlc_drift(self, ms: int) -> None
 ```
 
 ```python
@@ -685,11 +661,7 @@ def get_workflow_invocation(self, workflow_id: str) -> dict[str, Any] | None
 旧记录或非 flow 提交路径返回 ``None``。``args`` 是上层序列化字节。
 
 ```python
-def list_workflows(self) -> list[str]
-```
-
-```python
-def list_all_workflows(self) -> list[str]
+def list_workflows(self, include_archived: bool = False) -> list[str]
 ```
 
 ```python

@@ -234,6 +234,67 @@
   形参，`build_task_payload` 摘掉未使用的 `dag` / `execution` / `task_id` 形参；
   删除只在 `drop` 时打一条 debug 日志的 `impl Drop for Orchestrator`。
 
+### 破坏性变更（2026-11-11 API 审计）
+
+- **Runtime 内部协作原语私有化**：`register_task` / `unregister_task` /
+  `is_cancelled` / `list_tasks` / `get_task` / `submit_workflow` /
+  `register_wait_point` / `resolve_workflow_context_value` / `wait_wait_point` /
+  `wait_wait_point_async` 改为 `_` 前缀；它们是 `flow` / `tasks` 内部原语，
+  不构成稳定 API。`batch_progress` / `remove_batch` 保留公开——批量进度查询
+  仍由 `submit_batch` + `BatchProgress` 承担。
+- **`get_workflow_history` 合并进 `get_workflow_journal`**：新增
+  `raw: bool = False` 与 `after` 参数；`raw=True` 读取底层事件历史，
+  默认读取规范化 journal。原方法删除。
+- **PyO3 故障注入接口改为测试专用**：`close_peer` / `reopen_peer` /
+  `delay_heartbeat` / `inject_hlc_drift` 更名为 `_test_*`，不再出现在公开
+  PyO3 参考页；`actant.testkit` 的同名包装保持不变。
+- **`Runtime.metrics_text()` 删除**：统一使用顶层 `actant.metrics_text()`，
+  两者此前输出完全一致。
+- **PyO3 `list_all_workflows` 删除**：统一为
+  `list_workflows(include_archived: bool)`。
+- **零引用成员删除**：`FlowHandle.definition`、`PyRetryPolicy.default()`。
+- **稳定性分级进入 API 门禁**：`scripts/api_surface.py` 新增
+  `stable` / `advanced` / `test-only` / `internal` 四级；新增公开面必须先登记，
+  `test-only` 名字不得混入稳定命名空间。`scripts/gen_api_reference.py` 不再
+  为 `test-only` / `internal` 成员生成文档。
+- **冗余导出/常量收敛**：`FlowRegistry` 从 `actant.workflow.__all__` 移除
+  （仍可显式导入供扩展层使用）；删除 `WIRED_CAPABILITIES` 与
+  `_CapabilityRuntime.capability_count`（改用 `len(registered_capabilities())`）。
+- **`actant.get_version` 不再是包级名字**：公开版本入口为
+  `actant.__version__`；PyO3 模块内 `actant.actant.get_version` 保留为
+  advanced 低层接口。
+- **命名空间预算冻结**：`NAMESPACE_BUDGETS` 只降不升，新增公开 API 必须
+  先合并或删除同等数量（净零规则）。
+
+### 修复（2026-11-11 API 审计）
+
+- **`on_worker_state` 的 `stopped` 状态恢复**：worker 首次进入 `Stopped` 时
+  发布 `WorkerStopped` 生命周期事件；同时把事件订阅 task 的清理移到
+  `Runtime::shutdown()` 之后，避免关闭期间发布的终态事件永远送不到 Python 回调。
+- **新增 `actant.capability.invocations` 指标**：按 `capability` / `effect`
+  统计公共 effect 入口（`ask` / `perform` / `emit` 与 `aio.*`）的调用次数，
+  补齐按接口维度的观测缺口；框架内部 Store / ValueStore 读写不计入。
+- **调度器 `close` 语义在慢路径补齐**：`ActorScheduler` 慢路径在入队前检查
+  本地 `closed`，避免 `close()` 后立刻 `enqueue` 抢在异步 `CLOSE` 消息之前成功。
+- **稳定性门禁反向校验**：`api_surface.py` 现在会拒绝快照里未在
+  `SURFACE_TIERS` 登记的公开面，避免新面静默回退为 `internal`。
+- **Worker 生命周期回调保序**：`register_worker_state_callback` 原先为每个事件
+  各起一个 `spawn_blocking`，并发执行会导致 `stopped` 可能早于 `drained` 送达；
+  改为逐事件串行等待，保证回调顺序与事件总线一致。
+- **读取路径与控制面文档澄清**：补充任务/工作流结果读取决策表、双入口主从
+  说明，并在 `RoutingHandler` / `SchedulingHandler` / `RetryPolicyHandler`
+  文档中明确“不会自动分派”。
+- **`test-support` feature 实际可用**：`tests/rust/test_support.rs` 原先带
+  `#![cfg(test)]`，导致以 `actant-core = { features = ["test-support"] }`
+  依赖时模块为空；现已改为与 `src/lib.rs` 一致的门禁。
+- **新增可复用契约测试**：`test_support::assert_scheduler_contract` /
+  `assert_transport_contract`，把 `Scheduler` / `Transport` 的语义承诺跑成断言，
+  内置 priority/fifo 调度器与 `MockTransport` 已接入。
+- **`SubmitBackend` 稳定性归属明确**：标注为 internal 实现接缝，不承诺跨 0.x
+  兼容；跨进程提交的稳定入口指向 `extensions/act-service`。
+- **扩展接缝文档补齐**：新增 Python→Rust 桥接的三道判定与五步模板；
+  `service-layer.md` 增加“部署红线”（无鉴权 + 反序列化即执行）。
+
 ### 新增（服务层与直提任务租约）
 
 - **`actant.service`**：定义寻址（`DefinitionRef = name + version + hash`）、

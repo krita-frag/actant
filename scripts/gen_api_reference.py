@@ -165,6 +165,13 @@ def _has_details(node: ast.ClassDef) -> bool:
     return False
 
 
+def _hidden_member(owner: str, member: str) -> bool:
+    """按稳定性分级过滤：test-only / internal 成员不进入公开参考页。"""
+    from api_surface import member_tier
+
+    return member_tier("stub_classes", owner, member) in ("test-only", "internal")
+
+
 def _render_class(node: ast.ClassDef) -> str:
     bases = ", ".join(ast.unparse(base) for base in node.bases)
     heading = f"### `{node.name}`"
@@ -187,6 +194,8 @@ def _render_class(node: ast.ClassDef) -> str:
             continue
         if child.name in ("__new__", "__init__") or _is_setter(child):
             continue
+        if _hidden_member(node.name, child.name):
+            continue
         if _has_decorator(child, "property"):
             properties.append(child)
             continue
@@ -202,6 +211,8 @@ def _render_class(node: ast.ClassDef) -> str:
         if not isinstance(child, ast.AnnAssign) or not isinstance(child.target, ast.Name):
             continue
         if child.target.id in property_names or child.target.id.startswith("__"):
+            continue
+        if _hidden_member(node.name, child.target.id):
             continue
         annotation = ast.unparse(child.annotation) if child.annotation is not None else "Any"
         attributes.append((child.target.id, annotation))
@@ -260,6 +271,11 @@ def generate_pyo3_api() -> str:
         "本页覆盖 Python 可直接导入的 `actant.actant` 接口。纯 Python 公共 API 见 "
         "[Python API](python-api.md)，配置摘要见 [配置项](configuration.md)，"
         "命令行见 [CLI](cli.md)。",
+        "",
+        "稳定性分级：`stable`（跨 0.x 尽量不破坏）/ `advanced`（可用，随内部实现"
+        "调整）/ `test-only`（仅测试使用）/ `internal`（私有，不承诺兼容）。"
+        "本页不列出 test-only 与 internal 成员，分级规则见 "
+        "`scripts/api_surface.py`。",
         "",
     ]
     if functions:

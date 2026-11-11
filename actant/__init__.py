@@ -37,12 +37,13 @@ from __future__ import annotations
 from actant import aio, testkit, workflow  # noqa: F401  注册子命名空间属性
 from actant._internal.flow import FlowHandle, flow, host_flows, start_flow
 from actant._internal.runtime import Layer, Runtime, get_current_runtime, use_runtime
-from actant.actant import get_version, metrics_text
+from actant.actant import get_version as _get_version
+from actant.actant import metrics_text
 from actant.effects import ask, emit, perform
 from actant.exceptions import ActantError
 from actant.tasks import AsyncResult, Ref, gather, task
 
-__version__ = get_version()
+__version__ = _get_version()
 
 __all__ = [
     "ActantError",

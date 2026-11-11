@@ -795,6 +795,8 @@ pub struct PyStoreStats {
 #[pymethods]
 impl PyStoreStats {
     /// 数据文件高水位占 mmap 上限的比例（`file_bytes / map_size`）。
+    ///
+    /// advanced 观测辅助：供容量巡检使用，不构成稳定性承诺。
     #[getter]
     fn utilization_ratio(&self) -> f64 {
         if self.map_size == 0 {

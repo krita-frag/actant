@@ -223,6 +223,20 @@ class TestAsyncEffects:
         with pytest.raises(TypeError, match=r"handles\[0\]"):
             await aio.gather("not-a-handle")  # type: ignore[arg-type]
 
+    async def test_perform_batch_records_all_entries_in_one_call(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """批量记账必须整批提交，避免逐条跨 PyO3 边界。"""
+        rt = Runtime()
+        rt.layer("MyPerform", kind="perform").chain(lambda x: x)
+        recorded: list[list[tuple[str, str]]] = []
+        monkeypatch.setattr(
+            rt, "_record_effects", lambda entries: recorded.append(list(entries))
+        )
+        with actant.use_runtime(rt):
+            await aio.perform_batch([("MyPerform", 1), ("MyPerform", 2)])
+        assert recorded == [[("MyPerform", "perform"), ("MyPerform", "perform")]]
+
     async def test_perform_batch_async_preserves_order(self) -> None:
         rt = Runtime()
         rt.layer("MyPerform", kind="perform").chain(lambda x: f"done:{x}")

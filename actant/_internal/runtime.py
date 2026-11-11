@@ -492,7 +492,7 @@ class _RuntimeTaskMixin(_RuntimeBase):
             if batch_state is not None:
                 self._record_batch_terminal(task_id, batch_state)
             # 终态后从注册表移除（本地孤儿回收）；编排裁决为重试时保持等待。
-            self.unregister_task(task_id)
+            self._unregister_task(task_id)
 
     def _on_task_state_completed(self, handle: Any, task_id: str, raw: bytes) -> bool:
         """解析 COMPLETED 结果帧，返回「编排是否裁决重试（句柄保持等待）」。
@@ -598,7 +598,7 @@ class _RuntimeTaskMixin(_RuntimeBase):
             self._emit_batch("failed", task_id, handle.workflow_id, error=error_text)
         return False
 
-    def register_task(self, task_id: str, handle: AsyncResult) -> None:
+    def _register_task(self, task_id: str, handle: AsyncResult) -> None:
         """注册一个已提交任务的句柄（由 ``Task.submit`` 调用）。"""
         with self._lock:
             self._tasks[task_id] = handle
@@ -643,7 +643,7 @@ class _RuntimeTaskMixin(_RuntimeBase):
             core.report_task_result(workflow_id, task_id, state, result, error),
         )
 
-    def unregister_task(self, task_id: str) -> bool:
+    def _unregister_task(self, task_id: str) -> bool:
         """从本地任务表中移除任务句柄（任务完成后孤儿回收）。
 
         同步清理 ``_cancelled_tasks`` 中的条目，防止集合无界增长。
@@ -667,11 +667,11 @@ class _RuntimeTaskMixin(_RuntimeBase):
         with self._lock:
             self._cancelled_tasks.discard(task_id)
 
-    def is_cancelled(self, task_id: str) -> bool:
+    def _is_cancelled(self, task_id: str) -> bool:
         """查询任务是否处于**取消在途**状态（线程安全）。
 
         这是"取消已请求、尚未被消费"的标记，**不是任务的终态视图**：任务一旦到达
-        终态（含已取消）并被注册表回收（:meth:`unregister_task`），标记即清除。
+        终态（含已取消）并被注册表回收（:meth:`_unregister_task`），标记即清除。
         因此对**已经取消完成**的任务本方法返回 ``False``。
 
         三项查询的分工：能否取消看 :meth:`cancel_task` 的返回值；最终结果看
@@ -682,12 +682,12 @@ class _RuntimeTaskMixin(_RuntimeBase):
         with self._lock:
             return task_id in self._cancelled_tasks
 
-    def list_tasks(self) -> list[str]:
+    def _list_tasks(self) -> list[str]:
         """返回所有已提交（本地）任务的 task_id 列表。"""
         with self._lock:
             return list(self._tasks.keys())
 
-    def get_task(self, task_id: str) -> AsyncResult | None:
+    def _get_task(self, task_id: str) -> AsyncResult | None:
         """按 task_id 查询任务句柄（``AsyncResult``），不存在返回 ``None``。"""
         with self._lock:
             return self._tasks.get(task_id)
@@ -789,6 +789,9 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
     ) -> Any:
         """提交一个 ``@flow`` 工作流，**不在调用方执行函数体**。
 
+        主入口是模块级 :func:`actant.start_flow`；本方法是绑定当前 Runtime 的
+        便捷形式，二者语义一致。
+
         只落盘工作流外壳与 invocation（flow 名、版本、入参）；函数体由
         :meth:`host_flows` 在任意进程重放。定义未登记时可显式传 ``version``
         （及可选的 ``timeout_ms`` / ``failure_strategy``）；定义已登记时显式
@@ -829,6 +832,9 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
         self, *, once: bool = True, timeout_ms: int = 0
     ) -> list[str]:
         """驱动本 ``data_dir`` 中尚未完成、且带 invocation 的 flow。
+
+        主入口是模块级 :func:`actant.host_flows`；本方法是绑定当前 Runtime 的
+        便捷形式，二者语义一致。
 
         定义来自进程内 ``FLOW_REGISTRY``（由 ``@flow`` 导入登记），flow 名与
         入参来自 journal 的 ``Submitted.invocation``——因此提交进程与执行进程
@@ -876,7 +882,7 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
         """返回该代 ``continue_as_new`` 的后继 workflow id；无后继返回 ``None``。"""
         return self._get_workflow_context_value(workflow_id, _CONTINUED_TO_CONTEXT_KEY)
 
-    def submit_workflow(
+    def _submit_workflow(
         self,
         workflow_id: str,
         *,
@@ -977,7 +983,7 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
             raise InvalidStateError("Runtime not started: rust_core is None")
         core.seal_workflow(workflow_id)
 
-    def register_wait_point(
+    def _register_wait_point(
         self,
         workflow_id: str,
         wait_key: str,
@@ -1082,7 +1088,7 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
             raise InvalidStateError("Runtime not started: rust_core is None")
         return int(core.resume_suspended(workflow_id))
 
-    def resolve_workflow_context_value(
+    def _resolve_workflow_context_value(
         self,
         workflow_id: str,
         key: str,
@@ -1122,7 +1128,7 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
     ) -> bytes | None:
         """只读查询工作流已记录的确定性上下文值（未记录返回 ``None``）。
 
-        与 :meth:`resolve_workflow_context_value` 的差异是**不写历史**：
+        与 :meth:`_resolve_workflow_context_value` 的差异是**不写历史**：
         需要"读一个可能不存在的记录"时用它，避免为缺失键制造一条空记录。
         ``continue_as_new`` 用它读取续跑携带参数。
         """
@@ -1131,7 +1137,7 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
             raise InvalidStateError("Runtime not started: rust_core is None")
         return cast("bytes | None", core.get_context_value(workflow_id, key))
 
-    def wait_wait_point(
+    def _wait_wait_point(
         self,
         workflow_id: str,
         wait_key: str,
@@ -1140,7 +1146,7 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
     ) -> bytes | None:
         """阻塞等待等待点条件满足（flow 体 park 原语）。
 
-        **调用方须先** :meth:`register_wait_point`：注册是把等待点写入历史的
+        **调用方须先** :meth:`_register_wait_point`：注册是把等待点写入历史的
         动作，本方法只负责 park。两步之间的竞态由 Rust 侧"先注册句柄、再检查
         是否已 Signaled"关闭——信号早到不会丢失。
 
@@ -1169,19 +1175,19 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
             "bytes | None", core.wait_wait_point(workflow_id, wait_key, timeout_ms)
         )
 
-    def wait_wait_point_async(
+    def _wait_wait_point_async(
         self,
         workflow_id: str,
         wait_key: str,
         *,
         timeout_ms: int = 0,
     ) -> Awaitable[bytes | None]:
-        """非阻塞等待等待点条件满足（:meth:`wait_wait_point` 的 asyncio 版本）。
+        """非阻塞等待等待点条件满足（:meth:`_wait_wait_point` 的 asyncio 版本）。
 
         返回的 awaitable 在等待点被 signal / timer 唤醒时完成，等待期间不占用
-        线程、不阻塞 event loop；调用方仍须先 :meth:`register_wait_point`。
+        线程、不阻塞 event loop；调用方仍须先 :meth:`_register_wait_point`。
         语义与阻塞版本一致：``None`` 表示超时或等待者被释放，调用方须自行
-        区分（见 :meth:`wait_wait_point`）。
+        区分（见 :meth:`_wait_wait_point`）。
 
         Args:
             workflow_id: 工作流标识。
@@ -1347,45 +1353,17 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
             raise InvalidStateError("Runtime not started: rust_core is None")
         return cast("dict[str, Any] | None", core.get_dag(workflow_id))
 
-    def get_workflow_history(
+    def get_workflow_journal(
         self,
         workflow_id: str,
         *,
+        raw: bool = False,
         after: tuple[int, int] | None = None,
     ) -> list[dict[str, Any]]:
-        """读取工作流的事件历史（审计出口）。
+        """读取工作流的 journal（跨语言消费面）。
 
-        历史是**事实源**：``recover`` = 快照 + 其后事件重放，等待点与信号也以
-        事件形式进入同一历史。本方法是它的对外读取出口。
-
-        Args:
-            workflow_id: 工作流标识。
-            after: 游标 ``(sequence, timestamp_ms)``（取上一项的对应字段），
-                ``None`` 表示从头读取。
-
-        Returns:
-            每项 ``{sequence, timestamp_ms, kind, task_id, error, payload}``：
-            ``kind``（如 ``"TaskCompleted"``）/ ``task_id`` / ``error`` 供筛选；
-            ``payload`` 是原始编码字节，**不透明**——Python 不解释其布局。
-            无 event_log 或工作流不存在时返回空列表（历史是可选观测面，
-            缺失不构成错误）。
-
-        Raises:
-            InvalidStateError: Runtime 未启动。
-        """
-        core = self._rust_core
-        if core is None:
-            raise InvalidStateError("Runtime not started: rust_core is None")
-        return cast(
-            "list[dict[str, Any]]",
-            core.get_workflow_history(workflow_id, after=after),
-        )
-
-    def get_workflow_journal(self, workflow_id: str) -> list[dict[str, Any]]:
-        """读取工作流的稳定 journal（跨语言消费面）。
-
-        与 :meth:`get_workflow_history` 读同一份事实源，但导出**稳定、自描述**
-        的字段：``{seq, timestamp_ms, kind, workflow_id, task_id, wait_key,
+        ``raw=False``（默认）导出**稳定、自描述**的字段：
+        ``{seq, timestamp_ms, kind, workflow_id, task_id, wait_key,
         error, payload, condition, invocation}``。
 
         - ``kind`` 为小写稳定事件名（``"submitted"`` / ``"task_completed"`` …）；
@@ -1394,18 +1372,34 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
         - ``condition`` 是等待点条件的字符串标签；``invocation`` 是提交描述
           dict（无则为 ``None``）。
 
+        ``raw=True`` 返回底层事件历史（审计出口）：每项
+        ``{sequence, timestamp_ms, kind, task_id, error, payload}``，``kind`` 为
+        Rust 事件名，``payload`` 是原始编码字节。历史是**事实源**：
+        ``recover`` = 快照 + 其后事件重放，等待点与信号也以事件形式进入同一历史。
+
         Args:
             workflow_id: 工作流标识。
+            raw: ``True`` 读取底层事件历史；``False`` 读取规范化 journal。
+            after: 游标 ``(sequence, timestamp_ms)``（取上一项的对应字段），
+                仅 ``raw=True`` 有效；``None`` 表示从头读取。
 
         Returns:
             按 ``seq`` 升序的 journal 记录列表；工作流不存在时为空。
 
         Raises:
             InvalidStateError: Runtime 未启动。
+            ValueError: ``raw=False`` 时传入了 ``after``。
         """
         core = self._rust_core
         if core is None:
             raise InvalidStateError("Runtime not started: rust_core is None")
+        if raw:
+            return cast(
+                "list[dict[str, Any]]",
+                core.get_workflow_history(workflow_id, after=after),
+            )
+        if after is not None:
+            raise ValueError("after is only supported with raw=True")
         return cast("list[dict[str, Any]]", core.get_workflow_journal(workflow_id))
 
     def get_workflow_invocation(self, workflow_id: str) -> dict[str, Any] | None:
@@ -1438,9 +1432,7 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
         core = self._rust_core
         if core is None:
             raise InvalidStateError("Runtime not started: rust_core is None")
-        return list(
-            core.list_all_workflows() if include_archived else core.list_workflows()
-        )
+        return list(core.list_workflows(include_archived))
 
     def delete_workflow(self, workflow_id: str) -> None:
         """删除工作流（运维清理）。
@@ -1631,23 +1623,6 @@ class _RuntimeNetworkMixin(_RuntimeBase):
         if core is None:
             raise InvalidStateError("Runtime not started: rust_core is None")
         return [dict(item) for item in core.peers()]
-
-    def metrics_text(self) -> str:
-        """返回所有已注册指标的 Prometheus exposition format 文本。
-
-        用于自定义 HTTP 服务器暴露 ``/metrics`` 端点，或直接抓取/打印。
-        若 Runtime 未启动（``metrics::init()`` 未调用），返回空字符串。
-
-        HTTP 托管不在核心层（外置默认）：需要 HTTP 端点时用 ``http.server``
-        自行包裹本方法，参见 ``examples/metrics_server.py`` 与
-        ``actant worker --metrics-port``。
-
-        Returns:
-            Prometheus 文本格式字符串。
-        """
-        from actant.actant import metrics_text
-
-        return metrics_text()
 
     def update_node_state(
         self,

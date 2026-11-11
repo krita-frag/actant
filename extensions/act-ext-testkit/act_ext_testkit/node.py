@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from actant import metrics_text
 from actant import testkit as _testkit
 
 from .contract import ClockMode, EventCodec, ResourceLimits
@@ -217,7 +218,7 @@ class InProcessNode:
     def metrics_text(self) -> str:
         if not self._alive or self._runtime is None:
             return ""
-        return str(self._runtime.metrics_text())
+        return metrics_text()
 
     def subscribe(self, sink: Callable[[dict[str, Any]], None]) -> None:
         """订阅生命周期/日志/Worker 事件。

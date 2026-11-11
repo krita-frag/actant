@@ -349,8 +349,8 @@ class TestWaitPointDurability:
         rt_a = Runtime(name="wp-node", data_dir=data_dir)
         rt_a.start()
         try:
-            rt_a.submit_workflow(wf_id)
-            rt_a.register_wait_point(wf_id, "go", kind="signal", name="go")
+            rt_a._submit_workflow(wf_id)
+            rt_a._register_wait_point(wf_id, "go", kind="signal", name="go")
         finally:
             rt_a.stop()
 
@@ -363,6 +363,6 @@ class TestWaitPointDurability:
                 f"wait point must survive restart with payload, got {delivered!r}"
             )
             # 已唤醒的等待点：park 立即返回历史 payload（"已收到 → 直接返回"）。
-            assert rt_b.wait_wait_point(wf_id, "go", timeout_ms=1000) == b"durable-payload"
+            assert rt_b._wait_wait_point(wf_id, "go", timeout_ms=1000) == b"durable-payload"
         finally:
             rt_b.stop()

@@ -188,18 +188,18 @@ class TestFlowContextContract:
         rt.start()
         try:
             wf_id = "ctx-mismatch-wf"
-            rt.submit_workflow(wf_id)
+            rt._submit_workflow(wf_id)
 
             # 首次记录；重复调用返回记录值而非新候选值。
             assert (
-                rt.resolve_workflow_context_value(wf_id, "ctx-1", "now_ms", b"first")
+                rt._resolve_workflow_context_value(wf_id, "ctx-1", "now_ms", b"first")
                 == b"first"
             )
             assert (
-                rt.resolve_workflow_context_value(wf_id, "ctx-1", "now_ms", b"second")
+                rt._resolve_workflow_context_value(wf_id, "ctx-1", "now_ms", b"second")
                 == b"first"
             )
             with pytest.raises(FlowReplayError):
-                rt.resolve_workflow_context_value(wf_id, "ctx-1", "uuid", b"x")
+                rt._resolve_workflow_context_value(wf_id, "ctx-1", "uuid", b"x")
         finally:
             rt.stop()

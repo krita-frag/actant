@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
@@ -120,6 +121,30 @@ class TestWorkerStateCallback:
             rt.on_worker_state(lambda event: None)
         finally:
             rt.stop()
+
+    def test_stop_delivers_stopped_state(self) -> None:
+        """``stop()`` 关闭 worker 时必须回调 ``stopped``。
+
+        事件订阅 task 早先会在 shutdown 前被 abort，导致 ``stopped`` 永远
+        送不到 Python 回调；本用例真实驱动 start → serve → stop 生产路径。
+        """
+        rt = actant.Runtime.test()
+        rt.start()
+        states: list[str] = []
+        stopped = threading.Event()
+
+        def on_state(event: dict[str, str]) -> None:
+            states.append(event["state"])
+            if event["state"] == "stopped":
+                stopped.set()
+
+        try:
+            rt.on_worker_state(on_state)
+            rt.stop()
+        finally:
+            assert stopped.wait(timeout=5), f"no stopped event, got {states!r}"
+
+        assert states[-1] == "stopped"
 
 
 @actant.task(name="wl_slow")

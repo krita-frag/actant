@@ -90,12 +90,6 @@ impl PyCapabilityRuntime {
         Ok(list)
     }
 
-    /// 返回已注册的 capability 数量。
-    #[getter]
-    fn capability_count(&self) -> usize {
-        self.inner.capability_count()
-    }
-
     /// 返回所有已注册 capability 的名称列表。
     fn registered_capabilities<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let list = PyList::empty(py);

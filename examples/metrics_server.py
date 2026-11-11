@@ -1,6 +1,6 @@
 """第 3 层 metrics 托管样例：用标准库 ``http.server`` 暴露 Prometheus 文本。
 
-核心 ``Runtime`` 只提供 ``metrics_text()``（Prometheus exposition format），
+核心 ``actant.metrics_text()`` 提供 Prometheus exposition format 文本，
 不托管 HTTP server（外置默认守则）；HTTP 托管行为属第 3 层，不做自动化测试。
 
 运行::
@@ -21,7 +21,7 @@ class MetricsHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
             return
-        body = rt.metrics_text().encode("utf-8")
+        body = actant.metrics_text().encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))

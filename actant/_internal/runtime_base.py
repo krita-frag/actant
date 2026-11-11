@@ -64,6 +64,28 @@ class _RuntimeBase:
     _event_batcher: Any
     _terminal: TerminalRecordStore | None
 
+    def _record_effect(self, name: str, effect: str) -> None:
+        """记录一次 capability 调用计数（Rust 指标面）。
+
+        Runtime 未启动时没有指标管道，直接跳过。只由公共入口
+        ``actant.ask/perform/emit`` 与 ``actant.aio.*`` 调用；框架内部经
+        ``_dispatch_perform`` 的 Store / ValueStore 读写不计入，避免内部持久化
+        与 payload offload 淹没业务 capability 的计数。
+        """
+        core = self._rust_core
+        if core is not None:
+            core._record_capability_invocation(name, effect)
+
+    def _record_effects(self, entries: list[tuple[str, str]]) -> None:
+        """批量记录 capability 调用计数（整批一次 Python→Rust 穿越）。
+
+        与 ``_record_effect`` 同口径；供 ``aio.perform_batch`` 使用，避免逐条
+        记账抵消批量快路径的单次边界穿越。
+        """
+        core = self._rust_core
+        if core is not None and entries:
+            core._record_capability_invocations(entries)
+
     def _dispatch_ask(self, name: str, request: Any) -> Any | None:
         """决策型：逆序调用 handler，第一个返回非 None 的决定结果。
 

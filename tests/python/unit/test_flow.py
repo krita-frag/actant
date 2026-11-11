@@ -57,10 +57,10 @@ class _FakeRuntime:
     def __init__(self, handles: dict[str, _FakeHandle]) -> None:
         self._handles = handles
 
-    def list_tasks(self) -> list[str]:
+    def _list_tasks(self) -> list[str]:
         return list(self._handles.keys())
 
-    def get_task(self, task_id: str) -> _FakeHandle | None:
+    def _get_task(self, task_id: str) -> _FakeHandle | None:
         return self._handles.get(task_id)
 
 

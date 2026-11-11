@@ -96,6 +96,26 @@ failover 后失效。
 
 完整可运行示例：`cargo run --no-default-features --example rust_embed`。
 
+### 自定义 Scheduler / Transport 的契约验收
+
+实现 `Scheduler` 或 `Transport` 时，启用 `test-support` feature 后可直接调用
+框架自带的契约测试，把本文与 trait docstring 里的语义承诺跑成断言：
+
+```rust
+// Cargo.toml: actant-core = { features = ["test-support"] }
+use actant_core::test_support::{assert_scheduler_contract, assert_transport_contract};
+
+assert_scheduler_contract(&my_scheduler).await;
+assert_transport_contract(&my_transport, "actant:contract").await;
+```
+
+`assert_scheduler_contract` 覆盖：计数自洽、单任务/批量出队、`drain_unrouted`
+只取未路由任务、`close` 幂等且拒绝新入队、已排队任务在 `close` 后仍可取、
+关闭后 `dequeue` 返回 `None`。`assert_transport_contract` 覆盖：身份非空、
+重复 `subscribe` 容忍、已订阅 topic 可广播、地址可读、`discover_peers` 不失败、
+重复 `shutdown` 容忍。契约测试不覆盖各实现特有的语义（优先级顺序、真实网络
+行为），那部分仍需实现方自己的测试。
+
 ### Python 侧 capability 扩展路径
 
 Python 层有两条扩展路径，均经 `rt.layer(...)` 登记 handler，**只作用于 Python 发起的  
@@ -145,12 +165,45 @@ Python `_layers`。两条路径共用 capability 名字，但不共用分发链�
 `&NodeId` / 独占流）、`Discovery`（入参是 iroh `Builder`）、`EventLog`（需
 `LogEntry` codec）、`TaskDispatcher`（与 worker 帧协议语义重复）。
 
+#### 新增 Python→Rust 桥接的判定与模板
+
+新增桥接前先过三道判定，任一不通过就留在 Rust 或下沉到第 3 层：
+
+1. **位置**：该缝是否在每任务 / 每消息路径上？是 → 需要先证明 Python 回调不会
+   阻塞热路径，且失败可回退到内置策略。
+2. **签名**：trait 是否返回借用（如 `&NodeId`）、独占资源（stream / iroh
+   `Builder`）或要求 `async`？是 → 不桥接。
+3. **承载**：实现是否需要跨节点随工作流迁移？是 → 必须是 Rust 实现，Python
+   闭包在 failover 后不存在。
+
+通过判定的桥接按 `PyRoutePolicy` 的五步模板实现，不要另起一套机制：
+
+```rust
+// 1. 桥类型：src/py/<seam>.rs，持有 Python 对象，只做数据转换。
+struct PyMySeam { callback: Py<PyAny> }
+
+// 2. 构造期解析：字符串 → 内置实现；callable → 桥；其余 → TypeError。
+fn resolve_my_seam(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<...> { ... }
+
+// 3. 热路径回调必须 try_attach：拿不到 GIL 时回退，绝不阻塞等待。
+// 4. 回调抛异常 / 返回非法值时记 warning，回退内置策略。
+// 5. 回归只经公共入口驱动，见 tests/python/integration/test_route_policy_python.py。
+```
+
+模板的验收要求与其它扩展缝一致：注入入口 + 一条真实驱动生产路径的接线测试 +
+本节的边界说明；热路径文件仍受 `tests/python/unit/test_hot_path_guard.py` 约束。
+
 ### 任务提交接缝
 
 `Task.submit` 经 `actant/_internal/tasks/backend.py` 的 `SubmitBackend` 协议提交，
 不直接解析全局 Runtime。默认 `EmbeddedSubmitBackend` 转交进程内 Runtime 与 Rust
 调度器；跨进程提交只需在同一协议上提供远程实现，`Task` 与 `@task` 的调用语义
 不变。`submit_batch` 仍走内嵌批量路径（批次注册与回滚语义属于内嵌实现）。
+
+**稳定性归属**：`SubmitBackend` 位于 `actant._internal`，分级为 internal——它是
+实现接缝而非公开契约，方法签名随核心演进，不承诺跨 0.x 兼容。需要稳定跨进程
+提交的调用方应使用 `extensions/act-service` 的 `ServiceClient`，不要基于本协议
+自行实现长期依赖。
 
 接缝由线程局部的 `use_submit_backend(backend)` 临时替换；`resolve_submit_backend()`
 优先取显式后端，否则按当前 Runtime 构造 `EmbeddedSubmitBackend`，无活跃 Runtime

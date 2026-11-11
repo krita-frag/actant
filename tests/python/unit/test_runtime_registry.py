@@ -83,26 +83,26 @@ def test_capability_meta_unknown() -> None:
 def test_register_task() -> None:
     rt = Runtime()
     handle = AsyncResult("t1")
-    rt.register_task("t1", handle)
-    assert rt.list_tasks() == ["t1"]
-    assert rt.get_task("t1") is handle
+    rt._register_task("t1", handle)
+    assert rt._list_tasks() == ["t1"]
+    assert rt._get_task("t1") is handle
 
 
 def test_unregister_task() -> None:
     rt = Runtime()
     handle = AsyncResult("t1")
-    rt.register_task("t1", handle)
-    assert rt.unregister_task("t1") is True
-    assert rt.list_tasks() == []
-    assert rt.unregister_task("t1") is False
+    rt._register_task("t1", handle)
+    assert rt._unregister_task("t1") is True
+    assert rt._list_tasks() == []
+    assert rt._unregister_task("t1") is False
 
 
 def test_is_cancelled() -> None:
     rt = Runtime()
     rt._mark_task_cancelled("t1")
-    assert rt.is_cancelled("t1") is True
+    assert rt._is_cancelled("t1") is True
     rt._clear_task_cancelled("t1")
-    assert rt.is_cancelled("t1") is False
+    assert rt._is_cancelled("t1") is False
 
 
 def test_cancel_task_unknown() -> None:
@@ -114,7 +114,7 @@ def test_cancel_task_completed() -> None:
     rt = Runtime()
     handle = AsyncResult("t1")
     handle._set_result(1)
-    rt.register_task("t1", handle)
+    rt._register_task("t1", handle)
     assert rt.cancel_task("t1") is False
 
 

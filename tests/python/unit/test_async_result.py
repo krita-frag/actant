@@ -38,10 +38,10 @@ class _FakeRuntime:
     def _mark_task_cancelled(self, task_id: str) -> None:
         self._cancelled.add(task_id)
 
-    def list_tasks(self) -> list[str]:
+    def _list_tasks(self) -> list[str]:
         return list(self._tasks.keys())
 
-    def get_task(self, task_id: str) -> AsyncResult | None:
+    def _get_task(self, task_id: str) -> AsyncResult | None:
         return self._tasks.get(task_id)
 
     def cancel_task(self, task_id: str) -> None:

@@ -14,7 +14,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from actant import Runtime
+from actant import Runtime, metrics_text
 from actant.testkit import close_peer, delay_heartbeat, inject_hlc_drift, reopen_peer
 
 from .node import NodeConfig
@@ -176,7 +176,7 @@ def _dispatch(runtime: Runtime, request: dict[str, Any]) -> Any:
         runtime.set_max_concurrent_tasks(int(args["new_max"]))
         return None
     if cmd == "metrics_text":
-        return runtime.metrics_text()
+        return metrics_text()
     if cmd == "stop":
         return {"stopping": True, "timeout_s": float(args.get("timeout_s_arg", 30.0))}
     raise ValueError(f"unsupported command: {cmd!r}")

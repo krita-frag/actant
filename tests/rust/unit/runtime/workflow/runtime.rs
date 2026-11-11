@@ -59,9 +59,12 @@ use crate::test_support::{MockScheduler, MockTransport};
 use std::sync::Arc as StdArc;
 
 fn make_worker(node_id: &str) -> Worker {
+    make_worker_with_bus(node_id, EventBus::new())
+}
+
+fn make_worker_with_bus(node_id: &str, event_bus: EventBus) -> Worker {
     let network: Arc<dyn Transport> = Arc::new(MockTransport::new(node_id));
     let scheduler: Arc<dyn Scheduler> = Arc::new(MockScheduler::new());
-    let event_bus = EventBus::new();
     let dispatcher = Arc::new(
         crate::runtime::dispatcher::ProcessTaskDispatcher::new(
             0,
@@ -474,6 +477,26 @@ async fn worker_notify_stopped_sets_state() {
     assert_eq!(worker.state(), WorkerState::Running);
     worker.notify_stopped();
     assert_eq!(worker.state(), WorkerState::Stopped);
+}
+
+#[tokio::test]
+async fn worker_notify_stopped_publishes_lifecycle_event_once() {
+    let event_bus = EventBus::new();
+    let mut rx = event_bus.subscribe(crate::runtime::event_bus::Topic::WorkerLifecycle);
+    let worker = make_worker_with_bus("node-stop-event", event_bus);
+
+    worker.notify_stopped();
+    worker.notify_stopped();
+
+    let event = rx.try_recv().expect("WorkerStopped must be published");
+    assert!(
+        matches!(event, BusEvent::WorkerStopped { .. }),
+        "expected WorkerStopped, got {event:?}"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "repeat notify_stopped must not republish WorkerStopped"
+    );
 }
 
 #[tokio::test]

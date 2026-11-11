@@ -3,6 +3,19 @@
 
 use super::*;
 
+#[tokio::test]
+async fn mock_transport_satisfies_contract() {
+    let transport = crate::test_support::MockTransport::new("contract-node");
+    crate::test_support::assert_transport_contract(&transport, "actant:contract").await;
+
+    assert!(transport.subscribed_to("actant:contract"));
+    assert_eq!(transport.broadcast_count(), 1);
+    assert_eq!(
+        transport.last_broadcast(),
+        Some(("actant:contract".to_string(), b"contract".to_vec()))
+    );
+}
+
 #[test]
 fn test_peer_allowed_empty() {
     let allowed = build_allowed_peer_ids(&[]);

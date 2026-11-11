@@ -193,7 +193,7 @@ class _FlowState:
     - ``workflow_id``：任务的归属工作流（TaskEvent / 节点写入目标）。
     - ``timeout_ms``：工作流级 deadline。**不在 Python 侧判定**——到期
       由 orchestrator 的超时 watcher 强还原，本类只负责把它转交
-      ``submit_workflow``（惰性创建时携带）。
+      ``_submit_workflow``（惰性创建时携带）。
     - ``_seq``：提交序号计数器。每次 flow 内 ``submit``（含重放命中）递增，
       与节点确定性标识 ``{任务名}-{序号}-{workflow_id}`` 共同构成
       "第 n 次提交" 的身份；重放体执行到同一序号时据此查历史。
@@ -282,11 +282,6 @@ class FlowHandle:
     def __repr__(self) -> str:
         return f"FlowHandle(workflow_id={self.workflow_id!r}, flow={self.flow_name!r})"
 
-    @property
-    def definition(self) -> FlowDefinition | None:
-        """当前进程登记的 flow 定义；缺失时为 ``None``（代码未导入）。"""
-        return FLOW_REGISTRY.get(self.flow_name)
-
     def state(self) -> dict[str, Any] | None:
         """工作流执行状态快照（``None`` 表示工作流不存在）。"""
         return cast(
@@ -355,8 +350,8 @@ def _cancel_flow_tasks(workflow_id: str) -> None:
     runtime = get_current_runtime()
     if runtime is None:
         return
-    for tid in list(runtime.list_tasks()):
-        handle = runtime.get_task(tid)
+    for tid in list(runtime._list_tasks()):
+        handle = runtime._get_task(tid)
         if handle is not None and handle.workflow_id == workflow_id:
             try:
                 handle.cancel(propagate=False)
@@ -400,7 +395,7 @@ def _ensure_workflow_created(runtime: Any, state: _FlowState) -> None:
     （:func:`_wait_context`）都必须经此，否则会再次出现"两处各写一遍创建块"的
     漂移（守则：同一事实只有一个源）。
 
-    时序上刻意把 ``submitted`` / ``started`` 放在 ``submit_workflow`` **之后**：
+    时序上刻意把 ``submitted`` / ``started`` 放在 ``_submit_workflow`` **之后**：
     ``@flow`` 的 wrapper 曾在函数体开始前就广播这两个事件，而工作流那时还没
     建槽——等于把一个此刻不存在的 ``workflow_id`` 交给外部观察者，其立即调用
     ``Runtime.signal_wait_point`` 会撞 ``NotFound``（实测 1/5 复现）。事件与状态
@@ -408,7 +403,7 @@ def _ensure_workflow_created(runtime: Any, state: _FlowState) -> None:
     """
     if state.workflow_created:
         return
-    runtime.submit_workflow(
+    runtime._submit_workflow(
         state.workflow_id,
         failure_strategy=state.failure_strategy,
         timeout_ms=state.timeout_ms,
@@ -441,7 +436,7 @@ def _adopt_workflow_version(runtime: Any, state: _FlowState) -> None:
     """
     raw = cast(
         "bytes",
-        runtime.resolve_workflow_context_value(
+        runtime._resolve_workflow_context_value(
             state.workflow_id,
             _FLOW_VERSION_KEY,
             _FLOW_VERSION_KIND,
@@ -478,7 +473,7 @@ def _wait_context() -> tuple[Any, _FlowState]:
     - 不在 ``@flow`` 函数体内（线程局部无 state）→ :class:`InvalidStateError`；
     - 无活跃 Runtime → :class:`InvalidStateError`；
     - 工作流外壳尚未持久化 → 复用 ``Task.submit`` 的惰性创建路径。等待点必须
-      落在已存在的工作流上，否则 Rust 侧 ``register_wait_point`` 报 ``NotFound``
+      落在已存在的工作流上，否则 Rust 侧 ``_register_wait_point`` 报 ``NotFound``
       （等待点随工作流快照落盘，无工作流即无宿主）。
     """
     state = _flow_state.get()
@@ -523,7 +518,7 @@ class FlowContext:
         key = f"ctx-{state.next_ctx_seq()}"
         return cast(
             "bytes",
-            runtime.resolve_workflow_context_value(state.workflow_id, key, kind, candidate),
+            runtime._resolve_workflow_context_value(state.workflow_id, key, kind, candidate),
         )
 
     def now_ms(self) -> int:
@@ -608,11 +603,11 @@ def _park_payload(runtime: Any, workflow_id: str, wait_key: str, *, bound_ms: in
     的 park 等待者），:func:`_raise_if_workflow_terminal` 会直接抛错而不返回。
 
     三个 park 调用点（``sleep_until`` / ``wait_signal`` / ``suspend``）都必须经
-    本函数——``wait_signal`` 曾直接调 ``wait_wait_point``，于是终态释放被它当成
+    本函数——``wait_signal`` 曾直接调 ``_wait_wait_point``，于是终态释放被它当成
     "信号返回了空 payload"，函数体在已死的工作流上继续跑到返回。单一入口是为了
     让这条判定不可能漂移。
     """
-    payload = runtime.wait_wait_point(workflow_id, wait_key, timeout_ms=bound_ms)
+    payload = runtime._wait_wait_point(workflow_id, wait_key, timeout_ms=bound_ms)
     if payload is None:
         _raise_if_workflow_terminal(runtime, workflow_id)
     return cast("bytes | None", payload)
@@ -651,7 +646,7 @@ def sleep_until(deadline_ms: int, *, timeout_ms: int = 0) -> None:
     """
     runtime, state = _wait_context()
     wait_key = f"timer-{state.next_wait_seq()}"
-    runtime.register_wait_point(state.workflow_id, wait_key, kind="timer", deadline_ms=deadline_ms)
+    runtime._register_wait_point(state.workflow_id, wait_key, kind="timer", deadline_ms=deadline_ms)
     bound = timeout_ms or state.timeout_ms
     if not _park(runtime, state.workflow_id, wait_key, bound_ms=bound):
         raise ActantTimeoutError(
@@ -691,7 +686,7 @@ def wait_signal(name: str, *, timeout_ms: int = 0) -> bytes | None:
             未请求的提前返回会破坏确定性契约，故报错而非静默返回。
     """
     runtime, state = _wait_context()
-    runtime.register_wait_point(state.workflow_id, name, kind="signal", name=name)
+    runtime._register_wait_point(state.workflow_id, name, kind="signal", name=name)
     if timeout_ms > 0:
         return _park_payload(runtime, state.workflow_id, name, bound_ms=timeout_ms)
     bound = state.timeout_ms
@@ -741,7 +736,7 @@ def suspend(*, timeout_ms: int = 0) -> None:
     """
     runtime, state = _wait_context()
     wait_key = f"{_SUSPEND_WAIT_PREFIX}{state.next_wait_seq()}"
-    runtime.register_wait_point(state.workflow_id, wait_key, kind=_SUSPEND_KIND)
+    runtime._register_wait_point(state.workflow_id, wait_key, kind=_SUSPEND_KIND)
     bound = timeout_ms or state.timeout_ms
     if not _park(runtime, state.workflow_id, wait_key, bound_ms=bound):
         raise ActantTimeoutError(f"flow {state.workflow_id}: suspend() 在 {bound}ms 内未被恢复")
@@ -790,7 +785,7 @@ def patched(change_id: str, *, enabled: bool = True) -> bool:
     state.decisions[change_id] = enabled
     raw = cast(
         "bytes",
-        runtime.resolve_workflow_context_value(
+        runtime._resolve_workflow_context_value(
             state.workflow_id,
             f"{_PATCH_KEY_PREFIX}{change_id}",
             _PATCH_KIND,
@@ -860,14 +855,14 @@ def continue_as_new(*args: Any, **kwargs: Any) -> NoReturn:
     new_id = f"{state.flow_name}-{uuid.uuid4().hex[:8]}"
     # 先在旧工作流上记录"下一代 id"：重放旧代时返回记录值，故续跑只发生
     # 一次（候选 id 只在首次执行时生效）。
-    recorded_to = runtime.resolve_workflow_context_value(
+    recorded_to = runtime._resolve_workflow_context_value(
         state.workflow_id,
         _CONTINUED_TO_KEY,
         _CONTINUED_TO_KIND,
         new_id.encode(),
     )
     new_id = bytes(recorded_to).decode()
-    runtime.submit_workflow(
+    runtime._submit_workflow(
         new_id,
         failure_strategy=state.failure_strategy,
         timeout_ms=state.timeout_ms,
@@ -879,7 +874,7 @@ def continue_as_new(*args: Any, **kwargs: Any) -> NoReturn:
     # 携带参数同样幂等：重放旧代时 resolve 返回首次写入的入参，即使调用点
     # 传入不同值也不会改写新代的事实。进程内续跑也使用解析后的记录值，
     # 与"崩溃后按落盘入参恢复"保持同一条事实源。
-    resolved_carry = runtime.resolve_workflow_context_value(
+    resolved_carry = runtime._resolve_workflow_context_value(
         new_id,
         _CONTINUE_CARRY_KEY,
         _CONTINUE_CARRY_KIND,

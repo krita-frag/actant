@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 
 use super::error::actant_error_to_pyerr;
 use pyo3::prelude::*;
-use pyo3::types::PyType;
 
 use actant_core::common::{
     ActantConfig, DiscoveryMode, FailoverConfig, GossipConfig, NetworkConfig, NodeRole,
@@ -131,12 +130,6 @@ impl PyRetryPolicy {
                 e
             )))
         })
-    }
-
-    #[classmethod]
-    fn default(_: &Bound<'_, PyType>) -> PyRetryPolicy {
-        let policy = RetryPolicy::default();
-        PyRetryPolicy::from(policy)
     }
 }
 

@@ -59,6 +59,7 @@ def ask(name: str, request: Any) -> Any | None:
         KeyError: capability 未注册。
     """
     runtime = _resolve_by_kind(name, "ask", "ask")
+    runtime._record_effect(name, "ask")
     return runtime._dispatch_ask(name, request)
 
 
@@ -77,6 +78,7 @@ def perform(name: str, request: Any) -> Any:
         KeyError: capability 未注册。
     """
     runtime = _resolve_by_kind(name, "perform", "perform")
+    runtime._record_effect(name, "perform")
     return runtime._dispatch_perform(name, request)
 
 
@@ -106,6 +108,7 @@ def emit(
             f"on_error must be 'log'/'raise'/'collect', got {on_error!r}"
         )
     runtime = _resolve_by_kind(name, "emit", "emit")
+    runtime._record_effect(name, "emit")
     runtime._dispatch_emit(name, request, on_error=on_error)
 
 

@@ -88,7 +88,7 @@ class AsyncFlowContext:
         runtime, state = _wait_context()
         wait_key = f"timer-{state.next_wait_seq()}"
         deadline_ms = int(time.time() * 1000) + int(seconds * 1000)
-        runtime.register_wait_point(
+        runtime._register_wait_point(
             state.workflow_id,
             wait_key,
             kind="timer",
@@ -119,7 +119,7 @@ class AsyncFlowContext:
             ActantTimeoutError: 工作流级 deadline 到期。
         """
         runtime, state = _wait_context()
-        runtime.register_wait_point(state.workflow_id, name, kind="signal", name=name)
+        runtime._register_wait_point(state.workflow_id, name, kind="signal", name=name)
         if timeout_ms > 0:
             return await _park_payload_async(runtime, state.workflow_id, name, bound_ms=timeout_ms)
         bound = state.timeout_ms
@@ -171,7 +171,7 @@ async def _park_payload_async(
     bound_ms: int,
 ) -> bytes | None:
     """异步版 :func:`actant._internal.flow._park_payload`：await 等待点而非阻塞线程。"""
-    payload = await runtime.wait_wait_point_async(workflow_id, wait_key, timeout_ms=bound_ms)
+    payload = await runtime._wait_wait_point_async(workflow_id, wait_key, timeout_ms=bound_ms)
     if payload is None:
         # 与同步路径同源：``None`` 既可能是超时，也可能是工作流终态释放了
         # 等待者。先排除后者，否则会把 abort 当成空 payload。

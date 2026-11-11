@@ -47,7 +47,7 @@ def test_cancel_task_after_completion() -> None:
     with Runtime() as rt:
         handle = AsyncResult("t1")
         handle._set_result(1)
-        rt.register_task("t1", handle)
+        rt._register_task("t1", handle)
         assert rt.cancel_task("t1") is False
 
 
@@ -55,7 +55,7 @@ def test_cancel_task_already_cancelled() -> None:
     with Runtime() as rt:
         handle = AsyncResult("t1")
         handle._set_cancelled()
-        rt.register_task("t1", handle)
+        rt._register_task("t1", handle)
         assert rt.cancel_task("t1") is True
 
 

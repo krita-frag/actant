@@ -128,21 +128,34 @@ class WorkflowEvent:
 
 @runtime_checkable
 class RoutingHandler(Protocol):
-    """用户自定义路由 handler 的签名助手（非内置 capability）。"""
+    """用户自定义路由 handler 的签名助手（非内置 capability）。
+
+    **仅用于 payload 类型约束，框架不会自动调用。** 路由由 Rust
+    ``RoutePolicy`` 或 ``Runtime(route_policy=...)`` 生效；注册本 handler
+    不会改变任何分派行为。
+    """
 
     def __call__(self, ctx: RouteCtx) -> str | None: ...
 
 
 @runtime_checkable
 class SchedulingHandler(Protocol):
-    """用户自定义调度 handler 的签名助手（非内置 capability）。"""
+    """用户自定义调度 handler 的签名助手（非内置 capability）。
+
+    **仅用于 payload 类型约束，框架不会自动调用。** 调度由 Rust ``Scheduler``
+    或第 3 层外部调度器生效。
+    """
 
     def __call__(self, ctx: ScheduleCtx) -> str | None: ...
 
 
 @runtime_checkable
 class RetryPolicyHandler(Protocol):
-    """用户自定义重试 handler 的签名助手（非内置 capability）。"""
+    """用户自定义重试 handler 的签名助手（非内置 capability）。
+
+    **仅用于 payload 类型约束，框架不会自动调用。** 重试由 Rust
+    ``RetryPolicy``（``@task(retries=...)``）生效。
+    """
 
     def __call__(self, ctx: RetryCtx) -> bool | None: ...
 
@@ -191,10 +204,6 @@ BUILTIN_CAPABILITIES: dict[str, CapabilityMeta] = {
     "TaskLifecycle": CapabilityMeta("TaskLifecycle", "emit"),
     "WorkflowLifecycle": CapabilityMeta("WorkflowLifecycle", "emit"),
 }
-
-#: 已登记的 capability 清单。登记与接线由门禁共同约束，新增内置 capability
-#: 必须同时在 ``actant/`` 生产代码里提供 effect 发射点或默认 handler。
-WIRED_CAPABILITIES: frozenset[str] = frozenset(BUILTIN_CAPABILITIES)
 
 #: 仅 Python 层实现的 capability（无 Rust fallback）。
 #: 默认 handler 是 Python→Rust blob 桥（``_DefaultValueStoreHandler``），

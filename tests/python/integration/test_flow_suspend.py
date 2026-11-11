@@ -328,8 +328,8 @@ class TestSuspendDurability:
         rt_a = Runtime(name="suspend-node", data_dir=data_dir)
         rt_a.start()
         try:
-            rt_a.submit_workflow(wf_id)
-            rt_a.register_wait_point(wf_id, "suspend-1", kind="suspend")
+            rt_a._submit_workflow(wf_id)
+            rt_a._register_wait_point(wf_id, "suspend-1", kind="suspend")
             # 重启前未恢复 → 该挂起点仍在等待。
             assert rt_a.resume_suspended(wf_id) == 1
         finally:
@@ -339,7 +339,7 @@ class TestSuspendDurability:
         rt_b = Runtime(name="suspend-node", data_dir=data_dir)
         rt_b.start()
         try:
-            rt_b.register_wait_point(wf_id, "suspend-2", kind="suspend")
+            rt_b._register_wait_point(wf_id, "suspend-2", kind="suspend")
         finally:
             rt_b.stop()
 

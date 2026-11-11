@@ -80,7 +80,7 @@ class TestFlowRegistry:
     def test_host_flows_skips_workflow_without_invocation(self) -> None:
         """非 flow 提交路径创建的工作流没有 invocation：跳过 + 不抛错。"""
         with Runtime() as rt:
-            rt.submit_workflow("orphan-abcdef12")
+            rt._submit_workflow("orphan-abcdef12")
             assert host_flows(runtime=rt) == []
 
 

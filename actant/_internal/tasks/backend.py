@@ -1,9 +1,13 @@
-"""任务提交接缝。
+"""任务提交接缝（internal，不承诺跨版本兼容）。
 
 ``Task.submit`` 只依赖 :class:`SubmitBackend`，不再直接解析全局 ``Runtime``。
 默认实现 :class:`EmbeddedSubmitBackend` 把提交转交给进程内 Runtime 与 Rust
 调度器；跨进程提交只需在同一接缝上提供远程实现，``Task`` 与 ``@task``
 的调用语义保持不变。
+
+稳定性：本模块位于 ``actant._internal``，不属于公开 API 面，方法签名随核心
+实现演进；依赖它做远程提交的调用方需自行跟随 CHANGELOG。公开的跨进程入口是
+``extensions/act-service``，不是本接缝。
 """
 
 from __future__ import annotations
@@ -21,7 +25,11 @@ if TYPE_CHECKING:
 
 
 class SubmitBackend(Protocol):
-    """任务提交接缝。"""
+    """任务提交接缝。
+
+    仅保证 ``Task.submit`` 的调用协议；属于 internal 面，方法签名不承诺跨
+    0.x 版本兼容。跨进程提交建议直接使用 ``act_ext_service.ServiceClient``。
+    """
 
     def submit_task(
         self,
@@ -97,12 +105,12 @@ class EmbeddedSubmitBackend:
         )
         core = runtime._rust_core
         if core is None:
-            runtime.unregister_task(task_id)
+            runtime._unregister_task(task_id)
             raise InvalidStateError("Runtime not started: rust_core is None")
         try:
             core.submit_task(task_def)
         except Exception:
-            runtime.unregister_task(task_id)
+            runtime._unregister_task(task_id)
             raise
         return cast("AsyncResult", handle)
 

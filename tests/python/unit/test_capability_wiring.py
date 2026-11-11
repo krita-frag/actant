@@ -1,9 +1,8 @@
 """Capability 接线契约。
 
-所有公开内置 capability 必须同时登记在 ``WIRED_CAPABILITIES`` 中，并且有
-真实调用点。路由/调度/重试等放置类策略不属于 ERH 数据面：它们由 Rust
-``RoutePolicy`` / ``Scheduler`` 或第 3 层外部调度器承担，不得以"内置
-capability"的形式重新出现。
+所有公开内置 capability 必须有真实调用点。路由/调度/重试等放置类策略不属于
+ERH 数据面：它们由 Rust ``RoutePolicy`` / ``Scheduler`` 或第 3 层外部调度器
+承担，不得以"内置 capability"的形式重新出现。
 
 集合相等只能证明"名字登记过了"，证明不了"引擎真的会调用它"。因此本模块
 直接扫描 ``actant/`` 生产代码的 effect 发射点：新增一个只有声明、没有调用点
@@ -20,7 +19,6 @@ from actant.capabilities import (
     BUILTIN_CAPABILITIES,
     PYTHON_ONLY_CAPABILITIES,
     RUST_BACKED_CAPABILITIES,
-    WIRED_CAPABILITIES,
 )
 
 _REMOVED_POLICY_CAPABILITIES = ("Routing", "Scheduling", "RetryPolicy")
@@ -30,10 +28,6 @@ _REMOVED_EXPORTS = (
     "SCHEDULING",
     "RETRY_POLICY",
 )
-
-
-def test_builtin_capabilities_are_wired() -> None:
-    assert frozenset(BUILTIN_CAPABILITIES) == WIRED_CAPABILITIES
 
 
 def test_policy_capabilities_are_not_builtin() -> None:

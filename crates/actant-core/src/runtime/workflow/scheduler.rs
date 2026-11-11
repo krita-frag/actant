@@ -50,7 +50,7 @@ pub trait Scheduler: Send + Sync {
     ///
     /// 调用后调度器进入 drain 模式：
     /// 1. **新入队被拒**：后续 `enqueue` / `enqueue_batch` 返回
-    ///    `Err(ActantError::Internal("scheduler is closed"))`。
+    ///    `Err(ActantError::InvalidState("scheduler is closed ..."))`。
     /// 2. **等待中的消费者被唤醒**：阻塞在 `dequeue()` 的调用方会立即收到 `None`，
     ///    从而退出消费循环。
     /// 3. **已排队任务保留**：`close` 不清空队列，已入队任务仍可通过 `try_dequeue`
@@ -177,6 +177,13 @@ impl ActorScheduler {
 #[async_trait]
 impl Scheduler for ActorScheduler {
     async fn enqueue(&self, task: TaskDefinition) -> Result<(), ActantError> {
+        // 本地 closed 检查对快路径与慢路径都生效：慢路径的 CLOSE 消息是异步
+        // 投递的，若不在这里拦截，close 后立刻 enqueue 会抢在 Actor 处理前成功。
+        if self.closed.load(Ordering::Acquire) {
+            return Err(ActantError::InvalidState(
+                "scheduler is closed (drain mode), rejecting task".into(),
+            ));
+        }
         // 快路径：直接调用共享 InnerScheduler::enqueue，绕过 Actor 消息往返。
         // 适用于高 QPS 单任务入队场景（如 mailbox 持久化后的任务派发）。
         // Worker 唤醒由 InnerScheduler::enqueue 内部的 notify_one() 保证，
@@ -193,6 +200,11 @@ impl Scheduler for ActorScheduler {
     }
 
     async fn enqueue_batch(&self, tasks: Vec<TaskDefinition>) -> Result<(), ActantError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(ActantError::InvalidState(
+                "scheduler is closed (drain mode), rejecting task".into(),
+            ));
+        }
         // 快路径：批量入队同样直接操作共享状态。
         if let Some(ref inner) = self.fast_inner {
             return inner.enqueue_batch(tasks);

@@ -85,13 +85,13 @@ class TestContinueAsNew:
         with rt:
             workflow_id = "can-flow-cafe1234"
             # 模拟"上一代已创建新代外壳与携带参数，但新代函数体尚未执行"的崩溃现场。
-            rt.submit_workflow(
+            rt._submit_workflow(
                 workflow_id,
                 name="can-flow",
                 version=1,
                 args=cloudpickle.dumps(((marker, 0), {})),
             )
-            rt.resolve_workflow_context_value(
+            rt._resolve_workflow_context_value(
                 workflow_id,
                 "@continue_args",
                 "continue_args",
@@ -112,23 +112,23 @@ class TestContinueAsNew:
         rt = Runtime(name="can-node")
         with rt:
             # 旧代：已记录"下一代 id"，尚未封口。
-            rt.submit_workflow(
+            rt._submit_workflow(
                 old_id,
                 name="can-flow",
                 version=1,
                 args=cloudpickle.dumps(((marker, 0), {})),
             )
-            rt.resolve_workflow_context_value(
+            rt._resolve_workflow_context_value(
                 old_id, "@continued_to", "continued_to", new_id.encode()
             )
             # 新代：外壳与携带参数已落盘，函数体未执行（generation=1）。
-            rt.submit_workflow(
+            rt._submit_workflow(
                 new_id,
                 name="can-flow",
                 version=1,
                 args=cloudpickle.dumps(((marker, 1), {})),
             )
-            rt.resolve_workflow_context_value(
+            rt._resolve_workflow_context_value(
                 new_id,
                 "@continue_args",
                 "continue_args",
