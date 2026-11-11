@@ -5,7 +5,7 @@
 ```bash
 git clone https://github.com/actant/actant.git
 cd actant
-uv sync
+uv sync --extra dev
 uv run maturin develop
 ```
 

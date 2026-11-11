@@ -11,7 +11,7 @@
 ```bash
 git clone https://github.com/actant/actant.git
 cd actant
-uv sync
+uv sync --extra dev
 uv run maturin develop
 ```
 
@@ -28,7 +28,7 @@ uv run python -c "import actant; print(actant.__version__)"
 ## 文档站点
 
 ```bash
-uv sync
+uv sync --extra dev
 uv run mkdocs serve
 ```
 
