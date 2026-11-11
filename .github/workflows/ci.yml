@@ -47,6 +47,15 @@ jobs:
       - name: cargo clippy（零告警）
         run: cargo clippy --all-targets -- -D warnings
 
+      # 依赖漏洞门禁：cargo audit 默认只对漏洞返回非零，warning 不阻断。
+      # 已知 warning（2026-11-12）：atomic-polyfill / proc-macro-error 停维护，
+      # chacha20 / der / iroh-blobs 被 yank；随 iroh 升级清理，复审截止 2027-01-31。
+      - name: 安装 cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+
+      - name: cargo audit（依赖漏洞门禁）
+        run: cargo audit
+
       - name: cargo test --workspace（默认特性，含 PyO3）
         run: cargo test --workspace
 
