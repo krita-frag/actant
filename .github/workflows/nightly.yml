@@ -1,0 +1,79 @@
+# 夜间 soak：本机多进程集群 + 连续负载 + 周期故障。
+#
+# 设计取舍：
+# - 不用容器或自托管 runner：testkit 的 Sandbox + ProcessNode 已提供独立进程组、
+#   data_dir/TMPDIR/HOME 隔离与 SIGSTOP/SIGKILL，够覆盖"进程崩溃/冻结/分区"。
+# - 固定读 seed 与故障间隔，失败报告可重放；报告与节点日志始终上传。
+# - 默认 30 分钟；手动触发可缩短时长做冒烟。
+name: Nightly Soak
+
+on:
+  schedule:
+    - cron: "0 18 * * *"  # UTC 18:00 = 北京时间 02:00
+  workflow_dispatch:
+    inputs:
+      duration_seconds:
+        description: "稳定负载时长（秒）"
+        required: false
+        default: "1800"
+      workers:
+        description: "进程 Worker 数（至少 2 才能覆盖 kill 补位）"
+        required: false
+        default: "2"
+
+concurrency:
+  group: nightly-soak
+  cancel-in-progress: false
+
+jobs:
+  soak:
+    name: 本机多进程 soak
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      PYTHONPATH: ${{ github.workspace }}/extensions/act-ext-testkit
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Sync Python 依赖
+        run: uv sync --extra dev
+
+      - name: 构建 PyO3 扩展（maturin develop）
+        run: uv run maturin develop
+
+      - name: 运行 soak
+        env:
+          DURATION: ${{ github.event.inputs.duration_seconds || '1800' }}
+          WORKERS: ${{ github.event.inputs.workers || '2' }}
+        run: |
+          uv run python -m act_ext_testkit.soak \
+            --namespace "nightly-${GITHUB_RUN_ID}" \
+            --workers "$WORKERS" \
+            --duration-seconds "$DURATION" \
+            --warmup-seconds 5 \
+            --concurrency 8 \
+            --rate 20 \
+            --task-sleep-ms 25 \
+            --task-timeout 90 \
+            --fault-interval 30 \
+            --fault-hold 3 \
+            --max-failure-rate 0.01 \
+            --keep-data \
+            --report soak-report.json
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: soak-report-${{ github.run_id }}
+          path: |
+            soak-report.json
+            /tmp/actant-testkit-*/logs/*.log
+          if-no-files-found: warn

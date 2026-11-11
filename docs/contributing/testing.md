@@ -36,6 +36,20 @@ cargo test -p actant-core -p actant-common --no-default-features
 - 异步 Rust 测试用 `#[tokio::test]`；单元测试放在同文件 `#[cfg(test)] mod tests`。
 - Rust 基准测试：`cargo bench --bench <name>`。
 
+## 本机多进程 soak（testkit）
+
+夜间或发布前用它验证进程崩溃、冻结与分区下的收敛；不需要容器或额外机器：
+
+```bash
+PYTHONPATH=extensions/act-ext-testkit uv run python -m act_ext_testkit.soak \
+  --duration-seconds 60 --report /tmp/soak.json
+```
+
+节点是独立进程组，`data_dir` / `TMPDIR` / `HOME` 由 `Sandbox` 隔离；默认 2 个
+Worker、20 任务/秒，每 10 秒注入一次 freeze / partition / heartbeat / kill。
+`--no-kill` 关闭 SIGKILL 补位，`--keep-data` 保留沙箱目录便于排查。仅支持 POSIX；
+夜间任务为 30 分钟，见 `.github/workflows/nightly.yml`。
+
 ## 构建新鲜度
 
 测试会在 session 启动时比较已加载原生扩展与 Rust 构建输入（`Cargo.toml`、

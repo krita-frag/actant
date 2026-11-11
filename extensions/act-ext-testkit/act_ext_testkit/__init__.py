@@ -137,6 +137,7 @@ from .node import (
 )
 from .report import ClusterReport
 from .sandbox import Sandbox, SandboxError, sandbox
+from .soak import SoakConfig, SoakError, SoakResult, run_soak
 from .topology import Topology, TopologyChange, diff_topology
 from .trace import (
     DEFAULT_TRACE_POLICY,
@@ -209,6 +210,9 @@ __all__ = [
     "SandboxError",
     "ScenarioRequirements",
     "SemanticNetem",
+    "SoakConfig",
+    "SoakError",
+    "SoakResult",
     "TcNetemFabric",
     "TestCluster",
     "TestkitError",
@@ -252,6 +256,7 @@ __all__ = [
     "reset_backends",
     "resolve_profile",
     "restricted_domain",
+    "run_soak",
     "sandbox",
     "schedule_fingerprint",
     "shaping_supported",
