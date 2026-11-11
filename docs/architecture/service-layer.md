@@ -109,10 +109,15 @@ for event in client.subscribe(workflow_id):
 !!! danger "部署红线"
     `ServiceServer` **无鉴权**，且服务端会对客户端载荷执行
     `cloudpickle.loads`——等于把代码执行权交给能连接到该端口的人。
-    只允许监听 `127.0.0.1`，或置于已经完成身份认证与网络隔离的可信反向代理之后；
-    不要把 `base_url` 暴露到公网、共享 VPC 或未隔离的容器网络。
+    `host` 默认只允许 loopback；非 loopback 监听必须显式传入
+    `allow_insecure=True`（否则构造时直接 `ValueError`），并置于已经完成身份认证
+    与网络隔离的可信反向代理之后；不要把 `base_url` 暴露到公网、共享 VPC 或
+    未隔离的容器网络。
 
 - **无鉴权**：协议 v1 只适合可信网络。鉴权、租户隔离、审计属于第 3 层。
+- **绑定护栏**：默认只允许 loopback（`127.0.0.1` / `::1` / `localhost`）；
+  `host="0.0.0.0"` 等非 loopback 地址需显式 `allow_insecure=True`，启动时记录 WARN。
+- **请求体上限**：提交与信号请求体上限 64 MiB，超出返回 413 `payload_too_large`。
 - **反序列化即执行**：服务端会 `cloudpickle.loads` 客户端载荷；不要把端口暴露
   给不可信来源。
 - **服务不接管 Runtime 生命周期**：`ServiceServer` 只调用 `start_flow` /

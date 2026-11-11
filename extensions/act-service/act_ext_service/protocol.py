@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import base64
+import ipaddress
 import json
 import logging
 import threading
@@ -70,6 +71,17 @@ _PREFIX = f"/{PROTOCOL_VERSION}"
 _TERMINAL_STATES = frozenset({"Completed", "Failed", "Cancelled"})
 _SSE_HEARTBEAT_S = 5.0
 _MAX_BODY_BYTES = 64 * 1024 * 1024
+
+
+def _is_loopback(host: str) -> bool:
+    """判断监听地址是否仅本机可达。"""
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
 
 _DEFINITION_ERRORS: dict[str, type[DefinitionError]] = {
     "definition_not_found": DefinitionNotFoundError,
@@ -382,21 +394,36 @@ class ServiceServer:
         port: int = 0,
         resolver: DefinitionResolver | None = None,
         poll_interval_ms: int = 200,
+        allow_insecure: bool = False,
     ) -> None:
         """
         Args:
             runtime: 已启动的 Runtime；服务不接管其生命周期。
-            host: 监听地址。默认仅本机；跨机部署由调用方显式放开并自行
-                承担鉴权/网络边界。
+            host: 监听地址。默认仅本机；非 loopback 地址需要
+                ``allow_insecure=True`` 显式确认。
             port: 监听端口；``0`` 表示由内核分配。
             resolver: 定义解析器；默认使用进程级 ``FLOW_REGISTRY``。
             poll_interval_ms: SSE 轮询和事件检查间隔。
+            allow_insecure: 允许监听非 loopback 地址。协议 v1 无鉴权且会
+                ``cloudpickle.loads`` 客户端载荷，只应在可信网络内开启。
 
         Raises:
-            ValueError: ``poll_interval_ms`` 非正。
+            ValueError: ``poll_interval_ms`` 非正，或非 loopback 监听未显式确认。
         """
         if poll_interval_ms <= 0:
             raise ValueError("poll_interval_ms must be positive")
+        loopback = _is_loopback(host)
+        if not loopback and not allow_insecure:
+            raise ValueError(
+                "ServiceServer 无鉴权且会反序列化客户端载荷；"
+                "非 loopback 监听需显式 allow_insecure=True"
+            )
+        if not loopback:
+            _logger.warning(
+                "service: 监听非 loopback 地址 %s；协议 v1 无鉴权，"
+                "必须置于可信反向代理或网络隔离之后",
+                host,
+            )
         self._context = _ServiceContext(
             runtime=runtime,
             resolver=DefinitionResolver() if resolver is None else resolver,

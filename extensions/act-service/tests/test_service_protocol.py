@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import http.client
+import json
 import threading
 from pathlib import Path
 
@@ -137,5 +139,33 @@ def test_definition_drift_returns_stable_errors(tmp_path: Path) -> None:
         with pytest.raises(DefinitionHashMismatchError):
             client.submit(DefinitionRef(ref.name, ref.version, "0" * 64), 1)
     finally:
+        server.stop()
+        runtime.stop()
+
+
+def test_non_loopback_requires_explicit_opt_in(tmp_path: Path) -> None:
+    runtime = Runtime(name="service-node", data_dir=str(tmp_path))
+    runtime.start()
+    try:
+        with pytest.raises(ValueError, match="allow_insecure"):
+            ServiceServer(runtime, host="0.0.0.0")
+    finally:
+        runtime.stop()
+
+
+def test_payload_too_large_returns_413(tmp_path: Path) -> None:
+    runtime, server, _client = _serve(tmp_path)
+    host, port = server.address
+    conn = http.client.HTTPConnection(host, port, timeout=5.0)
+    try:
+        conn.putrequest("POST", "/v1/workflows")
+        conn.putheader("Content-Length", str(65 * 1024 * 1024))
+        conn.endheaders()
+        response = conn.getresponse()
+        assert response.status == 413
+        payload = json.loads(response.read())
+        assert payload["error"]["kind"] == "payload_too_large"
+    finally:
+        conn.close()
         server.stop()
         runtime.stop()

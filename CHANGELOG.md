@@ -42,6 +42,11 @@
   同时删除 PyO3 内部接缝 `_CapabilityRuntime.chain_python_handler` /
   `dispatch_ask` / `dispatch_perform` / `dispatch_emit`（Python handler 只走
   Python 侧分发链）。
+- **服务层非 loopback 监听需显式确认**：可选扩展 `act-service` 的
+  `ServiceServer` 新增 `allow_insecure` 参数（默认 `False`）。`host` 为
+  `0.0.0.0` / `::` 等非 loopback 地址时构造直接抛 `ValueError`；显式开启后
+  启动时记录 WARN。协议 v1 仍无鉴权且服务端会 `cloudpickle.loads` 客户端载荷，
+  部署边界不变；提交与信号请求体上限为 64 MiB（超出返回 413）。
 - **任务重试遵循退避策略**：`RetryPolicy.backoff_multiplier` / `max_delay_ms`
   现在参与计算（`delay_ms * multiplier^retry`，上限 `max_delay_ms`）；此前固定
   使用 `delay_ms`。
