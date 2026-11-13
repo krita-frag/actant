@@ -810,7 +810,7 @@ impl InnerScheduler {
             Self::Priority { queues, .. } => {
                 let mut qs = queues.lock();
                 let mut unrouted = Vec::new();
-                for (_, queue) in qs.iter_mut() {
+                for queue in qs.values_mut() {
                     let old = std::mem::take(queue);
                     for task in old {
                         if task.target_node.is_none() {

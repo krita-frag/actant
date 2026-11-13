@@ -5,12 +5,17 @@
 边界时自行断言。
 
 RSS 采样默认覆盖本进程；可通过 :meth:`PerformanceSampler.watch_process`
-登记 worker/节点 PID，逐进程采样（依赖 POSIX ``ps``）。
+登记 worker/节点 PID，逐进程采样（依赖 POSIX ``ps``）。RSS 采样仅在 POSIX
+可用；Windows 上自动跳过，延迟/吞吐统计不受影响。
 """
 
 from __future__ import annotations
 
-import resource
+try:
+    import resource
+except ImportError:  # Windows 没有 resource 模块
+    resource = None  # type: ignore[assignment]
+
 import shutil
 import statistics
 import subprocess
@@ -71,6 +76,8 @@ class PerformanceSampler:
             self._record_rss()
 
     def _record_rss(self) -> None:
+        if resource is None:
+            return
         usage = resource.getrusage(resource.RUSAGE_SELF)
         rss = int(usage.ru_maxrss)
         # macOS 的 ru_maxrss 单位是字节，Linux 是 KB。
