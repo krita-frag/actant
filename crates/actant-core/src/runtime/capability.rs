@@ -47,6 +47,27 @@ pub struct CapabilityEnvelope {
     pub payload: Vec<u8>,
 }
 
+/// 响应首字节：`1` 表示 handler 已处理并附有 codec 字节。
+const RESPONSE_HANDLED: u8 = 1;
+
+/// 编码 capability 响应：`[1][codec bytes]`。
+///
+/// `ask` 与 `perform` 共用同一编码，避免两条路径各自约定 tag。
+pub(crate) fn encode_handled(body: Vec<u8>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(body.len() + 1);
+    out.push(RESPONSE_HANDLED);
+    out.extend_from_slice(&body);
+    out
+}
+
+/// 解码 capability 响应；首字节非 [`RESPONSE_HANDLED`] 时返回 `None`。
+pub(crate) fn decode_handled(payload: &[u8]) -> Option<&[u8]> {
+    match payload.split_first() {
+        Some((&RESPONSE_HANDLED, rest)) => Some(rest),
+        _ => None,
+    }
+}
+
 /// Capability 序列化编解码器。
 ///
 /// 由于 capability 请求/响应是类型擦除的 `dyn Any`，而 Actor 消息负载为 `Vec<u8>`，
@@ -499,7 +520,7 @@ impl CapabilityRuntime {
             .map_err(|e| ActantError::Internal(format!("ask codec: {}", e)))?;
         let local_envelope = CapabilityEnvelope {
             kind: EffectKind::Ask,
-            payload: req_bytes.clone(),
+            payload: req_bytes,
         };
         let bytes = postcard::to_allocvec(&local_envelope)
             .map_err(|e| ActantError::Serialization(e.to_string()))?;
@@ -510,21 +531,12 @@ impl CapabilityRuntime {
         if let Some(err) = result.error {
             return Err(ActantError::from(err));
         }
-        let local_bytes = if result.payload.is_empty() || result.payload[0] == 0 {
-            None
-        } else {
-            Some(result.payload)
-        };
-
-        let response_bytes = local_bytes;
-
-        let response_bytes = match response_bytes {
-            Some(b) if !b.is_empty() && b[0] != 0 => b,
-            _ => return Ok(None),
+        let Some(response_bytes) = decode_handled(&result.payload) else {
+            return Ok(None);
         };
 
         let resp = codec
-            .deserialize_response(&response_bytes[1..])
+            .deserialize_response(response_bytes)
             .map_err(|e| ActantError::Internal(format!("ask decode: {}", e)))?;
         let resp = resp
             .downcast::<C::Response>()
@@ -584,10 +596,14 @@ impl CapabilityRuntime {
         if let Some(err) = result.error {
             return Err(ActantError::from(err));
         }
-        let response_bytes = result.payload;
+        let Some(response_bytes) = decode_handled(&result.payload) else {
+            return Err(ActantError::Internal(
+                "perform: response payload missing handled tag".into(),
+            ));
+        };
 
         let resp = codec
-            .deserialize_response(&response_bytes)
+            .deserialize_response(response_bytes)
             .map_err(|e| ActantError::Internal(format!("perform decode: {}", e)))?;
         let resp = resp
             .downcast::<C::Response>()

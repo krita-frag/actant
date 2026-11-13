@@ -15,8 +15,7 @@ class _MockHandle:
         self._result = result
         self._exc = exc
         self._wait_called = False
-        # 模拟真实 AsyncResult._future：完成状态 + intrusive callback 链。
-        # MockHandle 视为已完成（构造时即有结果/异常），因此 _future 也立即 set。
+        # 模拟真实 AsyncResult._future：构造时即已完成。
         self._future = _CompletionFuture()
         self._future.set()
 
@@ -84,6 +83,11 @@ def test_gather_timeout_propagates() -> None:
 
         def result(self, timeout: float | None = None) -> object:
             raise RuntimeError("should not reach")
+
+        def add_done_callback(self, fn: object) -> None:
+            # 永不完成，回调不会被触发。
+            self._callbacks = getattr(self, "_callbacks", [])
+            self._callbacks.append(fn)
 
     with pytest.raises(ActantTimeoutError, match="gather:"):
         gather(_SlowHandle(), timeout=0.01)

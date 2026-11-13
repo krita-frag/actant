@@ -31,7 +31,7 @@ ERH 只覆盖 `resolution=runtime` 的扩展域。Rust 热路径上的路由、�
 
 ## 两条 Python 扩展路径
 
-均经 `rt.layer(...)` 登记 handler，只作用于 Python 发起的 `actant.effects.ask` / `actant.perform` / `actant.emit`：
+均经 `rt.layer(...)` 登记，只作用于 Python 发起的 `ask` / `perform` / `emit`：
 
 ```python
 from actant import Runtime
@@ -40,46 +40,21 @@ def my_value_store_handler(req):
     return None  # 示例占位：实际实现应处理请求
 
 def my_router(ctx):
-    return None  # 弃权，交给后续 handler
-
-with Runtime() as rt:
-    # 覆盖内置 capability 的 handler
-    rt.layer("ValueStore").chain(my_value_store_handler)
-
-    # 新增自定义 capability
-    rt.layer("MyRouter", "ask").chain(my_router)
-```
-
-| 路径 | 入口 | 适用 |
-| --- | --- | --- |
-| 覆盖内置 | `rt.layer(name).chain(handler)` 或 `rt.chain(name, handler)` | 替换/追加数据面 handler（如 `ValueStore` 换后端） |
-| 新增自定义 | `rt.layer(name, kind).chain(handler)` | 声明新的 `ask` / `perform` / `emit` 扩展点 |
-
-## 双分发规则
-
-- Python 侧：`_dispatch_ask/perform/emit` 先走 Python handler 链；缺失或弃权时，仅 `RUST_BACKED_CAPABILITIES`（`Store` / `TaskLifecycle` / `WorkflowLifecycle`）转发到 Rust capability runtime。只有 `Store` 有 Rust `StoreHandler`；两个 lifecycle capability 在 Rust 侧只有 codec 与空 layer，emit 为空操作，实际订阅者是 Python handler。
-- Rust 内部：Worker 执行、Orchestrator 持久化等路径**不咨询** Python `_layers`；Python handler 永不进入 Rust 内部 dispatch。
-- `ValueStore` 没有 Rust 内部分发参与，只有 Python 一条路径。
-
-要覆盖 **Rust 内部行为**（任务执行、存储、传输等），只能用 Rust 侧 `RuntimeBuilder` 的注入缝，不能靠 `layer().chain()`。
-
-## 自定义 handler 示例
-
-```python
-from actant import Runtime
-
-def my_router(ctx):
     if ctx.tags.get("region") == "cn":
         return "node-cn"
     return None  # 弃权，交给后续 handler
 
 with Runtime() as rt:
-    rt.layer("MyRouter", "ask").chain(my_router)
+    rt.layer("ValueStore").chain(my_value_store_handler)  # 覆盖内置
+    rt.layer("MyRouter", "ask").chain(my_router)          # 新增自定义
 ```
 
-`with Runtime() as rt` 进入时已启动运行时，不要再调用 `rt.start()`。
+`with Runtime()` 进入时已启动运行时，不要再调用 `rt.start()`。入口形状、双分发
+边界与回退规则见[框架契约](../architecture/framework-contract.md)；覆盖 Rust 内部
+行为只能经 `RuntimeBuilder` 注入缝，不能靠 `layer().chain()`。
 
-`actant.capabilities.RouteCtx` / `ScheduleCtx` / `RetryCtx` 与对应 Protocol 仅作为自定义 capability 的 payload / 签名助手保留，**不会自动生效**。
+`actant.capabilities.RouteCtx` / `ScheduleCtx` / `RetryCtx` 与对应 Protocol 仅作为
+自定义 capability 的 payload / 签名助手保留，**不会自动生效**。
 
 ## 下一步
 

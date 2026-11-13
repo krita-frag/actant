@@ -46,7 +46,6 @@ impl PyCapabilityRuntime {
         gil_thread: GilThread,
     ) -> Self {
         let inner = runtime.capability().clone();
-        register_defaults(&inner);
         Self {
             inner,
             tokio,
@@ -57,6 +56,7 @@ impl PyCapabilityRuntime {
 
 #[pymethods]
 impl PyCapabilityRuntime {
+    /// 测试用：创建独立的 capability runtime（不共享统一 Runtime）。
     #[new]
     fn new() -> PyResult<Self> {
         let tokio = Arc::new(tokio::runtime::Runtime::new().map_err(|e| {

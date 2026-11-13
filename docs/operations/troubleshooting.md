@@ -77,9 +77,11 @@
 
 **处理**：
 
-- 未显式传 `data_dir` 时默认 `none`，仅 loopback；显式给 `data_dir` 才是 `local`。
+- Python `Runtime` 未显式传 `data_dir` 时默认 `none`（临时身份）；显式给 `data_dir` 才是 `local`。
+- CLI 未传 `--data-dir` 时不启动 iroh，只是单进程 worker，不参与 P2P。
 - 检查 `ACTANT_DISCOVERY` 是否覆盖了配置。
-- `none` 模式必须显式 `bootstrap_nodes` 拨号。
+- `none` 模式必须同时配置 `bootstrap_nodes`（完整 endpoint_addr）与
+  `gossip_bootstrap_peers`（endpoint id）；只配前者不会加入 gossip。
 - 生产模式检查 `allowed_peer_ids`、`require_signed_records` 与 `payload_signing_key`。
 
 ## 常用诊断开关

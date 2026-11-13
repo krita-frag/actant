@@ -19,9 +19,41 @@
 | 0.3.4 | `v0.3.4` | 身份与信任、Actor 精简、节点可见性 |
 | 0.3.5 | `v0.3.5` | 重构收尾、日志流、框架化 |
 
-## [Unreleased](https://github.com/actant/actant/compare/v0.3.0...HEAD)
+## [Unreleased](https://github.com/actant/actant/compare/v0.4.0...HEAD)
 
-> 本节是 0.3.1–0.3.5 的累积变更记录；发布 0.4.0 时拆分为版本条目。
+（暂无）
+
+## [0.4.0](https://github.com/actant/actant/compare/v0.3.5...v0.4.0) - 2026-11-12
+
+> 0.4.0 汇总 0.3.1–0.3.5 的累积变更与 0.4.0 新增内容；0.3.x 未按版本拆分。
+
+### 构建与发布
+
+- **多平台 abi3 wheel**：`pyo3` 启用 `abi3-py310`，每个平台一个 wheel 覆盖
+  CPython 3.10+；release workflow 扩展为 Linux x86_64/aarch64（manylinux_2_28）、
+  macOS universal2、Windows x64，并增加 `twine check`、按平台安装冒烟与
+  PyPI Trusted Publishing。musllinux 与 Windows arm64 暂未纳入矩阵。
+
+### Python 扩展契约
+
+- **新增 `actant.ext`**：提供稳定的类型化扩展词汇——`NodeView` /
+  `PlacementContext` / `PlacementDecision` / `bind_placement_policy`、
+  `EventEnvelope` / `EventAdapter`、`ClusterView`、`Component` / `compose`
+  与 `runtime_config` 构建器。它只做类型适配与显式装配，不新增 Rust 缝、
+  不做插件自动发现，也不改变“Python handler 不进入 Rust 内部 dispatch”的边界。
+
+### 新增与改进
+
+- **testkit 轻量 soak**：`act-ext-testkit` 新增 `act_ext_testkit.soak`，用本机
+  进程组构造多节点集群，连续提交任务并周期注入 freeze / partition / heartbeat /
+  kill，输出 JSON 报告；仅支持 POSIX。夜间任务见 `.github/workflows/nightly.yml`。
+- **testkit macOS 弱网**：`act-ext-testkit` 新增 `DnctlFabric`，用 macOS 自带的
+  `dnctl` + `pfctl`（dummynet）按节点 UDP 端口注入延迟 / 丢包 / 限速与双向分区，
+  不需要 Docker 或虚拟机；规则写入 `com.apple/actant-testkit` anchor，需要 root，
+  `jitter` / `duplicate` / `reorder` 明确不支持。
+- **CLI 内网参数**：`actant worker` 新增 `--discovery` / `--listen-ip` /
+  `--gossip-bootstrap-peers` / `--relay-endpoints`；纯内网或离线部署可显式关闭
+  公网发现并注入 bootstrap 与 gossip 引导对端。
 
 ### 破坏性变更
 
@@ -47,9 +79,6 @@
   `0.0.0.0` / `::` 等非 loopback 地址时构造直接抛 `ValueError`；显式开启后
   启动时记录 WARN。协议 v1 仍无鉴权且服务端会 `cloudpickle.loads` 客户端载荷，
   部署边界不变；提交与信号请求体上限为 64 MiB（超出返回 413）。
-- **testkit 轻量 soak**：`act-ext-testkit` 新增 `act_ext_testkit.soak`，用本机
-  进程组构造多节点集群，连续提交任务并周期注入 freeze / partition / heartbeat /
-  kill，输出 JSON 报告；仅支持 POSIX。夜间任务见 `.github/workflows/nightly.yml`。
 - **任务重试遵循退避策略**：`RetryPolicy.backoff_multiplier` / `max_delay_ms`
   现在参与计算（`delay_ms * multiplier^retry`，上限 `max_delay_ms`）；此前固定
   使用 `delay_ms`。

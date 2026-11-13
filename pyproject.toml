@@ -3,7 +3,7 @@ requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "actant"
+name = "actant-engine"
 version = "0.4.0"
 description = "基于 Actor 模型的跨平台通用分布式任务编排引擎"
 readme = "README.md"
@@ -45,8 +45,8 @@ dev = [
 ]
 
 [project.urls]
-Repository = "https://github.com/actant/actant"
-Issues = "https://github.com/actant/actant/issues"
+Repository = "https://github.com/krita-frag/actant"
+Issues = "https://github.com/krita-frag/actant/issues"
 
 [project.scripts]
 actant = "actant.cli:main"

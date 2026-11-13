@@ -106,16 +106,23 @@ def _payload_signing_key(args: argparse.Namespace) -> str:
 
 def _build_config(args: argparse.Namespace) -> Any:
     """根据 CLI 参数构造 ``_ActantConfig``；无自定义参数时返回 ``None``（用默认配置）。"""
+    network_keys = (
+        "bootstrap_nodes",
+        "listen_port",
+        "listen_ip",
+        "gossip_bootstrap_peers",
+        "relay_endpoints",
+        "discovery",
+    )
     has_custom = any(
         getattr(args, k, None) is not None
         for k in (
+            *network_keys,
             "max_concurrent_tasks",
             "default_task_timeout_ms",
             "drain_timeout_secs",
             "remote_fallback_delay_ms",
             "scheduler",
-            "bootstrap_nodes",
-            "listen_port",
             "role",
             "heartbeat_interval_ms",
             "failure_timeout_ms",
@@ -132,10 +139,14 @@ def _build_config(args: argparse.Namespace) -> Any:
     )
 
     network = None
-    if any(getattr(args, k, None) is not None for k in ("bootstrap_nodes", "listen_port")):
+    if any(getattr(args, k, None) is not None for k in network_keys):
         network = _NetworkConfig(
-            bootstrap_nodes=_split_comma(args.bootstrap_nodes),
-            listen_port=args.listen_port or 0,
+            preset=getattr(args, "discovery", None),
+            bootstrap_nodes=_split_comma(getattr(args, "bootstrap_nodes", None)),
+            gossip_bootstrap_peers=_split_comma(getattr(args, "gossip_bootstrap_peers", None)),
+            relay_endpoints=_split_comma(getattr(args, "relay_endpoints", None)),
+            listen_ip=getattr(args, "listen_ip", None) or "",
+            listen_port=getattr(args, "listen_port", None) or 0,
         )
 
     failover = None
@@ -442,13 +453,40 @@ def _add_worker_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--bootstrap-nodes",
         default=None,
-        help="逗号分隔的 bootstrap 节点地址",
+        help="逗号分隔的 bootstrap 节点地址（完整 endpoint_addr，而非仅 endpoint id）",
+    )
+    p.add_argument(
+        "--gossip-bootstrap-peers",
+        default=None,
+        help=(
+            "逗号分隔的 gossip 引导对端 endpoint ID；discovery=none 时必填，"
+            "否则只建立直连、不会加入 gossip"
+        ),
+    )
+    p.add_argument(
+        "--discovery",
+        default=None,
+        choices=["none", "local", "dns"],
+        help=(
+            "节点发现 preset（默认 local）。纯内网/离线用 none；"
+            "也可用 ACTANT_DISCOVERY 环境变量覆盖"
+        ),
+    )
+    p.add_argument(
+        "--listen-ip",
+        default=None,
+        help="P2P 监听 IPv4 地址（默认所有接口；内网部署建议显式指定）",
     )
     p.add_argument(
         "--listen-port",
         type=int,
         default=None,
         help="P2P 监听端口（默认随机端口）",
+    )
+    p.add_argument(
+        "--relay-endpoints",
+        default=None,
+        help="逗号分隔的自建 relay URL 列表（覆盖 preset 自带 relay）",
     )
     p.add_argument(
         "--heartbeat-interval-ms",

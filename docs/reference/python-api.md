@@ -19,6 +19,7 @@
 | 顶层异常与版本 | `actant` | `ActantError` `__version__` |
 | 异常 | `actant.exceptions` | 全部具名异常与 `raise_for_kind` / `raise_for_state` |
 | 观测 | `actant` | `metrics_text`（Prometheus exposition 文本） |
+| 扩展契约 | `actant.ext` | `NodeView` `PlacementContext` `PlacementDecision` `PlacementPolicy` `bind_placement_policy` `EventEnvelope` `EventAdapter` `ClusterView` `Component` `compose` `runtime_config` |
 | 测试台 | `actant.testkit` | `close_peer` `reopen_peer` `delay_heartbeat` `inject_hlc_drift` `kill_node` |
 
 同步面只保留默认名；异步动词集中在 `actant.aio`，与同步面同名（`aio.flow` /
@@ -36,7 +37,7 @@ from actant.effects import ask
 from actant.workflow import patched, wait_signal
 ```
 
-`from actant import *` 只导入 `actant.__all__` 里的 18 个名字（含 `__version__`：虽以下划线开头，但显式列入 `__all__` 因而同样被导出）；旧路径（如 `from actant import Task`）已移除，不再提供兼容垫片。
+`from actant import *` 只导入 `actant.__all__` 里的 18 个名字（含 `__version__`：虽以下划线开头，但显式列入 `__all__` 因而同样被导出）。其余名字不在顶层导出，例如 `from actant import Task` 会直接 `ImportError`，不提供兼容垫片。
 
 ## 结果读取路径
 
@@ -45,11 +46,11 @@ from actant.workflow import patched, wait_signal
 | 场景 | 入口 | 返回 | 数据来源 |
 | --- | --- | --- | --- |
 | 本进程持有句柄（首选） | `AsyncResult.result()` / `FlowHandle.result()` | 值；失败重抛异常 | 内存完成 future |
-| 本进程按 `task_id` 查询 | `Runtime.get_task_result(task_id)` | 值或 `None` | 本进程任务注册表 |
-| 跨进程/重启取 flow 返回值 | `Runtime.get_workflow_result(workflow_id)` | 值或 `None` | 持久化 Store |
+| 本进程按 `task_id` 查询 | `Runtime.get_task_result(task_id)` | 值；缺失抛 `NotFoundError` | 持久化 Store（LMDB） |
+| 跨进程/重启取 flow 返回值 | `Runtime.get_workflow_result(workflow_id)` | 值；缺失抛 `NotFoundError` | 持久化 Store（LMDB） |
 | 查看流程编排进度 | `Runtime.get_workflow_state(workflow_id)` | 状态 dict 或 `None` | Orchestrator 快照 |
 
-- 句柄路径包含等待与异常重抛；其余三条都是**非阻塞读取**。
+- 句柄路径包含等待与异常重抛；其余三条都是**非阻塞读取**（缺失记录抛 `NotFoundError`，不返回 `None`）。
 - `get_workflow_state` 看的是节点/等待点进度，不返回 flow 函数体返回值。
 - `get_workflow_journal(workflow_id)` 返回事件视图（`raw=True` 为底层历史），用于审计而非取结果。
 
@@ -71,6 +72,8 @@ from actant.workflow import patched, wait_signal
 ## 扩展与观测
 
 ::: actant.effects
+
+::: actant.ext
 
 ## 测试台
 

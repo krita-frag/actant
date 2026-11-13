@@ -33,7 +33,10 @@ usage: actant worker [-h] [--name NAME] [--data-dir DATA_DIR]
                      [--remote-fallback-delay-ms REMOTE_FALLBACK_DELAY_MS]
                      [--scheduler {priority,fifo}] [--role {both,orchestrator,worker}]
                      [--payload-signing-key PAYLOAD_SIGNING_KEY]
-                     [--bootstrap-nodes BOOTSTRAP_NODES] [--listen-port LISTEN_PORT]
+                     [--bootstrap-nodes BOOTSTRAP_NODES]
+                     [--gossip-bootstrap-peers GOSSIP_BOOTSTRAP_PEERS]
+                     [--discovery {none,local,dns}] [--listen-ip LISTEN_IP]
+                     [--listen-port LISTEN_PORT] [--relay-endpoints RELAY_ENDPOINTS]
                      [--heartbeat-interval-ms HEARTBEAT_INTERVAL_MS]
                      [--failure-timeout-ms FAILURE_TIMEOUT_MS] [--metrics-port METRICS_PORT]
                      [--resume] [--host-flows]
@@ -60,9 +63,17 @@ options:
   --payload-signing-key PAYLOAD_SIGNING_KEY
                         P2P payload 签名密钥（也可用 ACTANT_PAYLOAD_KEY 环境变量）
   --bootstrap-nodes BOOTSTRAP_NODES
-                        逗号分隔的 bootstrap 节点地址
+                        逗号分隔的 bootstrap 节点地址（完整 endpoint_addr，而非仅 endpoint id）
+  --gossip-bootstrap-peers GOSSIP_BOOTSTRAP_PEERS
+                        逗号分隔的 gossip 引导对端 endpoint ID；discovery=none 时必填，否则只建立直连、不会加入 gossip
+  --discovery {none,local,dns}
+                        节点发现 preset（默认 local）。纯内网/离线用 none；也可用 ACTANT_DISCOVERY 环境变量覆盖
+  --listen-ip LISTEN_IP
+                        P2P 监听 IPv4 地址（默认所有接口；内网部署建议显式指定）
   --listen-port LISTEN_PORT
                         P2P 监听端口（默认随机端口）
+  --relay-endpoints RELAY_ENDPOINTS
+                        逗号分隔的自建 relay URL 列表（覆盖 preset 自带 relay）
   --heartbeat-interval-ms HEARTBEAT_INTERVAL_MS
                         故障转移心跳间隔毫秒
   --failure-timeout-ms FAILURE_TIMEOUT_MS

@@ -58,6 +58,7 @@ from actant._internal.runtime_base import (
     TASK_STATE_RUNNING,
     _RuntimeBase,
 )
+from actant.actant import get_version as _get_extension_version
 from actant.capabilities import (
     BUILTIN_CAPABILITIES,
     RUST_BACKED_CAPABILITIES,
@@ -83,6 +84,9 @@ if TYPE_CHECKING:
 _runtime_local = threading.local()
 
 _logger = logging.getLogger("actant.runtime")
+
+# 运行时元数据写入 node_meta.json 时使用；扩展版本在模块加载时确定。
+_PACKAGE_VERSION = _get_extension_version()
 
 #: ``Runtime.test()`` 的默认 drain 超时（秒）。测试进程退出应快速，
 #: 避免命中生产默认的 30s 等待。
@@ -176,23 +180,7 @@ class Layer:
         """
         if not callable(handler):
             raise TypeError(f"handler must be callable, got {type(handler)}")
-        with self._runtime._lock:
-            self._runtime._layers[self._meta.name].append(handler)
-            # 检测"start 后追加 Rust-backed handler"的常见误用场景并 warn。
-            # 不阻止操作——Python 端 actant.ask/perform/emit 仍会读到该 handler，
-            # 但用户期望它影响 Rust 内部分发（如 Worker 任务执行）时会失效。
-            if self._runtime._started and self._meta.name in RUST_BACKED_CAPABILITIES:
-                _logger.warning(
-                    "Layer.chain(%r) called after Runtime.start(); "
-                    "this Python handler will NOT be consulted by Rust-internal "
-                    "dispatch paths (e.g. Worker task execution). It only takes "
-                    "effect for Python-initiated actant.ask/perform/emit calls. "
-                    "Placement policies (routing/scheduling/retry) are provided "
-                    "by Rust RoutePolicy/Scheduler or a layer-3 scheduler. "
-                    "To override Rust-internal behavior, configure Rust-side "
-                    "handlers via RuntimeBuilder.",
-                    self._meta.name,
-                )
+        self._runtime.chain(self._meta.name, handler)
         return self
 
     def remove(self, handler: Callable[[Any], Any]) -> bool:
@@ -352,7 +340,6 @@ class _RuntimeTaskMixin(_RuntimeBase):
         """事件批处理器渲染回调：把本 Runtime 绑定到当前线程后直接 emit。
 
         由 ``_EventBatcher`` 的后台 flush 线程调用（该线程无线程局部 Runtime）。
-        ``_bypass_batcher=True`` 防止 flush 中再次路由回 batcher 造成回环。
 
         Args:
             kind: ``TaskLifecycle`` 事件类型（started/completed/failed）。
@@ -364,13 +351,7 @@ class _RuntimeTaskMixin(_RuntimeBase):
         from actant._internal.tasks.helpers import _emit_task_event
 
         with use_runtime(cast("Runtime", self)):
-            _emit_task_event(
-                kind,
-                task_id,
-                workflow_id,
-                _bypass_batcher=True,
-                **event_kwargs,
-            )
+            _emit_task_event(kind, task_id, workflow_id, **event_kwargs)
 
     def _emit_batch(self, kind: str, task_id: str, workflow_id: str, **kwargs: Any) -> None:
         """发布一条 ``TaskLifecycle`` 事件。
@@ -637,7 +618,7 @@ class _RuntimeTaskMixin(_RuntimeBase):
         """
         core = self._rust_core
         if core is None:
-            raise InvalidStateError("Runtime not started: rust_core is None")
+            raise InvalidStateError("Runtime not started")
         return cast(
             "dict[str, Any]",
             core.report_task_result(workflow_id, task_id, state, result, error),
@@ -915,7 +896,7 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
         """
         core = self._rust_core
         if core is None:
-            raise InvalidStateError("Runtime not started: rust_core is None")
+            raise InvalidStateError("Runtime not started")
         core.submit_workflow(
             workflow_id,
             failure_strategy,
@@ -953,7 +934,7 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
         """
         core = self._rust_core
         if core is None:
-            raise InvalidStateError("Runtime not started: rust_core is None")
+            raise InvalidStateError("Runtime not started")
         return cast("dict[str, Any]", core.add_workflow_node(workflow_id, node, deps))
 
     def cancel_workflow(self, workflow_id: str) -> None:
@@ -966,7 +947,7 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
         """
         core = self._rust_core
         if core is None:
-            raise InvalidStateError("Runtime not started: rust_core is None")
+            raise InvalidStateError("Runtime not started")
         core.cancel_workflow(workflow_id)
 
     def _seal_workflow(self, workflow_id: str) -> None:
@@ -980,7 +961,7 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
         """
         core = self._rust_core
         if core is None:
-            raise InvalidStateError("Runtime not started: rust_core is None")
+            raise InvalidStateError("Runtime not started")
         core.seal_workflow(workflow_id)
 
     def _register_wait_point(
@@ -1013,7 +994,7 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
         """
         core = self._rust_core
         if core is None:
-            raise InvalidStateError("Runtime not started: rust_core is None")
+            raise InvalidStateError("Runtime not started")
         core.register_wait_point(workflow_id, wait_key, kind, name, deadline_ms)
 
     def signal_wait_point(
@@ -1056,7 +1037,7 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
         """
         core = self._rust_core
         if core is None:
-            raise InvalidStateError("Runtime not started: rust_core is None")
+            raise InvalidStateError("Runtime not started")
         return cast(
             "bytes | None",
             core.signal_wait_point(workflow_id, wait_key, payload),
@@ -1085,7 +1066,7 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
         """
         core = self._rust_core
         if core is None:
-            raise InvalidStateError("Runtime not started: rust_core is None")
+            raise InvalidStateError("Runtime not started")
         return int(core.resume_suspended(workflow_id))
 
     def _resolve_workflow_context_value(
@@ -1116,7 +1097,7 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
         """
         core = self._rust_core
         if core is None:
-            raise InvalidStateError("Runtime not started: rust_core is None")
+            raise InvalidStateError("Runtime not started")
         return bytes(
             core.resolve_context_value(workflow_id, key, kind, candidate)
         )
@@ -1134,7 +1115,7 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
         """
         core = self._rust_core
         if core is None:
-            raise InvalidStateError("Runtime not started: rust_core is None")
+            raise InvalidStateError("Runtime not started")
         return cast("bytes | None", core.get_context_value(workflow_id, key))
 
     def _wait_wait_point(
@@ -1170,7 +1151,7 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
         """
         core = self._rust_core
         if core is None:
-            raise InvalidStateError("Runtime not started: rust_core is None")
+            raise InvalidStateError("Runtime not started")
         return cast(
             "bytes | None", core.wait_wait_point(workflow_id, wait_key, timeout_ms)
         )
@@ -1202,7 +1183,7 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
         """
         core = self._rust_core
         if core is None:
-            raise InvalidStateError("Runtime not started: rust_core is None")
+            raise InvalidStateError("Runtime not started")
         return cast(
             "Awaitable[bytes | None]",
             core.wait_wait_point_async(workflow_id, wait_key, timeout_ms),
@@ -1220,7 +1201,7 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
         """
         core = self._rust_core
         if core is None:
-            raise InvalidStateError("Runtime not started: rust_core is None")
+            raise InvalidStateError("Runtime not started")
         return cast("dict[str, Any] | None", core.get_workflow_state(workflow_id))
 
     def get_task_result(self, task_id: str) -> Any:
@@ -1248,10 +1229,10 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
         # 当前帧的局部引用；局部 core 会延长 LMDB env 的生命周期直到 GC
         # （同进程立即重开同一 data_dir 会撞上 "environment already open"）。
         if self._rust_core is None:
-            raise InvalidStateError("Runtime not started: rust_core is None")
+            raise InvalidStateError("Runtime not started")
         store = self._terminal
         if store is None:
-            raise InvalidStateError("Runtime not started: rust_core is None")
+            raise InvalidStateError("Runtime not started")
         return store.task_result(task_id)
 
     def forget(
@@ -1283,10 +1264,10 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
             self._idempotency.forget(key)
             return
         if self._rust_core is None:
-            raise InvalidStateError("Runtime not started: rust_core is None")
+            raise InvalidStateError("Runtime not started")
         store = self._terminal
         if store is None:
-            raise InvalidStateError("Runtime not started: rust_core is None")
+            raise InvalidStateError("Runtime not started")
         if kind == "task":
             store.forget_task(key)
         elif kind == "workflow_result":
@@ -1320,10 +1301,10 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
                 或从未在此 ``data_dir`` 运行）。
         """
         if self._rust_core is None:
-            raise InvalidStateError("Runtime not started: rust_core is None")
+            raise InvalidStateError("Runtime not started")
         store = self._terminal
         if store is None:
-            raise InvalidStateError("Runtime not started: rust_core is None")
+            raise InvalidStateError("Runtime not started")
         return store.workflow_result(workflow_id, self._continued_to)
 
     def get_dag(self, workflow_id: str) -> dict[str, Any] | None:
@@ -1350,7 +1331,7 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
         """
         core = self._rust_core
         if core is None:
-            raise InvalidStateError("Runtime not started: rust_core is None")
+            raise InvalidStateError("Runtime not started")
         return cast("dict[str, Any] | None", core.get_dag(workflow_id))
 
     def get_workflow_journal(
@@ -1392,7 +1373,7 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
         """
         core = self._rust_core
         if core is None:
-            raise InvalidStateError("Runtime not started: rust_core is None")
+            raise InvalidStateError("Runtime not started")
         if raw:
             return cast(
                 "list[dict[str, Any]]",
@@ -1415,7 +1396,7 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
         """
         core = self._rust_core
         if core is None:
-            raise InvalidStateError("Runtime not started: rust_core is None")
+            raise InvalidStateError("Runtime not started")
         return cast("dict[str, Any] | None", core.get_workflow_invocation(workflow_id))
 
     def list_workflows(self, *, include_archived: bool = False) -> list[str]:
@@ -1431,7 +1412,7 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
         """
         core = self._rust_core
         if core is None:
-            raise InvalidStateError("Runtime not started: rust_core is None")
+            raise InvalidStateError("Runtime not started")
         return list(core.list_workflows(include_archived))
 
     def delete_workflow(self, workflow_id: str) -> None:
@@ -1449,7 +1430,7 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
         """
         core = self._rust_core
         if core is None:
-            raise InvalidStateError("Runtime not started: rust_core is None")
+            raise InvalidStateError("Runtime not started")
         core.delete_workflow(workflow_id)
 
 
@@ -1470,7 +1451,7 @@ class _RuntimeNetworkMixin(_RuntimeBase):
                 "node_id": self.node_id,
                 "name": self._name,
                 "last_started": datetime.now(timezone.utc).isoformat(),
-                "version": __import__("actant").__version__,
+                "version": _PACKAGE_VERSION,
             }
             meta_path = os.path.join(self._data_dir, "node_meta.json")
             with open(meta_path, "w", encoding="utf-8") as f:
@@ -1587,7 +1568,7 @@ class _RuntimeNetworkMixin(_RuntimeBase):
         """
         core = self._rust_core
         if core is None:
-            raise InvalidStateError("Runtime not started: rust_core is None")
+            raise InvalidStateError("Runtime not started")
         core.register_task_log_callback(callback, task_id)
 
     def on_worker_state(self, callback: Callable[[dict[str, Any]], None]) -> None:
@@ -1604,7 +1585,7 @@ class _RuntimeNetworkMixin(_RuntimeBase):
         """
         core = self._rust_core
         if core is None:
-            raise InvalidStateError("Runtime not started: rust_core is None")
+            raise InvalidStateError("Runtime not started")
         core.register_worker_state_callback(callback)
 
     def peers(self) -> list[dict[str, Any]]:
@@ -1621,7 +1602,7 @@ class _RuntimeNetworkMixin(_RuntimeBase):
         """
         core = self._rust_core
         if core is None:
-            raise InvalidStateError("Runtime not started: rust_core is None")
+            raise InvalidStateError("Runtime not started")
         return [dict(item) for item in core.peers()]
 
     def update_node_state(

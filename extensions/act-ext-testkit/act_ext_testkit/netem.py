@@ -315,15 +315,23 @@ class NetemRun:
 
 
 def shaping_supported() -> tuple[bool, str]:
-    """当前环境是否支持 OS 级整形（检测 ``tc`` 与 Linux 平台）。"""
+    """当前环境是否支持 OS 级整形（Linux ``tc`` 或 macOS dummynet）。"""
+    import os
     import platform
     import shutil
 
-    if platform.system() != "Linux":
+    system = platform.system()
+    if system == "Darwin":
+        if shutil.which("dnctl") is None or shutil.which("pfctl") is None:
+            return (False, "macOS dummynet needs 'dnctl' and 'pfctl' on PATH")
+        if not os.path.exists("/dev/pf") or os.geteuid() != 0:
+            return (False, "macOS dummynet requires root; see DnctlFabric")
+        return (True, "macOS dummynet available; see DnctlFabric for port wiring")
+    if system != "Linux":
         return (
             False,
-            "OS-level traffic shaping requires Linux; use CommandFabric "
-            "(toxiproxy/iptables on another host) or SemanticNetem",
+            "OS-level traffic shaping requires Linux 'tc' or macOS dummynet; "
+            "use CommandFabric or SemanticNetem",
         )
     if shutil.which("tc") is None:
         return (

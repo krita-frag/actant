@@ -56,13 +56,15 @@ def test_reorder_is_documented_as_drop_approximation() -> None:
     assert profile.effective_drop == pytest.approx(0.25)
 
 
-def test_shaping_is_explicitly_unavailable() -> None:
+def test_shaping_reports_platform_capability() -> None:
     supported, reason = shaping_supported()
-    if sys.platform != "linux":
-        assert supported is False
-        assert "Linux" in reason
-    else:
+    if sys.platform == "linux":
         assert supported is True or reason
+    elif sys.platform == "darwin":
+        assert supported is True or "dummynet" in reason
+    else:
+        assert supported is False
+        assert "Linux" in reason or "macOS" in reason
 
 
 def test_empty_nodes_rejected() -> None:

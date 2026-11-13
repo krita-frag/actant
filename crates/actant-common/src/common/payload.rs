@@ -1,7 +1,8 @@
 //! 任务 payload 编解码与完整性保护。
 //!
 //! Rust 核心不感知宿主语言的参数语义：本模块只提供不透明字节的基础打包
-//! （`pack_group` 由 Python 侧调用），payload 序列化后签名、反序列化前验证。
+//! （`pack_group` 由 Python 侧与 Rust orchestrator 共用），payload 序列化后
+//! 签名、反序列化前验证。
 //!
 //! 载荷布局、tag 边界与完整性策略见 `docs/architecture/framework-contract.md`。
 
@@ -16,7 +17,7 @@ const TAG_SINGLE_KW: u8 = 0x02;
 
 /// 将多个结果打包为 `[TAG_GROUP, count(u32 LE), len1(u32 LE), data1, ...]`。
 ///
-/// 由 Python 侧调用构建 default_payload，Rust 不直接调用。
+/// 由 Python 侧与 Rust orchestrator 共同用于构建分组 payload。
 ///
 /// 返回 `Err` 当 `results.len()` 或任一 `data.len()` 超过 `u32::MAX`——
 /// payload 格式用 u32 LE 编码长度，超过会静默截断，导致 unpack 时读到

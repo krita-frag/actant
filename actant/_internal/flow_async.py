@@ -47,10 +47,10 @@ from actant._internal.flow import (
     _ContinueAsNew,
     _current_flow_state,
     _deadline_failure,
+    _emit_terminal,
     _FlowContext,
     _FlowState,
     _raise_if_workflow_terminal,
-    _safe_emit,
     _settle_flow_failure,
     _terminal_kind,
     _wait_context,
@@ -245,21 +245,12 @@ async def _wait_terminal_and_emit_async(
             "dict[str, Any] | None",
             runtime.get_workflow_state(workflow_id),
         )
-        kind = _terminal_kind(state)
-        if kind in ("missing", "completed"):
-            if on_completed is not None:
-                on_completed()
-            _safe_emit(workflow_id, "completed")
-            return state
-        if kind == "failed":
-            _safe_emit(workflow_id, "failed", error=(state or {}).get("error") or "")
-            return state
-        if kind == "cancelled":
-            _safe_emit(
-                workflow_id,
-                "failed",
-                error=(state or {}).get("error") or "workflow cancelled",
-            )
+        if _emit_terminal(
+            workflow_id,
+            state,
+            _terminal_kind(state),
+            on_completed=on_completed,
+        ):
             return state
         await asyncio.sleep(_FLOW_TERMINAL_POLL_INTERVAL_S)
 

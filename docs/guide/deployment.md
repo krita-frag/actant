@@ -41,14 +41,14 @@
 
 | preset | 用途 | 行为 |
 | --- | --- | --- |
-| `none` | 测试 / CI / 单节点 | 仅 loopback，无 DNS Pkarr，无 relay；须通过 `bootstrap_nodes` 显式拨号 |
+| `none` | 测试 / CI / 内网离线 | 无 DNS Pkarr；默认无 relay（`relay_endpoints` 可覆盖）；监听地址由 `listen_ip` / `listen_port` 决定；须同时配置 `bootstrap_nodes`（完整 endpoint_addr）与 `gossip_bootstrap_peers`（endpoint id） |
 | `local` | 互联网节点通用模式（默认） | iroh N0 preset：DNS Pkarr 发现 + relay 兜底 |
-| `dns` | 仅 DNS endpoint 发现 | 配合 `dns_origin_domain` 使用自定义 DNS 起源域 |
+| `dns` | 有公网出站的内网 | 自定义 DNS 查询域；发布端仍固定为 n0 Pkarr，纯离线不可用 |
 
 `Runtime()` 的默认 preset 取决于 `data_dir`：**未显式传 `data_dir` 时为 `none`**，**显式给了 `data_dir` 时为 `local`**。
 
-!!! note "已删除的 preset"
-    `mdns` 与 `relay` preset 已在 0.3.5 删除。需要自定义 relay 时使用 `relay_endpoints` 配置项。
+!!! note "内置 preset"
+    内置 preset 只有 `none` / `local` / `dns`；需要自定义 relay 时使用 `relay_endpoints` 配置项。
 
 ```python
 from actant import Runtime
@@ -60,12 +60,53 @@ def _cfg(preset: str, **kw):
         network=_NetworkConfig(preset=preset, **kw),
     )
 
-rt = Runtime(config=_cfg("none", bootstrap_nodes=["<endpoint-id>"]))
+rt = Runtime(config=_cfg(
+    "none",
+    listen_ip="10.0.0.11",
+    listen_port=41000,
+    bootstrap_nodes=["<seed 的完整 endpoint_addr hex>"],
+    gossip_bootstrap_peers=["<seed 的 endpoint_id>"],
+))
 ```
+
+`bootstrap_nodes` 只建立直连，不会把对端加入 gossip；`none` 模式下必须同时配置
+`gossip_bootstrap_peers`，否则心跳与任务分发都无法建立成员关系。
 
 环境变量 `ACTANT_DISCOVERY=<preset>` 优先于配置，用于在不动代码的前提下切换发现策略（例如 CI 中强制 `ACTANT_DISCOVERY=none`）。
 
 未知 preset 在启动时通过 `DiscoveryMode::validate` 校验并返回 `Config` 错误，无静默回退。
+
+## 内网 / 离线部署
+
+内网部署的核心是三件事：关闭公网发现、显式指定可达地址、显式注入成员。
+Python API 在上方 `none` preset 示例基础上追加 `allowed_peer_ids` /
+`require_signed_records`，并在启动顺序不可控时调用 `rt.dial(seed_endpoint_addr)`
+自行重试；下面只列 CLI 与运维步骤。
+
+**CLI**
+
+```bash
+actant worker \
+  --data-dir /data/actant \
+  --discovery none \
+  --listen-ip 10.0.0.12 --listen-port 41000 \
+  --bootstrap-nodes "<seed 的完整 endpoint_addr hex>" \
+  --gossip-bootstrap-peers "<seed 的 endpoint_id>" \
+  --payload-signing-key "$ACTANT_PAYLOAD_KEY"
+```
+
+**运维要点**
+
+- 先启动 seed（可以只有 seed 不配置 bootstrap）；其他节点都指向 seed。
+- 每台节点用 `rt.listen_addresses()["direct_addrs"]` 确认通告的是内网地址，
+  用 `rt.peers()` 确认成员收敛。
+- 防火墙放行 UDP `listen_port`；跨子网且无法直连时，自建 iroh relay 并配置
+  `relay_endpoints`。生产建议使用受信任的 TLS 证书（自签证书默认不被信任）；
+  明文 `http://` 仅适合隔离测试环境。
+- `listen_ip` 只接受 IPv4，且不会禁用 IPv6；有全局 IPv6 的宿主机需要额外
+  在网络层限制。
+- 启动时 bootstrap 失败只记 WARN、不会自动重试；需要时在 `start()` 后自行
+  循环调用 `rt.dial()`。
 
 ## 构造预设
 
@@ -81,49 +122,14 @@ rt = Runtime(config=_cfg("none", bootstrap_nodes=["<endpoint-id>"]))
 
 ### 自定义路由策略
 
-`route_policy` 接受内置名称或 Python callable：
-
-| 取值 | 行为 |
-| --- | --- |
-| `None` / `"default"` | 心跳新鲜度 + 槽位比较 + 标签适配（`DefaultRoutePolicy`） |
-| `"label_affinity"` | 本地满足标签即本地执行，否则转给标签匹配且槽位最多的 peer |
-| callable | `fn(ctx: dict, candidates: list[dict]) -> 决策` |
-
-callable 的返回值：
-
-| 返回 | 含义 |
-| --- | --- |
-| `"local"` | 本地执行；本地不满足标签或配额时框架仍会改写为 `defer` |
-| `"defer"` | 本轮延后，按 `remote_fallback_delay_ms` 重新入队 |
-| `("remote", node_id)` | 转发到指定 peer；节点不在候选或缺 endpoint 地址时降级为 `defer` |
-| `("defer", reason)` | 同上，`reason` 进入日志与 starvation 失败信息 |
-| `None` | 弃权，交回 `DefaultRoutePolicy` |
-
-`ctx` 的键：`local_role` / `local_draining` / `local_available_slots` /
-`heartbeat_ttl_ms` / `local_labels` / `local_available_quotas` / `required_tags` /
-`required_quota`。`candidates` 每项的键：`node_id` / `endpoint_addr` /
-`available_slots` / `max_slots` / `role` / `draining` / `last_heartbeat_ms` /
-`labels` / `available_quotas`。
-
-回调抛异常、返回非法值、或拿不到 GIL 时，本次决策记 warning 并回退到
-`DefaultRoutePolicy`，不会中断任务。回调在 routing 线程上同步执行，**不要**在其中
-等待任务结果或做阻塞调用（例如 `AsyncResult.result()`），否则会与该线程负责的
-结果回泵互相等待。
+`route_policy` 接受内置名称或 Python callable；自定义策略可用
+`actant.ext.bind_placement_policy` 包装。取值、字段、异常与 GIL 回退语义见
+[框架契约](../architecture/framework-contract.md)，类型化写法与示例见
+[扩展作者指南](extensions.md)。
 
 ```python
-def pick(ctx, candidates):
-    if ctx["local_available_slots"] > 0 and not ctx["local_draining"]:
-        return "local"
-    free = [c for c in candidates if c["available_slots"] > 0 and not c["draining"]]
-    if not free:
-        return "defer"
-    best = max(free, key=lambda c: c["available_slots"])
-    return ("remote", best["node_id"])
-
-
-rt = Runtime(route_policy=pick)
+rt = Runtime(route_policy="label_affinity")
 ```
-
 
 **高级参数**通过 `config=_ActantConfig(...)` 传入，仅在明确需要调优时使用：`store`（`_StoreConfig`）、`prefetch_*`、`state_poll_interval_ms`、`pending_result_channel_capacity`、`completed_retention_count`、`max_history_events`、`num_worker_processes`、`node_quotas` 等。字段与默认值见 [配置项](../reference/configuration.md)。
 
@@ -146,7 +152,10 @@ uv run actant worker --max-concurrent-tasks 8 --scheduler priority
 uv run actant worker --resume
 ```
 
-显式指定 `--data-dir` 后节点才启用 iroh P2P 自动发现，无需中心服务器；不指定时默认 `preset="none"`，仅 loopback（见上文「网络发现」）。
+显式指定 `--data-dir` 后节点默认使用 `local`（公网 DNS + relay）发现；内网部署请加
+`--discovery none`，并同时提供 `--bootstrap-nodes` 与 `--gossip-bootstrap-peers`
+（见上文「内网 / 离线部署」）。不指定 `--data-dir` 时 CLI 不启动 iroh，只是单进程
+worker，不参与 P2P。
 
 ## 节点标签与配额
 

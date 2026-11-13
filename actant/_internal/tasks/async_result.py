@@ -59,6 +59,9 @@ def _raise_if_blocking_in_loop() -> None:
 # 已完成"必须以 _state 终态为准而非 _future.is_set()（后者存在窗口）。
 _TERMINAL_STATES = frozenset(("completed", "failed", "cancelled"))
 
+# `_finish` 的"未提供该字段"哨兵；用独立对象区分"显式传入 None"。
+_UNSET = object()
+
 
 class _CompletionFuture:
     """``AsyncResult`` 的底层完成信号。
@@ -68,21 +71,16 @@ class _CompletionFuture:
     - ``set()``：标记完成并唤醒所有等待者。
     - ``is_set()``：非阻塞查询。
 
-    与 ``threading.Event`` 的区别：``Condition`` 允许我们在同一锁下原子地
-    设置完成状态并触发 intrusive callback 链，避免 Event + Lock 两次锁切换。
-    所有 ``add_done_callback`` 注册的回调以 singly-linked list 形式 intrusive
-    串接在 future 上——节点本身持有 next 指针，避免维护单独的 list 容器。
+    完成回调统一由 :meth:`AsyncResult.add_done_callback` 维护，本类只负责
+    等待/唤醒，不再维护第二套回调容器。
     """
 
-    __slots__ = ("_callback_head", "_cond", "_done", "_lock")
+    __slots__ = ("_cond", "_done", "_lock")
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._cond = threading.Condition(self._lock)
         self._done = False
-        # Intrusive linked list head: 每个节点是 (callback, next_node)。
-        # None 表示链表为空。新回调插入头部（O(1)）。
-        self._callback_head: tuple[Callable[[], None], Any] | None = None
 
     def is_set(self) -> bool:
         with self._lock:
@@ -100,39 +98,13 @@ class _CompletionFuture:
             self._cond.wait(timeout=timeout)
             return self._done
 
-    def add_callback(self, cb: Callable[[], None]) -> None:
-        """注册一个完成回调。若已完成，立即同步调用。"""
-        invoke_now = False
-        with self._lock:
-            if self._done:
-                invoke_now = True
-            else:
-                # 头插法：intrusive linked list。
-                self._callback_head = (cb, self._callback_head)
-        if invoke_now:
-            cb()
-
     def set(self) -> None:
-        """标记完成并唤醒所有等待者，触发 intrusive callback 链。"""
+        """标记完成并唤醒所有等待者。"""
         with self._lock:
             if self._done:
                 return
             self._done = True
-            head = self._callback_head
-            self._callback_head = None
             self._cond.notify_all()
-        # 在锁外顺序触发回调，避免回调内再次获取锁导致死锁。
-        while head is not None:
-            cb, next_node = head
-            head = next_node
-            try:
-                cb()
-            except Exception:
-                _logger.debug(
-                    "CompletionFuture: callback %r raised",
-                    getattr(cb, "__name__", cb),
-                    exc_info=True,
-                )
 
 
 class AsyncResult:
@@ -401,18 +373,22 @@ class AsyncResult:
             if self._state == "pending":
                 self._state = "running"
 
-    def _set_result(self, result_obj: Any) -> None:
-        """设置任务成功结果（对象缓存态）并触发回调。
-
-        Args:
-            result_obj: 任务返回值（worker 结果帧反序列化产物，任意类型，
-                包括 bytes）。
-        """
+    def _finish(
+        self,
+        state: TaskState,
+        *,
+        result: Any = _UNSET,
+        error_payload: Any = _UNSET,
+    ) -> None:
+        """统一的终态写入：置 state/结果、清空回调、唤醒 future。"""
         with self._lock:
             if self._future.is_set():
                 return
-            self._result = result_obj
-            self._state = "completed"
+            if result is not _UNSET:
+                self._result = result
+            if error_payload is not _UNSET:
+                self._error_payload = error_payload
+            self._state = state
             callbacks = list(self._callbacks)
             self._callbacks.clear()
         # 在锁外触发 future.set()，使 Condition.notify_all 与 callback 链
@@ -424,25 +400,22 @@ class AsyncResult:
             label=f"AsyncResult {self.task_id}: done callback",
         )
 
+    def _set_result(self, result_obj: Any) -> None:
+        """设置任务成功结果（对象缓存态）并触发回调。
+
+        Args:
+            result_obj: 任务返回值（worker 结果帧反序列化产物，任意类型，
+                包括 bytes）。
+        """
+        self._finish("completed", result=result_obj)
+
     def _set_result_ref(self, ref_bytes: bytes) -> None:
         """设置任务成功结果为 ``Ref``（大结果态）并触发回调。
 
         Args:
             ref_bytes: 结果帧字节落 blob 后的 BlobRef wire 编码。
         """
-        with self._lock:
-            if self._future.is_set():
-                return
-            self._result = Ref(ref_bytes)
-            self._state = "completed"
-            callbacks = list(self._callbacks)
-            self._callbacks.clear()
-        self._future.set()
-        _invoke_callbacks(
-            callbacks,
-            self,
-            label=f"AsyncResult {self.task_id}: done callback",
-        )
+        self._finish("completed", result=Ref(ref_bytes))
 
     def _set_error(self, error_payload_or_msg: bytes | str | BaseException) -> None:
         """设置任务失败结果并触发回调。
@@ -454,39 +427,17 @@ class AsyncResult:
                 - ``BaseException``：异常对象（本地 dispatch 的优化路径），
                   序列化后存入 ``_error_payload`` 供 ``result()`` 重新抛出。
         """
-        with self._lock:
-            if self._future.is_set():
-                return
-            if isinstance(error_payload_or_msg, bytes):
-                self._error_payload = error_payload_or_msg
-            elif isinstance(error_payload_or_msg, BaseException):
-                self._error_payload = cloudpickle.dumps(error_payload_or_msg)
-            else:
-                self._error_payload = cloudpickle.dumps(ActantError(error_payload_or_msg))
-            self._state = "failed"
-            callbacks = list(self._callbacks)
-            self._callbacks.clear()
-        self._future.set()
-        _invoke_callbacks(
-            callbacks,
-            self,
-            label=f"AsyncResult {self.task_id}: done callback",
-        )
+        if isinstance(error_payload_or_msg, bytes):
+            payload = error_payload_or_msg
+        elif isinstance(error_payload_or_msg, BaseException):
+            payload = cloudpickle.dumps(error_payload_or_msg)
+        else:
+            payload = cloudpickle.dumps(ActantError(error_payload_or_msg))
+        self._finish("failed", error_payload=payload)
 
     def _set_cancelled(self) -> None:
         """标记任务为已取消并触发回调。"""
-        with self._lock:
-            if self._future.is_set():
-                return
-            self._state = "cancelled"
-            callbacks = list(self._callbacks)
-            self._callbacks.clear()
-        self._future.set()
-        _invoke_callbacks(
-            callbacks,
-            self,
-            label=f"AsyncResult {self.task_id}: done callback",
-        )
+        self._finish("cancelled")
 
     def __repr__(self) -> str:
         return f"AsyncResult(task_id={self.task_id!r}, state={self.state!r})"
@@ -712,9 +663,9 @@ def gather(
                 shared_event.set()
 
         for h in pending:
-            # 注册 intrusive callback 到 handle 的 CompletionFuture。
-            # 回调本身轻量（仅原子递减 + 条件 set），不阻塞 handle 完成路径。
-            h._future.add_callback(_on_done)
+            # 复用 handle 的完成回调链；回调本身轻量（仅原子递减 + 条件 set），
+            # 不阻塞 handle 完成路径。
+            h.add_done_callback(lambda _h: _on_done())
 
         # 主线程等待：所有 handle 完成或超时。
         # 共享 event 仅在最慢 handle 完成时被 set，因此 wait() 实际等待时长

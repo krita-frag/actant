@@ -34,11 +34,10 @@ Rust / Python 侧拼装。因此「有哪些缝」直接看 `RuntimeBuilder::wit
 | `Transport` | `RuntimeBuilder::with_transport` | 是 | 否 |
 | `Discovery` | `RuntimeBuilder::with_discovery` | 是 | 否 |
 | `EventLog` | `RuntimeBuilder::with_event_log` | 是 | 否 |
-| `SubmitBackend` | `Task.submit` 的后端协议（Python 侧） | 否 | 是 |
 | 内置 capability handler | `rt.layer(name).chain(handler)` | 否 | 是 |
 
 「跨节点可用」只对 Rust 缝成立：实现随引擎部署，workflow failover 后仍在本节点
-可用；Python handler 与 `SubmitBackend` 是进程内对象，不随工作流迁移。
+可用；Python handler 是进程内对象，不随工作流迁移。
 
 **统一的是词汇，不是调用路径**。所有扩展共用 capability / handler / effect 词汇，
 但按解析时机分两个执行域：
@@ -193,22 +192,15 @@ fn resolve_my_seam(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<...> { 
 模板的验收要求与其它扩展缝一致：注入入口 + 一条真实驱动生产路径的接线测试 +
 本节的边界说明；热路径文件仍受 `tests/python/unit/test_hot_path_guard.py` 约束。
 
-### 任务提交接缝
+### 任务提交路径
 
-`Task.submit` 经 `actant/_internal/tasks/backend.py` 的 `SubmitBackend` 协议提交，
-不直接解析全局 Runtime。默认 `EmbeddedSubmitBackend` 转交进程内 Runtime 与 Rust
-调度器；跨进程提交只需在同一协议上提供远程实现，`Task` 与 `@task` 的调用语义
-不变。`submit_batch` 仍走内嵌批量路径（批次注册与回滚语义属于内嵌实现）。
+`Task.submit` 直接解析当前线程的 Runtime，再按是否处于 flow 上下文分流：
+flow 内走 `_flow_submit`（节点持久化 + orchestrator 派发），否则构造
+`TaskDefinition` 交给 Rust 调度器。无活跃 Runtime 时抛 `InvalidStateError`。
+`submit_batch` 走内嵌批量路径（批次注册与回滚语义内联在同一实现）。
 
-**稳定性归属**：`SubmitBackend` 位于 `actant._internal`，分级为 internal——它是
-实现接缝而非公开契约，方法签名随核心演进，不承诺跨 0.x 兼容。需要稳定跨进程
-提交的调用方应使用 `extensions/act-service` 的 `ServiceClient`，不要基于本协议
-自行实现长期依赖。
-
-接缝由线程局部的 `use_submit_backend(backend)` 临时替换；`resolve_submit_backend()`
-优先取显式后端，否则按当前 Runtime 构造 `EmbeddedSubmitBackend`，无活跃 Runtime
-时返回 `None`（由 `Task._submit` 转成 `InvalidStateError`）。这是 Python 侧唯一的
-提交路径替换点，不影响 Rust 内部 dispatch。
+跨进程提交使用 `extensions/act-service` 的 `ServiceClient`，不在核心内预置
+可替换后端协议——单实现接缝没有运行时价值。
 
 ## 三、进程内 worker 协议（帧协议版本承诺）
 
@@ -232,7 +224,7 @@ worker 子进程（或任意语言的自定义 worker）与父进程经 **stdio*
 ### 载荷完整性
 
 - Rust 核心**不感知**宿主语言的参数语义（args/kwargs/TaskRef 等）；tag 常量仅用于 `unpack_payload` 内部校验，不构成跨语言契约。
-- `pack_group` 由 Python 侧调用构建分组 payload，Rust 视为不透明字节。
+- `pack_group` 供 Python 侧与 Rust orchestrator 构建分组 payload。
 - 所有任务 payload 序列化后签名、反序列化前验证，阻止被攻破的节点向集群投递恶意 cloudpickle payload。
 
 ## 四、子工作流组合模式

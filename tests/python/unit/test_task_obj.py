@@ -82,12 +82,10 @@ def test_task_submit_requires_runtime() -> None:
 
 
 def test_task_submit_to_sets_remote_target(monkeypatch: pytest.MonkeyPatch) -> None:
-    import importlib
-
-    backend = importlib.import_module("actant._internal.tasks.backend")
+    from actant._internal.tasks import task as task_mod
 
     fake_runtime = _FakeRuntime()
-    monkeypatch.setattr(backend, "get_current_runtime", lambda: fake_runtime)
+    monkeypatch.setattr(task_mod, "get_current_runtime", lambda: fake_runtime)
 
     @task
     def add(a: int, b: int) -> int:
@@ -100,52 +98,6 @@ def test_task_submit_to_sets_remote_target(monkeypatch: pytest.MonkeyPatch) -> N
     assert submitted is not None
     assert submitted.target_node == "worker-node"
     assert submitted.target_endpoint_addr == "peer-id"
-
-
-def test_task_submit_uses_registered_backend() -> None:
-    """提交接缝可替换：``Task.submit`` 只依赖 ``SubmitBackend``。"""
-    import importlib
-
-    backend_mod = importlib.import_module("actant._internal.tasks.backend")
-
-    class _RecordingBackend:
-        def __init__(self) -> None:
-            self.calls: list[tuple[tuple[object, ...], dict[str, object], str | None]] = []
-
-        def submit_task(
-            self,
-            task: object,
-            args: tuple[object, ...],
-            kwargs: dict[str, object],
-            *,
-            target_node: str | None,
-            target_endpoint_addr: str | None,
-            idempotency_key: str | None,
-        ) -> AsyncResult:
-            self.calls.append((args, kwargs, idempotency_key))
-            return AsyncResult("remote-task")
-
-    @task
-    def add(a: int, b: int) -> int:
-        return a + b
-
-    recorder = _RecordingBackend()
-    with backend_mod.use_submit_backend(recorder):
-        handle = add.submit(1, 2, idempotency_key="k1")
-
-    assert isinstance(handle, AsyncResult)
-    assert handle.task_id == "remote-task"
-    assert recorder.calls == [((1, 2), {}, "k1")]
-
-
-def test_submit_backend_stays_internal() -> None:
-    """``SubmitBackend`` 是实现接缝，不进入包级公开面。"""
-    import actant
-    from actant._internal.tasks import backend
-
-    assert "SubmitBackend" not in actant.__all__
-    assert not hasattr(actant, "SubmitBackend")
-    assert backend.SubmitBackend.__module__.startswith("actant._internal")
 
 
 def test_task_options_preserved() -> None:

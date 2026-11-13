@@ -31,7 +31,7 @@ Actant 的身份 = **P2P 无中心 fabric + ERH 能力分发 + 进程级隔离 +
 | 执行域 | 解析时机 | 典型扩展面 | 运行期成本 |
 | --- | --- | --- | --- |
 | 构造期定稿 | `build_time` | `RuntimeBuilder::with_*` 注入的 trait 缝、`PyRoutePolicy` 桥 | 一次 vtable 调用；无 PyO3 setter，不可热替换 |
-| 运行期解析 | `runtime` | `rt.layer(...).chain(...)` 的 capability handler、`SubmitBackend` | handler 链 + 注册表查表 / 编解码 / Actor 邮箱往返 |
+| 运行期解析 | `runtime` | `rt.layer(...).chain(...)` 的 capability handler | handler 链 + 注册表查表 / 编解码 / Actor 邮箱往返 |
 
 路由、调度、任务分发、传输广播与事件日志落盘位于每任务 / 每消息路径（`hot_path=true`），一律在构造期定稿；`ask` / `perform` / `emit` 只用于数据面与观测面。具体条目、验收强度与未覆盖方向以清单为准，边界与理由见[框架契约](framework-contract.md)。
 

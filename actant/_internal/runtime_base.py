@@ -86,16 +86,13 @@ class _RuntimeBase:
         if core is not None and entries:
             core._record_capability_invocations(entries)
 
-    def _dispatch_ask(self, name: str, request: Any) -> Any | None:
-        """决策型：逆序调用 handler，第一个返回非 None 的决定结果。
-
-        Python handler 全部弃权时，仅对 `RUST_BACKED_CAPABILITIES` 中的 capability
-        转发到 Rust capability runtime；是否有内置 handler 取决于该 capability。
-        自定义 capability 无 Rust 路径，全部弃权时返回 None。
-        """
-        with self._lock:
-            handlers = list(self._layers.get(name, []))
-        # 逆序：后注册的 handler 优先决策（用户自定义覆盖默认）
+    def _ask_chain(
+        self,
+        handlers: list[Callable[[Any], Any]],
+        name: str,
+        request: Any,
+    ) -> Any | None:
+        """逆序调用 handler 链；全部弃权时按需回退 Rust，否则返回 None。"""
         for handler in reversed(handlers):
             result = handler(request)
             if result is not None:
@@ -105,21 +102,29 @@ class _RuntimeBase:
         _logger.debug("ask %r: all %d handler(s) abstained", name, len(handlers))
         return None
 
-    def _dispatch_perform(self, name: str, request: Any) -> Any:
-        """副作用型：调用最后注册的 handler，结果直接返回。
+    def _dispatch_ask(self, name: str, request: Any) -> Any | None:
+        """决策型：逆序调用 handler，第一个返回非 None 的决定结果。
 
-        无 Python handler 时，仅对 `RUST_BACKED_CAPABILITIES` 转发到 Rust
-        capability runtime。`Store` 有 Rust `StoreHandler`；两个 lifecycle
-        capability 在 Rust 侧只有 codec 与空 layer，emit 时为空操作。
+        Python handler 全部弃权时，仅对 `RUST_BACKED_CAPABILITIES` 中的 capability
+        转发到 Rust capability runtime；是否有内置 handler 取决于该 capability。
+        自定义 capability 无 Rust 路径，全部弃权时返回 None。
         """
+        with self._lock:
+            handlers = list(self._layers.get(name, []))
+        return self._ask_chain(handlers, name, request)
+
+    def _perform_one(self, name: str, request: Any) -> Any:
+        """副作用型：调用最后注册的 handler；无 Python handler 时回退 Rust。"""
         with self._lock:
             handlers = list(self._layers.get(name, []))
         if handlers:
             return handlers[-1](request)
         if self._rust_runtime is not None and name in RUST_BACKED_CAPABILITIES:
             return self._rust_runtime.perform(name, request)
-
         raise NotFoundError(f"perform: capability {name!r} has no handlers")
+
+    def _dispatch_perform(self, name: str, request: Any) -> Any:
+        return self._perform_one(name, request)
 
     def _dispatch_emit(
         self,
@@ -191,37 +196,17 @@ class _RuntimeBase:
     def _dispatch_ask_async(self, name: str, request: Any) -> Any:
         """异步决策型 effect：返回 ``asyncio.Future``。
 
-        与 ``_dispatch_ask`` 的区别：
-        - 若 capability 是 Rust-backed 且无 Python handler 弃权，
-          转发到 ``_rust_runtime.ask_async``，结果通过 ``asyncio.Future`` 异步返回。
-        - 若 Python handler 命中，结果立即 resolve（无阻塞）。
-        - 若 Python handler 全部弃权且为 Python-only capability，
-          立即 resolve 为 ``None``。
-
-        Returns:
-            ``asyncio.Future``，await 后得到 handler 结果或 ``None``。
+        与 ``_dispatch_ask`` 共用 ``_ask_chain``：有 Python handler 时把整条链
+        放到 executor 执行；无 Python handler 时 Rust-backed 走 ``ask_async``，
+        其余立即 resolve 为 ``None``。
         """
         loop = self._get_asyncio_loop()
         with self._lock:
             handlers = list(self._layers.get(name, []))
         if handlers:
-            # Python handler 链：逆序调用，可能命中。
-            # 由于 handler 是同步函数，用 run_in_executor 在默认线程池中执行，
-            # 避免 GIL 长时间阻塞 event loop（如 CPU-bound handler）。
-            def _run_python_chain() -> Any | None:
-                for handler in reversed(handlers):
-                    result = handler(request)
-                    if result is not None:
-                        return result
-                # 全部弃权 → 若 Rust-backed 回退到 Rust，否则 None
-                if self._rust_runtime is not None and name in RUST_BACKED_CAPABILITIES:
-                    # 同步回退路径：在 executor 中调用同步 ask。
-                    return self._rust_runtime.ask(name, request)
-                _logger.debug("ask_async %r: all %d handler(s) abstained", name, len(handlers))
-                return None
-
-            return loop.run_in_executor(None, _run_python_chain)
-        # 无 Python handler：Rust-backed 走 ask_async，否则立即 None
+            return loop.run_in_executor(
+                None, lambda: self._ask_chain(handlers, name, request)
+            )
         if self._rust_runtime is not None and name in RUST_BACKED_CAPABILITIES:
             return self._rust_runtime.ask_async(name, request)
         fut = loop.create_future()
@@ -233,7 +218,7 @@ class _RuntimeBase:
 
         - 若 Python handler 存在，在 executor 中执行最后一个 handler。
         - 若无 Python handler 但为 Rust-backed，转发到 ``perform_async``。
-        - 若无 Python handler 且非 Rust-backed，抛 ``NotFoundError``。
+        - 若无 Python handler 且非 Rust-backed，返回带 ``NotFoundError`` 的 future。
         """
         loop = self._get_asyncio_loop()
         with self._lock:
@@ -276,8 +261,10 @@ class _RuntimeBase:
             return self._rust_runtime.perform_batch_async(items)
 
         async def _run_batch() -> list[Any]:
-            coros = [self._perform_one_async(name, req) for name, req in items]
-            return await asyncio.gather(*coros, return_exceptions=True)
+            awaitables = [
+                self._dispatch_perform_async(name, req) for name, req in items
+            ]
+            return await asyncio.gather(*awaitables, return_exceptions=True)
 
         return asyncio.ensure_future(_run_batch(), loop=loop)
 
@@ -288,21 +275,10 @@ class _RuntimeBase:
                 return False
         return name in RUST_BACKED_CAPABILITIES
 
-    async def _perform_one_async(self, name: str, request: Any) -> Any:
-        """单个 perform 的 async 包装，供 batch 使用。
-
-        区分 Python handler / Rust-backed / 未注册三种路径。
-        """
-        with self._lock:
-            handlers = list(self._layers.get(name, []))
-        if handlers:
-            last = handlers[-1]
-            # 同步 handler 在默认 executor 中执行
-            loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(None, lambda: last(request))
-        if self._rust_runtime is not None and name in RUST_BACKED_CAPABILITIES:
-            return await self._rust_runtime.perform_async(name, request)
-        raise NotFoundError(f"perform_async: capability {name!r} has no handlers")
+    def _require_started(self) -> None:
+        """确保 Runtime 已启动；未启动时抛 ``InvalidStateError``。"""
+        if self._rust_runtime is None:
+            raise InvalidStateError("Runtime not started")
 
     def _store_get(self, key: str) -> bytes | None:
         """读取持久化 Store 中的原始字节；未启动时返回 ``None``。
@@ -317,14 +293,12 @@ class _RuntimeBase:
 
     def _store_put(self, key: str, value: bytes) -> None:
         """写入持久化 Store 原始字节；未启动时抛 ``InvalidStateError``。"""
-        if self._rust_runtime is None:
-            raise InvalidStateError("Runtime not started: rust_core is None")
+        self._require_started()
         self._dispatch_perform("Store", StoreReq(op="put", key=key.encode(), value=value))
 
     def _store_put_batch(self, entries: list[tuple[str, bytes]]) -> None:
         """在单个 Store 事务内写入多条记录；未启动时抛 ``InvalidStateError``。"""
-        if self._rust_runtime is None:
-            raise InvalidStateError("Runtime not started: rust_core is None")
+        self._require_started()
         self._dispatch_perform(
             "Store",
             StoreReq(
@@ -335,8 +309,7 @@ class _RuntimeBase:
 
     def _store_delete(self, key: str) -> None:
         """删除持久化 Store 中的记录；未启动时抛 ``InvalidStateError``。"""
-        if self._rust_runtime is None:
-            raise InvalidStateError("Runtime not started: rust_core is None")
+        self._require_started()
         self._dispatch_perform("Store", StoreReq(op="delete", key=key.encode()))
 
     def _idempotent_submit(

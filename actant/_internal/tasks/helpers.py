@@ -136,8 +136,6 @@ class _EventBatcher:
             events = list(self._buffer)
             self._buffer.clear()
         # 在锁外派发，避免 emit 失败导致 buffer 锁死。
-        # _bypass_batcher=True 防止事件回环：flush 调用 _emit_task_event 时
-        # 若不绕过 batcher，事件会重新进 batcher.add（被 _closed 拒绝而丢失）。
         # 当提供了 render（如 Runtime 绑定的生命周期事件渲染器）时，改由 render
         # 负责在正确的运行时上下文中 emit；未提供时走默认 _emit_task_event。
         for kind, task_id, workflow_id, kwargs in events:
@@ -150,7 +148,6 @@ class _EventBatcher:
                         task_id,
                         workflow_id,
                         on_error="log",
-                        _bypass_batcher=True,
                         **kwargs,
                     )
             except Exception:
@@ -194,65 +191,6 @@ class _EventBatcher:
             self._flush_thread = None
         # 派发剩余事件（包括 flush 线程未处理完的）。
         self.flush()
-
-
-# 线程局部：当前活跃的 EventBatcher（由 _EventBatcherScope 设置）。
-# None 表示不启用 batching，_emit_task_event 走同步路径。
-_event_batcher_local = threading.local()
-
-
-def _get_event_batcher() -> _EventBatcher | None:
-    """返回当前线程活跃的 EventBatcher，未启用返回 None。"""
-    return getattr(_event_batcher_local, "batcher", None)
-
-
-class _EventBatcherScope:
-    """``with`` 上下文：在作用域内启用事件 batching。
-
-    进入时创建并设置线程局部 batcher；退出时关闭 batcher 并派发剩余事件。
-    可重入：嵌套 scope 重用外层 batcher（避免双重缓冲）。
-
-    用法::
-
-        with _EventBatcherScope(flush_interval_ms=1, flush_threshold=100):
-            for i in range(1000):
-                task.submit(i)  # 内部 emit 走 batcher
-        # 退出时自动 flush 剩余事件
-    """
-
-    def __init__(
-        self,
-        *,
-        flush_interval_ms: int = 1,
-        flush_threshold: int = 100,
-    ) -> None:
-        self._flush_interval_ms = flush_interval_ms
-        self._flush_threshold = flush_threshold
-        self._batcher: _EventBatcher | None = None
-        self._owns_batcher = False
-
-    def __enter__(self) -> _EventBatcher:
-        prev: _EventBatcher | None = getattr(_event_batcher_local, "batcher", None)
-        if prev is not None:
-            # 可重入：重用外层 batcher，避免双重缓冲。
-            self._batcher = prev
-            self._owns_batcher = False
-            return prev
-        batcher = _EventBatcher(
-            flush_interval_ms=self._flush_interval_ms,
-            flush_threshold=self._flush_threshold,
-        )
-        _event_batcher_local.batcher = batcher
-        self._batcher = batcher
-        self._owns_batcher = True
-        return batcher
-
-    def __exit__(self, *exc: object) -> None:
-        if self._owns_batcher and self._batcher is not None:
-            self._batcher.close()
-            _event_batcher_local.batcher = None
-        self._batcher = None
-        self._owns_batcher = False
 
 
 # 进程级复用的 asyncio 事件循环：worker 子进程主线程首个 async 任务懒创建，
@@ -741,7 +679,6 @@ def _emit_task_event(
     error: str = "",
     on_error: CallbackErrorPolicy = "log",
     silent: bool = False,
-    _bypass_batcher: bool = False,
 ) -> Exception | None:
     """广播 ``TaskLifecycle`` 事件，失败时按 ``on_error`` 策略处理。
 
@@ -753,33 +690,15 @@ def _emit_task_event(
     Args:
         on_error: ``log``（默认）仅记录 warning；``raise`` 立即抛出；
             ``collect`` 记录并返回异常。
-        silent: ``True`` 时跳过事件发布（既不进 batcher 也不直接 emit）。
-            用于 ``@task(silent=True)`` 等场景，避免每个 task 产生
-            started/completed 事件造成 event_bus 噪声。批量提交/低优先级
-            任务可启用此选项以提升吞吐。
-        _bypass_batcher: 内部参数。``True`` 时绕过当前线程的 batcher 直接 emit，
-            用于 batcher.flush() 避免事件回环（flush 调用 emit 时若不绕过，
-            事件会重新进 batcher.add 被 _closed 拒绝而丢失）。
+        silent: ``True`` 时跳过事件发布。用于 ``@task(silent=True)`` 等场景，
+            避免每个 task 产生 started/completed 事件造成 event_bus 噪声。
+            批量提交/低优先级任务可启用此选项以提升吞吐。
 
     Returns:
         捕获到的异常（仅当 ``on_error="collect"`` 时）。
     """
     if silent:
         return None
-    # 若当前线程启用了 EventBatcher，路由到 batcher 而非直接 emit。
-    # batcher 内部最终会回调本函数（_bypass_batcher=True）走直接 emit。
-    if not _bypass_batcher:
-        batcher = _get_event_batcher()
-        if batcher is not None:
-            batcher.add(
-                kind,
-                task_id,
-                workflow_id,
-                attempt=attempt,
-                next_attempt=next_attempt,
-                error=error,
-            )
-            return None
     try:
         from actant.capabilities import TASK_LIFECYCLE, TaskEvent
         from actant.effects import emit as _emit
@@ -812,7 +731,6 @@ def _emit_task_event(
 __all__ = [
     "CallbackErrorPolicy",
     "_EventBatcher",
-    "_EventBatcherScope",
     "_emit_task_event",
     "_ensure_picklable",
     "_execute_with_cancellation",

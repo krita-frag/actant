@@ -8,7 +8,7 @@ resolution-markers = [
 ]
 
 [[package]]
-name = "actant"
+name = "actant-engine"
 version = "0.4.0"
 source = { editable = "." }
 dependencies = [

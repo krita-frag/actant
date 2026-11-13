@@ -150,7 +150,8 @@ async fn perform_returns_last_handler_result() {
         .unwrap();
     assert!(called.load(Ordering::SeqCst));
     assert!(result.error.is_none());
-    let resp: String = postcard::from_bytes(&result.payload).unwrap();
+    assert_eq!(result.payload[0], 1); // perform 与 ask 共用 handled tag
+    let resp: String = postcard::from_bytes(&result.payload[1..]).unwrap();
     assert_eq!(resp, "performed");
 }
 

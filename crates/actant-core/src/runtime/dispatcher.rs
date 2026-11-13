@@ -164,10 +164,9 @@ async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Option<Vec<u
         .await
         .map_err(map_io("worker stdout"))?;
     if msg_type != FRAME_RESULT {
-        tracing::warn!(
-            frame_type = msg_type,
-            "worker returned unexpected frame type (expected Result)"
-        );
+        return Err(ActantError::Worker(format!(
+            "worker returned unexpected frame type {msg_type} (expected Result)"
+        )));
     }
     Ok(Some(buf))
 }
@@ -445,7 +444,7 @@ impl ProcessTaskDispatcher {
     async fn kill_and_replace(&self, mut worker: WorkerProc) {
         Self::force_kill(&mut worker.child).await;
         self.ensure_replacement();
-        let _ = worker;
+        drop(worker);
     }
 
     /// 等待取消标志置位后的宽限窗口结束（15ms 轮询，与 `spawn_cancel_poller` 一致）。
@@ -471,7 +470,10 @@ impl ProcessTaskDispatcher {
     /// 取消强杀：向 worker 发送 `Cancel` 帧 → 宽限等待协作退出 → 未退出则强杀，
     /// 并替补新 worker 以保持进程池容量恒定。调用方持有该 worker 的槽位许可。
     async fn terminate_and_replace(&self, mut worker: WorkerProc) {
-        let _ = worker.send_frame(FRAME_CANCEL, &[]).await;
+        if let Err(e) = worker.send_frame(FRAME_CANCEL, &[]).await {
+            // 写帧失败通常意味着 worker 已退出；继续走宽限/强杀路径收尾。
+            tracing::warn!(error = %e, "failed to send cancel frame; falling back to grace/kill");
+        }
         let grace = tokio::time::sleep(self.cancel_grace);
         tokio::pin!(grace);
         let child = &mut worker.child;
@@ -485,7 +487,7 @@ impl ProcessTaskDispatcher {
             }
         }
         self.ensure_replacement();
-        let _ = worker; // 丢弃已终止的 worker
+        drop(worker);
     }
 
     /// 强制终止 worker 进程树并等待回收，避免僵尸与孙进程泄漏。
@@ -542,7 +544,7 @@ impl ProcessTaskDispatcher {
     async fn recover_crash(&self, mut worker: WorkerProc) {
         Self::force_kill(&mut worker.child).await;
         self.ensure_replacement();
-        let _ = worker;
+        drop(worker);
     }
 
     /// 后台任务：轮询 `cancel_flag`，置位时向 worker 发送 `Cancel` 帧。

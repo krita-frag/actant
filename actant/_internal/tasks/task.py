@@ -15,7 +15,6 @@ from typing import Any
 
 from actant._internal.runtime import get_current_runtime
 from actant._internal.tasks.async_result import AsyncResult, _resolve_args_with_deps
-from actant._internal.tasks.backend import resolve_submit_backend
 from actant._internal.tasks.context import TaskContext
 from actant._internal.tasks.helpers import (
     _is_coroutine_function,
@@ -217,20 +216,52 @@ class Task:
         target_endpoint_addr: str | None,
         idempotency_key: str | None = None,
     ) -> AsyncResult:
-        backend = resolve_submit_backend()
-        if backend is None:
+        runtime = get_current_runtime()
+        if runtime is None:
             raise InvalidStateError(
                 "task.submit: no active Runtime; "
                 "wrap your code in `with actant.Runtime() as rt:`"
             )
-        return backend.submit_task(
-            self,
-            args,
-            kwargs,
+        if idempotency_key is not None:
+            if not isinstance(idempotency_key, str) or not idempotency_key:
+                raise ValueError("idempotency_key must be a non-empty string")
+            return runtime._idempotent_submit(
+                idempotency_key,
+                lambda: self._submit(
+                    args,
+                    kwargs,
+                    target_node=target_node,
+                    target_endpoint_addr=target_endpoint_addr,
+                    idempotency_key=None,
+                ),
+            )
+
+        from actant._internal.flow import _current_flow_state
+
+        resolved_args, resolved_kwargs, deps = _resolve_args_with_deps(args, kwargs)
+        flow_state = _current_flow_state()
+        if flow_state is not None:
+            return self._flow_submit(
+                runtime, flow_state, resolved_args, resolved_kwargs, deps
+            )
+
+        task_id, _, _, _, handle, task_def = self._prepare_task_def(
+            resolved_args,
+            resolved_kwargs,
             target_node=target_node,
             target_endpoint_addr=target_endpoint_addr,
-            idempotency_key=idempotency_key,
+            runtime=runtime,
         )
+        core = runtime._rust_core
+        if core is None:
+            runtime._unregister_task(task_id)
+            raise InvalidStateError("Runtime not started")
+        try:
+            core.submit_task(task_def)
+        except Exception:
+            runtime._unregister_task(task_id)
+            raise
+        return handle
 
     def _flow_submit(
         self,
@@ -489,25 +520,25 @@ class Task:
 
         core = runtime._rust_core
         if core is None:
-            raise InvalidStateError("Runtime not started: rust_core is None")
+            raise InvalidStateError("Runtime not started")
 
         # 准备所有 task_def + handle。任一失败则回滚已注册的 task_id。
-        prepared: list[tuple[str, bytes, list[str], AsyncResult, Any]] = []
+        prepared: list[tuple[str, AsyncResult, Any]] = []
         registered_ids: list[str] = []
         try:
             for item in items:
                 raw_args, raw_kwargs = _unpack_item(item, unpack)
-                # 单遍解析本项参数：解析上游 AsyncResult 并收集 task_id 作为依赖边。
-                resolved_args, resolved_kwargs, deps = _resolve_args_with_deps(
+                # 单遍解析本项参数：解析上游 AsyncResult（依赖边只用于 flow 路径）。
+                resolved_args, resolved_kwargs, _deps = _resolve_args_with_deps(
                     raw_args, raw_kwargs
                 )
-                task_id, _wf, payload, _ctx, handle, task_def = self._prepare_task_def(
+                task_id, _, _, _, handle, task_def = self._prepare_task_def(
                     resolved_args, resolved_kwargs,
                     target_node=target_node,
                     target_endpoint_addr=target_endpoint_addr,
                     runtime=runtime,
                 )
-                prepared.append((task_id, payload, deps, handle, task_def))
+                prepared.append((task_id, handle, task_def))
                 registered_ids.append(task_id)
         except Exception:
             # 序列化失败：清理已注册的 task_id。
@@ -520,7 +551,7 @@ class Task:
         # 到达时若成员索引尚未建立，该项进度会永久丢失。
         if batch_id is not None:
             core.register_batch(batch_id, registered_ids)
-        task_defs = [td for _, _, _, _, td in prepared]
+        task_defs = [td for _, _, td in prepared]
         try:
             core.submit_tasks_batch(task_defs)
         except Exception:
@@ -530,7 +561,7 @@ class Task:
                 core.remove_batch(batch_id)
             raise
 
-        return [handle for _, _, _, handle, _ in prepared]
+        return [handle for _, handle, _ in prepared]
 
     def __repr__(self) -> str:
         return f"Task(name={self._name!r})"

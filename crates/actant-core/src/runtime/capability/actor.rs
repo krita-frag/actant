@@ -11,7 +11,9 @@ use async_trait::async_trait;
 
 use crate::common::{ActorMessage, ActorMessageResult, MessageId};
 use crate::runtime::actor::Actor;
-use crate::runtime::capability::{CapabilityCodec, CapabilityEnvelope, EffectKind, ErasedHandler};
+use crate::runtime::capability::{
+    encode_handled, CapabilityCodec, CapabilityEnvelope, EffectKind, ErasedHandler,
+};
 
 /// Capability 执行 Actor。
 ///
@@ -87,9 +89,7 @@ impl Actor for CapabilityActor {
                             Ok(b) => b,
                             Err(e) => return Ok(Self::error(msg_id, e)),
                         };
-                        let mut result = vec![1u8];
-                        result.extend_from_slice(&bytes);
-                        return Ok(Self::payload(msg_id, result));
+                        return Ok(Self::payload(msg_id, encode_handled(bytes)));
                     }
                 }
                 Ok(Self::payload(msg_id, vec![0u8]))
@@ -102,7 +102,7 @@ impl Actor for CapabilityActor {
                                 Ok(b) => b,
                                 Err(e) => return Ok(Self::error(msg_id, e)),
                             };
-                            Ok(Self::payload(msg_id, bytes))
+                            Ok(Self::payload(msg_id, encode_handled(bytes)))
                         }
                         Err(e) => Ok(Self::error(msg_id, e)),
                     }

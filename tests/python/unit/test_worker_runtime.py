@@ -22,7 +22,7 @@ from typing import Any
 import pytest
 
 from actant._internal.tasks import worker as w
-from actant._internal.tasks.helpers import _build_v2_envelope
+from actant._internal.tasks.helpers import _build_v2_envelope, _ensure_picklable
 from actant.exceptions import ActantError, TaskCancelledError
 
 # ───────────────────────── 辅助 ─────────────────────────
@@ -442,15 +442,15 @@ def test_pack_result_degrades_when_payload_unserializable() -> None:
     assert "unserializable result" in str(payload)
 
 
-def test_ensure_exception_keeps_picklable_instance() -> None:
+def test_ensure_picklable_keeps_picklable_instance() -> None:
     exc = ValueError("v")
-    assert w._ensure_exception(exc) is exc
+    assert _ensure_picklable(exc) is exc
 
 
-def test_ensure_exception_wraps_unpicklable_instance() -> None:
+def test_ensure_picklable_wraps_unpicklable_instance() -> None:
     exc = ValueError("v")
     exc.attr = threading.Lock()  # type: ignore[attr-defined]  # 不可序列化的附加属性
-    wrapped = w._ensure_exception(exc)
+    wrapped = _ensure_picklable(exc)
     assert isinstance(wrapped, RuntimeError)
     assert "ValueError: v" in str(wrapped)
 

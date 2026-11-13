@@ -37,7 +37,7 @@ value = handle.result()             # 阻塞等待
 
 ### 等待与回调
 
-同一 `AsyncResult` 的所有消费者共享一个完成 future：`result()` / `wait()` 一次阻塞等待，不轮询。`add_done_callback` 以侵入式链表串接在 future 上，完成时只遍历一次。`gather(N)` 把 N 个句柄的完成信号汇聚到单个共享事件，只等待一次，避免 N 次 `wait_for` 累加延迟。
+同一 `AsyncResult` 的所有消费者共享一个完成 future：`result()` / `wait()` 一次阻塞等待，不轮询。`add_done_callback` 在句柄的锁内完成注册，完成时统一遍历一次。`gather(N)` 把 N 个句柄的完成信号汇聚到单个共享事件，只等待一次，避免 N 次 `wait_for` 累加延迟。
 
 ### 大结果与 Ref
 
@@ -90,7 +90,7 @@ b = add.submit(1, 2, idempotency_key="order-42")  # 返回同一个 AsyncResult
 ## 批量提交
 
 ```python
-rt.submit_batch([(add, (1, 2)), (add, (3, 4))], batch_id="b1")
+add.submit_batch([(1, 2), (3, 4)], unpack=True, batch_id="b1")
 progress = rt.batch_progress("b1")
 ```
 
@@ -106,7 +106,7 @@ rt.on_task_log(callback, task_id="t-123")  # 省略 task_id 接收全部任务�
 
 ## 生命周期事件批处理
 
-每个任务产生 `started` + `completed` 两次 `TaskLifecycle` 事件。高吞吐场景下逐条 publish 会成为瓶颈，因此可通过 `_EventBatcherScope` 在作用域内启用批处理：事件累积到 buffer，按 1ms 窗口或 100 条阈值 flush，emit 次数降为约 N/100。未启用时直接同步 emit，零额外开销；单条 emit 失败按 `log` 策略隔离，不阻塞同批其他事件。
+每个任务产生 `started` + `completed` 两次 `TaskLifecycle` 事件。`Runtime.start()` 会创建事件批处理器：事件先累积到 buffer，按 1ms 窗口或 100 条阈值 flush，emit 次数降为约 N/100。没有 `TaskLifecycle` 消费者时直接跳过；单条 emit 失败按 `log` 策略隔离，不阻塞同批其他事件。用户无需手动开启或关闭。
 
 ## 下一步
 

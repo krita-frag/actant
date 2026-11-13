@@ -10,7 +10,7 @@ requires-python = ">=3.11"
 dependencies = []
 
 [project.optional-dependencies]
-actant = ["actant>=0.3.0"]
+actant = ["actant-engine>=0.3.0"]
 dev = ["pytest>=8", "pytest-timeout>=2"]
 
 [project.entry-points.pytest11]

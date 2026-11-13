@@ -26,6 +26,7 @@ from actant._internal.tasks.context import _DispatchTaskContext, _task_context_s
 from actant._internal.tasks.helpers import (
     _PAYLOAD_VERSION,
     MAX_FRAME_BYTES,
+    _ensure_picklable,
     _execute_with_retries,
 )
 from actant._internal.tasks.ref import _resolve_ref_arg
@@ -453,7 +454,7 @@ def _run_dispatch(payload: bytes, cancel_event: threading.Event) -> bytes:
     except Exception as exc:  # 头解析 / 反序列化失败：返回可序列化的错误
         from actant.exceptions import ActantError
 
-        safe = _ensure_exception(ActantError(
+        safe = _ensure_picklable(ActantError(
             f"failed to deserialize payload: {exc}", kind="serialization",
         ))
         return _pack_result(False, safe)
@@ -485,14 +486,6 @@ def _pack_result(success: bool, payload_obj: Any) -> bytes:
         return _reuse_pack(
             (False, RuntimeError(f"unserializable result: {payload_obj!r}"))
         )
-
-
-def _ensure_exception(exc: BaseException) -> BaseException:
-    try:
-        cloudpickle.dumps(exc)
-        return exc
-    except Exception:
-        return RuntimeError(f"{type(exc).__name__}: {exc}")
 
 
 def _reader_loop(
@@ -577,7 +570,7 @@ def main() -> int:
         try:
             result = _run_dispatch(payload, cancel_event)
         except BaseException as exc:  # 防御：任何异常都转成结果帧，保协议不中断
-            result = _pack_result(False, _ensure_exception(exc))
+            result = _pack_result(False, _ensure_picklable(exc))
         finally:
             cancel_holder.clear_current()
             _restore_process_state(baseline_cwd, baseline_env)

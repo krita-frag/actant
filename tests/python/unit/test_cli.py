@@ -11,6 +11,7 @@ import pytest
 import actant
 from actant.capabilities import TaskEvent
 from actant.cli import (
+    _add_worker_args,
     _build_config,
     _configure_logging,
     _payload_signing_key,
@@ -32,6 +33,10 @@ def _make_args(**kwargs: object) -> argparse.Namespace:
         "role": None,
         "bootstrap_nodes": None,
         "listen_port": None,
+        "listen_ip": None,
+        "gossip_bootstrap_peers": None,
+        "relay_endpoints": None,
+        "discovery": None,
         "heartbeat_interval_ms": None,
         "failure_timeout_ms": None,
     }
@@ -96,6 +101,59 @@ def test_build_config_with_network_params() -> None:
     assert config.network.bootstrap_nodes == ["a", "b"]
     assert config.network.listen_port == 1234
     assert config.gossip is not None
+
+
+def test_build_config_with_intranet_network_params() -> None:
+    args = _make_args(
+        discovery="none",
+        listen_ip="10.0.0.11",
+        listen_port=41000,
+        bootstrap_nodes="addr-a, addr-b",
+        gossip_bootstrap_peers="peer-a,peer-b",
+        relay_endpoints="https://relay.intra.example",
+        payload_signing_key="k",
+    )
+    config = _build_config(args)
+    assert config is not None
+    assert config.network is not None
+    assert config.network.preset == "none"
+    assert config.network.listen_ip == "10.0.0.11"
+    assert config.network.listen_port == 41000
+    assert config.network.bootstrap_nodes == ["addr-a", "addr-b"]
+    assert config.network.gossip_bootstrap_peers == ["peer-a", "peer-b"]
+    assert config.network.relay_endpoints == ["https://relay.intra.example"]
+    assert config.gossip is not None
+
+
+def test_worker_parser_accepts_intranet_flags() -> None:
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="command")
+    worker = sub.add_parser("worker")
+    _add_worker_args(worker)
+
+    args = parser.parse_args(
+        [
+            "worker",
+            "--discovery",
+            "none",
+            "--listen-ip",
+            "10.0.0.11",
+            "--listen-port",
+            "41000",
+            "--bootstrap-nodes",
+            "addr-a",
+            "--gossip-bootstrap-peers",
+            "peer-a,peer-b",
+            "--relay-endpoints",
+            "https://relay.intra.example",
+        ]
+    )
+    assert args.discovery == "none"
+    assert args.listen_ip == "10.0.0.11"
+    assert args.listen_port == 41000
+    assert args.bootstrap_nodes == "addr-a"
+    assert args.gossip_bootstrap_peers == "peer-a,peer-b"
+    assert args.relay_endpoints == "https://relay.intra.example"
 
 
 def test_print_task_event(capsys: pytest.CaptureFixture[str]) -> None:

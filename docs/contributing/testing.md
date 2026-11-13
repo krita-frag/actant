@@ -50,6 +50,27 @@ Worker、20 任务/秒，每 10 秒注入一次 freeze / partition / heartbeat /
 `--no-kill` 关闭 SIGKILL 补位，`--keep-data` 保留沙箱目录便于排查。仅支持 POSIX；
 夜间任务为 30 分钟，见 `.github/workflows/nightly.yml`。
 
+## macOS 真实弱网（dummynet）
+
+macOS 没有 `tc` 与 network namespace，但可以用系统自带的 dummynet 对
+UDP（Actant 的 iroh/QUIC 流量）做真实延迟、丢包与限速，不需要 Docker：
+
+```python
+from act_ext_testkit import DnctlFabric, NetworkProfile
+
+# 端口必须与各节点 `NodeConfig(network={"listen_port": ...})` 一致
+fabric = DnctlFabric({"worker-0": 40001, "worker-1": 40002})
+fabric.apply(NetworkProfile(latency_ms=80, loss=0.05, bandwidth_kbps=2048))
+fabric.partition("worker-0", "worker-1")   # 双向 block
+fabric.heal("worker-0", "worker-1")
+fabric.clear()
+```
+
+`fabric` 可以直接传给 `TestCluster(fabric=...)`。规则写入
+`com.apple/actant-testkit` anchor，不改主规则集；需要 root（不自动 `sudo`），
+`shaping_supported()` 会报告平台、`dnctl`/`pfctl` 与权限缺失。
+`jitter`/`duplicate`/`reorder` 在 dummynet 下不可表达，`supports()` 会明确返回。
+
 ## 构建新鲜度
 
 测试会在 session 启动时比较已加载原生扩展与 Rust 构建输入（`Cargo.toml`、

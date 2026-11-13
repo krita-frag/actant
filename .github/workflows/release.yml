@@ -1,8 +1,12 @@
-# 发布：tag 触发。先校验 tag / 清单版本 / CHANGELOG 一致，再构建三平台原生
-# wheel 与 sdist，最后创建 GitHub Release。
+# 发布：tag 触发。先校验 tag / 清单版本 / CHANGELOG 一致，再构建多平台
+# abi3 wheel 与 sdist，校验后发布到 PyPI 并创建 GitHub Release。
 #
-# 说明：当前 wheel 覆盖 runner 自带解释器；CPython 3.10–3.13 完整矩阵待发布
-# 流程稳定后扩展。sdist 覆盖全部 Python 版本。
+# wheel 覆盖：
+#   - Linux x86_64 / aarch64（manylinux_2_28）
+#   - macOS universal2（arm64 + x86_64）
+#   - Windows x64
+# PyO3 启用 abi3-py310，因此每个平台一个 wheel 覆盖 CPython 3.10+。
+# musllinux、Windows arm64 暂未纳入矩阵；需要时在 matrix.include 中追加。
 name: Release
 
 on:
@@ -10,7 +14,7 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -19,7 +23,7 @@ concurrency:
 jobs:
   verify:
     name: 版本与 CHANGELOG 校验
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -35,14 +39,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+            manylinux: "2_28"
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            manylinux: "2_28"
           - os: macos-14
-            target: aarch64-apple-darwin
-          - os: windows-latest
+            target: universal2-apple-darwin
+          - os: windows-2022
             target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -51,6 +59,20 @@ jobs:
           command: build
           args: --release --out dist
           target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux || 'auto' }}
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装并导入冒烟
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install dist/*.whl
+          python -c "import actant; print(actant.__version__)"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -62,7 +84,7 @@ jobs:
   sdist:
     name: sdist
     needs: verify
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -79,18 +101,70 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  publish:
-    name: 创建 GitHub Release
+  validate:
+    name: 校验分发包
     needs: [wheels, sdist]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: twine check
+        run: |
+          python -m pip install --upgrade pip twine
+          twine check dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-pypi:
+    name: 发布到 PyPI
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/p/actant-engine
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      # 需要先在 PyPI 配置 Trusted Publisher（owner/repo/workflow/environment）。
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+
+  github-release:
+    name: 创建 GitHub Release
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/download-artifact@v4
         with:
+          name: dist
           path: dist
-          merge-multiple: true
 
       - name: 生成 Release Notes
         run: python3 scripts/check_release.py --notes > RELEASE_NOTES.md

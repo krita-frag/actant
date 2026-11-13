@@ -359,6 +359,23 @@ fn sign_payload(key: &[u8], payload: Vec<u8>) -> PyResult<Vec<u8>> {
         .map_err(|e| actant_error_to_pyerr(ActantError::Internal(format!("payload sign: {e}"))))
 }
 
+impl PyRuntimeCore {
+    /// 取已启动的运行时；未启动时返回 Python `RuntimeError`。
+    fn core(&self) -> PyResult<&Arc<actant_core::runtime::Runtime>> {
+        self.runtime
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))
+    }
+
+    /// 取进程级 tokio runtime 句柄；不可用时返回 Python `RuntimeError`。
+    fn tokio_handle(&self) -> PyResult<Arc<tokio::runtime::Runtime>> {
+        self.tokio
+            .lock()
+            .clone()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("tokio runtime unavailable"))
+    }
+}
+
 #[pymethods]
 impl PyRuntimeCore {
     /// 启动统一运行时。
@@ -555,13 +572,8 @@ impl PyRuntimeCore {
     /// 连接建立后，本节点会自动加入对端的 gossip topic，开始接收 P2P 消息。
     #[tracing::instrument(name = "py.dial", level = "info", skip(self, py))]
     fn dial(&self, py: Python<'_>, addr: String) -> PyResult<()> {
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))?;
-        let tokio = self.tokio.lock().clone().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("tokio runtime unavailable")
-        })?;
+        let runtime = self.core()?;
+        let tokio = self.tokio_handle()?;
         let network = runtime.network().clone();
         py.detach(move || {
             tokio
@@ -577,13 +589,8 @@ impl PyRuntimeCore {
     /// ``peer_id`` 为对端 ``node_id()`` 返回的字符串。
     #[tracing::instrument(name = "py.add_gossip_peer", level = "info", skip(self, py))]
     fn add_gossip_peer(&self, py: Python<'_>, peer_id: String) -> PyResult<()> {
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))?;
-        let tokio = self.tokio.lock().clone().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("tokio runtime unavailable")
-        })?;
+        let runtime = self.core()?;
+        let tokio = self.tokio_handle()?;
         let network = runtime.network().clone();
         py.detach(move || {
             tokio
@@ -595,13 +602,8 @@ impl PyRuntimeCore {
 
     /// 返回当前已知对等节点列表（已建立 gossip 邻居关系的节点）。
     fn discover_peers(&self, py: Python<'_>) -> PyResult<Vec<String>> {
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))?;
-        let tokio = self.tokio.lock().clone().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("tokio runtime unavailable")
-        })?;
+        let runtime = self.core()?;
+        let tokio = self.tokio_handle()?;
         let network = runtime.network().clone();
         py.detach(move || {
             tokio
@@ -623,13 +625,8 @@ impl PyRuntimeCore {
         task_id: String,
         workflow_id: String,
     ) -> PyResult<()> {
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))?;
-        let tokio = self.tokio.lock().clone().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("tokio runtime unavailable")
-        })?;
+        let runtime = self.core()?;
+        let tokio = self.tokio_handle()?;
         let runtime = runtime.clone();
         let task_id_for_log = task_id.clone();
         let workflow_id_for_log = workflow_id.clone();
@@ -668,10 +665,7 @@ impl PyRuntimeCore {
     /// 若任务尚未入队或已完成，返回 ``false``。
     #[tracing::instrument(name = "py.cancel_task", level = "info", skip(self))]
     fn cancel_task(&self, task_id: String) -> PyResult<bool> {
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))?;
+        let runtime = self.core()?;
         let worker = runtime
             .worker()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("worker not initialized"))?;
@@ -690,10 +684,7 @@ impl PyRuntimeCore {
         quotas: Option<BTreeMap<String, u32>>,
         draining: Option<bool>,
     ) -> PyResult<()> {
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))?;
+        let runtime = self.core()?;
         let update = NodeStateUpdate {
             labels,
             quotas,
@@ -709,10 +700,7 @@ impl PyRuntimeCore {
     /// Tokio Semaphore 不支持减少 permits，因此缩容请求会被忽略并记录警告日志。
     /// 若需缩容，建议重启 Worker。
     fn set_max_concurrent_tasks(&self, new_max: usize) -> PyResult<()> {
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))?;
+        let runtime = self.core()?;
         let worker = runtime
             .worker()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("worker not initialized"))?;
@@ -722,10 +710,7 @@ impl PyRuntimeCore {
 
     /// 返回 Worker 当前最大并发任务数。
     fn max_concurrent_tasks(&self) -> PyResult<usize> {
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))?;
+        let runtime = self.core()?;
         let worker = runtime
             .worker()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("worker not initialized"))?;
@@ -738,13 +723,8 @@ impl PyRuntimeCore {
     /// 寻址。经 `ValueStore` capability 的默认 handler 调用。
     #[tracing::instrument(name = "py.value_store", level = "debug", skip(self, py, data))]
     fn value_store(&self, py: Python<'_>, data: Vec<u8>) -> PyResult<Vec<u8>> {
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))?;
-        let tokio = self.tokio.lock().clone().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("tokio runtime unavailable")
-        })?;
+        let runtime = self.core()?;
+        let tokio = self.tokio_handle()?;
         let network = runtime.network().clone();
         let node = self.local_endpoint_addr(py)?;
         py.detach(move || {
@@ -767,13 +747,8 @@ impl PyRuntimeCore {
     #[tracing::instrument(name = "py.value_fetch", level = "debug", skip(self, py, ref_bytes))]
     fn value_fetch(&self, py: Python<'_>, ref_bytes: Vec<u8>) -> PyResult<Vec<u8>> {
         let r = decode_blob_ref(&ref_bytes).map_err(actant_error_to_pyerr)?;
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))?;
-        let tokio = self.tokio.lock().clone().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("tokio runtime unavailable")
-        })?;
+        let runtime = self.core()?;
+        let tokio = self.tokio_handle()?;
         let network = runtime.network().clone();
         py.detach(move || {
             tokio.block_on(async move {
@@ -824,10 +799,7 @@ impl PyRuntimeCore {
     #[tracing::instrument(name = "py.submit_task", level = "debug", skip(self, py, task), fields(task_id = %task.task_id))]
     fn submit_task(&self, py: Python<'_>, task: PyTask) -> PyResult<()> {
         actant_core::metrics::inc_tasks_submitted();
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))?;
+        let runtime = self.core()?;
         let node_id = runtime.node_id().clone();
 
         // endpoint_addr lazy 缓存：节点启动后 iroh endpoint 不会变。
@@ -892,10 +864,7 @@ impl PyRuntimeCore {
     fn submit_tasks_batch(&self, py: Python<'_>, tasks: Vec<PyTask>) -> PyResult<()> {
         let n = tasks.len();
         actant_core::metrics::inc_tasks_submitted_by(n as u64);
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))?;
+        let runtime = self.core()?;
         let node_id = runtime.node_id().clone();
         let endpoint_addr = self.local_endpoint_addr(py)?;
         let task_defs: Vec<TaskDefinition> = tasks
@@ -1345,16 +1314,11 @@ impl PyRuntimeCore {
         wait_key: String,
         timeout_ms: u64,
     ) -> PyResult<Option<Vec<u8>>> {
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))?;
+        let runtime = self.core()?;
         let Some(orchestrator) = runtime.orchestrator_handle().cloned() else {
             return Ok(None);
         };
-        let tokio = self.tokio.lock().clone().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("tokio runtime unavailable")
-        })?;
+        let tokio = self.tokio_handle()?;
         let wf = WorkflowId::from(workflow_id);
         let rx = orchestrator.register_wait_point_waiter(wf, &wait_key);
         // 阻塞期间释放 GIL：否则 tokio worker 的 pyo3_log 回调会与持 GIL 的
@@ -1405,13 +1369,8 @@ impl PyRuntimeCore {
         wait_key: String,
         timeout_ms: u64,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))?;
-        let tokio = self.tokio.lock().clone().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("tokio runtime unavailable")
-        })?;
+        let runtime = self.core()?;
+        let tokio = self.tokio_handle()?;
         let handle = tokio.handle().clone();
         let Some(orchestrator) = runtime.orchestrator_handle().cloned() else {
             return future_into_py_iter(
@@ -1494,17 +1453,12 @@ impl PyRuntimeCore {
         result: Option<Vec<u8>>,
         error: Option<String>,
     ) -> PyResult<Py<PyAny>> {
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))?;
+        let runtime = self.core()?;
         let worker = runtime
             .worker()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("worker not initialized"))?
             .clone();
-        let tokio = self.tokio.lock().clone().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("tokio runtime unavailable")
-        })?;
+        let tokio = self.tokio_handle()?;
         let outcome = match state.as_str() {
             "Completed" => TaskResultOutcome::Completed(result.unwrap_or_default()),
             "Failed" => TaskResultOutcome::Failed(
@@ -1882,10 +1836,7 @@ impl PyRuntimeCore {
 
     /// 测试专用故障注入：给本节点 HLC 施加时钟偏移（毫秒，可正可负），0 恢复。
     fn _test_inject_hlc_drift(&self, ms: i64) -> PyResult<()> {
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))?;
+        let runtime = self.core()?;
         runtime.inject_hlc_drift_ms(ms);
         Ok(())
     }
@@ -1903,10 +1854,9 @@ impl PyRuntimeCore {
         task_ids: Vec<String>,
     ) -> PyResult<Py<PyAny>> {
         let worker = self
-            .runtime
-            .as_ref()
-            .and_then(|rt| rt.worker())
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))?;
+            .core()?
+            .worker()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("worker not available"))?;
         let progress = worker
             .batch_tracker()
             .register(&batch_id, task_ids.into_iter().map(TaskId::from));
@@ -1916,10 +1866,9 @@ impl PyRuntimeCore {
     /// 查询 batch 进度；未注册返回 `None`。
     fn batch_progress(&self, py: Python<'_>, batch_id: String) -> PyResult<Option<Py<PyAny>>> {
         let worker = self
-            .runtime
-            .as_ref()
-            .and_then(|rt| rt.worker())
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))?;
+            .core()?
+            .worker()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("worker not available"))?;
         match worker.batch_tracker().progress(&batch_id) {
             Some(progress) => Ok(Some(batch_progress_to_py(py, &progress)?)),
             None => Ok(None),
@@ -1940,10 +1889,9 @@ impl PyRuntimeCore {
         use actant_core::runtime::batch::BatchItemState;
 
         let worker = self
-            .runtime
-            .as_ref()
-            .and_then(|rt| rt.worker())
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))?;
+            .core()?
+            .worker()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("worker not available"))?;
         let state = match state.to_ascii_lowercase().as_str() {
             "completed" => BatchItemState::Completed,
             "failed" => BatchItemState::Failed,
@@ -1966,10 +1914,9 @@ impl PyRuntimeCore {
     /// 移除 batch 注册与成员索引。
     fn remove_batch(&self, batch_id: String) -> PyResult<bool> {
         let worker = self
-            .runtime
-            .as_ref()
-            .and_then(|rt| rt.worker())
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))?;
+            .core()?
+            .worker()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("worker not available"))?;
         Ok(worker.batch_tracker().remove(&batch_id))
     }
 
@@ -1986,13 +1933,8 @@ impl PyRuntimeCore {
         skip(self, callback)
     )]
     fn register_task_result_callback(&self, callback: Py<PyAny>) -> PyResult<()> {
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))?;
-        let tokio = self.tokio.lock().clone().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("tokio runtime unavailable")
-        })?;
+        let runtime = self.core()?;
+        let tokio = self.tokio_handle()?;
         let event_bus = runtime.event_bus().clone();
         let callback = Arc::new(callback);
 
@@ -2072,13 +2014,8 @@ impl PyRuntimeCore {
         callback: Py<PyAny>,
         task_id: Option<String>,
     ) -> PyResult<()> {
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))?;
-        let tokio = self.tokio.lock().clone().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("tokio runtime unavailable")
-        })?;
+        let runtime = self.core()?;
+        let tokio = self.tokio_handle()?;
         let event_bus = runtime.event_bus().clone();
         let callback = Arc::new(callback);
         let mut rx_log = match task_id {
@@ -2135,13 +2072,8 @@ impl PyRuntimeCore {
         skip(self, callback)
     )]
     fn register_worker_state_callback(&self, callback: Py<PyAny>) -> PyResult<()> {
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))?;
-        let tokio = self.tokio.lock().clone().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("tokio runtime unavailable")
-        })?;
+        let runtime = self.core()?;
+        let tokio = self.tokio_handle()?;
         let event_bus = runtime.event_bus().clone();
         let callback = Arc::new(callback);
         let mut rx = event_bus.subscribe(BusTopic::WorkerLifecycle);
@@ -2204,13 +2136,8 @@ impl PyRuntimeCore {
             tracing::debug!("serve() ignored: worker daemon loop already running");
             return Ok(());
         }
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))?;
-        let tokio = self.tokio.lock().clone().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("tokio runtime unavailable")
-        })?;
+        let runtime = self.core()?;
+        let tokio = self.tokio_handle()?;
         let worker = runtime
             .worker()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("worker not initialized"))?
@@ -2332,8 +2259,8 @@ impl PyRuntimeCore {
         // 清理 register_task_result_callback spawn 的事件消费 task 放到
         // Runtime::shutdown() 之后执行：shutdown 会发布 WorkerStopped 等终态
         // 事件，提前 abort 订阅循环会让这批事件永远送不到 Python 回调。
-        let mut guard = self.tokio.lock();
-        if let Some(tokio) = guard.take() {
+        let tokio_opt = self.tokio.lock().take();
+        if let Some(tokio) = tokio_opt {
             // 1. 在 tokio runtime 上执行 ActantRuntime::shutdown()：停止 Actor
             //    并关闭 iroh endpoint（endpoint.close()）。必须在 tokio runtime
             //    关闭前完成，否则 close 无 reactor 可用 → Endpoint 被无声 drop。
@@ -2357,10 +2284,14 @@ impl PyRuntimeCore {
                         // （endpoint.close 含 QUIC 连接 drain），导致 endpoint 被强 drop
                         // 影响后续测试的 iroh 资源释放。15s 在 loopback 上足够完成
                         // 优雅关闭，慢机/CI 仍有 shutdown_timeout 兜底。
-                        // 丢弃 timeout Err 是有意为之：超时路径已 log。
-                        let _ =
-                            tokio::time::timeout(std::time::Duration::from_secs(15), rt.shutdown())
-                                .await;
+                        if tokio::time::timeout(std::time::Duration::from_secs(15), rt.shutdown())
+                            .await
+                            .is_err()
+                        {
+                            tracing::warn!(
+                                "runtime shutdown exceeded 15s; forcing tokio runtime shutdown"
+                            );
+                        }
                     });
                 });
             }
@@ -2387,7 +2318,6 @@ impl PyRuntimeCore {
                     .await;
                 });
             }
-            drop(guard);
             // 2. 关闭 tokio runtime（超时强制）。
             // 如果是进程级共享 runtime，GLOBAL_TOKIO 持有强引用，try_unwrap 不会成功，
             // 此时只关闭 ActantRuntime，tokio runtime 随进程结束自然回收。
@@ -2401,7 +2331,7 @@ impl PyRuntimeCore {
         }
         // 清空 serve 的在册句柄：Runtime::shutdown 已等待 worker 进入 Stopped，
         // 该任务不会再被 join；留着会阻止后续 serve() 重新拉起（幂等判据）。
-        let _ = self.worker_handle.lock().take();
+        drop(self.worker_handle.lock().take());
         tracing::info!(
             shutdown_ms = t0.elapsed().as_millis() as u64,
             "PyRuntimeCore::shutdown done"
@@ -2414,10 +2344,7 @@ impl PyRuntimeCore {
     ///
     /// 节点启动后 iroh endpoint 不会变：首次调用计算并缓存，后续直接 clone。
     fn local_endpoint_addr(&self, _py: Python<'_>) -> PyResult<String> {
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))?;
+        let runtime = self.core()?;
         let mut cache = self.endpoint_addr_cache.lock();
         if let Some(addr) = cache.as_ref() {
             return Ok(addr.clone());
@@ -2440,13 +2367,8 @@ impl PyRuntimeCore {
         method: &str,
         payload: Vec<u8>,
     ) -> PyResult<T> {
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("runtime not started"))?;
-        let tokio = self.tokio.lock().clone().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("tokio runtime unavailable")
-        })?;
+        let runtime = self.core()?;
+        let tokio = self.tokio_handle()?;
         let system = runtime.actor_system().clone();
         let actor_id = runtime.workflow_actor_id().clone();
         let method = method.to_string();

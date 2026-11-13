@@ -271,12 +271,17 @@ _STATE_TO_EXCEPTION: dict[str, type[ActantError]] = {
 }
 
 
-def raise_for_kind(kind: str, message: str) -> None:
-    """根据 Rust ActantError kind 抛出对应的 Python 异常。"""
+def _exception_for_kind(kind: str, message: str) -> ActantError:
+    """按 kind 构造异常实例；未知 kind 退化为基类 ``ActantError``。"""
     exc_cls = _KIND_TO_EXCEPTION.get(kind)
     if exc_cls is not None:
-        raise exc_cls(message)
-    raise ActantError(message, kind=kind)
+        return exc_cls(message)
+    return ActantError(message, kind=kind)
+
+
+def raise_for_kind(kind: str, message: str) -> None:
+    """根据 Rust ActantError kind 抛出对应的 Python 异常。"""
+    raise _exception_for_kind(kind, message)
 
 
 # 跨语言错误类型保留协议：
@@ -331,11 +336,8 @@ def reconstruct_error(error_str: str) -> ActantError:
     无 kind 前缀时返回 ``TaskError``（任务执行失败的默认语义）。
     """
     kind, message = decode_error_kind(error_str)
-    exc_cls = _KIND_TO_EXCEPTION.get(kind)
-    if exc_cls is not None:
-        # 各子类 __init__ 会添加 hint 后缀，这里直接调用。
-        return exc_cls(message)
-    return ActantError(message, kind=kind)
+    # 各子类 __init__ 会添加 hint 后缀，这里直接调用。
+    return _exception_for_kind(kind, message)
 
 
 def raise_for_state(state: str, error: str, *, failed_tasks: list[list[str]] | None = None) -> None:

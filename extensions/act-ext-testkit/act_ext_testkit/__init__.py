@@ -77,7 +77,7 @@ from .contract import (
     TestkitError,
     resolve_profile,
 )
-from .fabric import CommandFabric, FabricError, TcNetemFabric
+from .fabric import CommandFabric, DnctlFabric, FabricError, TcNetemFabric
 from .faults import (
     ChaosPlan,
     ClockDrift,
@@ -168,6 +168,7 @@ __all__ = [
     "CommandFabric",
     "Crash",
     "CustomFault",
+    "DnctlFabric",
     "EventCodec",
     "FabricError",
     "Fault",

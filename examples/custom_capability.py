@@ -1,17 +1,12 @@
 """自定义 Capability 与 handler 链组合。
 
-演示扩展能力：
-
-- 用 ``rt.layer(name, kind)`` 直接注册自定义 capability（自动创建 meta）
-- 用 Protocol 约定自定义 handler 签名（``RouteCtx`` / ``ScheduleCtx`` 等 payload 助手）
-- 多 handler 链式组合：ask 逆序决策、emit 顺序多播、perform 取末位
+演示 ``ask`` 逆序决策、``perform`` 取末位、``emit`` 顺序多播。
 
 .. note::
-    自定义 capability 只由用户代码自己 ``ask`` / ``perform`` / ``emit`` 驱动，
-    引擎不会自动调用它们。示例里的 ``KVStore`` 是独立名字，**不会替换内置
-    ``Store``**；要覆盖引擎侧数据面请用 ``rt.layer("Store").chain(...)``。
-    ``MyRouter`` / ``MyScheduler`` 同理——真实的放置由 Rust ``RoutePolicy`` /
-    ``Scheduler`` 或第 3 层外部调度器承担。
+    自定义 capability 只由用户代码自己驱动，引擎不会自动调用。示例里的
+    ``KVStore`` 是独立名字，**不会替换内置 ``Store``**；覆盖数据面请用
+    ``rt.layer("Store").chain(...)``。真实的放置由 Rust ``RoutePolicy`` /
+    ``Scheduler`` 承担。
 
 运行::
 
@@ -20,26 +15,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any
 
 from actant import Runtime, emit, perform
 from actant.capabilities import RouteCtx, ScheduleCtx
 from actant.effects import ask
-
-# Handler Protocol 类型从 capabilities 子模块导入（未在顶层 re-export）。
-
-@dataclass
-class ThrottleCtx:
-    """``Throttle`` capability 的请求上下文。"""
-
-    key: str
-    tokens: int = 1
-    capacity: int = 10
-
-
-# 自定义 capability 通过 ``rt.layer(name, kind)`` 直接注册，
-# layer() 会自动创建 CapabilityMeta 并存入 Runtime._metas，无需单独声明。
 
 
 class TagAwareRouter:
@@ -108,22 +88,6 @@ def main() -> None:
         # 无 P0 → PriorityScheduler 弃权，返回 None。
         print(f"  no P0       -> {ask('MyScheduler', ScheduleCtx('wf', pending=['t1', 't2']))}")
 
-        print("\n=== 自定义 capability：Throttle ===")
-        # 用 dataclass 作为请求 payload，注册自定义 ask capability。
-        buckets: dict[str, int] = {}
-
-        def token_bucket(ctx: ThrottleCtx) -> bool | None:
-            used = buckets.get(ctx.key, 0)
-            if used + ctx.tokens <= ctx.capacity:
-                buckets[ctx.key] = used + ctx.tokens
-                return True  # 放行
-            return False  # 拒绝
-
-        rt.layer("Throttle", "ask").chain(token_bucket)
-        for i in range(4):
-            ok = ask("Throttle", ThrottleCtx(key="api", tokens=3, capacity=10))
-            print(f"  request {i + 1} (tokens=3) -> {'放行' if ok else '拒绝'}")
-
         print("\n=== 自定义 perform capability：KVStore ===")
         store = InMemoryStore()
         rt.layer("KVStore", "perform").chain(store)
@@ -142,8 +106,8 @@ def main() -> None:
         emit("Metrics", {"name": "tasks_failed", "value": 0})
 
         print("\n=== capability 元数据 ===")
-        meta = rt.capability_meta("Throttle")
-        print(f"  Throttle: name={meta.name!r} kind={meta.kind!r}")
+        meta = rt.capability_meta("MyRouter")
+        print(f"  MyRouter: name={meta.name!r} kind={meta.kind!r}")
         print(f"  registered: {sorted(rt.capabilities)}")
 
     print("\n完成。")

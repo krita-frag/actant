@@ -1490,6 +1490,36 @@ def _terminal_kind(state: dict[str, Any] | None) -> str:
     return "pending"
 
 
+def _emit_terminal(
+    workflow_id: str,
+    state: dict[str, Any] | None,
+    kind: str,
+    *,
+    on_completed: Callable[[], None] | None = None,
+) -> bool:
+    """广播终态事件；返回 ``True`` 表示已到终态。
+
+    同步与异步等待路径共用本函数，保证完成/失败事件时序只在一处维护。
+    ``on_completed`` 在广播 ``completed`` 之前调用。
+    """
+    if kind in ("missing", "completed"):
+        if on_completed is not None:
+            on_completed()
+        _safe_emit(workflow_id, "completed")
+        return True
+    if kind == "failed":
+        _safe_emit(workflow_id, "failed", error=(state or {}).get("error") or "")
+        return True
+    if kind == "cancelled":
+        _safe_emit(
+            workflow_id,
+            "failed",
+            error=(state or {}).get("error") or "workflow cancelled",
+        )
+        return True
+    return False
+
+
 def _wait_terminal_and_emit(
     runtime: Any,
     workflow_id: str,
@@ -1515,21 +1545,12 @@ def _wait_terminal_and_emit(
     """
     while True:
         state = cast("dict[str, Any] | None", runtime.get_workflow_state(workflow_id))
-        kind = _terminal_kind(state)
-        if kind in ("missing", "completed"):
-            if on_completed is not None:
-                on_completed()
-            _safe_emit(workflow_id, "completed")
-            return state
-        if kind == "failed":
-            _safe_emit(workflow_id, "failed", error=(state or {}).get("error") or "")
-            return state
-        if kind == "cancelled":
-            _safe_emit(
-                workflow_id,
-                "failed",
-                error=(state or {}).get("error") or "workflow cancelled",
-            )
+        if _emit_terminal(
+            workflow_id,
+            state,
+            _terminal_kind(state),
+            on_completed=on_completed,
+        ):
             return state
         time.sleep(_FLOW_TERMINAL_POLL_INTERVAL_S)
 

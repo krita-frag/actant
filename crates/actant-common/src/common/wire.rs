@@ -915,27 +915,33 @@ impl WireEnvelope {
                         return None;
                     }
                 };
-                // 流式分段验证（与发送侧同段序，字节序不变）。
+                // 编码与分段拼接只做一次；候选密钥仅重复 MAC 校验。
+                let message_bytes = match crate::common::encode_postcard(&envelope.message) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "dropping message: failed to encode message for MAC verification"
+                        );
+                        return None;
+                    }
+                };
+                let traceparent_bytes = match crate::common::encode_postcard(&envelope.traceparent)
+                {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "dropping message: failed to encode traceparent for MAC verification"
+                        );
+                        return None;
+                    }
+                };
+                let version_bytes = [envelope.version];
+                let mac_input =
+                    mac_input_segments(&version_bytes, &message_bytes, &traceparent_bytes).concat();
                 candidates.iter().any(|key| {
-                    let message_bytes = match crate::common::encode_postcard(&envelope.message) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "dropping message: failed to encode message for MAC verification"
-                            );
-                            return false;
-                        }
-                    };
-                    let traceparent_bytes =
-                        match crate::common::encode_postcard(&envelope.traceparent) {
-                            Ok(b) => b,
-                            Err(_) => return false,
-                        };
-                    let version_bytes = [envelope.version];
-                    let segments =
-                        mac_input_segments(&version_bytes, &message_bytes, &traceparent_bytes);
-                    crate::common::payload::verify_wire_mac(key, &segments.concat(), mac).is_ok()
+                    crate::common::payload::verify_wire_mac(key, &mac_input, mac).is_ok()
                 })
             }
         };

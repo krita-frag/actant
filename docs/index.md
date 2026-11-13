@@ -15,6 +15,7 @@ Actant 用 Rust + iroh 构建核心运行时，通过 PyO3 暴露给 Python 用�
 | 理解 `Runtime` / `@task` / `@flow` | [核心概念](start/concepts.md) |
 | 查某个函数或类的签名 | [Python API](reference/python-api.md) · [PyO3 绑定 API](reference/pyo3-api.md) · [CLI](reference/cli.md) |
 | 扩展 capability 或写自定义 handler | [能力扩展](guide/capabilities.md) |
+| 写 Python 扩展、类型化放置或装配组件 | [扩展作者指南](guide/extensions.md) |
 | 查有哪些扩展缝、哪些能从 Python 覆盖 | [框架契约](architecture/framework-contract.md) |
 | 部署多节点、配置发现与信任 | [部署与发现](guide/deployment.md) |
 | 理解分层、ERH、Worker 与持久化 | [架构总览](architecture/overview.md) |
@@ -24,7 +25,7 @@ Actant 用 Rust + iroh 构建核心运行时，通过 PyO3 暴露给 Python 用�
 ## 文档结构
 
 - **入门**：安装、5 分钟上手、核心概念。
-- **使用指南**：任务、工作流、能力扩展、部署。
+- **使用指南**：任务、工作流、能力扩展、扩展作者指南、部署。
 - **API 参考**：Python / Rust 公共接口、CLI、配置，由源码生成。
 - **架构**：分层、ERH 扩展模型、Worker 运行模型、调度器、故障转移、恢复语义、框架契约（扩展面边界与执行域）。
 - **运维**：SLA 行为基线、排障。

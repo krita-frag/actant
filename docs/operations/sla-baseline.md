@@ -17,7 +17,7 @@
 | 平台 | macOS 14.7.8（Darwin 23.6.0），arm64（Apple Silicon） |
 | Python | CPython 3.11.14 |
 | CPU | 10 核 |
-| 执行后端 | 进程池（worker 子进程，`python -m actant._internal.tasks.worker`），线程后端已移除 |
+| 执行后端 | 进程池（worker 子进程，`python -m actant._internal.tasks.worker`；无线程后端） |
 | 版本 | 当前工作树（版本号以 `Cargo.toml` 为准） |
 | 发现模式 | `ACTANT_DISCOVERY=none`（测试离线约定，无 DNS/relay 干扰） |
 
@@ -149,8 +149,8 @@
   节点重启续跑由 `Runtime.host_flows()` 扫描未完成 flow 并重放（`_replay_flow`）。
 - **单机基线**：所有数字来自单节点 + 本地进程池；多节点 P2P（跨机网络、gossip 收敛、
   远端 failover）的吞吐/恢复时间数据待补，预计受网络 RTT 主导，不可由本文档外推。
-- **Windows 未验证**：本基线在 macOS arm64 观测；worker IPC 已统一为 stdio pipe
-  （SHM ring 已移除，Windows/POSIX 行为归一），行为等价性由 CI 冒烟用例保障，性能数字未测。
+- **Windows 未验证**：本基线在 macOS arm64 观测；worker IPC 统一为 stdio pipe
+  （Windows/POSIX 行为一致），行为等价性由 CI 冒烟用例保障，性能数字未测。
 - **量级参考而非承诺**：样本 2 次运行、单机、离线发现模式；数字随硬件/负载漂移，
   CI 不做阈值断言（deliberate choice，理由见 bench workflow 的注释）。
 - **冷/热池差异**：首次提交含 worker 子进程冷启动（每进程 ~百 ms 量级）；表中吞吐均为

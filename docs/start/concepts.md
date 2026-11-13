@@ -32,7 +32,7 @@ ERH 描述 `runtime` 域的扩展词汇：
 - **Layer**：同一 capability 的 handler 链。
 - **Effect**：请求能力，分 `ask`（决策）/ `perform`（副作用）/ `emit`（广播）。
 
-内置 4 个 capability，全部有引擎发射点或默认 handler：`Store` 回退到 Rust `StoreHandler`（可用 `rt.layer("Store").chain(...)` 覆盖），`ValueStore` 由 Python 层提供默认 handler；`TaskLifecycle` / `WorkflowLifecycle` 由引擎在任务与工作流生命周期节点发射，用户以 handler 订阅。用户自建的 capability 通过 `rt.layer(name, kind).chain(...)` 登记，由用户代码自行 `ask` / `perform` / `emit` 驱动，引擎不会自动调用。放置类策略（路由/调度/重试）不是 capability，由 Rust `RoutePolicy` / `Scheduler` 或第 3 层外部调度器承担；哪些点能从 Python 覆盖、哪些只能在 Rust 装配期注入，见[框架契约](../architecture/framework-contract.md)。
+内置 4 个 capability：`Store` 回退 Rust `StoreHandler`（可用 `rt.layer("Store").chain(...)` 覆盖），`ValueStore` 由 Python 默认 handler 提供，`TaskLifecycle` / `WorkflowLifecycle` 由引擎在生命周期节点发射。自定义 capability 经 `rt.layer(name, kind).chain(...)` 登记，由用户代码驱动。放置类策略（路由/调度/重试）不是 capability，边界见[框架契约](../architecture/framework-contract.md)。
 
 ## Worker 与节点
 

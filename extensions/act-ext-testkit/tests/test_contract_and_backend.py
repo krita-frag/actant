@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import os
+import platform
+import shutil
+import subprocess
 import time
 from pathlib import Path
 from typing import Any
@@ -14,6 +17,7 @@ from act_ext_testkit import (
     ClockMode,
     CommandFabric,
     Crash,
+    DnctlFabric,
     FabricError,
     FaultKind,
     FaultScript,
@@ -282,6 +286,89 @@ def test_command_fabric_dry_run_records_commands() -> None:
     assert fabric.supports(NetworkProfile(bandwidth_kbps=512)) == {"bandwidth_kbps"}
     with pytest.raises(FabricError):
         fabric.partition("a", "b")
+
+
+def test_dnctl_fabric_dry_run_shapes_and_partitions() -> None:
+    fabric = DnctlFabric({"a": 40001, "b": 40002}, dry_run=True)
+    profile = NetworkProfile(latency_ms=120, loss=0.05, bandwidth_kbps=512)
+    assert fabric.supports(profile) == set()
+
+    fabric.apply(profile)
+    assert fabric.commands[0] == [
+        "dnctl",
+        "pipe",
+        "39000",
+        "config",
+        "bw",
+        "512Kbit/s",
+        "delay",
+        "120",
+        "plr",
+        "0.0500",
+    ]
+    assert fabric.commands[1] == ["pfctl", "-E"]
+    assert fabric.commands[2] == ["pfctl", "-a", "com.apple/actant-testkit", "-f", "-"]
+    assert fabric.rules == [
+        "dummynet out quick proto udp from any port 40001 to any pipe 39000",
+        "dummynet out quick proto udp from any port 40002 to any pipe 39000",
+    ]
+
+    fabric.partition("b", "a")
+    assert fabric.rules[:2] == [
+        "block drop out quick proto udp from any port 40001 to any port 40002",
+        "block drop out quick proto udp from any port 40002 to any port 40001",
+    ]
+
+    fabric.heal("a", "b")
+    assert all(not rule.startswith("block") for rule in fabric.rules)
+
+    fabric.clear()
+    assert fabric.rules == []
+    assert fabric.commands[-1] == ["dnctl", "pipe", "delete", "39000"]
+
+
+def test_dnctl_fabric_rejects_invalid_topology() -> None:
+    with pytest.raises(FabricError):
+        DnctlFabric({})
+    with pytest.raises(FabricError):
+        DnctlFabric({"a": 40001, "b": 40001})
+    with pytest.raises(FabricError):
+        DnctlFabric({"a": 0})
+
+    fabric = DnctlFabric({"a": 40001}, dry_run=True)
+    with pytest.raises(FabricError):
+        fabric.partition("a", "a")
+    with pytest.raises(FabricError):
+        fabric.partition("a", "missing")
+
+
+def test_dnctl_fabric_reports_unsupported_profile_fields() -> None:
+    fabric = DnctlFabric({"a": 40001}, dry_run=True)
+    assert fabric.supports(NetworkProfile(jitter_ms=10)) == {"jitter_ms"}
+    assert fabric.supports(NetworkProfile(duplicate=0.1)) == {"duplicate"}
+    assert fabric.supports(NetworkProfile(reorder=0.1)) == {"reorder"}
+    with pytest.raises(FabricError):
+        fabric.apply(NetworkProfile(duplicate=0.1))
+
+
+@pytest.mark.skipif(
+    platform.system() != "Darwin" or shutil.which("pfctl") is None,
+    reason="pfctl is only available on macOS",
+)
+def test_dnctl_fabric_rules_parse_with_pfctl() -> None:
+    """用系统 pfctl 的 parse-only 模式验证真实规则语法（不需要 root）。"""
+    fabric = DnctlFabric({"a": 40001, "b": 40002}, dry_run=True)
+    fabric.apply(NetworkProfile(latency_ms=50, loss=0.01))
+    fabric.partition("a", "b")
+
+    result = subprocess.run(
+        ["pfctl", "-n", "-f", "-"],
+        input="\n".join(fabric.rules) + "\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_trace_policy_supports_custom_terminal_semantics() -> None:

@@ -34,6 +34,7 @@ nav:
       - 任务: guide/tasks.md
       - 工作流: guide/flows.md
       - 能力扩展: guide/capabilities.md
+      - 扩展作者指南: guide/extensions.md
       - 部署与发现: guide/deployment.md
   - API 参考:
       - Python API: reference/python-api.md

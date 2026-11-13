@@ -2,7 +2,7 @@
 
 ## 对等节点
 
-Actant 是 P2P 对等混合架构：每个节点同时是编排器与执行器。启动一个 `Runtime` 即在该节点自动启动一个 Worker（含 `SchedulerActor`，负责并发槽位、任务超时、优雅 drain）。显式指定 `data_dir` 后节点才启用 iroh P2P 自动发现，无需中心服务器；未指定时默认 `preset="none"`，仅 loopback。发现模式见[部署指南](../guide/deployment.md)。
+Actant 是 P2P 对等混合架构：每个节点同时是编排器与执行器。启动一个 `Runtime` 即在该节点自动启动一个 Worker（含 `SchedulerActor`，负责并发槽位、任务超时、优雅 drain）。显式指定 `data_dir` 时节点默认使用 `preset="local"`（公网 DNS + relay 发现）；未指定时使用临时目录并默认 `preset="none"`（仅 loopback）。内网部署应显式设置 `preset="none"` 并配置 bootstrap。发现模式见[部署指南](../guide/deployment.md)。
 
 `rt.serve()` 在 tokio 后台 spawn worker 守护循环（订阅 P2P topic + 任务执行循环），非阻塞。
 

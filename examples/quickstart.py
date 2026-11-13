@@ -1,16 +1,8 @@
-"""快速开始：Actant ERH（Effect-Resource-Handler）架构。
+"""快速开始：``Runtime`` 与三种 effect 原语。
 
-本示例演示统一扩展语法：
-
-- ``Runtime`` / ``Runtime()``：运行时入口
-- ``rt.layer(name, kind).chain(handler)``：向自定义 capability 注册 handler
-- ``ask`` / ``perform`` / ``emit``：三种 effect 原语
-- handler 覆盖优先级（后注册 = 高优先级）
-- ``Runtime`` 作为 context manager 的生命周期
-
-放置类策略（路由/调度/重试）由 Rust ``RoutePolicy`` / ``Scheduler`` 或
-第 3 层外部调度器承担，不在 Python 层预装 handler。这里用自定义 capability
-演示 ERH 语法。
+演示 ``ask``（逆序决策）、``emit``（顺序多播）与 Runtime 生命周期。
+放置类策略由 Rust ``RoutePolicy`` / ``Scheduler`` 承担，这里只演示自定义
+capability；更完整的 handler 链见 ``examples/custom_capability.py``。
 
 运行::
 
@@ -66,11 +58,6 @@ def main() -> None:
         emit("Audit", {"action": "logout", "user": "bob"})
         for line in audit:
             print(f"  {line}")
-
-        print("\n=== 决策型 effect ===")
-        # ``ask`` 逆序询问 handler 链，首个非 None 的结果生效。
-        result = ask("MyRouter", RouteCtx(task_name="x", tags=["gpu"]))
-        print(f"  ask(MyRouter)               -> {result}")
 
         print("\n=== 运行时查询 ===")
         print(f"  capabilities: {sorted(rt.capabilities)}")

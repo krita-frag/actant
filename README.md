@@ -76,7 +76,6 @@ with Runtime():
 uv run python examples/quickstart.py            # ERH 全流程：ask/perform/emit/impossible
 uv run python examples/custom_capability.py     # 自定义 capability、handler 链组合
 uv run python examples/flow_pipeline.py         # 真实 DAG 流水线：分支/汇合/依赖/失败路径
-uv run python -m examples.github_analyzer       # 大型示例：真实 GitHub 仓库分析
 ```
 
 ## 文档
@@ -123,4 +122,4 @@ uv run actant worker --max-concurrent-tasks 8 --scheduler priority
 uv run actant worker --resume
 ```
 
-显式指定 `--data-dir`（或 `Runtime(data_dir=...)`）后，节点才启用 iroh P2P 自动发现，无需中心服务器；不指定时默认 `preset="none"`，仅 loopback。部署与发现配置见 `docs/guide/deployment.md`。
+显式指定 `--data-dir`（或 `Runtime(data_dir=...)`）时，节点默认使用 `preset="local"`（公网 DNS + relay 发现）；不指定时使用临时目录并默认 `preset="none"`（仅 loopback）。内网部署应显式使用 `--discovery none` 并配置 bootstrap。部署与发现配置见 `docs/guide/deployment.md`。
