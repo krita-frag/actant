@@ -462,3 +462,101 @@ mod cancel_poller {
         }
     }
 }
+
+// ─────────────────── worker 池存活校验与写失败重试 ───────────────────
+
+#[cfg(unix)]
+fn sh_worker(script: &str, env: BTreeMap<String, String>) -> WorkerLaunchSpec {
+    WorkerLaunchSpec::new(
+        "sh".to_string(),
+        vec!["-c".to_string(), script.to_string()],
+        env,
+    )
+}
+
+/// 空闲 worker 在池中死亡后，`pop_worker` 必须丢弃它并返回替补，
+/// 而不是把死进程交给 dispatch 后触发一次无意义的 crash failover。
+#[cfg(unix)]
+#[tokio::test]
+async fn pop_worker_discards_exited_worker_and_spawns_replacement() {
+    let d = ProcessTaskDispatcher::new(
+        1,
+        sh_worker("exec sleep 60", BTreeMap::new()),
+        50,
+        Vec::new(),
+        None,
+    )
+    .unwrap();
+
+    let mut dead = d.free_workers.lock().pop_front().expect("one worker");
+    let dead_id = dead.child.id();
+    dead.child.start_kill().expect("kill idle worker");
+    dead.child.wait().await.expect("reap idle worker");
+    d.free_workers.lock().push_back(dead);
+
+    let mut live = d.pop_worker().await.expect("replacement worker");
+    assert_ne!(
+        live.child.id(),
+        dead_id,
+        "pop_worker must not hand out the exited worker"
+    );
+
+    live.child.start_kill().expect("kill replacement");
+    live.child.wait().await.expect("reap replacement");
+    d.shutdown();
+}
+
+/// Dispatch 帧写入失败（worker 在领用后恰好退出）时必须换 worker 重试一次。
+/// 重试成功的判定是进入正常的结果等待并由短超时结束，而不是返回
+/// `worker terminated before dispatch`。
+#[cfg(unix)]
+#[tokio::test]
+async fn dispatch_retries_once_when_worker_stdin_is_closed() {
+    let base = std::env::temp_dir().join(format!("actant-dispatch-retry-{}", std::process::id()));
+    let state = base.with_extension("state");
+    let ready = base.with_extension("ready");
+    let _ = std::fs::remove_file(&state);
+    let _ = std::fs::remove_file(&ready);
+
+    let script = r#"if [ -f "$ACTANT_RETRY_STATE" ]; then exec cat >/dev/null; else exec 0<&-; : > "$ACTANT_RETRY_READY"; exec sleep 60; fi"#;
+    let mut env = BTreeMap::new();
+    env.insert(
+        "ACTANT_RETRY_STATE".to_string(),
+        state.to_string_lossy().into_owned(),
+    );
+    env.insert(
+        "ACTANT_RETRY_READY".to_string(),
+        ready.to_string_lossy().into_owned(),
+    );
+
+    let d =
+        ProcessTaskDispatcher::new(1, sh_worker(script, env), 50, TEST_KEY.to_vec(), None).unwrap();
+
+    // 等第一个 worker 确认已关闭 stdin：只有此时写入才必然 EPIPE。
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !ready.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "first worker did not close stdin in time"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let err = d
+        .dispatch(
+            "retry",
+            signed(b"payload"),
+            new_cancel_flag(),
+            Duration::from_millis(200),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ActantError::Timeout(_)),
+        "expected write retry to reach a live worker and time out, got: {err:?}"
+    );
+
+    d.shutdown();
+    let _ = std::fs::remove_file(&state);
+    let _ = std::fs::remove_file(&ready);
+}

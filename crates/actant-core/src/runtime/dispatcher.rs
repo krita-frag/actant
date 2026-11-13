@@ -262,6 +262,8 @@ pub struct ProcessTaskDispatcher {
     free_workers: Mutex<VecDeque<WorkerProc>>,
     /// 并发槽位：容量 = 进程池大小，dispatch 据此公平领用空闲 worker。
     slots: Arc<Semaphore>,
+    /// 进程池目标容量，用于限制连续丢弃死 worker 的次数。
+    pool_size: usize,
     /// Payload 签名密钥。非空时 dispatch 会验证 payload MAC。
     signing_key: Vec<u8>,
     /// 取消后等待 worker 协作退出的宽限期，超时则强杀。
@@ -300,6 +302,7 @@ impl ProcessTaskDispatcher {
             launch,
             free_workers: Mutex::new(VecDeque::with_capacity(num_workers)),
             slots: Arc::new(Semaphore::new(num_workers)),
+            pool_size: num_workers,
             signing_key,
             cancel_grace,
             shutting_down: AtomicBool::new(false),
@@ -323,6 +326,7 @@ impl ProcessTaskDispatcher {
             launch: WorkerLaunchSpec::default(),
             free_workers: Mutex::new(VecDeque::new()),
             slots: Arc::new(Semaphore::new(0)),
+            pool_size: 0,
             signing_key,
             cancel_grace: Duration::from_millis(10),
             shutting_down: AtomicBool::new(false),
@@ -408,12 +412,53 @@ impl ProcessTaskDispatcher {
         })
     }
 
-    /// 领用一个空闲 worker。调用方须先持有 `slots` 信号量许可，
-    /// 保证空闲队列非空；队列为空时等待（仅发生在极端竞态下）。
+    /// 领用一个**存活**的空闲 worker。
+    ///
+    /// 调用方须先持有 `slots` 信号量许可，保证空闲队列最终非空。队列中的
+    /// worker 可能在空闲期间自行退出（崩溃、被外部终止），因此出队后先用
+    /// `try_wait` 探测；已退出的直接丢弃并同步替补，避免把死进程交给
+    /// `send_frame` 后触发一次无意义的 crash failover。
     async fn pop_worker(&self) -> Result<WorkerProc, ActantError> {
+        let mut discarded = 0usize;
         loop {
-            if let Some(w) = self.free_workers.lock().pop_front() {
-                return Ok(w);
+            let candidate = self.free_workers.lock().pop_front();
+            if let Some(mut worker) = candidate {
+                match worker.child.try_wait() {
+                    Ok(None) => return Ok(worker),
+                    Ok(Some(status)) => {
+                        tracing::warn!(
+                            ?status,
+                            "discarding exited worker before dispatch; respawning"
+                        );
+                        drop(worker);
+                        if discarded >= self.pool_size {
+                            return Err(ActantError::Worker(
+                                "worker pool kept returning exited processes; \
+                                 check the worker program"
+                                    .into(),
+                            ));
+                        }
+                        discarded += 1;
+                        self.ensure_replacement()?;
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "failed to probe worker liveness; respawning"
+                        );
+                        // 探测失败时进程可能仍存活；按崩溃路径终止后再丢弃。
+                        Self::force_kill(&mut worker.child).await;
+                        if discarded >= self.pool_size {
+                            return Err(ActantError::Worker(format!(
+                                "worker liveness probe failed: {e}"
+                            )));
+                        }
+                        discarded += 1;
+                        self.ensure_replacement()?;
+                        continue;
+                    }
+                }
             }
             if self.shutting_down.load(Ordering::Acquire) {
                 return Err(ActantError::Internal("worker pool shut down".into()));
@@ -443,7 +488,9 @@ impl ProcessTaskDispatcher {
     /// 立即强杀保证计算资源即时释放、槽位即时回收（与取消的宽限语义区分）。
     async fn kill_and_replace(&self, mut worker: WorkerProc) {
         Self::force_kill(&mut worker.child).await;
-        self.ensure_replacement();
+        if let Err(e) = self.ensure_replacement() {
+            tracing::warn!(error = %e, "failed to respawn worker after hard timeout; pool shrunk");
+        }
         drop(worker);
     }
 
@@ -486,7 +533,9 @@ impl ProcessTaskDispatcher {
                 // worker 在宽限期内协作退出。
             }
         }
-        self.ensure_replacement();
+        if let Err(e) = self.ensure_replacement() {
+            tracing::warn!(error = %e, "failed to respawn worker after cancel; pool shrunk");
+        }
         drop(worker);
     }
 
@@ -528,23 +577,24 @@ impl ProcessTaskDispatcher {
     }
 
     /// 替补一个已崩溃/被杀的 worker。
-    fn ensure_replacement(&self) {
+    fn ensure_replacement(&self) -> Result<(), ActantError> {
         // shutdown 后不再替补：在途任务的终止路径（超时强杀/崩溃回收）会走到这里，
         // 新 spawn 的 worker 在 shutdown 语义下无人消费也无人回收，属纯泄漏。
         if self.shutting_down.load(Ordering::Acquire) {
-            return;
+            return Ok(());
         }
-        match ProcessTaskDispatcher::spawn_one(&self.launch, self.log_bus.clone()) {
-            Ok(worker) => self.release_worker(worker),
-            Err(e) => tracing::warn!(error = %e, "failed to respawn worker; pool shrunk"),
-        }
+        let worker = ProcessTaskDispatcher::spawn_one(&self.launch, self.log_bus.clone())?;
+        self.release_worker(worker);
+        Ok(())
     }
 
     /// `dispatch` 内派发帧写失败 / 读到 EOF 时的崩溃回收路径。
-    async fn recover_crash(&self, mut worker: WorkerProc) {
+    ///
+    /// 返回替补结果：调用方若还要继续使用进程池（写失败重试），必须在替补
+    /// 失败时终止，否则会在空队列上无限等待。
+    async fn recover_crash(&self, mut worker: WorkerProc) -> Result<(), ActantError> {
         Self::force_kill(&mut worker.child).await;
-        self.ensure_replacement();
-        drop(worker);
+        self.ensure_replacement()
     }
 
     /// 后台任务：轮询 `cancel_flag`，置位时向 worker 发送 `Cancel` 帧。
@@ -716,37 +766,73 @@ impl TaskDispatcher for ProcessTaskDispatcher {
             .acquire_owned()
             .await
             .map_err(|_| ActantError::Internal("worker pool closed".into()))?;
-        let mut worker = self.pop_worker().await?;
+        // 领用 worker 并写入 Dispatch 帧。写失败通常意味着该 worker 在领用后
+        // 恰好退出（校验与写之间的 TOCTOU）；此时换一个 worker 重试一次，
+        // 而不是把错误冒泡给调用方并消耗 crash failover 配额。
+        let (mut worker, canceller, cancel_stdin_rx, active, writing) = {
+            let mut retried = false;
+            loop {
+                let mut worker = self.pop_worker().await?;
 
-        // 取出独立取消写端，交由 poller task 拥有；归还有两种路径：
-        //  1) poller 通过 oneshot 在自己发完 Cancel 后归还（正常/取消分支）；
-        //  2) abort poller 时，cancel_stdin 所有权在 poller 内 → oneshot 被 close 变为
-        //     RecvError → 本函数视为 None，等下次 ensure_replacement / spawn_one 重建。
-        // 这样 hot-path send_frame（→write_vectored）全程无 Mutex、无 Arc clone 竞争。
-        let cancel_stdin = worker.cancel_stdin.take();
-        let active = Arc::new(AtomicBool::new(true));
-        // 与 poller 共享的写帧标记：poller 进入写 Cancel 路径前置位，dispatch 在
-        // poller 退出后据此判断 worker stdin 是否可能残留过期 Cancel 帧。
-        let writing = Arc::new(AtomicBool::new(false));
-        let (canceller, cancel_stdin_rx) = Self::spawn_cancel_poller(
-            cancel_stdin,
-            cancel_flag.clone(),
-            active.clone(),
-            writing.clone(),
-        );
+                // 取出独立取消写端，交由 poller task 拥有；归还有两种路径：
+                //  1) poller 通过 oneshot 在自己发完 Cancel 后归还（正常/取消分支）；
+                //  2) abort poller 时，cancel_stdin 所有权在 poller 内 → oneshot 被
+                //     close 变为 RecvError → 本函数视为 None，等下次 spawn_one 重建。
+                // 这样 hot-path send_frame（→write_vectored）全程无 Mutex、无 Arc
+                // clone 竞争。
+                let cancel_stdin = worker.cancel_stdin.take();
+                let active = Arc::new(AtomicBool::new(true));
+                // 与 poller 共享的写帧标记：poller 进入写 Cancel 路径前置位，dispatch
+                // 在 poller 退出后据此判断 worker stdin 是否可能残留过期 Cancel 帧。
+                let writing = Arc::new(AtomicBool::new(false));
+                let (canceller, cancel_stdin_rx) = Self::spawn_cancel_poller(
+                    cancel_stdin,
+                    cancel_flag.clone(),
+                    active.clone(),
+                    writing.clone(),
+                );
 
-        if let Err(e) = worker.send_frame(FRAME_DISPATCH, &verified).await {
-            // 派发帧写失败：worker 已死，等待 poller 退出后替补并返回错误。
-            active.store(false, Ordering::Relaxed);
-            let (cancel_stdin, _) =
-                Self::stop_cancel_poller(canceller, cancel_stdin_rx, &writing).await;
-            worker.cancel_stdin = cancel_stdin;
-            tracing::warn!(error = %e, "worker dispatch write failed; crashing worker");
-            self.recover_crash(worker).await;
-            return Err(ActantError::Worker(format!(
-                "worker terminated before dispatch: {e}"
-            )));
-        }
+                match worker.send_frame(FRAME_DISPATCH, &verified).await {
+                    Ok(()) => break (worker, canceller, cancel_stdin_rx, active, writing),
+                    Err(e) => {
+                        // 先停 poller 再处置 worker，避免残留 Cancel 帧。
+                        active.store(false, Ordering::Relaxed);
+                        let (cancel_stdin, _) =
+                            Self::stop_cancel_poller(canceller, cancel_stdin_rx, &writing).await;
+                        worker.cancel_stdin = cancel_stdin;
+                        let cancelled = cancel_flag.load(Ordering::Relaxed);
+                        if retried || cancelled {
+                            tracing::warn!(
+                                error = %e,
+                                "worker dispatch write failed; no retry left"
+                            );
+                            if let Err(re) = self.recover_crash(worker).await {
+                                tracing::warn!(error = %re, "failed to respawn worker; pool shrunk");
+                            }
+                            return if cancelled {
+                                Err(ActantError::Cancelled("task cancelled".into()))
+                            } else {
+                                Err(ActantError::Worker(format!(
+                                    "worker terminated before dispatch: {e}"
+                                )))
+                            };
+                        }
+                        tracing::warn!(
+                            error = %e,
+                            "worker dispatch write failed; replacing worker and retrying once"
+                        );
+                        // 替补失败时不能进入下一轮：pop_worker 会在空队列上等待。
+                        if let Err(re) = self.recover_crash(worker).await {
+                            return Err(ActantError::Worker(format!(
+                                "worker terminated before dispatch ({e}); \
+                                 failed to spawn replacement: {re}"
+                            )));
+                        }
+                        retried = true;
+                    }
+                }
+            }
+        };
 
         let outcome = tokio::select! {
             result = worker.read_result_frame() => {
@@ -764,7 +850,9 @@ impl TaskDispatcher for ProcessTaskDispatcher {
                             tracing::warn!(
                                 "cancel frame raced with task completion; recycling worker"
                             );
-                            self.recover_crash(worker).await;
+                            if let Err(e) = self.recover_crash(worker).await {
+                                tracing::warn!(error = %e, "failed to respawn worker; pool shrunk");
+                            }
                         } else {
                             self.release_worker(worker);
                         }
@@ -773,13 +861,17 @@ impl TaskDispatcher for ProcessTaskDispatcher {
                     Ok(None) => {
                         // EOF：worker 崩溃退出。替补后返回错误。
                         tracing::warn!("worker encountered EOF (crash) while reading result");
-                        self.recover_crash(worker).await;
+                        if let Err(e) = self.recover_crash(worker).await {
+                            tracing::warn!(error = %e, "failed to respawn worker; pool shrunk");
+                        }
                         Err(ActantError::Worker(
                             "worker process crashed while executing task".into(),
                         ))
                     }
                     Err(e) => {
-                        self.recover_crash(worker).await;
+                        if let Err(re) = self.recover_crash(worker).await {
+                            tracing::warn!(error = %re, "failed to respawn worker; pool shrunk");
+                        }
                         Err(e)
                     }
                 }

@@ -58,6 +58,8 @@ Rust `ProcessTaskDispatcher` 与 worker 子进程通过 stdio 长度前缀二进
 
 worker 进程崩溃（非逻辑失败、非硬超时）属基础设施级失败：任务清空 `target_node` 重新入队，由路由器重选本地或远端节点执行。重路由受 `crash_failover_max_attempts`（默认 3）上限约束，达到上限才降级为正常失败路径。超时与业务失败不参与该上限。
 
+派发前会探测空闲 worker 是否仍存活；若 Dispatch 帧写入失败（worker 恰在领用后退出），dispatcher 换一个 worker 重试一次，只有重试仍失败才把错误交给上层，因此这类基础设施抖动不消耗 `crash_failover_max_attempts`。
+
 ## 可调参数
 
 Worker 行为由 `actant.actant._ActantConfig` 控制。高层 `Runtime` 暴露 `config` 入口与一组便捷参数（`max_concurrent_tasks` / `default_task_timeout_ms` / `drain_timeout_secs` / `remote_fallback_delay_ms` / `scheduler`），二者互斥：提供 `config` 时便捷参数被忽略。
