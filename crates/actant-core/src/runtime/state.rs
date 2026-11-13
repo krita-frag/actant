@@ -1113,6 +1113,7 @@ impl Store {
     }
 }
 
+#[cfg(unix)]
 const FILE_MODE: u32 = 0o600;
 #[cfg(unix)]
 const DIR_MODE: u32 = 0o700;

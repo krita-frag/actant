@@ -10,7 +10,7 @@ use actant_core::common::{
 use actant_core::runtime::workflow::Phase;
 
 #[pyclass(name = "_WorkflowState", from_py_object)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PyWorkflowState {
     Pending,
     Running,
