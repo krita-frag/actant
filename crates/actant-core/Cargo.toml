@@ -37,8 +37,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "registry", "j
 opentelemetry = { version = "0.32", features = ["metrics"] }
 opentelemetry_sdk = { version = "0.32", features = ["metrics"] }
 opentelemetry-prometheus = "0.32"
-opentelemetry-appender-tracing = "0.32"
-opentelemetry-semantic-conventions = "0.32"
 # OTLP gRPC exporter：通过 `OTEL_EXPORTER_OTLP_ENDPOINT` 自动启用。
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["metrics", "grpc-tonic"] }
 tonic = { version = "0.14", default-features = false }

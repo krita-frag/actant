@@ -1195,7 +1195,7 @@ impl crate::runtime::actor::Actor for FlakyCompleteActor {
         let fail = msg.method == "on_task_result"
             && self
                 .fails_left
-                .fetch_update(AtomicOrdering::SeqCst, AtomicOrdering::SeqCst, |n| {
+                .try_update(AtomicOrdering::SeqCst, AtomicOrdering::SeqCst, |n| {
                     if n > 0 {
                         Some(n - 1)
                     } else {
