@@ -121,6 +121,19 @@ jobs:
       - name: pytest（act-service 扩展）
         run: uv run pytest extensions/act-service/tests
 
+      - name: 构建 manylinux wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --out dist
+          manylinux: "2_28"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-x86_64-unknown-linux-gnu
+          path: dist/*.whl
+          if-no-files-found: error
+
   windows:
     name: Windows 编译 + pipe 路径冒烟
     runs-on: windows-latest
@@ -153,3 +166,12 @@ jobs:
           uv run pytest
           tests/python/unit/test_worker_frames.py
           tests/python/unit/test_task.py
+
+      - name: 构建 wheel
+        run: uv run maturin build --release --out dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-x86_64-pc-windows-msvc
+          path: dist/*.whl
+          if-no-files-found: error
