@@ -44,3 +44,10 @@ default = ["python"]
 name = "actant"
 path = "src/lib.rs"
 crate-type = ["cdylib", "rlib"]
+
+# 运行时性能优先：跨 crate 内联，不做 size 优化；strip 仅去掉符号表，
+# 不影响执行速度。panic 保持 unwind，以便 PyO3 把 Rust panic 转成 Python 异常。
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
