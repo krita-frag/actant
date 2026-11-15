@@ -196,6 +196,12 @@ rt = Runtime(route_policy="label_affinity")
 
 ## 信任与生产模式
 
+> **⚠️ 默认配置不签名 payload**：`payload_signing_key` 为空时，任意来源的任务
+> payload 都被接受。cloudpickle 反序列化即任意代码执行——多节点或任何非回环
+> 网络部署**必须**显式配置 `payload_signing_key`，或直接使用
+> `Runtime.production()`（同时强制成员白名单与记录签名）。
+
+
 - `NetworkConfig.allowed_peer_ids` 非空时校验 gossip 成员资格；直连侧另有 ALPN 白名单与 wire MAC。元素必须是 iroh endpoint id（如 `rt.peer_id`），写成完整 `endpoint_addr` 会在启动期报 `Config` 错误。
 - `require_signed_records=True` 时拒绝缺签/坏签心跳，并要求 `node_id` 等于 endpoint id：`name` 留空即自动采用持久身份，友好展示名请用 `node_labels`。
 - `Runtime.production()` 强制：非空 `payload_signing_key`、非空 `allowed_peer_ids`（空则拒启）、`require_signed_records=True`。

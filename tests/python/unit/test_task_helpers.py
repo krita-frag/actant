@@ -12,7 +12,6 @@ from actant._internal.tasks.helpers import (
     _emit_task_event,
     _execute_with_cancellation,
     _interruptible_sleep,
-    _pickle_exception,
     _safe_serialize,
     _suppress_pickle_errors,
 )
@@ -77,28 +76,6 @@ def test_execute_with_cancellation_checks_cancel_before_start() -> None:
     ctx._cancel()
     with _task_context_scope(ctx), pytest.raises(TaskCancelledError):
         _execute_with_cancellation(lambda: None, (), {})
-
-
-def test_pickle_exception_round_trip() -> None:
-    exc = ValueError("round")
-    raw = _pickle_exception(exc)
-    out = cloudpickle.loads(raw)
-    assert isinstance(out, ValueError)
-    assert str(out) == "round"
-
-
-def test_pickle_exception_falls_back_for_unpicklable() -> None:
-    """不可序列化的异常应退化为携带类型与消息的 RuntimeError。"""
-
-    class _Unpicklable(Exception):
-        def __reduce__(self) -> None:
-            raise TypeError("cannot pickle")
-
-    raw = _pickle_exception(_Unpicklable("secret"))
-    out = cloudpickle.loads(raw)
-    assert isinstance(out, RuntimeError)
-    assert "_Unpicklable" in str(out)
-    assert "secret" in str(out)
 
 
 def test_safe_serialize_round_trip() -> None:

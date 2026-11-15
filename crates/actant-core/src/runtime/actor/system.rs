@@ -17,7 +17,7 @@ use crate::common::{
 };
 use crate::runtime::actor::mailbox::MailboxRegistry;
 use crate::runtime::actor::runtime::{Actor, ActorContext};
-use crate::runtime::event_bus::{BusEvent, EventBus};
+use crate::runtime::events::{EventTap, TapEvent};
 
 /// 单次 actor 调用的默认上限。
 ///
@@ -60,18 +60,20 @@ struct RunningActor {
     ctx: ActorContext,
     rx: mpsc::Receiver<ActorMessage>,
     cancel_rx: watch::Receiver<bool>,
-    event_bus: EventBus,
+    tap: EventTap,
 }
 
 impl RunningActor {
-    /// 发布不可恢复的 Actor 生命周期错误到 `Topic::ActorLifecycleError`。
+    /// 发布不可恢复的 Actor 生命周期错误到观测 tap。
     ///
     /// 描述 panic / 状态机非法转换等需要外部介入的错误；常规消息失败不发布
     /// 事件，由 `tracing::error!` 与 `inc_actors_failed` 指标承载可观测性。
     fn emit_lifecycle_error(&self, error: String) {
         let actor_id = self.actor_id.clone();
-        self.event_bus
-            .publish(BusEvent::ActorLifecycleError { actor_id, error });
+        self.tap.publish(TapEvent::ActorLifecycleError {
+            actor_id,
+            error: std::sync::Arc::from(error.as_str()),
+        });
     }
 
     async fn run(mut self) {
@@ -231,7 +233,7 @@ pub struct ActorSystem {
     /// 串行化 spawn 的 check → reserve → insert，避免并发 spawn 同 id。
     spawn_lock: tokio::sync::Mutex<()>,
     registry: MailboxRegistry,
-    pub(crate) event_bus: EventBus,
+    pub(crate) tap: EventTap,
     node_id: Option<NodeId>,
     pub(crate) config: ActorConfig,
     /// `call` 的等待上限；见 [`DEFAULT_CALL_TIMEOUT`]。
@@ -245,7 +247,7 @@ impl ActorSystem {
             spawning: DashMap::new(),
             spawn_lock: tokio::sync::Mutex::new(()),
             registry: MailboxRegistry::new(),
-            event_bus: EventBus::new(),
+            tap: EventTap::new(),
             node_id: None,
             config: ActorConfig::default(),
             call_timeout: DEFAULT_CALL_TIMEOUT,
@@ -269,12 +271,12 @@ impl ActorSystem {
         self
     }
 
-    /// 注入共享的 `EventBus`，使 Actor 生命周期事件流向系统其他模块。
+    /// 注入共享的观测 tap，使 Actor 生命周期事件流向系统其他模块。
     ///
-    /// 所有已通过 `subscribe()` 建立的订阅会随旧 bus 一起失效；调用方应在
-    /// `with_event_bus` 之后再订阅。
-    pub fn with_event_bus(mut self, bus: EventBus) -> Self {
-        self.event_bus = bus;
+    /// 订阅应在 `with_tap` 之后建立（tap 默认实例上无订阅者时 publish 为
+    /// no-op，不会报错）。
+    pub fn with_tap(mut self, tap: EventTap) -> Self {
+        self.tap = tap;
         self
     }
 
@@ -325,7 +327,7 @@ impl ActorSystem {
             ctx,
             rx,
             cancel_rx,
-            event_bus: self.event_bus.clone(),
+            tap: self.tap.clone(),
         };
 
         let task = tokio::spawn(async move {
@@ -395,10 +397,21 @@ impl ActorSystem {
     ) -> Result<ActorMessageResult> {
         let method_name = method.to_string();
         let (msg, rx) = ActorMessage::with_reply(actor_id.clone(), method_name.clone(), payload);
-        self.registry.send(actor_id, msg).await?;
-        match tokio::time::timeout(self.call_timeout, rx).await {
-            Ok(Ok(result)) => Ok(result),
-            Ok(Err(e)) => Err(ActantError::Actor(format!("call failed: {}", e))),
+        // 超时覆盖投递与等待两段：有界邮箱满时 `registry.send` 会无限期
+        // await——若只包等待段，actor 卡死 + 邮箱已被填满时调用方（含 PyO3
+        // 释放 GIL 的 block_on）永久阻塞，文档承诺的「把永不返回降级为可
+        // 诊断超时」不成立。
+        match tokio::time::timeout(self.call_timeout, async {
+            self.registry.send(actor_id, msg).await?;
+            Ok(rx.await)
+        })
+        .await
+        {
+            // 内层 Ok(Ok(result))：投递成功且应答到达；内层 Err：投递失败或
+            // 应答通道关闭（actor panic），与外层 Timeout（30s 上限）三分。
+            Ok(Ok(Ok(result))) => Ok(result),
+            Ok(Ok(Err(e))) => Err(ActantError::Actor(format!("call failed: {}", e))),
+            Ok(Err(send_err)) => Err(send_err),
             Err(_elapsed) => Err(ActantError::Timeout(format!(
                 "actor {} call '{}' timed out after {:?}",
                 actor_id.as_str(),
@@ -470,14 +483,16 @@ impl ActorSystem {
         tracing::debug!(actor = %actor_id.0, "actor cleaned up");
     }
 
-    /// 发布不可恢复的 Actor 生命周期错误到 `Topic::ActorLifecycleError`。
+    /// 发布不可恢复的 Actor 生命周期错误到观测 tap。
     ///
     /// 用于 `run_actor_on_start` 等 spawn 前路径拦截到的 panic——这些路径
     /// RunningActor 尚未构造，无法用其 `emit_lifecycle_error`，由 ActorSystem
     /// 直接发布。
     pub(crate) fn emit_lifecycle_error(&self, actor_id: ActorId, error: String) {
-        self.event_bus
-            .publish(BusEvent::ActorLifecycleError { actor_id, error });
+        self.tap.publish(TapEvent::ActorLifecycleError {
+            actor_id,
+            error: std::sync::Arc::from(error.as_str()),
+        });
     }
 
     pub fn list_actors(&self) -> Vec<ActorId> {

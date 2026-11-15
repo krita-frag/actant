@@ -2,7 +2,7 @@
 //! （Heartbeat / DagUpdate / Claim）**直连分发**到 FailoverManager /
 //! DagGossipActor——peer 出现、gossip seen 登记、claim 生效。
 //!
-//! 控制面消息不经过 EventBus（观测 tap，有损）；本测试驱动与生产装配
+//! 控制面消息不经过事件通道（观测 tap，有损）；本测试驱动与生产装配
 //! 相同的分发入口（`NetworkEventRouter::handle_message`），断言真实
 //! handler 的副作用。
 //!
@@ -89,7 +89,8 @@ async fn make_wiring(node_id_str: &str) -> TestWiring {
 
     let router = NetworkEventRouter::new(NetworkEventRouterConfig {
         network: transport,
-        event_bus: EventBus::new(),
+        tap: crate::runtime::events::EventTap::new(),
+        result_feed: crate::runtime::events::TaskResultFeed::new().0,
         scheduler: Arc::new(crate::test_support::MockScheduler::new()),
         actor_system: Some(actor_system),
         workflow_actor_id: None,

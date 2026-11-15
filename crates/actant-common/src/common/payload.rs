@@ -172,12 +172,24 @@ pub fn sign(key: &[u8], payload: &[u8]) -> Result<Vec<u8>, String> {
 ///
 /// - 非空密钥：要求数据以 `MAC_PREFIX` 开头并验证 MAC；拒绝未签名 payload。
 /// - 空密钥：禁用签名验证，直接返回原始数据；若数据以 `MAC_PREFIX` 开头则报错，
-///   避免在禁用签名的节点上误处理本应签名的 payload。
+///   避免在禁用签名的节点上误处理本应签名的 payload。空密钥意味着**任意来源的
+///   payload 都被接受**（cloudpickle 反序列化即任意代码执行）——首次在空密钥
+///   下接收载荷时 warn 一次，提醒公网多节点部署显式启用签名。
 pub fn verify(key: &[u8], data: &[u8]) -> Result<Vec<u8>, String> {
+    // 签名禁用的提醒只发一次：重复 warn 在热路径刷屏；完全静默会让用户按
+    // "默认安全"的预期部署公网集群而无人提醒。
+    static UNSIGNED_PAYLOAD_WARN: std::sync::Once = std::sync::Once::new();
     if key.is_empty() {
         if data.len() >= MAC_PREFIX.len() && &data[..MAC_PREFIX.len()] == MAC_PREFIX {
             return Err("signing disabled but payload appears signed".into());
         }
+        UNSIGNED_PAYLOAD_WARN.call_once_force(|_| {
+            tracing::warn!(
+                "payload signing is DISABLED (empty key); accepting unsigned payloads \
+                 from any peer. Enable payload_signing_key for multi-node deployments — \
+                 cloudpickle deserialization is arbitrary code execution."
+            );
+        });
         return Ok(data.to_vec());
     }
     if data.len() < MAC_PREFIX.len() + MAC_LEN {

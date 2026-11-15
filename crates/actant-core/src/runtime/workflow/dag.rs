@@ -346,6 +346,11 @@ impl WorkflowExecution {
     }
 
     pub fn mark_running(&mut self) {
+        // 终态守卫：START/恢复路径不得把 Completed/Failed/Cancelled 工作流
+        // 复活为 Running——终态是事实源，复活会让终态守卫与恢复路径全部失准。
+        if self.state.is_terminal() {
+            return;
+        }
         self.state = Phase::Running;
         if self.started_at_ms.is_none() {
             self.started_at_ms = Some(crate::common::epoch_millis());
@@ -547,8 +552,12 @@ impl WorkflowExecution {
     ///
     /// `result_attempt` 语义与 [`Self::mark_task_completed`] 相同：过期派发
     /// 代数的失败报告同样会被 attempt fencing 丢弃。
+    ///
+    /// `dag` 提供 Continue 策略下级联取消所需的邻接表（失败任务的传递后继
+    /// 按「不可达 = 取消」处置，见 [`Self::cancel_unreachable_descendants`]）。
     pub fn fail_task(
         &mut self,
+        dag: &Dag,
         task_id: &TaskId,
         error: String,
         mode: FailureScope,
@@ -572,10 +581,43 @@ impl WorkflowExecution {
                 if self.failure_strategy == FailureStrategy::FailFast {
                     self.set_failed(error);
                 } else {
-                    // Continue：终态判定与完成路径同一封口约束（增量提交
+                    // Continue：失败任务的下游不可达（前驱计数门控保证其必为
+                    // Pending、永不派发）——按「下游不可达 = 取消」级联处置，
+                    // 否则其 pending 计数永不递减，工作流停在 Running 永不
+                    // 终态（无任何定时器/推进者可推动它）。级联是 DAG 结构 +
+                    // 失败位置的纯函数，journal 重放经同一 fail_task 路径
+                    // 确定性重建，无需单独事件。随后终态判定按
+                    // Failed > Cancelled 收敛（任一失败即工作流 Failed）。
+                    self.cancel_unreachable_descendants(dag, task_id);
+                    // 终态判定与完成路径同一封口约束（增量提交
                     // 进行中不得因已知节点终态而提前终态化）。
                     self.check_workflow_completion();
                 }
+            }
+        }
+    }
+
+    /// 把 `failed_id` 的全部传递后继中仍处 `Pending` 的节点置为 `Cancelled`。
+    ///
+    /// 仅取消 Pending：前驱门控下失败任务的下游不可能已在执行；若防御性
+    /// 场景中出现 Running 后继，让它自然终态、其下游已被取消，工作流仍可
+    /// 收敛。BFS 走 `dag` 的邻接表，visited 集合防环（DAG 无环，此为对重复
+    /// 边/数据损坏的防御）。
+    fn cancel_unreachable_descendants(&mut self, dag: &Dag, failed_id: &TaskId) {
+        let mut stack = vec![failed_id.clone()];
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(failed_id.clone());
+        while let Some(id) = stack.pop() {
+            for succ in dag.successor_ids(&id) {
+                if !visited.insert(succ.clone()) {
+                    continue;
+                }
+                if let Some(task) = self.tasks.get_mut(&succ) {
+                    if task.state == Phase::Pending {
+                        task.state = Phase::Cancelled;
+                    }
+                }
+                stack.push(succ);
             }
         }
     }
@@ -707,8 +749,11 @@ impl WorkflowExecution {
         if self.state.is_terminal() {
             return;
         }
+        // Running 与 Pending 一并取消：Pending 不可取消会让取消后仍被派发
+        // 执行（副作用照做、结果再被终态守卫丢弃）——同一论据适用于
+        // `cancel_task`（其注释已论证），工作流级取消必须同口径。
         for task in self.tasks.values_mut() {
-            if task.state == Phase::Running {
+            if matches!(task.state, Phase::Running | Phase::Pending) {
                 task.state = Phase::Cancelled;
             }
         }
@@ -834,6 +879,11 @@ impl Dag {
             return Err(crate::common::ActantError::Workflow(
                 "adding edge would create a cycle".into(),
             ));
+        }
+        // 重复边拒绝：邻接表重复条目会让 predecessor 计数与快照 deps 膨胀
+        // （add_node 已有重名拒绝，此处对齐同样的防御）。
+        if self.edges.iter().any(|e| e.from == from && e.to == to) {
+            return Ok(());
         }
 
         self.edges.push(DagEdge {

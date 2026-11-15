@@ -5,6 +5,8 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::common::serialization::serialize_rkyv;
 use crate::common::{Result, RetryPolicy, TaskDefinition, TaskId, WorkflowId, WorkflowInvocation};
 use crate::runtime::workflow::{Dag, DagNode, FailureScope, Phase, Terminal, WorkflowExecution};
@@ -12,6 +14,26 @@ use crate::runtime::workflow::{Dag, DagNode, FailureScope, Phase, Terminal, Work
 use super::{keys::*, types::*, Orchestrator};
 
 mod timeout;
+
+/// [`Orchestrator::handle_task_failure`] 的裁决结果。
+///
+/// 结果回灌是 at-least-once（重试队列重投 + 直连/gossip 三路回灌），迟到
+/// 重复失败是常态而非异常——`Ignored` 与 `Final` 必须可区分：把迟到重复
+/// 失败当作终局发布会让提交方句柄在重试在途时被错误置为失败（甚至已
+/// Completed 之后被翻转为失败）。跨 actor 消息边界（`ON_TASK_RESULT`
+/// 响应）传递，须可序列化。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum FailureOutcome {
+    /// 重试已排定：携带重派发定义与延迟毫秒，调用方延迟入队调度器。
+    /// `TaskDefinition` 装箱以压平枚举尺寸（裁决值在 actor 消息路径高频传递）。
+    Retry(Box<TaskDefinition>, u64),
+    /// 终局失败：任务已按失败语义（`failure_strategy`）落定，调用方应把
+    /// 失败终态发布给提交方。
+    Final,
+    /// 忽略：迟到重复失败（重试在途 / 任务已终态 / 未封口合成失败）。
+    /// 调用方不得发布终态、不得结算句柄。
+    Ignored,
+}
 
 /// 第 `retry_index` 次重试（0 基）的等待时长。
 ///
@@ -467,26 +489,29 @@ impl Orchestrator {
     ///
     /// 节点 RetryPolicy（来自 `@task(retries=...)` 的映射）仍有余量且任务/
     /// 工作流未终态时：`begin_orchestrated_retry` 把任务直接从 Running 重置回
-    /// Pending（attempt 同步递增，fencing 前提），返回重派发的
-    /// [`TaskDefinition`] 与重试间隔，调用方延迟入队调度器；余量耗尽或不可
-    /// 重试 → 回退到既有 `WorkflowLevel` 失败语义。派发侧 payload 头部
-    /// retries 为 0（Python flow 提交路径置 0），worker 层不重试，两层
-    /// 不会叠加。
-    ///
-    /// 返回 `None` 表示失败为最终结果，调用方应将结果事件发布给提交方。
+    /// Pending（attempt 同步递增，fencing 前提），返回 [`FailureOutcome::Retry`]
+    /// 与重试间隔，调用方延迟入队调度器；余量耗尽或不可重试 → 回退到既有
+    /// `WorkflowLevel` 失败语义并返回 [`FailureOutcome::Final`]。派发侧
+    /// payload 头部 retries 为 0（Python flow 提交路径置 0），worker 层不重试，
+    /// 两层不会叠加。
     ///
     /// ## 迟到失败守卫
     ///
     /// 重试中的任务处于 `Pending`（`retry_count > 0` 可区分"从未运行的
-    /// Pending"）：此时到达的重复失败（gossip / 直连重投）按过期结果忽略，
-    /// 不得把已排定重试的任务改写为 Failed。wire 协议尚未携带派发代数，
-    /// attempt fencing 放行，此守卫是引入重试后的必要补偿。
+    /// Pending"）：此时到达的重复失败（gossip / 直连重投）按过期结果返回
+    /// [`FailureOutcome::Ignored`]，不得把已排定重试的任务改写为 Failed。
+    /// wire 协议尚未携带派发代数，attempt fencing 放行，此守卫是引入重试后
+    /// 的必要补偿。
+    ///
+    /// 结果回灌整体是 at-least-once（重试队列无限重投 + 直连/gossip 三路），
+    /// `Ignored` 与 `Final` 必须可区分：把迟到重复失败当终局发布会让提交方
+    /// 句柄在重试在途时被错误置为失败（甚至已 Completed 之后被翻转）。
     pub async fn handle_task_failure(
         &self,
         workflow_id: &WorkflowId,
         task_id: &TaskId,
         error: String,
-    ) -> Result<Option<(TaskDefinition, u64)>> {
+    ) -> Result<FailureOutcome> {
         let (should_retry, delay_ms) = {
             let slot = self.state.slots.get(workflow_id).ok_or_else(|| {
                 crate::common::ActantError::NotFound(format!(
@@ -495,7 +520,7 @@ impl Orchestrator {
                 ))
             })?;
             if !slot.execution.can_transition_task(task_id) {
-                return Ok(None);
+                return Ok(FailureOutcome::Ignored);
             }
             match slot
                 .execution
@@ -505,16 +530,19 @@ impl Orchestrator {
             {
                 // 重试已在途：迟到的重复失败（gossip / 直连重投）按过期结果忽略，
                 // 不得把已排定重试的任务改写为 Failed。
-                Some((Phase::Pending, count)) if count > 0 => return Ok(None),
+                Some((Phase::Pending, count)) if count > 0 => {
+                    return Ok(FailureOutcome::Ignored);
+                }
                 // 从未派发的本地 Pending（retry_count == 0）且工作流尚未封口：
                 // 只可能来自编排内部的合成失败，忽略。封口后的 Pending 失败
                 // 报告按真实失败处理——远端执行中任务的真实失败可与本地状态
                 // 推进乱序到达（gossip / 直连），交由 can_transition_task 与
                 // fencing 决定取舍。
                 Some((Phase::Pending, 0)) if !slot.execution.nodes_sealed() => {
-                    return Ok(None);
+                    return Ok(FailureOutcome::Ignored);
                 }
-                Some((Phase::Cancelled, _)) => return Ok(None),
+                // Cancelled 分支不可达：can_transition_task 已在入口拒绝一切
+                // 终态任务，无需单独的取消语义分支。
                 _ => {}
             }
             match slot.dag.effective_retry_policy(task_id) {
@@ -562,14 +590,27 @@ impl Orchestrator {
                         task = %task_id.as_str(),
                         "orchestrator-driven retry scheduled"
                     );
-                    return Ok(Some((task, delay_ms)));
+                    return Ok(FailureOutcome::Retry(Box::new(task), delay_ms));
                 }
-                // build 失败（并发淘汰）：按终局失败处理。
+                // reset 失败 = 任务已被并发推进（终态/工作流终态）：按
+                // can_transition_task 复查——不可迁移返回 Ignored（迟到重复
+                // 失败，调用方不得发布终态），可迁移才按终局失败处理。
+                // 直接持有 Orchestrator 句柄的调用方（绕过 actor 串行化）可
+                // 触发该窗口。
+                let still_migratable = {
+                    match self.state.slots.get(workflow_id) {
+                        Some(slot) => slot.execution.can_transition_task(task_id),
+                        None => false,
+                    }
+                };
+                if !still_migratable {
+                    return Ok(FailureOutcome::Ignored);
+                }
             }
         }
         self.fail_task(workflow_id, task_id, error, FailureScope::WorkflowLevel)
             .await?;
-        Ok(None)
+        Ok(FailureOutcome::Final)
     }
 
     /// 由 DAG 节点构造待派发的任务定义。
@@ -719,30 +760,124 @@ impl Orchestrator {
         Ok((ready, info.workflow_terminal))
     }
 
-    /// 取消整个工作流并置为 `Cancelled` 终态。
+    /// 取消整个工作流并置为 `Cancelled` 终态，并**向全部非终态任务传播取消**。
+    ///
+    /// 传播是必须的：只翻转状态不广播时，远端在途任务要占满自身超时才释放，
+    /// 排队任务会继续被派发执行、结果再被终态守卫丢弃（纯浪费的副作用执行）。
+    /// 传播复用 deadline 路径的双腿广播（[`Self::broadcast_task_cancel`]）：
+    /// gossip 腿管远端在途任务，本地自投递腿经 `cancelled_tasks` 注册表让
+    /// 本节点在途/排队任务被取消标志或派发前短路命中。
     ///
     /// 收尾统一走 [`Self::complete_terminal`]：持久化终态快照、追加
     /// `Cancelled` 终态事件、更新指标并唤醒等待者。已终态（Failed /
     /// Completed / Cancelled）的工作流为幂等 no-op——`mark_cancelled` 自带终态
     /// 守卫，兜底取消不得改写更准确的事实源（如 fail-fast 的 Failed）。
+    ///
+    /// Loading 占位符守卫与 `complete_task` 同口径：占位符尚未加载真实 DAG，
+    /// 取消落空后 gossip 快照到达会全量覆盖占位符、把已取消的工作流复活为
+    /// Running——显式拒绝，调用方待数据就绪后重试。
     pub async fn cancel(&self, workflow_id: &WorkflowId) -> Result<()> {
-        let terminal_snapshot = {
+        let (cancels_to_broadcast, terminal_snapshot) = {
             let mut slot = self.state.slots.get_mut(workflow_id).ok_or_else(|| {
                 crate::common::ActantError::NotFound(format!(
                     "workflow {} not found",
                     workflow_id.as_str()
                 ))
             })?;
+            if slot.state == SlotState::Loading {
+                return Err(crate::common::ActantError::InvalidState(format!(
+                    "workflow {} is still loading (placeholder), cannot cancel yet",
+                    workflow_id.as_str()
+                )));
+            }
             let was_terminal = slot.execution.is_terminal();
+            // 状态翻转前收集非终态任务：mark_cancelled 会把它们置 Cancelled，
+            // 之后读不到。Running + Pending 都要传播——Pending 可能已在
+            // 调度队列中（排队任务经注册表短路）或已转发远端。
+            let cancels: Vec<TaskId> = slot
+                .execution
+                .tasks
+                .iter()
+                .filter(|(_, ts)| !ts.state.is_terminal())
+                .map(|(id, _)| id.clone())
+                .collect();
             slot.execution.mark_cancelled();
-            (!was_terminal && slot.execution.is_terminal()).then(|| slot.execution.clone())
+            let snapshot =
+                (!was_terminal && slot.execution.is_terminal()).then(|| slot.execution.clone());
+            (cancels, snapshot)
         };
 
         if let Some(exec_snapshot) = terminal_snapshot {
             self.complete_terminal(workflow_id, None, &exec_snapshot)
                 .await?;
         }
+        // 即使持久化失败也要传播取消，否则在途/排队任务继续占用 Worker 槽位。
+        for task_id in cancels_to_broadcast {
+            self.broadcast_task_cancel(workflow_id, &task_id).await;
+        }
         Ok(())
+    }
+
+    /// 把单个任务的取消指令经双腿发出：gossip 广播 + 本地自投递。
+    ///
+    /// 两条腿缺一不可：gossip 只到邻居（管远端在途任务），且**不会**把消息
+    /// 发回发送者；本地自投递复用 `NetworkEventRouter` 的 `TopicRoute::Cancel`
+    /// 分支，与远端收到广播后的处理完全同路（置位在途任务的 cancel 标志 +
+    /// 登记 `cancelled_tasks` 注册表让排队任务被派发前短路）。deadline 路径
+    /// （timeout watcher）与用户级 `cancel` 共用本方法，避免两类入口的取消
+    /// 语义漂移。未注入 `network` 时（单元测试）为 no-op。
+    pub(crate) async fn broadcast_task_cancel(&self, workflow_id: &WorkflowId, task_id: &TaskId) {
+        let Some(ref network) = self.network else {
+            return;
+        };
+        // 载荷经 `WireEnvelope` 封装（签名集群下随 MAC 验证），与
+        // `Runtime::broadcast_cancel` 同管线——两条取消路径不得一条加密一条裸奔。
+        let bytes =
+            crate::common::WireEnvelope::wrap(crate::common::wire::WireMessage::CancelBroadcast(
+                crate::common::wire::CancelBroadcast {
+                    task_id: task_id.clone(),
+                    workflow_id: workflow_id.clone(),
+                },
+            ))
+            .and_then(|envelope| {
+                postcard::to_allocvec(&envelope)
+                    .map_err(|e| crate::common::ActantError::Serialization(e.to_string()))
+            });
+        let bytes = match bytes {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!(
+                    workflow_id = %workflow_id.as_str(),
+                    task_id = %task_id.as_str(),
+                    error = %e,
+                    "failed to encode CancelBroadcast"
+                );
+                return;
+            }
+        };
+        if let Err(e) = network
+            .broadcast(crate::common::wire::TOPIC_CANCEL, bytes.clone())
+            .await
+        {
+            tracing::warn!(
+                workflow_id = %workflow_id.as_str(),
+                task_id = %task_id.as_str(),
+                error = %e,
+                "failed to broadcast cancel"
+            );
+        }
+        if !network.inject_local_event(crate::runtime::network::NetworkEvent::Message(
+            crate::runtime::network::NetworkMessage {
+                topic: crate::common::wire::TOPIC_CANCEL.to_string(),
+                data: bytes,
+            },
+        )) {
+            tracing::warn!(
+                workflow_id = %workflow_id.as_str(),
+                task_id = %task_id.as_str(),
+                "failed to self-deliver cancel; a locally running task may not be released"
+            );
+        }
     }
 
     /// 取消工作流内的单个任务。
@@ -924,9 +1059,14 @@ impl Orchestrator {
                     workflow_id.as_str()
                 ))
             })?;
-            let accepted = slot.execution.can_transition_task(task_id);
-            slot.execution.fail_task(task_id, error, mode, None);
-            (accepted, accepted && slot.execution.is_terminal())
+            // 字段级解构拆分借用：fail_task 同时需要 execution（可变）与
+            // dag 的邻接表（Continue 级联取消），整体借用无法通过。
+            let crate::runtime::workflow::orchestrator::types::WorkflowSlot {
+                dag, execution, ..
+            } = &mut *slot;
+            let accepted = execution.can_transition_task(task_id);
+            execution.fail_task(dag, task_id, error, mode, None);
+            (accepted, accepted && execution.is_terminal())
         };
 
         if accepted {
@@ -1132,6 +1272,18 @@ impl Orchestrator {
 
         crate::metrics::dec_active_workflows();
 
+        // 终态收尾统一广播取消：fail-fast / fail_workflow / Continue 级联三类
+        // 入口翻转终态时，快照中的 Running 兄弟任务与已被级联取消的 Pending
+        // 下游可能仍在本节点或远端执行——与 `cancel()` 文档批判的行为一致
+        // （远端在途任务占满自身超时、结果再被终态守卫丢弃，纯浪费）。在
+        // 唯一收尾点单次收口，消除三类入口的行为漂移。快照携带终态前视图，
+        // 非终态任务即需要取消传播的对象。
+        for (task_id, ts) in &exec_snapshot.tasks {
+            if !ts.state.is_terminal() {
+                self.broadcast_task_cancel(workflow_id, task_id).await;
+            }
+        }
+
         self.notify_terminal(workflow_id);
         Ok(CompletionInfo {
             workflow_terminal: true,
@@ -1163,7 +1315,7 @@ impl Orchestrator {
 
     /// 释放工作流进入终态后仍 park 在等待点上的等待者。
     ///
-    /// `AsyncResult` 的等待由 `BusEvent::TaskCancelled` 结算，而等待点 park
+    /// `AsyncResult` 的等待由 correctness 通道的 `TaskCancelled` 事件结算，而等待点 park
     /// 是另一条阻塞原语，仅靠运行时关停的 `release_all_wait_point_waiters`
     /// 释放不够：缺了这一步，cancel / fail / deadline 都到不了 park 中的
     /// flow 体——工作流已终态而函数体永久挂起。
@@ -1213,6 +1365,20 @@ impl Orchestrator {
     /// 本方法表示执行失败（Failed），错误串进入终态快照与 `Failed` 事件，
     /// 使 `FlowHandle.result()` 能区分失败与取消。
     pub async fn fail_workflow(&self, workflow_id: &WorkflowId, error: String) -> Result<()> {
+        // 状态翻转前采集 Running 任务：mark_workflow_failed 会把它们翻成
+        // Failed，complete_terminal 的快照收口（W3）看不到仍在本节点或远端
+        // 执行的对象——须由本入口显式广播取消。
+        let running_task_ids: Vec<TaskId> = match self.state.slots.get(workflow_id) {
+            Some(slot) if slot.state == SlotState::Ready => slot
+                .execution
+                .tasks
+                .iter()
+                .filter(|(_, ts)| ts.state == Phase::Running)
+                .map(|(id, _)| id.clone())
+                .collect(),
+            _ => Vec::new(),
+        };
+
         let terminal_snapshot = {
             let mut slot = self.state.slots.get_mut(workflow_id).ok_or_else(|| {
                 crate::common::ActantError::NotFound(format!(
@@ -1220,6 +1386,14 @@ impl Orchestrator {
                     workflow_id.as_str()
                 ))
             })?;
+            // Loading 占位符守卫与 `cancel` 同口径：占位符上置 Failed 会被
+            // gossip 快照的全量覆盖复活。
+            if slot.state == SlotState::Loading {
+                return Err(crate::common::ActantError::InvalidState(format!(
+                    "workflow {} is still loading (placeholder), cannot fail yet",
+                    workflow_id.as_str()
+                )));
+            }
             let was_terminal = slot.execution.is_terminal();
             slot.execution.mark_workflow_failed(error);
             (!was_terminal && slot.execution.is_terminal()).then(|| slot.execution.clone())
@@ -1228,6 +1402,10 @@ impl Orchestrator {
         if let Some(exec_snapshot) = terminal_snapshot {
             self.complete_terminal(workflow_id, None, &exec_snapshot)
                 .await?;
+            // 统一走双腿广播（gossip + 本地自投递），与 `cancel` 同管线。
+            for task_id in running_task_ids {
+                self.broadcast_task_cancel(workflow_id, &task_id).await;
+            }
         }
         Ok(())
     }
@@ -1329,6 +1507,19 @@ impl Orchestrator {
         &self,
         workflow_id: &WorkflowId,
     ) -> Result<Vec<TaskDefinition>> {
+        // 终态守卫前置：终态工作流（如 fail-fast 已 Failed）上的 Running 任务
+        // 不得被重置回 Pending——状态翻转先于过滤会让快照失真（任务状态与
+        // 工作流终态矛盾）。守卫用独立作用域：guard 不得横跨 mark_task_pending
+        // （内部对同一 key 取写守卫，DashMap 同分片重入死锁）。
+        {
+            let slot = match self.state.slots.get(workflow_id) {
+                Some(slot) => slot,
+                None => return Ok(Vec::new()),
+            };
+            if slot.execution.is_terminal() {
+                return Ok(Vec::new());
+            }
+        }
         let running_task_ids = self.get_running_task_ids(workflow_id);
         for task_id in &running_task_ids {
             self.mark_task_pending(workflow_id, task_id)?;
@@ -1338,10 +1529,6 @@ impl Orchestrator {
             Some(slot) => slot,
             None => return Ok(Vec::new()),
         };
-        if slot.execution.is_terminal() {
-            return Ok(Vec::new());
-        }
-
         let ready_ids: Vec<TaskId> = slot
             .pending
             .iter()

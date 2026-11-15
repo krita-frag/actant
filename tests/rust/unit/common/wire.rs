@@ -13,7 +13,7 @@ fn node(s: &str) -> NodeId {
 fn topic_task_uses_correct_prefix() {
     let t = Topic::task(&node("worker-1"));
     assert_eq!(t.as_str(), "actant:task:worker-1");
-    assert!(t.starts_with(constants::TOPIC_TASK_PREFIX));
+    assert!(t.as_str().starts_with(constants::TOPIC_TASK_PREFIX));
 }
 
 #[test]

@@ -7,7 +7,7 @@
 //!
 //! 底层基于 `LmdbStore`（LMDB），事件 ID 全局唯一且可排序。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -620,16 +620,19 @@ impl EventLog for LmdbEventLog {
     }
 }
 
-/// 内存实现的 EventLog，仅用于测试。
+/// 内存实现的 EventLog，仅用于测试（随 `test-support` feature 或 crate 内
+/// 测试编译；生产路径的事件日志由 [`Store`] 承载）。
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Default)]
 pub struct MemoryEventLog {
     inner: std::sync::Arc<parking_lot::Mutex<HashMap<String, Vec<LogEntry>>>>,
     clock: HybridLogicalClock,
     sequences: std::sync::Arc<parking_lot::Mutex<HashMap<String, u64>>>,
     /// 已淘汰 topic：仍有事件数据，但不再出现在 `list_topics` 中。
-    hidden: parking_lot::Mutex<HashSet<String>>,
+    hidden: parking_lot::Mutex<std::collections::HashSet<String>>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl EventLog for MemoryEventLog {
     fn append(&self, topic: &str, payload: &[u8]) -> Result<EventId> {
         if topic.is_empty() {

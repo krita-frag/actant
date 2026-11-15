@@ -112,13 +112,7 @@ async fn blob_roundtrip_with_direct_protocol_coexistence() {
     // 直连协议：请求-响应完整往返，返回约定的 Error 变体。
     let response = tokio::time::timeout(
         Duration::from_secs(10),
-        alice.send_direct_request(
-            bob_addr.as_str(),
-            DirectRequest::QueryWorkflowState {
-                workflow_id: crate::common::WorkflowId::from("wf-coexist"),
-                requesting_node: NodeId::from("alice"),
-            },
-        ),
+        alice.send_direct_request(bob_addr.as_str(), DirectRequest::Ping),
     )
     .await
     .expect("direct request must not hang");

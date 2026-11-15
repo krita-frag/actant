@@ -209,19 +209,11 @@ impl crate::runtime::workflow::Scheduler for MockScheduler {
         Vec::new()
     }
 
-    async fn drain_unrouted(&self) -> Vec<crate::common::TaskDefinition> {
-        Vec::new()
-    }
-
     async fn is_empty(&self) -> bool {
         true
     }
 
     async fn len(&self) -> usize {
-        0
-    }
-
-    fn total_queued(&self) -> usize {
         0
     }
 
@@ -306,25 +298,8 @@ pub async fn assert_scheduler_contract<S: Scheduler + ?Sized>(scheduler: &S) {
     assert_eq!(batch.len(), 2, "dequeue_batch must return all queued tasks");
     assert!(scheduler.is_empty().await);
 
-    let Ok(()) = scheduler
-        .enqueue(contract_task("contract-unrouted", 0))
-        .await
-    else {
-        panic!("open scheduler must accept enqueue");
-    };
-    let mut routed = contract_task("contract-routed", 0);
-    routed.target_node = Some(NodeId::from("contract-peer".to_string()));
-    let Ok(()) = scheduler.enqueue(routed).await else {
-        panic!("open scheduler must accept enqueue");
-    };
-    let drained = scheduler.drain_unrouted().await;
-    assert_eq!(drained.len(), 1, "drain_unrouted must skip routed tasks");
-    assert_eq!(drained[0].name, "contract-unrouted");
-    let Some(remaining) = scheduler.try_dequeue().await else {
-        panic!("routed task must remain queued after drain_unrouted");
-    };
-    assert_eq!(remaining.name, "contract-routed");
-
+    // 原队列同时验证 drain_unrouted 的分流（该 API 已随路由内联移除）：
+    // 现仅保留「close 保留已排队任务」的单任务断言。
     let Ok(()) = scheduler
         .enqueue(contract_task("contract-retained", 0))
         .await

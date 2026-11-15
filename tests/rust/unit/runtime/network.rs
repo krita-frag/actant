@@ -101,10 +101,7 @@ async fn test_send_direct_request_returns_timeout_for_unreachable_peer() {
 
     let unreachable_addr =
         "0000000000000000000000000000000000000000000000000000000000000000@127.0.0.1:1";
-    let request = DirectRequest::QueryWorkflowState {
-        workflow_id: WorkflowId::from("wf-1"),
-        requesting_node: NodeId::from("test-node"),
-    };
+    let request = DirectRequest::Ping;
 
     let result = manager.send_direct_request(unreachable_addr, request).await;
     match result {
@@ -378,29 +375,6 @@ fn direct_response_dispatch_ack_serialization_roundtrip() {
 }
 
 #[test]
-fn direct_response_workflow_state_serialization_roundtrip() {
-    let resp = DirectResponse::WorkflowState {
-        dag: Some(vec![0xAB]),
-        execution: None,
-        pending: Some(vec![0xCD, 0xEF]),
-    };
-    let bytes = postcard::to_allocvec(&resp).expect("serialize");
-    let decoded: DirectResponse = postcard::from_bytes(&bytes).expect("deserialize");
-    match decoded {
-        DirectResponse::WorkflowState {
-            dag,
-            execution,
-            pending,
-        } => {
-            assert_eq!(dag, Some(vec![0xAB]));
-            assert!(execution.is_none());
-            assert_eq!(pending, Some(vec![0xCD, 0xEF]));
-        }
-        _ => panic!("wrong variant"),
-    }
-}
-
-#[test]
 fn direct_response_error_serialization_roundtrip() {
     let resp = DirectResponse::Error {
         message: "something went wrong".into(),
@@ -527,23 +501,11 @@ fn direct_ping_pong_serialization_roundtrip() {
 }
 
 #[test]
-fn direct_request_query_workflow_state_serialization_roundtrip() {
-    let req = DirectRequest::QueryWorkflowState {
-        workflow_id: WorkflowId::from("wf-q"),
-        requesting_node: NodeId::from("node-q"),
-    };
+fn direct_request_ping_serialization_roundtrip() {
+    let req = DirectRequest::Ping;
     let bytes = postcard::to_allocvec(&req).expect("serialize");
     let decoded: DirectRequest = postcard::from_bytes(&bytes).expect("deserialize");
-    match decoded {
-        DirectRequest::QueryWorkflowState {
-            workflow_id,
-            requesting_node,
-        } => {
-            assert_eq!(workflow_id.as_str(), "wf-q");
-            assert_eq!(requesting_node.as_str(), "node-q");
-        }
-        _ => panic!("wrong variant"),
-    }
+    assert!(matches!(decoded, DirectRequest::Ping));
 }
 
 // ───────────────────────── DirectResponseChannel::send_error ─────────────────────────
@@ -603,10 +565,7 @@ fn direct_event_request_variant_constructs() {
     let channel = DirectResponseChannel::test_stub();
     let event = DirectEvent::Request {
         peer_id: "peer-test".to_string(),
-        request: DirectRequest::QueryWorkflowState {
-            workflow_id: WorkflowId::from("wf-ev"),
-            requesting_node: NodeId::from("node-ev"),
-        },
+        request: DirectRequest::Ping,
         channel,
     };
     // 仅验证可构造且 Debug 可打印（DirectResponseChannel 实现 Debug）
@@ -772,10 +731,7 @@ async fn network_manager_send_direct_request_invalid_address_returns_error() {
         .await
         .expect("create manager");
 
-    let request = DirectRequest::QueryWorkflowState {
-        workflow_id: WorkflowId::from("wf-1"),
-        requesting_node: NodeId::from("test-req"),
-    };
+    let request = DirectRequest::Ping;
 
     let result = manager.send_direct_request("bad-address", request).await;
     assert!(result.is_err(), "invalid peer address should fail");
@@ -864,33 +820,19 @@ async fn network_manager_new_with_invalid_discovery_mode_returns_error() {
 
 // ───────────────────────── route_direct_request ─────────────────────────
 
-fn stub_direct_event(payload_len: usize) -> DirectEvent {
-    // route_direct_request 按请求序列化后的字节数判定超限，
-    // 用等长 workflow_id 使 payload_len 真实反映序列化大小。
+fn stub_direct_event() -> DirectEvent {
     DirectEvent::Request {
         peer_id: "peer-under-test".to_string(),
-        request: DirectRequest::QueryWorkflowState {
-            workflow_id: crate::common::WorkflowId::from("w".repeat(payload_len)),
-            requesting_node: NodeId::from("caller"),
-        },
+        request: DirectRequest::Ping,
         channel: DirectResponseChannel::test_stub(),
     }
-}
-
-/// 超尺寸请求应被拒绝且回送错误（stub channel 上表现为仅日志），不进入转发通道。
-#[tokio::test]
-async fn route_direct_request_rejects_oversize() {
-    let (tx, rx) = mpsc::channel::<NetworkEvent>(4);
-    let outcome = route_direct_request(&tx, 64, stub_direct_event(256)).await;
-    assert_eq!(outcome, DirectRouteOutcome::RejectedOversize);
-    assert!(rx.is_empty(), "rejected request must not be forwarded");
 }
 
 /// event channel 有空位时请求正常转发。
 #[tokio::test]
 async fn route_direct_request_forwards_within_limit() {
     let (tx, mut rx) = mpsc::channel::<NetworkEvent>(4);
-    let outcome = route_direct_request(&tx, 1024, stub_direct_event(16)).await;
+    let outcome = route_direct_request(&tx, stub_direct_event()).await;
     assert_eq!(outcome, DirectRouteOutcome::Forwarded);
     match rx.recv().await {
         Some(NetworkEvent::DirectRequest { peer_id, .. }) => {
@@ -912,7 +854,7 @@ async fn route_direct_request_reports_channel_full() {
     .await
     .expect("fill channel");
 
-    let outcome = route_direct_request(&tx, 1024, stub_direct_event(16)).await;
+    let outcome = route_direct_request(&tx, stub_direct_event()).await;
     assert_eq!(outcome, DirectRouteOutcome::ChannelFull);
 
     // 排空后通道内不应混入该直连请求。

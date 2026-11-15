@@ -367,14 +367,15 @@ class _StdoutLogProxy:
 
     def write(self, text: str) -> int:
         self._buf.append(text)
-        while "\n" in "".join(self._buf):
-            joined = "".join(self._buf)
-            self._buf = []
-            *lines, rest = joined.split("\n")
-            for line in lines:
-                _emit_task_log(self._task_id, "STDOUT", line)
-            if rest:
-                self._buf.append(rest)
+        joined = "".join(self._buf)
+        if "\n" not in joined:
+            return len(text)
+        self._buf = []
+        *lines, rest = joined.split("\n")
+        for line in lines:
+            _emit_task_log(self._task_id, "STDOUT", line)
+        if rest:
+            self._buf.append(rest)
         return len(text)
 
     def flush(self) -> None:

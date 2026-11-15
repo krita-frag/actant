@@ -444,10 +444,6 @@ impl Topic {
     }
 
     /// 判断此话题是否以给定前缀开头。
-    pub fn starts_with(&self, prefix: &str) -> bool {
-        self.0.starts_with(prefix)
-    }
-
     /// 查看底层字符串。
     pub fn as_str(&self) -> &str {
         &self.0
@@ -559,9 +555,15 @@ pub struct WireEnvelope {
     /// [`WireEnvelope::decode`] 恒定时间校验，签名不匹配则丢弃消息。
     ///
     /// - 集群共享密钥非空（已注册，见 [`register_wire_signing_key`] / [`set_wire_signing_key`]）：
-    ///   所有节点入站消息必须携带正确 MAC；伪造者即使持有合法 iroh EndpointId
-    ///   （TLS 层认证通过）也无法伪造 wire message，实现端到端集群身份认证。
+    ///   所有节点入站 gossip 消息必须携带正确 MAC；伪造者即使持有合法 iroh
+    ///   EndpointId（TLS 层认证通过）也无法伪造 wire message，实现端到端
+    ///   集群身份认证。
     /// - 集群共享密钥为空：MAC 字段为 `None`，decode 时跳过验证（向后兼容 0.2）。
+    ///
+    /// **边界**：MAC 只覆盖 gossip 面。直连协议（`DirectRequest` / `DirectResponse`：
+    /// 任务分发、结果投递、Ping 探测）不经 envelope——其对端身份由 iroh TLS
+    /// 端点认证 + `allowed_peer_ids` 白名单保障，无共享密钥 MAC；开放模式
+    /// （白名单为空）下任意可达对端可投递直连帧。
     ///
     /// MAC 覆盖范围：`version` + `message` + `trace_id` 三字段序列化后的字节，
     /// 不包含本字段自身（避免循环）。这样 MAC 与 wire 协议版本耦合，版本不匹配
@@ -757,7 +759,9 @@ fn message_origin_node(msg: &WireMessage) -> Option<&NodeId> {
         WireMessage::HeadsExchange(m) => Some(&m.node_id),
         WireMessage::DagStateUpdate(m) => Some(&m.origin_node),
         WireMessage::WorkflowStateRequest(m) => Some(&m.requesting_node),
-        WireMessage::WorkflowStateResponse(_) | WireMessage::TaskDispatch(_) => None,
+        WireMessage::WorkflowStateResponse(_)
+        | WireMessage::TaskDispatch(_)
+        | WireMessage::CancelBroadcast(_) => None,
     }
 }
 
@@ -876,7 +880,8 @@ impl WireEnvelope {
     /// 调用方无需重复样板代码。
     ///
     /// 反序列化失败、协议版本不兼容或 MAC 验证失败时返回 `None`（并记录告警）。
-    /// MAC 验证失败时记录 `warn` 并计数到 `actant_wire_messages_failed_total{reason="mac"}`。
+    /// MAC 验证失败时记录 `warn`（验证失败即整条消息被丢弃，无计数指标；
+    /// 丢弃趋势经 warn 日志观测）。
     ///
     /// MAC 验证依次尝试注册表中全部去重密钥（同进程多 Runtime 各自集群的
     /// 消息均可验证，见 [`WireSigningKeys`]）；注册表为空 = 跳过验证
@@ -988,6 +993,10 @@ pub enum WireMessage {
     HeadsExchange(HeadsExchange),
     WorkflowStateRequest(WorkflowStateRequest),
     WorkflowStateResponse(WorkflowStateResponse),
+    /// 跨节点任务取消广播。与其他 gossip 控制面消息一致走 envelope：签名
+    /// 集群下随 MAC 验证，杜绝任意 mesh 成员伪造 `(task_id, workflow_id)`
+    /// 取消任意任务（裸 postcard 旁路是与 wire 安全承诺矛盾的缺口）。
+    CancelBroadcast(CancelBroadcast),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

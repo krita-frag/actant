@@ -36,14 +36,8 @@ pub trait Scheduler: Send + Sync {
     async fn try_dequeue(&self) -> Option<TaskDefinition>;
     /// 至多出队 `limit` 个任务，按优先级排序返回。队列不足时返回数量少于 `limit`。
     async fn dequeue_batch(&self, limit: usize) -> Vec<TaskDefinition>;
-    /// 仅取出未指定 `target_node` 的任务，保留已路由任务，避免「先全部取出再重入队」的竞态。
-    async fn drain_unrouted(&self) -> Vec<TaskDefinition>;
     async fn is_empty(&self) -> bool;
     async fn len(&self) -> usize;
-    /// 返回所有优先级队列中的任务总数。
-    fn total_queued(&self) -> usize {
-        0
-    }
     /// 关闭调度器——拒绝新入队并唤醒等待者，使 `dequeue()` 在队列清空后返回 `None`。
     ///
     /// # 语义
@@ -116,7 +110,8 @@ pub async fn spawn_fast_path_scheduler(
 /// 快路径安全性：`InnerScheduler` 的队列由 `parking_lot::Mutex` 保护，
 /// `notify` 为线程安全 `tokio::sync::Notify`，`closed` 为 `AtomicBool`。
 /// `enqueue` 的 `notify_one()` 唤醒语义与 Actor 路径的
-/// `notify_task_enqueued()` 一致（Worker 通过 `Notify` 信号驱动 `try_dequeue`）。
+/// `InnerScheduler::enqueue` 内部的 `notify_one()` 一致（Worker 通过 `Notify`
+/// 信号驱动 `try_dequeue`）。
 ///
 /// `dequeue` / `try_dequeue` / `close` 等仍走 Actor 消息协议——这些操作
 /// 涉及 Actor 侧协调（如 `dequeue` 的阻塞等待、`close` 的 drain 模式），
@@ -187,7 +182,8 @@ impl Scheduler for ActorScheduler {
         // 快路径：直接调用共享 InnerScheduler::enqueue，绕过 Actor 消息往返。
         // 适用于高 QPS 单任务入队场景（如 mailbox 持久化后的任务派发）。
         // Worker 唤醒由 InnerScheduler::enqueue 内部的 notify_one() 保证，
-        // 语义与 Actor 路径的 notify_task_enqueued() 一致。
+        // 语义与 Actor 消息路径一致（两条路径最终都经 InnerScheduler::enqueue
+        // 内部的 notify_one() 唤醒 Worker）。
         if let Some(ref inner) = self.fast_inner {
             return inner.enqueue(task).await;
         }
@@ -250,16 +246,6 @@ impl Scheduler for ActorScheduler {
             Ok(result) => decode_result::<Vec<TaskDefinition>>(result).unwrap_or_default(),
             Err(e) => {
                 tracing::warn!("SchedulerActor dequeue_batch call failed: {}", e);
-                vec![]
-            }
-        }
-    }
-
-    async fn drain_unrouted(&self) -> Vec<TaskDefinition> {
-        match self.call(scheduler_methods::DRAIN_UNROUTED, vec![]).await {
-            Ok(result) => decode_result::<Vec<TaskDefinition>>(result).unwrap_or_default(),
-            Err(e) => {
-                tracing::warn!("SchedulerActor drain_unrouted call failed: {}", e);
                 vec![]
             }
         }

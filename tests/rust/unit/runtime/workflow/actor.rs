@@ -28,7 +28,10 @@ fn make_node(id: &str, name: &str) -> DagNode {
 async fn workflow_actor_submit_and_start_roundtrip() {
     let system = ActorSystem::new();
     let actor_id = ActorId::from("wf-actor-1");
-    let actor = WorkflowActor::new(Orchestrator::new());
+    // START 消息已从 actor 协议移除（无生产发送方）：Rust 原生提交路径的
+    // start 由编排器句柄直接驱动，actor 协议保留 SUBMIT/COMPLETE_TASK 等。
+    let orchestrator = Orchestrator::new();
+    let actor = WorkflowActor::new(orchestrator.clone());
     system.spawn(actor_id.clone(), actor).await.unwrap();
 
     let mut dag = Dag::new();
@@ -46,12 +49,9 @@ async fn workflow_actor_submit_and_start_roundtrip() {
         .await
         .unwrap();
 
-    let result = system
-        .call(&actor_id, workflow_methods::START, encode(&wf_id).unwrap())
-        .await
-        .unwrap();
-    assert!(result.error.is_none(), "{:?}", result.error);
-    let roots: Vec<TaskDefinition> = decode(&result.payload).unwrap();
+    let roots: Vec<TaskDefinition> = orchestrator
+        .start(&wf_id)
+        .expect("start must return root tasks");
     assert_eq!(roots.len(), 1);
     assert_eq!(roots[0].id.as_str(), "a");
 
@@ -231,17 +231,19 @@ use crate::runtime::state::event_log::{EventLog, MemoryEventLog};
 use crate::runtime::workflow::orchestrator::types::JournalEvent;
 use crate::runtime::workflow::{FailureStrategy, Phase, Terminal};
 
-/// 构造带事件日志的 WorkflowActor 并 spawn。
+/// 构造带事件日志的 WorkflowActor 并 spawn，返回编排器句柄——START 消息
+/// 已从 actor 协议移除（无生产发送方），测试经此句柄直调 `start`。
 async fn spawn_workflow_actor(
     system: &ActorSystem,
     actor_id: &ActorId,
     event_log: Arc<MemoryEventLog>,
-) {
+) -> Orchestrator {
     let orchestrator = Orchestrator::new().with_event_log(event_log);
     system
-        .spawn(actor_id.clone(), WorkflowActor::new(orchestrator))
+        .spawn(actor_id.clone(), WorkflowActor::new(orchestrator.clone()))
         .await
         .unwrap();
+    orchestrator
 }
 
 /// 经三条路径注入同一任务结果（Local / Remote / Gossip）。
@@ -308,7 +310,7 @@ async fn task_result_three_paths_idempotent() {
     let system = ActorSystem::new();
     let actor_id = ActorId::from("wf-actor-s8-complete");
     let event_log = Arc::new(MemoryEventLog::default());
-    spawn_workflow_actor(&system, &actor_id, event_log.clone()).await;
+    let orchestrator = spawn_workflow_actor(&system, &actor_id, event_log.clone()).await;
 
     // 两个独立节点：a 完成后工作流仍非终态（b 未决），可在非终态阶段
     // 验证三路重复注入的幂等性；b 经本地通道收尾触发工作流终态。
@@ -325,14 +327,9 @@ async fn task_result_three_paths_idempotent() {
         )
         .await
         .unwrap();
-    system
-        .call(
-            &actor_id,
-            workflow_methods::START,
-            encode(&wf_id.clone()).unwrap(),
-        )
-        .await
-        .unwrap();
+    orchestrator
+        .start(&wf_id)
+        .expect("start must return root tasks");
 
     let task_id = TaskId::from("a");
 
@@ -436,7 +433,7 @@ async fn remote_failure_fail_fast_fails_workflow() {
     let system = ActorSystem::new();
     let actor_id = ActorId::from("wf-actor-s8-failfast");
     let event_log = Arc::new(MemoryEventLog::default());
-    spawn_workflow_actor(&system, &actor_id, event_log.clone()).await;
+    let orchestrator = spawn_workflow_actor(&system, &actor_id, event_log.clone()).await;
 
     let wf_id = WorkflowId::from("wf-s8-failfast");
     let mut dag = Dag::new();
@@ -452,14 +449,9 @@ async fn remote_failure_fail_fast_fails_workflow() {
         )
         .await
         .unwrap();
-    system
-        .call(
-            &actor_id,
-            workflow_methods::START,
-            encode(&wf_id.clone()).unwrap(),
-        )
-        .await
-        .unwrap();
+    orchestrator
+        .start(&wf_id)
+        .expect("start must return root tasks");
 
     // 远端直连路径报告 a 失败（fail-fast 默认策略）。
     inject_result(
@@ -504,7 +496,7 @@ async fn gossip_failure_continue_strategy_consistent_across_paths() {
     let system = ActorSystem::new();
     let actor_id = ActorId::from("wf-actor-s8-continue");
     let event_log = Arc::new(MemoryEventLog::default());
-    spawn_workflow_actor(&system, &actor_id, event_log.clone()).await;
+    let orchestrator = spawn_workflow_actor(&system, &actor_id, event_log.clone()).await;
 
     let wf_id = WorkflowId::from("wf-s8-continue");
     let mut dag = Dag::new();
@@ -520,14 +512,9 @@ async fn gossip_failure_continue_strategy_consistent_across_paths() {
         )
         .await
         .unwrap();
-    system
-        .call(
-            &actor_id,
-            workflow_methods::START,
-            encode(&wf_id.clone()).unwrap(),
-        )
-        .await
-        .unwrap();
+    orchestrator
+        .start(&wf_id)
+        .expect("start must return root tasks");
 
     // gossip 路径报告 a 失败：任务 Failed，工作流非终态（b 未终态）。
     inject_result(
@@ -629,7 +616,7 @@ async fn late_result_for_evicted_workflow_settles_without_error() {
     let system = ActorSystem::new();
     let actor_id = ActorId::from("wf-actor-evicted-result");
     system
-        .spawn(actor_id.clone(), WorkflowActor::new(orchestrator))
+        .spawn(actor_id.clone(), WorkflowActor::new(orchestrator.clone()))
         .await
         .unwrap();
 
@@ -644,14 +631,9 @@ async fn late_result_for_evicted_workflow_settles_without_error() {
         )
         .await
         .unwrap();
-    system
-        .call(
-            &actor_id,
-            workflow_methods::START,
-            encode(&wf_id.clone()).unwrap(),
-        )
-        .await
-        .unwrap();
+    orchestrator
+        .start(&wf_id)
+        .expect("start must return root tasks");
     system
         .call(
             &actor_id,

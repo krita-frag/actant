@@ -13,7 +13,7 @@
 //! - [`blobs`] 提供内容寻址 blob 存取与流式传输原语。
 //! - [`workflow`] 在上述基础上实现 DAG 编排、Worker 执行、调度与 failover。
 //! - [`dispatcher`] 是 Worker 调用本地任务 handler 的最后一跳。
-//! - [`event_bus`] 在运行时内部广播生命周期、网络和 workflow 事件。
+//! - [`events`] 提供任务结果 correctness 通道（`TaskResultFeed`）与观测 tap（`EventTap`）。
 
 pub mod actor;
 pub mod batch;
@@ -22,7 +22,7 @@ pub mod builder;
 pub mod capability;
 pub mod context;
 pub mod dispatcher;
-pub mod event_bus;
+pub mod events;
 pub mod network;
 pub mod quota;
 pub mod state;

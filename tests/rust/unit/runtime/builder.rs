@@ -140,8 +140,10 @@ fn init_actor_system_binds_node_id_without_persistence() {
     // 不接 data_dir——mailbox 与 actor 状态是进程内存活对象，跨重启不保留
     //（工作流恢复由 orchestrator 的统一历史承载）。
     let node_id = make_node("node-A");
-    let event_bus = EventBus::new();
-    let system = init_actor_system(&node_id, &event_bus).unwrap();
+    let tap = EventTap::new();
+    let (result_feed, _result_rx) = crate::runtime::events::TaskResultFeed::new();
+    let _ = &result_feed;
+    let system = init_actor_system(&node_id, &tap).unwrap();
     assert_eq!(system.node_id(), Some(&node_id));
 }
 
@@ -237,7 +239,9 @@ async fn make_failover(node_id: &NodeId, network: &Arc<dyn Transport>) -> Arc<Fa
 async fn init_worker_with_fifo_scheduler_spawns_actor_and_returns_worker() {
     let node_id = make_node("node-F");
     let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-F"));
-    let event_bus = EventBus::new();
+    let tap = EventTap::new();
+    let (result_feed, _result_rx) = crate::runtime::events::TaskResultFeed::new();
+    let _ = &result_feed;
     let actor_system = Arc::new(ActorSystem::new());
     let dispatcher = hermetic_dispatcher();
     let failover = make_failover(&node_id, &network).await;
@@ -249,7 +253,8 @@ async fn init_worker_with_fifo_scheduler_spawns_actor_and_returns_worker() {
         orchestrator_ingest: false,
         node_id: &node_id,
         network: &network,
-        event_bus,
+        tap,
+        result_feed,
         node_labels: &labels,
         route_policy: None,
         scheduler_kind: scheduler_kind::FIFO,
@@ -272,7 +277,9 @@ async fn init_worker_with_fifo_scheduler_spawns_actor_and_returns_worker() {
 async fn init_worker_with_priority_scheduler_spawns_actor() {
     let node_id = make_node("node-G");
     let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-G"));
-    let event_bus = EventBus::new();
+    let tap = EventTap::new();
+    let (result_feed, _result_rx) = crate::runtime::events::TaskResultFeed::new();
+    let _ = &result_feed;
     let actor_system = Arc::new(ActorSystem::new());
     let dispatcher = hermetic_dispatcher();
     let failover = make_failover(&node_id, &network).await;
@@ -284,7 +291,8 @@ async fn init_worker_with_priority_scheduler_spawns_actor() {
         orchestrator_ingest: false,
         node_id: &node_id,
         network: &network,
-        event_bus,
+        tap,
+        result_feed,
         node_labels: &labels,
         route_policy: None,
         scheduler_kind: scheduler_kind::PRIORITY,
@@ -306,7 +314,9 @@ async fn init_worker_with_priority_scheduler_spawns_actor() {
 async fn init_worker_with_unknown_scheduler_kind_returns_config_error() {
     let node_id = make_node("node-H");
     let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-H"));
-    let event_bus = EventBus::new();
+    let tap = EventTap::new();
+    let (result_feed, _result_rx) = crate::runtime::events::TaskResultFeed::new();
+    let _ = &result_feed;
     let actor_system = Arc::new(ActorSystem::new());
     let dispatcher = hermetic_dispatcher();
     let failover = make_failover(&node_id, &network).await;
@@ -318,7 +328,8 @@ async fn init_worker_with_unknown_scheduler_kind_returns_config_error() {
         orchestrator_ingest: false,
         node_id: &node_id,
         network: &network,
-        event_bus,
+        tap,
+        result_feed,
         node_labels: &labels,
         route_policy: None,
         scheduler_kind: "lifo",
@@ -342,7 +353,9 @@ async fn init_worker_with_unknown_scheduler_kind_returns_config_error() {
 async fn init_worker_attaches_optional_actor_ids_when_provided() {
     let node_id = make_node("node-I");
     let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-I"));
-    let event_bus = EventBus::new();
+    let tap = EventTap::new();
+    let (result_feed, _result_rx) = crate::runtime::events::TaskResultFeed::new();
+    let _ = &result_feed;
     let actor_system = Arc::new(ActorSystem::new());
     let dispatcher = hermetic_dispatcher();
     let failover = make_failover(&node_id, &network).await;
@@ -356,7 +369,8 @@ async fn init_worker_attaches_optional_actor_ids_when_provided() {
         orchestrator_ingest: false,
         node_id: &node_id,
         network: &network,
-        event_bus,
+        tap,
+        result_feed,
         node_labels: &labels,
         route_policy: None,
         scheduler_kind: scheduler_kind::FIFO,
@@ -850,9 +864,13 @@ async fn build_redispatches_recovered_pending_tasks_only() {
 
 // ───────────────────────── 注入缝「真实接入」验证 ─────────────────────────
 // 6 个 `RuntimeBuilder::with_*` 缝中，`with_event_log`/`with_task_dispatcher`/
-// `with_orchestrator_ingest` 已被既有测试与 `examples/rust_embed.rs` 接入验证；
-// 以下为 `with_transport`/`with_scheduler`/`with_discovery` 三个注入缝的端到端
-// 接入测试：每个都注入自定义实现，并断言其**真实接管**而非回退到内置实现。
+// `with_orchestrator_ingest` 已被既有测试与 `examples/rust_embed.rs` 接入验证。
+// `with_scheduler` 由下方哨兵调度器用例断言「真实接管」，`with_transport` 由
+// `build_uses_injected_transport` 断言「传送层原样采纳」。
+//
+// `with_discovery` 无法端到端断言：它唯一的作用点是内置 `NetworkManager`
+// 的 iroh endpoint 构造，需要真实身份与网络绑定；它与 `with_transport` 的
+// 互斥关系由 `build_rejects_transport_and_discovery_together` 守护。
 
 /// 始终报告 `len() == 7`、`is_empty() == false` 的哨兵调度器。
 ///
@@ -884,9 +902,6 @@ impl crate::runtime::workflow::Scheduler for SentinelScheduler {
     async fn dequeue_batch(&self, _limit: usize) -> Vec<crate::common::TaskDefinition> {
         Vec::new()
     }
-    async fn drain_unrouted(&self) -> Vec<crate::common::TaskDefinition> {
-        Vec::new()
-    }
     async fn is_empty(&self) -> bool {
         false
     }
@@ -895,99 +910,109 @@ impl crate::runtime::workflow::Scheduler for SentinelScheduler {
     }
 }
 
-/// 记录 `apply` 是否被调用的发现策略桩。
-///
-/// `Discovery::apply` 在 `NetworkManager` 构造（build 期间）同步调用一次；
-/// 注入后若标志被置位，即证明注入发现策略被应用（而非使用 config 的
-/// `discovery_mode` preset）。
-#[derive(Debug)]
-struct SeamDiscovery {
-    applied: std::sync::atomic::AtomicBool,
-}
-
-impl crate::runtime::network::Discovery for SeamDiscovery {
-    fn apply(&self, builder: iroh::endpoint::Builder) -> iroh::endpoint::Builder {
-        self.applied
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        builder
-    }
-    fn name(&self) -> &'static str {
-        "seam-test"
-    }
-}
-
+/// 注入缝 `with_scheduler` 的「真实接管」断言：注入后 `worker.scheduler()`
+/// 必须就是该实现——回退到内置 FIFO/priority 时 `len()` 为 0。
 #[tokio::test]
-async fn build_with_injected_transport_uses_it_as_live_network() {
-    let dir = tempdir().unwrap();
-    let node_id = make_node("node-transport-seam");
-    // 记录订阅的注入传输层；与传入 builder 的是同一底层实例（Arc 克隆）。
-    let mock = MockTransport::new("node-transport-seam");
-    let transport: Arc<dyn crate::runtime::network::Transport> = Arc::new(mock.clone());
+async fn init_worker_uses_injected_scheduler() {
+    let node_id = make_node("node-Sentinel");
+    let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-Sentinel"));
+    let tap = EventTap::new();
+    let (result_feed, _result_rx) = crate::runtime::events::TaskResultFeed::new();
+    let actor_system = Arc::new(ActorSystem::new());
+    let dispatcher = hermetic_dispatcher();
+    let failover = make_failover(&node_id, &network).await;
+    let handle = tokio::runtime::Handle::current();
+    let labels = std::collections::BTreeMap::new();
 
-    let runtime = RuntimeBuilder::new(node_id, make_test_config())
-        .with_data_dir(dir.path().to_str().unwrap().to_string())
-        .with_transport(transport)
-        .build()
-        .await
-        .expect("build with injected transport should succeed");
+    let worker = init_worker(WorkerInitParams {
+        scheduler: Some(Arc::new(SentinelScheduler)),
+        orchestrator_ingest: false,
+        node_id: &node_id,
+        network: &network,
+        tap,
+        result_feed,
+        node_labels: &labels,
+        route_policy: None,
+        scheduler_kind: scheduler_kind::FIFO,
+        worker_config: &WorkerConfig::default(),
+        actor_system: actor_system.clone(),
+        task_dispatcher: dispatcher,
+        failover: &failover,
+        tokio_handle: handle,
+        workflow_actor_id: None,
+        dag_gossip_actor_id: None,
+    })
+    .await
+    .expect("init_worker with injected scheduler ok");
 
-    // failover 装配会订阅 heartbeat topic。注入传输层若真是 live network，
-    // 该订阅会被记录；内置 NetworkManager 则不会写入此桩。
-    assert!(
-        mock.subscribed_to(crate::common::wire::constants::TOPIC_HEARTBEAT),
-        "injected transport must be the live network and receive build-time subscriptions"
-    );
-
-    runtime.shutdown().await.expect("shutdown ok");
-}
-
-#[tokio::test]
-async fn build_with_injected_scheduler_is_authoritative() {
-    let dir = tempdir().unwrap();
-    let node_id = make_node("node-scheduler-seam");
-
-    let runtime = RuntimeBuilder::new(node_id, make_test_config())
-        .with_data_dir(dir.path().to_str().unwrap().to_string())
-        .with_scheduler(Arc::new(SentinelScheduler))
-        .build()
-        .await
-        .expect("build with injected scheduler should succeed");
-
-    let worker = runtime.worker().expect("worker injected");
     assert_eq!(
         worker.scheduler().len().await,
         7,
-        "injected scheduler must govern len(), not fall back to built-in FIFO/priority"
+        "注入的调度器必须真实接管，而不是回退到内置 FIFO"
     );
-
-    runtime.shutdown().await.expect("shutdown ok");
+    assert!(
+        !worker.scheduler().is_empty().await,
+        "哨兵调度器 is_empty() == false 必须被透传"
+    );
 }
 
+/// `with_transport` 的「真实接管」：注入的传输层必须被 Runtime 原样采纳。
+///
+/// 断言用 `Arc::ptr_eq`——同一分配即证明没有换成内置 `NetworkManager`。
+/// 这是该缝唯一可离线验证的形态：内置构造需要真实 endpoint 身份与网络绑定。
 #[tokio::test]
-async fn build_applies_injected_discovery() {
-    let dir = tempdir().unwrap();
-    let node_id = make_node("node-discovery-seam");
-    let discovery = Arc::new(SeamDiscovery {
-        applied: std::sync::atomic::AtomicBool::new(false),
-    });
+async fn build_uses_injected_transport() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let node_id = make_node("node-SEAM-transport");
+    let mut mock = MockTransport::new("node-SEAM-transport");
+    // `require_signed_records` 要求 node_id 等于 endpoint id；桩传输层的
+    // local_peer_id 默认带 `peer-` 前缀，这里对齐以免被这条守卫拦下。
+    mock.local_peer_id = node_id.as_str().to_string();
+    let injected: Arc<dyn Transport> = Arc::new(mock);
 
-    let runtime = RuntimeBuilder::new(node_id, make_test_config())
-        .with_data_dir(dir.path().to_str().unwrap().to_string())
-        .with_discovery(discovery.clone())
+    let runtime = RuntimeBuilder::new(node_id, ActantConfig::default())
+        .with_data_dir(dir.path().to_string_lossy().into_owned())
+        .with_transport(injected.clone())
+        .with_task_dispatcher(hermetic_dispatcher())
         .build()
         .await
-        .expect("build with injected discovery should succeed");
+        .expect("build with injected transport");
 
     assert!(
-        discovery.applied.load(std::sync::atomic::Ordering::Relaxed),
-        "injected discovery must be applied to the built network, not the config preset"
+        Arc::ptr_eq(runtime.network(), &injected),
+        "注入的传输层必须原样采纳，而不是换成内置 NetworkManager"
     );
-
     runtime.shutdown().await.expect("shutdown ok");
 }
 
-/// 委托 MemoryEventLog 并记录 append 次数；测试只经 orchestrator 的提交路径
-/// 触发写入，不直接调用 log.append。
+/// `with_transport` 与 `with_discovery` 互斥。
+///
+/// `discovery` 的唯一消费者是内置 `NetworkManager`；注入 transport 后它会被
+/// 静默丢弃。两者同给属于装配误解，必须在启动期失败而不是留下「配了没生效」。
+#[tokio::test]
+async fn build_rejects_transport_and_discovery_together() {
+    use crate::runtime::network::NoDiscovery;
+
+    let transport: Arc<dyn Transport> = Arc::new(MockTransport::new("node-SEAM-both"));
+    // `Runtime` 不是 `Debug`，因此不能直接用 `expect_err`。
+    let err = match RuntimeBuilder::new(make_node("node-SEAM-both"), ActantConfig::default())
+        .with_transport(transport)
+        .with_discovery(Arc::new(NoDiscovery))
+        .build()
+        .await
+    {
+        Ok(_) => panic!("transport + discovery must be rejected at build time"),
+        Err(e) => e,
+    };
+
+    assert!(
+        matches!(&err, ActantError::Config(msg) if msg.contains("mutually exclusive")),
+        "expected Config error mentioning mutual exclusion, got: {err:?}"
+    );
+}
+
+/// 记录 `append` 次数的事件日志桩：委托 `MemoryEventLog` 并统计 append 批次，
+/// 供 `with_event_log` 注入缝的「真实接管」断言使用。
 struct RecordingEventLog {
     inner: crate::runtime::state::event_log::MemoryEventLog,
     appends: std::sync::atomic::AtomicUsize,

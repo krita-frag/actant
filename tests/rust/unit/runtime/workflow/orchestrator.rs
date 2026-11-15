@@ -303,6 +303,188 @@ async fn cancel_unknown_workflow_returns_not_found() {
     assert!(matches!(err, crate::common::ActantError::NotFound(_)));
 }
 
+/// 核心回归（取消传播）：工作流级取消必须把 Running **与 Pending** 任务一并
+/// 置为 Cancelled。旧行为 Pending 保持 Pending——排队任务在取消后仍被派发
+/// 执行（副作用照做、结果再被终态守卫丢弃）。
+#[tokio::test]
+async fn cancel_propagates_to_running_and_pending_tasks() {
+    let orch = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
+    let wf = WorkflowId::from("wf-cancel-propagate");
+    orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
+    orch.start(&wf).unwrap();
+    // t1 已派发在途（Running），t2/t3 尚未派发（Pending，可能已在调度队列）。
+    orch.mark_task_running(&wf, &TaskId::from("t1")).unwrap();
+
+    orch.cancel(&wf).await.unwrap();
+
+    let state = orch.get_state(&wf).unwrap();
+    assert_eq!(state.state, Phase::Cancelled);
+    for tid in ["t1", "t2", "t3"] {
+        assert_eq!(
+            state.tasks[&TaskId::from(tid)].state,
+            Phase::Cancelled,
+            "task {tid} must be cancelled by workflow-level cancel"
+        );
+    }
+}
+
+/// 取消传播的双腿广播：每个非终态任务（Running + Pending）各产生一条
+/// gossip 广播与一条本地自投递——本地腿经 `cancelled_tasks` 注册表让排队
+/// 任务被派发前短路，缺了它本节点排队任务会照常执行。
+#[tokio::test]
+async fn cancel_broadcasts_cancels_for_all_non_terminal_tasks() {
+    use crate::common::wire::{WireEnvelope, WireMessage, TOPIC_CANCEL};
+
+    let transport = Arc::new(BroadcastCaptureTransport::new("n1"));
+    let orch = Orchestrator::new()
+        .with_signing_key(TEST_SIGNING_KEY.to_vec())
+        .with_network(transport.clone());
+    let wf = WorkflowId::from("wf-cancel-broadcast");
+    orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
+    orch.start(&wf).unwrap();
+    orch.mark_task_running(&wf, &TaskId::from("t1")).unwrap();
+
+    orch.cancel(&wf).await.unwrap();
+
+    let broadcasts = transport.take_broadcasts();
+    let mut cancel_task_ids: Vec<String> = broadcasts
+        .iter()
+        .filter(|(t, _)| t == TOPIC_CANCEL)
+        .map(
+            |(_, data)| match WireEnvelope::decode(data).expect("valid envelope").0 {
+                WireMessage::CancelBroadcast(m) => m.task_id.0.clone(),
+                other => panic!("expected CancelBroadcast, got {other:?}"),
+            },
+        )
+        .collect();
+    cancel_task_ids.sort();
+    assert_eq!(
+        cancel_task_ids,
+        vec!["t1", "t2", "t3"],
+        "every non-terminal task must receive a cancel broadcast"
+    );
+
+    let injected = transport.take_injected();
+    let injected_cancels = injected
+        .iter()
+        .filter_map(|ev| match ev {
+            NetworkEvent::Message(m) if m.topic == TOPIC_CANCEL => Some(m.data.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        injected_cancels.len(),
+        3,
+        "local self-delivery leg must fire for every cancelled task"
+    );
+}
+
+/// 终态收尾统一广播取消：fail-fast 把工作流翻成 Failed 时，仍在 Running 的
+/// 兄弟任务必须收到双腿取消广播。
+///
+/// `set_failed` 只翻转工作流状态、不动其余任务：不广播时兄弟任务会跑满自身
+/// 超时才释放，结果再被终态守卫丢弃——与 `cancel()` 文档批判的行为完全相同。
+#[tokio::test]
+async fn fail_fast_terminal_broadcasts_cancel_to_running_siblings() {
+    use crate::common::wire::{WireEnvelope, WireMessage, TOPIC_CANCEL};
+
+    let transport = Arc::new(BroadcastCaptureTransport::new("n1"));
+    let orch = Orchestrator::new()
+        .with_signing_key(TEST_SIGNING_KEY.to_vec())
+        .with_network(transport.clone());
+    let wf = WorkflowId::from("wf-failfast-cancel");
+    orch.submit(wf.clone(), make_diamond_dag()).await.unwrap();
+    orch.start(&wf).unwrap();
+    orch.mark_task_running(&wf, &TaskId::from("t1")).unwrap();
+    orch.complete_task(&wf, &TaskId::from("t1"), b"ok".to_vec(), Some(0))
+        .await
+        .unwrap();
+    orch.mark_task_running(&wf, &TaskId::from("t2")).unwrap();
+    orch.mark_task_running(&wf, &TaskId::from("t3")).unwrap();
+    // 丢弃完成 t1 之前产生的噪声（若有）。
+    transport.take_broadcasts();
+    transport.take_injected();
+
+    orch.fail_task(
+        &wf,
+        &TaskId::from("t2"),
+        "boom".to_string(),
+        FailureScope::WorkflowLevel,
+    )
+    .await
+    .unwrap();
+
+    // 前提校验：工作流已 Failed，而兄弟任务 t3 仍是 Running（终态守卫之外）。
+    let state = orch.get_state(&wf).expect("workflow state");
+    assert!(state.is_terminal(), "fail-fast 必须立即封口工作流");
+    assert_eq!(
+        state.tasks[&TaskId::from("t3")].state,
+        Phase::Running,
+        "兄弟任务不随 fail-fast 翻转——正因如此才必须广播取消"
+    );
+
+    let mut cancel_ids: Vec<String> = transport
+        .take_broadcasts()
+        .iter()
+        .filter(|(t, _)| t == TOPIC_CANCEL)
+        .map(
+            |(_, data)| match WireEnvelope::decode(data).expect("valid envelope").0 {
+                WireMessage::CancelBroadcast(m) => m.task_id.0.clone(),
+                other => panic!("expected CancelBroadcast, got {other:?}"),
+            },
+        )
+        .collect();
+    cancel_ids.sort();
+    // 口径与 `cancel()` 一致：Running 兄弟（t3）与从未派发的下游（t4）都在
+    // 传播范围内——Pending 可能已在调度队列或已转发远端，靠 `cancelled_tasks`
+    // 注册表在派发前短路。已终态的任务不重复广播。
+    assert_eq!(
+        cancel_ids,
+        vec!["t3", "t4"],
+        "收尾必须为所有非终态任务广播取消"
+    );
+
+    let injected = transport.take_injected();
+    let local_cancels = injected
+        .iter()
+        .filter(|ev| matches!(ev, NetworkEvent::Message(m) if m.topic == TOPIC_CANCEL))
+        .count();
+    assert_eq!(local_cancels, 2, "每个非终态任务都要有本地自投递腿");
+}
+
+/// Loading 占位符守卫：占位符上的取消必须显式拒绝——静默落空后 gossip 快照
+/// 到达会全量覆盖占位符，把已取消的工作流复活为 Running。
+#[tokio::test]
+async fn cancel_rejects_loading_placeholder() {
+    let orch = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
+    let wf = WorkflowId::from("wf-cancel-loading");
+    orch.adopt_workflow(&wf).await.unwrap();
+
+    let err = orch.cancel(&wf).await.unwrap_err();
+    assert!(
+        matches!(err, crate::common::ActantError::InvalidState(_)),
+        "cancel on Loading placeholder must be rejected, got: {err:?}"
+    );
+    // 占位符未被改写（仍处 Loading 非终态，等待 gossip 数据填充）。
+    let state = orch.get_state(&wf).expect("placeholder slot exists");
+    assert!(!state.is_terminal(), "placeholder must stay non-terminal");
+}
+
+#[tokio::test]
+async fn fail_workflow_rejects_loading_placeholder() {
+    let orch = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
+    let wf = WorkflowId::from("wf-fail-loading");
+    orch.adopt_workflow(&wf).await.unwrap();
+
+    let err = orch.fail_workflow(&wf, "boom".into()).await.unwrap_err();
+    assert!(
+        matches!(err, crate::common::ActantError::InvalidState(_)),
+        "fail_workflow on Loading placeholder must be rejected, got: {err:?}"
+    );
+    let state = orch.get_state(&wf).expect("placeholder slot exists");
+    assert!(!state.is_terminal(), "placeholder must stay non-terminal");
+}
+
 #[test]
 fn builder_with_node_id_sets_node_id() {
     let orch = Orchestrator::new()
@@ -422,7 +604,7 @@ impl Transport for BroadcastCaptureTransport {
 /// 关键测试：注入网络后，工作流超时触发 CancelBroadcast 广播。
 #[tokio::test]
 async fn workflow_timeout_broadcasts_cancel_when_network_set() {
-    use crate::common::wire::{CancelBroadcast, TOPIC_CANCEL};
+    use crate::common::wire::{WireEnvelope, WireMessage, TOPIC_CANCEL};
 
     // 配置极短的轮询间隔与超时窗口，确保测试在 1s 内完成。
     let mut config = ActantConfig::default();
@@ -466,10 +648,28 @@ async fn workflow_timeout_broadcasts_cancel_when_network_set() {
         captured.iter().map(|(t, _)| t).collect::<Vec<_>>()
     );
 
-    // 解码验证内容：task_id 与 workflow_id 必须匹配超时的工作流与运行中任务。
-    let decoded: CancelBroadcast = postcard::from_bytes(&cancel_msgs[0].1).unwrap();
-    assert_eq!(decoded.workflow_id, wf);
-    assert_eq!(decoded.task_id, roots[0].id);
+    // 解码验证内容：全部非终态任务（Running 的 roots[0] + 尚未派发的
+    // Pending 后继）必须各收到一条取消广播，workflow_id 匹配超时的工作流。
+    // 广播集合 = 超时 watcher 预采集的 Running + complete_terminal 统一收口的
+    // 快照非终态任务，顺序不敏感。
+    let mut cancelled_task_ids: Vec<String> = Vec::new();
+    for (topic, data) in &cancel_msgs {
+        assert_eq!(topic, TOPIC_CANCEL);
+        match WireEnvelope::decode(data).expect("valid envelope").0 {
+            WireMessage::CancelBroadcast(m) => {
+                assert_eq!(m.workflow_id, wf);
+                cancelled_task_ids.push(m.task_id.0);
+            }
+            other => panic!("expected CancelBroadcast, got {other:?}"),
+        }
+    }
+    cancelled_task_ids.sort();
+    cancelled_task_ids.dedup();
+    assert_eq!(
+        cancelled_task_ids,
+        vec!["t1", "t2", "t3"],
+        "every non-terminal task must be broadcast on workflow timeout"
+    );
 
     // 工作流应已进入 Failed 终态。
     let state = orch.get_state(&wf).unwrap();
@@ -484,7 +684,7 @@ async fn workflow_timeout_broadcasts_cancel_when_network_set() {
 /// running）。故本测试断言的正是"广播 + 自投递"必须成对出现，且字节一致。
 #[tokio::test]
 async fn workflow_timeout_self_delivers_cancel_locally() {
-    use crate::common::wire::{CancelBroadcast, TOPIC_CANCEL};
+    use crate::common::wire::{WireEnvelope, WireMessage, TOPIC_CANCEL};
     use crate::runtime::network::{NetworkEvent, NetworkMessage};
 
     let mut config = ActantConfig::default();
@@ -514,10 +714,12 @@ async fn workflow_timeout_self_delivers_cancel_locally() {
     }
     let _ = cancel_tx.send(true);
 
+    // 自投递覆盖全部非终态任务：Running 的 roots[0] 由 watcher 预采集，
+    // Pending 的 t2/t3 由 complete_terminal 统一收口（W3）。
     assert_eq!(
         injected.len(),
-        1,
-        "timeout watcher must self-deliver exactly one cancel event; \
+        3,
+        "timeout watcher must self-deliver one cancel event per non-terminal task; \
          gossip broadcast does NOT loop back to the sender"
     );
     let NetworkEvent::Message(NetworkMessage { topic, data }) = &injected[0] else {
@@ -531,9 +733,13 @@ async fn workflow_timeout_self_delivers_cancel_locally() {
         "self-delivered event must ride the cancel topic so the router's \
          existing TopicRoute::Cancel branch handles it"
     );
-    let decoded: CancelBroadcast = postcard::from_bytes(data).unwrap();
+    // 自投递腿与广播腿同批产生：注入的事件覆盖全部非终态任务即可，单条
+    // 内容断言交给上一测试（同一对生产路径）。
+    let decoded = match WireEnvelope::decode(data).expect("valid envelope").0 {
+        WireMessage::CancelBroadcast(m) => m,
+        other => panic!("expected CancelBroadcast, got {other:?}"),
+    };
     assert_eq!(decoded.workflow_id, wf);
-    assert_eq!(decoded.task_id, roots[0].id);
 }
 
 /// 回归：注入网络后，派发的工作流任务必须携带本节点 endpoint addr。
@@ -1106,11 +1312,14 @@ async fn handle_task_failure_retries_with_incremented_attempt_and_carries_it_on_
 
     // 真实失败结果只能来自已派发的任务：先标记 Running 再回灌失败。
     orch.mark_task_running(&wf, &TaskId::from("t1")).unwrap();
-    let (task_def, _delay_ms) = orch
+    let FailureOutcome::Retry(task_def, _delay_ms) = orch
         .handle_task_failure(&wf, &TaskId::from("t1"), "boom".into())
         .await
         .unwrap()
-        .expect("task with retry budget must be scheduled for orchestrator retry");
+    else {
+        panic!("task with retry budget must be scheduled for orchestrator retry");
+    };
+    let task_def = *task_def;
     assert_eq!(
         task_def.attempt, 1,
         "retry dispatch must carry the incremented attempt"
@@ -1151,11 +1360,13 @@ async fn handle_task_failure_applies_retry_backoff_and_cap() {
     let mut delays = Vec::new();
     for _ in 0..3 {
         orch.mark_task_running(&wf, &TaskId::from("t1")).unwrap();
-        let (_, delay) = orch
+        let FailureOutcome::Retry(_, delay) = orch
             .handle_task_failure(&wf, &TaskId::from("t1"), "boom".into())
             .await
             .unwrap()
-            .expect("retry budget remains");
+        else {
+            panic!("retry budget remains");
+        };
         delays.push(delay);
     }
     assert_eq!(
@@ -1165,7 +1376,7 @@ async fn handle_task_failure_applies_retry_backoff_and_cap() {
     );
 }
 
-/// 重试余量耗尽后失败为终局（返回 None，fail-fast 下工作流进入 Failed）。
+/// 重试余量耗尽后失败为终局（返回 `Final`，fail-fast 下工作流进入 Failed）。
 #[tokio::test]
 async fn handle_task_failure_exhausts_budget_then_fails_workflow() {
     let orch = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
@@ -1189,7 +1400,10 @@ async fn handle_task_failure_exhausts_budget_then_fails_workflow() {
         .handle_task_failure(&wf, &TaskId::from("t1"), "boom-1".into())
         .await
         .unwrap();
-    assert!(retry.is_some(), "first failure must be retried");
+    assert!(
+        matches!(retry, FailureOutcome::Retry(..)),
+        "first failure must be retried"
+    );
 
     // 第二次失败前任务处于重试 Pending：先标记 Running 再失败（余量 0）。
     orch.mark_task_running(&wf, &TaskId::from("t1")).unwrap();
@@ -1198,7 +1412,7 @@ async fn handle_task_failure_exhausts_budget_then_fails_workflow() {
         .await
         .unwrap();
     assert!(
-        final_verdict.is_none(),
+        matches!(final_verdict, FailureOutcome::Final),
         "exhausted retry budget must settle the failure terminally"
     );
 
@@ -1207,7 +1421,8 @@ async fn handle_task_failure_exhausts_budget_then_fails_workflow() {
 }
 
 /// 迟到失败守卫：重试在途（Pending 且 retry_count > 0）时到达的重复失败
-/// 按过期结果忽略，不得把已排定重试的任务改写为 Failed。
+/// 返回 `Ignored`（与终局可区分——结果回灌是 at-least-once，重复失败不得
+/// 被当作终局发布），不得把已排定重试的任务改写为 Failed。
 #[tokio::test]
 async fn handle_task_failure_ignores_late_duplicate_while_retry_pending() {
     let orch = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
@@ -1230,16 +1445,20 @@ async fn handle_task_failure_ignores_late_duplicate_while_retry_pending() {
         .handle_task_failure(&wf, &TaskId::from("t1"), "boom".into())
         .await
         .unwrap();
-    assert!(retry.is_some(), "first failure schedules a retry");
+    assert!(
+        matches!(retry, FailureOutcome::Retry(..)),
+        "first failure schedules a retry"
+    );
 
-    // 重试已排定（任务回到 Pending 且 retry_count=1）：迟到重复失败被忽略。
+    // 重试已排定（任务回到 Pending 且 retry_count=1）：迟到重复失败被忽略，
+    // 且裁决必须显式为 Ignored——调用方据此不发布终态、不结算句柄。
     let late = orch
         .handle_task_failure(&wf, &TaskId::from("t1"), "boom-duplicate".into())
         .await
         .unwrap();
     assert!(
-        late.is_none(),
-        "late duplicate failure while retry is pending must be ignored"
+        matches!(late, FailureOutcome::Ignored),
+        "late duplicate failure while retry is pending must be ignored (distinct from final)"
     );
 
     let state = orch.get_state(&wf).unwrap();
@@ -2680,7 +2899,10 @@ async fn retry_with_predecessors_remains_reschedulable_after_failover() {
         .handle_task_failure(&wf, &TaskId::from("b"), "boom".into())
         .await
         .unwrap();
-    assert!(retry.is_some(), "retry budget must schedule b again");
+    assert!(
+        matches!(retry, FailureOutcome::Retry(..)),
+        "retry budget must schedule b again"
+    );
 
     // 模拟接管：恢复路径只挑 pending == 0 的 Pending 任务。
     let rescheduled = orch.reschedule_incomplete_tasks(&wf).unwrap();
@@ -2690,15 +2912,20 @@ async fn retry_with_predecessors_remains_reschedulable_after_failover() {
     );
 }
 
-/// Continue 策略下工作流可以带着 Failed 任务保持非终态；恢复时不得把
-/// Failed 重置为 Pending，否则失败任务会在重启后绕过重试预算重跑。
+/// Continue 策略下（失败任务**无下游**——有下游时级联取消会立即终态化，
+/// 见 continue_cascade_cancels_unreachable_descendants）工作流可以带着
+/// Failed 任务保持非终态；恢复时不得把 Failed 重置为 Pending，否则失败
+/// 任务会在重启后绕过重试预算重跑。
 #[tokio::test]
 async fn recovery_keeps_failed_tasks_terminal_under_continue() {
     let dir = tempdir().unwrap();
     let store = Store::open(dir.path()).await.unwrap();
 
     let wf = WorkflowId::from("wf-recover-failed");
-    let mut dag = make_linear_dag();
+    // 两个互不依赖的独立节点：t1 失败不影响 t2 的可达性。
+    let mut dag = Dag::new();
+    dag.add_node(make_node("t1", "first")).unwrap();
+    dag.add_node(make_node("t2", "independent")).unwrap();
     dag.failure_strategy = crate::runtime::workflow::dag::FailureStrategy::Continue;
 
     let orch = Orchestrator::new()
@@ -2740,6 +2967,103 @@ async fn recovery_keeps_failed_tasks_terminal_under_continue() {
     assert!(
         !ready.contains(&"t1".to_string()),
         "failed task must not be redispatched after recovery"
+    );
+}
+
+/// 核心回归（Continue 卡死）：失败任务的下游节点按「不可达 = 取消」级联
+/// 处置，工作流在有限步骤内收敛到终态。旧行为下游永久 Pending、工作流
+/// 永久 Running（无任何推进者）。
+#[tokio::test]
+async fn continue_cascade_cancels_unreachable_descendants() {
+    let orch = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
+    let wf = WorkflowId::from("wf-continue-cascade");
+
+    // 线性图 t1 → t2 → t3：t1 终局失败后 t2/t3 均不可达。
+    let mut dag = make_linear_dag();
+    dag.failure_strategy = crate::runtime::workflow::dag::FailureStrategy::Continue;
+
+    orch.submit(wf.clone(), dag).await.unwrap();
+    orch.start(&wf).unwrap();
+    orch.mark_task_running(&wf, &TaskId::from("t1")).unwrap();
+    orch.fail_task(
+        &wf,
+        &TaskId::from("t1"),
+        "boom".into(),
+        FailureScope::WorkflowLevel,
+    )
+    .await
+    .unwrap();
+
+    let state = orch.get_state(&wf).unwrap();
+    assert_eq!(
+        state.state,
+        Phase::Failed,
+        "continue + failed task with unreachable downstream must converge to Failed"
+    );
+    assert_eq!(
+        state.tasks[&TaskId::from("t1")].state,
+        Phase::Failed,
+        "failed task stays Failed"
+    );
+    assert_eq!(
+        state.tasks[&TaskId::from("t2")].state,
+        Phase::Cancelled,
+        "direct downstream must be cascade-cancelled"
+    );
+    assert_eq!(
+        state.tasks[&TaskId::from("t3")].state,
+        Phase::Cancelled,
+        "transitive downstream must be cascade-cancelled"
+    );
+}
+
+/// Continue 级联取消经 journal 重放确定性重建：崩溃恢复后 t2/t3 仍是
+/// Cancelled，不会复活为 Pending 重新派发。
+#[tokio::test]
+async fn continue_cascade_survives_journal_replay() {
+    let dir = tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+
+    let wf = WorkflowId::from("wf-continue-cascade-replay");
+    let mut dag = make_linear_dag();
+    dag.failure_strategy = crate::runtime::workflow::dag::FailureStrategy::Continue;
+
+    let orch = Orchestrator::new()
+        .with_signing_key(TEST_SIGNING_KEY.to_vec())
+        .with_store(store.clone());
+    orch.submit(wf.clone(), dag).await.unwrap();
+    orch.start(&wf).unwrap();
+    orch.mark_task_running(&wf, &TaskId::from("t1")).unwrap();
+    orch.fail_task(
+        &wf,
+        &TaskId::from("t1"),
+        "boom".into(),
+        FailureScope::WorkflowLevel,
+    )
+    .await
+    .unwrap();
+    orch.flush_dirty().await.unwrap();
+    drop(orch);
+
+    let recovered = Orchestrator::recover(store, recover_config(), None)
+        .await
+        .unwrap();
+    let state = recovered.get_state(&wf).unwrap();
+    assert_eq!(
+        state.state,
+        Phase::Failed,
+        "replay must rebuild the cascade-cancelled terminal state"
+    );
+    assert_eq!(state.tasks[&TaskId::from("t2")].state, Phase::Cancelled);
+    assert_eq!(state.tasks[&TaskId::from("t3")].state, Phase::Cancelled);
+    let ready: Vec<String> = recovered
+        .recover_ready_tasks()
+        .into_iter()
+        .map(|t| t.id.to_string())
+        .collect();
+    assert!(
+        !ready.iter().any(|id| id.starts_with("t")),
+        "cancelled downstream must not be redispatched after recovery"
     );
 }
 

@@ -1162,19 +1162,11 @@ impl Scheduler for RecordingScheduler {
         Vec::new()
     }
 
-    async fn drain_unrouted(&self) -> Vec<crate::common::TaskDefinition> {
-        Vec::new()
-    }
-
     async fn is_empty(&self) -> bool {
         true
     }
 
     async fn len(&self) -> usize {
-        0
-    }
-
-    fn total_queued(&self) -> usize {
         0
     }
 }
@@ -1193,6 +1185,8 @@ async fn reschedule_workflow_tasks_enqueues_tasks_via_scheduler() {
     assert_eq!(enqueued.len(), 1);
     assert_eq!(enqueued[0].name, "rescheduled");
 }
+
+// ───────────────────────── detect_and_claim_failed_nodes ─────────────────────────
 
 // ───────────────────────── detect_and_claim_failed_nodes ─────────────────────────
 
@@ -1378,7 +1372,6 @@ async fn register_and_age_peer(fm: &FailoverManager, node: &str, workflows: &[&s
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
 }
 
-/// 制造一条归属 `node` 的租约，模拟 claim 已随 gossip 复制到本节点。
 async fn seed_lease(fm: &FailoverManager, workflow_id: &str, node: &str) {
     let claim = OrchestratorClaim {
         node_id: NodeId::from(node.to_string()),
@@ -1388,8 +1381,7 @@ async fn seed_lease(fm: &FailoverManager, workflow_id: &str, node: &str) {
     fm.handle_claim(&claim).await;
 }
 
-/// 活跃 workflow 集合可变的 WorkflowActor 桩：真实响应
-/// `active_workflow_ids` 与 `remove_active_workflow`，其余方法返回空 ok。
+/// 可变活跃集的 WorkflowActor 桩：`remove_active_workflow` 消息真实生效。
 struct MutableActiveIdsActor {
     active: std::sync::Mutex<HashSet<WorkflowId>>,
 }
@@ -1598,16 +1590,27 @@ async fn expire_leases_keeps_own_valid_lease() {
 
 // ─────────────── 在途转发登记与失联终结（第 2 腿） ───────────────
 
-/// 短租约 + 短失败窗口 + 真实 event_bus 的 manager（用于第 2 腿测试）。
-async fn make_fm_short_lease_with_bus(node_id: &str) -> (FailoverManager, EventBus) {
-    let (fm, bus, _) = make_fm_short_lease_with_bus_and_transport(node_id).await;
-    (fm, bus)
+/// 短租约 + 短失败窗口 + 真实 result feed 的 manager（用于第 2 腿测试）。
+async fn make_fm_short_lease_with_bus(
+    node_id: &str,
+) -> (
+    FailoverManager,
+    TaskResultFeed,
+    tokio::sync::mpsc::UnboundedReceiver<TaskLifecycleEvent>,
+) {
+    let (fm, result_feed, result_rx, _) = make_fm_short_lease_with_bus_and_transport(node_id).await;
+    (fm, result_feed, result_rx)
 }
 
 /// 同上，但把底层 transport 一并返回，供需要配置存活探测应答的用例使用。
 async fn make_fm_short_lease_with_bus_and_transport(
     node_id: &str,
-) -> (FailoverManager, EventBus, Arc<MockTransport>) {
+) -> (
+    FailoverManager,
+    TaskResultFeed,
+    tokio::sync::mpsc::UnboundedReceiver<TaskLifecycleEvent>,
+    Arc<MockTransport>,
+) {
     let transport = Arc::new(MockTransport::new(node_id));
     let network: Arc<dyn crate::runtime::network::Transport> = transport.clone();
     let actor_system = Arc::new(ActorSystem::new());
@@ -1622,7 +1625,7 @@ async fn make_fm_short_lease_with_bus_and_transport(
         lease_duration_ms: 10,
         lease_expiry_check_interval_secs: 1,
     };
-    let event_bus = EventBus::new();
+    let (result_feed, result_rx) = TaskResultFeed::new();
     let fm = FailoverManager::with_config(
         NodeId::from(node_id.to_string()),
         network,
@@ -1631,8 +1634,8 @@ async fn make_fm_short_lease_with_bus_and_transport(
         config,
         None,
     )
-    .with_event_bus(event_bus.clone());
-    (fm, event_bus, transport)
+    .with_result_feed(result_feed.clone());
+    (fm, result_feed, result_rx, transport)
 }
 
 /// 构造一条直提任务的完整定义，供 `record_outbound` 的租约重投路径使用。
@@ -1662,8 +1665,7 @@ fn standalone_task(task_id: &str, workflow_id: Option<&str>, task_name: &str) ->
 /// 转发到它身上的在途任务必须被终结为 `TaskFailed`；其他节点的任务不受牵连。
 #[tokio::test]
 async fn node_lost_settles_inflight_forwarded_tasks() {
-    let (fm, event_bus) = make_fm_short_lease_with_bus("node-A").await;
-    let mut rx = event_bus.subscribe(crate::runtime::event_bus::Topic::TaskFailed);
+    let (fm, _result_feed, mut rx) = make_fm_short_lease_with_bus("node-A").await;
 
     fm.record_outbound(
         &standalone_task("task-lost", Some("wf-x"), "slow_task"),
@@ -1690,7 +1692,7 @@ async fn node_lost_settles_inflight_forwarded_tasks() {
         "only node-B's entry may be drained; node-C's task is still in flight"
     );
     match rx.try_recv().expect("TaskFailed must be published") {
-        BusEvent::TaskFailed(c) => {
+        TaskLifecycleEvent::TaskFailed(c) => {
             assert_eq!(c.task_id().as_str(), "task-lost");
             assert_eq!(c.task_name(), "slow_task");
             assert_eq!(c.workflow_id().as_str(), "wf-x");
@@ -1708,8 +1710,7 @@ async fn node_lost_settles_inflight_forwarded_tasks() {
 /// 编排任务的 `error` 串必须带 `worker` kind 前缀——Python 侧据此还原异常子类。
 #[tokio::test]
 async fn node_lost_error_carries_kind_prefix() {
-    let (fm, event_bus) = make_fm_short_lease_with_bus("node-A").await;
-    let mut rx = event_bus.subscribe(crate::runtime::event_bus::Topic::TaskFailed);
+    let (fm, _result_feed, mut rx) = make_fm_short_lease_with_bus("node-A").await;
 
     fm.record_outbound(
         &standalone_task("task-k", Some("wf-k"), "t"),
@@ -1719,7 +1720,8 @@ async fn node_lost_error_carries_kind_prefix() {
     register_and_age_peer(&fm, "node-B", &[]).await;
     fm.detect_and_claim_failed_nodes().await;
 
-    let BusEvent::TaskFailed(c) = rx.try_recv().expect("TaskFailed must be published") else {
+    let TaskLifecycleEvent::TaskFailed(c) = rx.try_recv().expect("TaskFailed must be published")
+    else {
         panic!("expected TaskFailed");
     };
     let TaskCompletion::Failed { error, .. } = &c else {
@@ -1734,8 +1736,7 @@ async fn node_lost_error_carries_kind_prefix() {
 /// 结果已回的登记条目必须可被清除：清除后不得再因失联重复发布失败事件。
 #[tokio::test]
 async fn cleared_outbound_entry_is_not_settled() {
-    let (fm, event_bus) = make_fm_short_lease_with_bus("node-A").await;
-    let mut rx = event_bus.subscribe(crate::runtime::event_bus::Topic::TaskFailed);
+    let (fm, _result_feed, mut rx) = make_fm_short_lease_with_bus("node-A").await;
 
     fm.record_outbound(
         &standalone_task("task-done", None, "t"),
@@ -1760,8 +1761,7 @@ async fn cleared_outbound_entry_is_not_settled() {
 /// 递增 attempt 后重新派发。
 #[tokio::test]
 async fn node_lost_queues_standalone_task_for_lease_redispatch() {
-    let (fm, event_bus) = make_fm_short_lease_with_bus("node-A").await;
-    let mut rx = event_bus.subscribe(crate::runtime::event_bus::Topic::TaskFailed);
+    let (fm, _result_feed, mut rx) = make_fm_short_lease_with_bus("node-A").await;
 
     fm.record_outbound(
         &standalone_task("task-s", None, "standalone"),
@@ -1870,8 +1870,8 @@ async fn take_outbound_if_not_stale_accepts_attempt_advanced_by_executor() {
 /// 完全没有它），必须靠主动探测判定——探测无应答则终结在途任务。
 #[tokio::test]
 async fn probe_settles_tasks_of_ghost_target() {
-    let (fm, event_bus, transport) = make_fm_short_lease_with_bus_and_transport("node-A").await;
-    let mut rx = event_bus.subscribe(crate::runtime::event_bus::Topic::TaskFailed);
+    let (fm, _result_feed, mut rx, transport) =
+        make_fm_short_lease_with_bus_and_transport("node-A").await;
     // 默认 mock 不响应直连请求 → 等价于目标不可达。
     assert!(transport.direct_request_response.lock().is_none());
 
@@ -1888,7 +1888,8 @@ async fn probe_settles_tasks_of_ghost_target() {
         0,
         "ghost target's in-flight task must be settled"
     );
-    let BusEvent::TaskFailed(c) = rx.try_recv().expect("TaskFailed must be published") else {
+    let TaskLifecycleEvent::TaskFailed(c) = rx.try_recv().expect("TaskFailed must be published")
+    else {
         panic!("expected TaskFailed");
     };
     assert_eq!(c.task_id().as_str(), "task-ghost");
@@ -1898,8 +1899,8 @@ async fn probe_settles_tasks_of_ghost_target() {
 /// 探测成功的对端**不得**被误判：健康但未进入心跳视图的目标，其任务继续等待。
 #[tokio::test]
 async fn probe_keeps_tasks_of_live_target() {
-    let (fm, event_bus, transport) = make_fm_short_lease_with_bus_and_transport("node-A").await;
-    let mut rx = event_bus.subscribe(crate::runtime::event_bus::Topic::TaskFailed);
+    let (fm, _result_feed, mut rx, transport) =
+        make_fm_short_lease_with_bus_and_transport("node-A").await;
     transport.with_direct_request_response(crate::runtime::network::DirectResponse::Pong);
 
     fm.record_outbound(
@@ -1928,7 +1929,8 @@ async fn probe_keeps_tasks_of_live_target() {
 async fn heartbeat_broadcasts_remaining_quotas() {
     use crate::runtime::quota::QuotaTracker;
 
-    let (fm, _bus, transport) = make_fm_short_lease_with_bus_and_transport("node-A").await;
+    let (fm, _result_feed, _result_rx, transport) =
+        make_fm_short_lease_with_bus_and_transport("node-A").await;
     let mut capacities = BTreeMap::new();
     capacities.insert("gpu".to_string(), 2u32);
     let tracker = Arc::new(QuotaTracker::new(capacities));
@@ -2065,5 +2067,156 @@ fn signed_heartbeat_with_spoofed_node_id_rejected() {
     assert!(
         fm.get_peer_infos().is_empty(),
         "heartbeat whose node_id differs from endpoint identity must be rejected"
+    );
+}
+
+// ───────────────── 分区恢复收敛（第 5 腿）与 claim 时间戳上界 ─────────────────
+
+/// 构造带 broadcast 捕获的 FailoverManager，返回 (manager, 具体传输桩)。
+fn make_fm_with_capture(node_id: &str) -> (FailoverManager, Arc<MockTransport>) {
+    let transport = Arc::new(MockTransport::new(node_id));
+    let network: Arc<dyn crate::runtime::network::Transport> = transport.clone();
+    let actor_system = Arc::new(ActorSystem::new());
+    let wf_id = ActorId::workflow(&NodeId::from(node_id.to_string()));
+    let fm = FailoverManager::new(
+        NodeId::from(node_id.to_string()),
+        network,
+        actor_system,
+        wf_id,
+    );
+    (fm, transport)
+}
+
+/// 核心回归（分区 > lease_duration 后恢复的双主）：本节点持有租约且收到
+/// 存活 peer 声明同一 workflow 活跃的心跳时，detect 循环必须重广播 claim
+/// 触发仲裁——旧行为双方各自续租、各自派发直到一方重启。
+/// 仲裁 claim 的时间戳必须取现有租约的 `claimed_at_ms` 而非刷新——续租式
+/// 刷新会让两侧的 (timestamp, node_id) 比较失去稳定基准。
+#[tokio::test]
+async fn arbitrate_lease_overlaps_rebroadcasts_claim_for_alive_peer() {
+    let (fm, transport) = make_fm_with_capture("node-A");
+    let now = crate::common::epoch_millis();
+
+    // 本节点持有 wf-overlap 的有效租约（同节点 handle_claim 不走广播路径）。
+    fm.handle_claim(&OrchestratorClaim {
+        node_id: fm.node_id().clone(),
+        workflow_id: WorkflowId("wf-overlap".to_string()),
+        timestamp_ms: now,
+    })
+    .await;
+    assert_eq!(transport.broadcast_count(), 0, "自持租约不应广播");
+
+    // 分区恢复：存活 peer 的心跳声明同一 workflow 仍在活跃。
+    fm.handle_heartbeat(&hb_with("node-B", now, &["wf-overlap"]));
+
+    fm.detect_and_claim_failed_nodes().await;
+
+    assert!(
+        transport.broadcast_count() >= 1,
+        "重叠租约必须重广播 claim 触发仲裁"
+    );
+    let (topic, data) = transport.last_broadcast().expect("broadcast recorded");
+    assert_eq!(topic, TOPIC_FAILOVER);
+    let (msg, _) = WireEnvelope::decode(&data).expect("valid envelope");
+    let WireMessage::SignedOrchestratorClaim(signed) = msg else {
+        panic!("expected SignedOrchestratorClaim, got {msg:?}");
+    };
+    assert_eq!(signed.claim.workflow_id.0, "wf-overlap");
+    assert_eq!(
+        signed.claim.timestamp_ms, now,
+        "arbitration claim must carry the existing lease timestamp, not a renewal"
+    );
+}
+
+/// 无重叠时不广播：健康集群（peer 活跃集与本节点租约无交集）不受影响。
+#[tokio::test]
+async fn arbitrate_lease_overlaps_noop_without_overlap() {
+    let (fm, transport) = make_fm_with_capture("node-A");
+    let now = crate::common::epoch_millis();
+    fm.handle_claim(&OrchestratorClaim {
+        node_id: fm.node_id().clone(),
+        workflow_id: WorkflowId("wf-mine".to_string()),
+        timestamp_ms: now,
+    })
+    .await;
+    // peer 活跃的是别的 workflow。
+    fm.handle_heartbeat(&hb_with("node-B", now, &["wf-other"]));
+
+    fm.detect_and_claim_failed_nodes().await;
+
+    assert_eq!(
+        transport.broadcast_count(),
+        0,
+        "no overlap must not trigger arbitration broadcasts"
+    );
+}
+
+/// 未来时间戳上界：claim 时间戳超前本地时钟超过容差一律拒绝——否则该 claim
+/// 在无有效租约分支被接受后，重启恢复走墙钟得到"永久有效"租约，工作流接管
+/// 被单条消息锁死。
+#[test]
+fn handle_claim_rejects_future_timestamp_beyond_drift() {
+    let fm = make_fm("node-A");
+    let now = crate::common::epoch_millis();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(fm.handle_claim(&OrchestratorClaim {
+        node_id: NodeId::from("node-Z".to_string()),
+        workflow_id: WorkflowId("wf-future".to_string()),
+        timestamp_ms: now.saturating_add(365 * 24 * 3600 * 1000),
+    }));
+    assert!(
+        fm.active_leases().is_empty(),
+        "future-dated claim must be rejected outright"
+    );
+
+    // 容差内的轻微超前仍被接受（时钟偏移不应阻断合法接管）。
+    rt.block_on(fm.handle_claim(&OrchestratorClaim {
+        node_id: NodeId::from("node-Z".to_string()),
+        workflow_id: WorkflowId("wf-slight-drift".to_string()),
+        timestamp_ms: now.saturating_add(1_000),
+    }));
+    assert_eq!(fm.active_leases().len(), 1);
+    assert_eq!(fm.active_leases()[0].0, "wf-slight-drift");
+}
+
+/// 恢复期消毒：持久化层中 claimed_at 超前本地时钟超过容差的租约（历史未来
+/// 时间戳 claim 的残留）在重启恢复时被丢弃并删除，而不是以"永久有效"租约
+/// 复活锁死接管。
+#[tokio::test]
+async fn recover_discards_future_dated_lease_from_store() {
+    let dir = tempdir().unwrap();
+    let store_config = StoreConfig {
+        data_dir: None,
+        sync_mode: SyncMode::NoSync,
+        ..Default::default()
+    };
+    let store = LmdbStore::open_with_config(dir.path(), &store_config).unwrap();
+
+    let now = crate::common::epoch_millis();
+    // 直接写入持久化层（绕过 handle_claim 的入界校验），模拟历史残留。
+    let poisoned = PersistedLease {
+        node_id: NodeId::from("node-Z".to_string()),
+        claimed_at_ms: now.saturating_add(365 * 24 * 3600 * 1000),
+        expires_at_ms: now.saturating_add(365 * 24 * 3600 * 1000)
+            + FailoverConfig::default().lease_duration_ms,
+    };
+    let data = rkyv::to_bytes::<rkyv::rancor::Error>(&poisoned).unwrap();
+    store
+        .put(&format!("{STORE_KEY_LEASE}wf-poisoned"), data.as_slice())
+        .unwrap();
+
+    let fm = make_fm_with_store("node-R", store.clone()).await;
+    let leases = fm.active_leases();
+    assert!(
+        leases.iter().all(|(wf, _, _, _)| wf != "wf-poisoned"),
+        "future-dated lease must not be recovered, got: {leases:?}"
+    );
+    let leftovers = store.scan_prefix(STORE_KEY_LEASE).unwrap();
+    assert!(
+        leftovers.iter().all(|(k, _)| !k.contains("wf-poisoned")),
+        "poisoned lease key must be deleted during recovery, residual: {leftovers:?}"
     );
 }

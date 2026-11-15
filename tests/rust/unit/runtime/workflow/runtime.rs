@@ -12,10 +12,7 @@ async fn pending_results_channel_rejects_when_full() {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<PendingResult>(1);
     let capacity = 1usize;
 
-    let req = crate::runtime::network::DirectRequest::QueryWorkflowState {
-        workflow_id: WorkflowId::from("wf-test"),
-        requesting_node: NodeId::from("n-test"),
-    };
+    let req = DirectRequest::Ping;
 
     // 第一次入队成功
     assert!(
@@ -37,10 +34,7 @@ async fn pending_results_channel_rejects_when_full() {
 
     // 取出一个后，下一次入队应再次成功。
     let _ = rx.recv().await.expect("first item present");
-    let req2 = crate::runtime::network::DirectRequest::QueryWorkflowState {
-        workflow_id: WorkflowId::from("wf-test"),
-        requesting_node: NodeId::from("n-test"),
-    };
+    let req2 = DirectRequest::Ping;
     assert!(
         try_enqueue_pending_result(&tx, "peer-3".to_string(), req2, 0, capacity).await,
         "enqueue should succeed after drain"
@@ -52,17 +46,37 @@ async fn pending_results_channel_rejects_when_full() {
 
 use crate::common::{NodeHeartbeat, WorkerConfig};
 use crate::runtime::dispatcher::WorkerLaunchSpec;
-use crate::runtime::event_bus::BusEvent;
+use crate::runtime::events::TaskLifecycleEvent;
 use crate::runtime::network::NetworkEvent;
 use crate::runtime::workflow::Scheduler;
 use crate::test_support::{MockScheduler, MockTransport};
 use std::sync::Arc as StdArc;
 
 fn make_worker(node_id: &str) -> Worker {
-    make_worker_with_bus(node_id, EventBus::new())
+    let (tap, result_feed, _result_rx) = make_worker_channels();
+    make_worker_with_channels(node_id, tap, result_feed)
 }
 
-fn make_worker_with_bus(node_id: &str, event_bus: EventBus) -> Worker {
+/// 测试通道三元组：tap、feed 发布端与接收端（需要断言终态事件的测试保留
+/// 接收端）。
+fn make_worker_channels() -> (
+    crate::runtime::events::EventTap,
+    crate::runtime::events::TaskResultFeed,
+    tokio::sync::mpsc::UnboundedReceiver<TaskLifecycleEvent>,
+) {
+    let (result_feed, result_rx) = crate::runtime::events::TaskResultFeed::new();
+    (
+        crate::runtime::events::EventTap::new(),
+        result_feed,
+        result_rx,
+    )
+}
+
+fn make_worker_with_channels(
+    node_id: &str,
+    tap: crate::runtime::events::EventTap,
+    result_feed: crate::runtime::events::TaskResultFeed,
+) -> Worker {
     let network: Arc<dyn Transport> = Arc::new(MockTransport::new(node_id));
     let scheduler: Arc<dyn Scheduler> = Arc::new(MockScheduler::new());
     let dispatcher = Arc::new(
@@ -79,7 +93,11 @@ fn make_worker_with_bus(node_id: &str, event_bus: EventBus) -> Worker {
     Worker::new(
         NodeId::from(node_id.to_string()),
         network,
-        event_bus,
+        crate::runtime::workflow::runtime::WorkerChannels {
+            tap,
+            result_feed,
+            task_notify: Arc::new(tokio::sync::Notify::new()),
+        },
         scheduler,
         dispatcher,
         &WorkerConfig::default(),
@@ -244,16 +262,18 @@ async fn worker_discover_peers_returns_empty_with_mock_transport() {
 
 // ───────────────────────── NetworkEventRouter 测试 ─────────────────────────
 
-use crate::runtime::event_bus::Topic as BusTopic;
+use crate::runtime::events::TapEvent as BusTapEvent;
 
 #[tokio::test]
 async fn router_handle_peer_connected_publishes_event() {
     let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-A"));
-    let event_bus = EventBus::new();
+    let tap = crate::runtime::events::EventTap::new();
+    let (result_feed, _result_rx) = crate::runtime::events::TaskResultFeed::new();
     let scheduler: Arc<dyn Scheduler> = Arc::new(MockScheduler::new());
     let router = NetworkEventRouter::new(NetworkEventRouterConfig {
         network,
-        event_bus: event_bus.clone(),
+        tap: tap.clone(),
+        result_feed: result_feed.clone(),
         scheduler,
         actor_system: None,
         workflow_actor_id: None,
@@ -263,20 +283,20 @@ async fn router_handle_peer_connected_publishes_event() {
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
     });
 
-    let mut sub = event_bus.subscribe(BusTopic::NetworkPeer);
+    let mut sub = tap.subscribe();
     router
         .handle(NetworkEvent::PeerConnected {
             peer_id: "peer-B".to_string(),
         })
         .await;
 
-    // 订阅应在 publish 之后收到 BusEvent::PeerConnected
+    // 订阅应在 publish 之后收到 TapEvent::PeerConnected
     let event = tokio::time::timeout(Duration::from_millis(500), sub.recv())
         .await
         .expect("event published in time")
         .expect("event present");
     match event {
-        BusEvent::PeerConnected(node_id) => assert_eq!(node_id.as_str(), "peer-B"),
+        BusTapEvent::PeerConnected(node_id) => assert_eq!(node_id.as_str(), "peer-B"),
         other => panic!("expected PeerConnected, got {:?}", other),
     }
 }
@@ -284,11 +304,13 @@ async fn router_handle_peer_connected_publishes_event() {
 #[tokio::test]
 async fn router_handle_peer_disconnected_publishes_event() {
     let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-A"));
-    let event_bus = EventBus::new();
+    let tap = crate::runtime::events::EventTap::new();
+    let (result_feed, _result_rx) = crate::runtime::events::TaskResultFeed::new();
     let scheduler: Arc<dyn Scheduler> = Arc::new(MockScheduler::new());
     let router = NetworkEventRouter::new(NetworkEventRouterConfig {
         network,
-        event_bus: event_bus.clone(),
+        tap: tap.clone(),
+        result_feed: result_feed.clone(),
         scheduler,
         actor_system: None,
         workflow_actor_id: None,
@@ -298,7 +320,7 @@ async fn router_handle_peer_disconnected_publishes_event() {
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
     });
 
-    let mut sub = event_bus.subscribe(BusTopic::NetworkPeer);
+    let mut sub = tap.subscribe();
     router
         .handle(NetworkEvent::PeerDisconnected {
             peer_id: "peer-C".to_string(),
@@ -310,7 +332,7 @@ async fn router_handle_peer_disconnected_publishes_event() {
         .expect("event published in time")
         .expect("event present");
     match event {
-        BusEvent::PeerDisconnected(node_id) => assert_eq!(node_id.as_str(), "peer-C"),
+        BusTapEvent::PeerDisconnected(node_id) => assert_eq!(node_id.as_str(), "peer-C"),
         other => panic!("expected PeerDisconnected, got {:?}", other),
     }
 }
@@ -318,11 +340,13 @@ async fn router_handle_peer_disconnected_publishes_event() {
 #[tokio::test]
 async fn router_handle_message_unknown_topic_is_noop() {
     let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-A"));
-    let event_bus = EventBus::new();
+    let tap = crate::runtime::events::EventTap::new();
+    let (result_feed, _result_rx) = crate::runtime::events::TaskResultFeed::new();
     let scheduler: Arc<dyn Scheduler> = Arc::new(MockScheduler::new());
     let router = NetworkEventRouter::new(NetworkEventRouterConfig {
         network,
-        event_bus: event_bus.clone(),
+        tap: tap.clone(),
+        result_feed: result_feed.clone(),
         scheduler,
         actor_system: None,
         workflow_actor_id: None,
@@ -352,7 +376,8 @@ async fn router_handle_message_heartbeat_dispatches_to_failover() {
     ));
     let router = NetworkEventRouter::new(NetworkEventRouterConfig {
         network,
-        event_bus: EventBus::new(),
+        tap: crate::runtime::events::EventTap::new(),
+        result_feed: crate::runtime::events::TaskResultFeed::new().0,
         scheduler,
         actor_system: None,
         workflow_actor_id: None,
@@ -399,11 +424,13 @@ async fn router_handle_message_heartbeat_dispatches_to_failover() {
 async fn router_handle_task_result_returns_false_without_actor_system() {
     // 无 actor_system / workflow_actor_id：handle_task_result 应返回 false。
     let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-A"));
-    let event_bus = EventBus::new();
+    let tap = crate::runtime::events::EventTap::new();
+    let (result_feed, _result_rx) = crate::runtime::events::TaskResultFeed::new();
     let scheduler: Arc<dyn Scheduler> = Arc::new(MockScheduler::new());
     let router = NetworkEventRouter::new(NetworkEventRouterConfig {
         network,
-        event_bus,
+        tap,
+        result_feed,
         scheduler,
         actor_system: None,
         workflow_actor_id: None,
@@ -482,16 +509,18 @@ async fn worker_notify_stopped_sets_state() {
 
 #[tokio::test]
 async fn worker_notify_stopped_publishes_lifecycle_event_once() {
-    let event_bus = EventBus::new();
-    let mut rx = event_bus.subscribe(crate::runtime::event_bus::Topic::WorkerLifecycle);
-    let worker = make_worker_with_bus("node-stop-event", event_bus);
+    let tap = crate::runtime::events::EventTap::new();
+    let (result_feed, _result_rx) = crate::runtime::events::TaskResultFeed::new();
+    // WorkerStopped 走独立生命周期通道（与通用 tap 隔离，日志洪泛不影响送达）。
+    let mut rx = tap.subscribe_lifecycle();
+    let worker = make_worker_with_channels("node-stop-event", tap, result_feed);
 
     worker.notify_stopped();
     worker.notify_stopped();
 
     let event = rx.try_recv().expect("WorkerStopped must be published");
     assert!(
-        matches!(event, BusEvent::WorkerStopped { .. }),
+        matches!(event, BusTapEvent::WorkerStopped { .. }),
         "expected WorkerStopped, got {event:?}"
     );
     assert!(
@@ -556,7 +585,8 @@ async fn worker_schedule_task_with_real_scheduler() {
     let scheduler: Arc<dyn Scheduler> = Arc::new(ActorScheduler::new(actor_id, system.clone()));
 
     let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-sched"));
-    let event_bus = EventBus::new();
+    let tap = crate::runtime::events::EventTap::new();
+    let (result_feed, _result_rx) = crate::runtime::events::TaskResultFeed::new();
     let dispatcher = Arc::new(
         crate::runtime::dispatcher::ProcessTaskDispatcher::new(
             0,
@@ -571,7 +601,11 @@ async fn worker_schedule_task_with_real_scheduler() {
     let worker = Worker::new(
         NodeId::from("node-sched".to_string()),
         network,
-        event_bus,
+        crate::runtime::workflow::runtime::WorkerChannels {
+            tap,
+            result_feed,
+            task_notify: Arc::new(tokio::sync::Notify::new()),
+        },
         scheduler,
         dispatcher,
         &WorkerConfig::default(),
@@ -651,13 +685,24 @@ impl crate::runtime::actor::Actor for RecordingActor {
     }
 }
 
-fn make_router(node_id: &str) -> (NetworkEventRouter, EventBus, Arc<MockTransport>) {
+/// (router, tap, result 接收端, transport)。断言 correctness 事件的测试用
+/// result_rx；断言观测事件的测试用 tap 订阅。
+fn make_router(
+    node_id: &str,
+) -> (
+    NetworkEventRouter,
+    crate::runtime::events::EventTap,
+    tokio::sync::mpsc::UnboundedReceiver<TaskLifecycleEvent>,
+    Arc<MockTransport>,
+) {
     let network = Arc::new(MockTransport::new(node_id));
-    let event_bus = EventBus::new();
+    let tap = crate::runtime::events::EventTap::new();
+    let (result_feed, result_rx) = crate::runtime::events::TaskResultFeed::new();
     let scheduler: Arc<dyn Scheduler> = Arc::new(MockScheduler::new());
     let router = NetworkEventRouter::new(NetworkEventRouterConfig {
         network: network.clone() as Arc<dyn Transport>,
-        event_bus: event_bus.clone(),
+        tap: tap.clone(),
+        result_feed: result_feed.clone(),
         scheduler,
         actor_system: None,
         workflow_actor_id: None,
@@ -666,12 +711,12 @@ fn make_router(node_id: &str) -> (NetworkEventRouter, EventBus, Arc<MockTranspor
         cancel_flags: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
     });
-    (router, event_bus, network)
+    (router, tap, result_rx, network)
 }
 
 #[tokio::test]
 async fn router_handle_message_cancel_broadcast_sets_cancel_flag() {
-    let (_router, event_bus, _network) = make_router("node-cancel");
+    let (_router, _tap, _result_rx, _network) = make_router("node-cancel");
 
     // 在 cancel_flags 中注册一个 task，然后用新的 router 测试 cancel 逻辑
     let task_id = "task-cancel-test";
@@ -685,7 +730,8 @@ async fn router_handle_message_cancel_broadcast_sets_cancel_flag() {
             Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let router2 = NetworkEventRouter::new(NetworkEventRouterConfig {
             network: Arc::new(MockTransport::new("node-cancel")),
-            event_bus: event_bus.clone(),
+            tap: crate::runtime::events::EventTap::new(),
+            result_feed: crate::runtime::events::TaskResultFeed::new().0,
             scheduler: Arc::new(MockScheduler::new()),
             actor_system: None,
             workflow_actor_id: None,
@@ -699,7 +745,12 @@ async fn router_handle_message_cancel_broadcast_sets_cancel_flag() {
             task_id: TaskId::from(task_id.to_string()),
             workflow_id: WorkflowId::from("wf-cancel".to_string()),
         };
-        let payload = postcard::to_allocvec(&cancel_msg).unwrap();
+        // 与生产契约一致：取消广播经 WireEnvelope 封装（签名集群下随 MAC 验证）。
+        let envelope = crate::common::wire::WireEnvelope::wrap(
+            crate::common::wire::WireMessage::CancelBroadcast(cancel_msg),
+        )
+        .unwrap();
+        let payload = postcard::to_allocvec(&envelope).unwrap();
         let topic =
             crate::common::Topic::from(crate::common::wire::constants::TOPIC_CANCEL).to_string();
         router2.handle_message(&topic, &payload).await;
@@ -718,7 +769,7 @@ async fn router_handle_message_cancel_broadcast_sets_cancel_flag() {
 
 #[tokio::test]
 async fn router_handle_message_task_dispatch_enqueues_to_scheduler() {
-    let (router, _event_bus, _network) = make_router("node-dispatch");
+    let (router, _tap, _result_rx, _network) = make_router("node-dispatch");
 
     let task = TaskDefinition {
         tags: Vec::new(),
@@ -776,7 +827,8 @@ async fn router_handle_message_dag_state_update_dispatches_to_dag_gossip_actor()
 
     let router = NetworkEventRouter::new(NetworkEventRouterConfig {
         network,
-        event_bus: EventBus::new(),
+        tap: crate::runtime::events::EventTap::new(),
+        result_feed: crate::runtime::events::TaskResultFeed::new().0,
         scheduler: Arc::new(MockScheduler::new()) as Arc<dyn Scheduler>,
         actor_system: Some(actor_system),
         workflow_actor_id: None,
@@ -823,7 +875,8 @@ async fn router_handle_message_failover_claim_dispatches_to_failover() {
 
     let router = NetworkEventRouter::new(NetworkEventRouterConfig {
         network,
-        event_bus: EventBus::new(),
+        tap: crate::runtime::events::EventTap::new(),
+        result_feed: crate::runtime::events::TaskResultFeed::new().0,
         scheduler: Arc::new(MockScheduler::new()) as Arc<dyn Scheduler>,
         actor_system: None,
         workflow_actor_id: None,
@@ -858,7 +911,7 @@ async fn router_handle_message_failover_claim_dispatches_to_failover() {
 
 #[tokio::test]
 async fn router_handle_message_invalid_payload_is_silently_ignored() {
-    let (router, _event_bus, _network) = make_router("node-invalid");
+    let (router, _tap, _result_rx, _network) = make_router("node-invalid");
 
     // 给已知 topic 传入无效 payload，不应 panic。
     let topic = crate::common::Topic::heartbeat().to_string();
@@ -873,7 +926,7 @@ async fn router_handle_message_invalid_payload_is_silently_ignored() {
 
 #[tokio::test]
 async fn router_handle_direct_request_dispatch_task_sends_ack() {
-    let (router, _event_bus, _network) = make_router("node-direct");
+    let (router, _tap, _result_rx, _network) = make_router("node-direct");
 
     let task = TaskDefinition {
         tags: Vec::new(),
@@ -908,11 +961,9 @@ async fn router_handle_direct_request_dispatch_task_sends_ack() {
 
 #[tokio::test]
 async fn router_handle_direct_request_task_result_publishes_event() {
-    let (router, event_bus, _network) = make_router("node-result");
+    let (router, _tap, mut result_rx, _network) = make_router("node-result");
 
     let channel = DirectResponseChannel::test_stub();
-
-    let mut sub = event_bus.subscribe(BusTopic::TaskCompleted);
 
     router
         .handle(NetworkEvent::DirectRequest {
@@ -930,17 +981,18 @@ async fn router_handle_direct_request_task_result_publishes_event() {
         .await;
 
     // handle_task_result 无 actor_system 时走 publish_remote_completion 路径。
-    let event = tokio::time::timeout(Duration::from_millis(500), sub.recv())
+    let event = tokio::time::timeout(Duration::from_millis(500), result_rx.recv())
         .await
         .expect("event published in time")
         .expect("event present");
-    assert!(matches!(event, BusEvent::TaskCompleted(_)));
+    assert!(matches!(event, TaskLifecycleEvent::TaskCompleted(_)));
 }
 
 #[tokio::test]
 async fn router_fences_standalone_task_results_by_attempt() {
     let network = Arc::new(MockTransport::new("node-fence"));
-    let event_bus = EventBus::new();
+    let tap = crate::runtime::events::EventTap::new();
+    let (result_feed, mut result_rx) = crate::runtime::events::TaskResultFeed::new();
     let failover = Arc::new(crate::runtime::workflow::FailoverManager::new(
         NodeId::from("node-fence".to_string()),
         network.clone() as Arc<dyn Transport>,
@@ -954,7 +1006,8 @@ async fn router_fences_standalone_task_results_by_attempt() {
 
     let router = NetworkEventRouter::new(NetworkEventRouterConfig {
         network: network.clone() as Arc<dyn Transport>,
-        event_bus: event_bus.clone(),
+        tap: tap.clone(),
+        result_feed: result_feed.clone(),
         scheduler: Arc::new(MockScheduler::new()),
         actor_system: None,
         workflow_actor_id: None,
@@ -963,7 +1016,6 @@ async fn router_fences_standalone_task_results_by_attempt() {
         cancel_flags: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
     });
-    let mut sub = event_bus.subscribe(BusTopic::TaskCompleted);
 
     let result = |attempt: u32| {
         Box::new(DirectRequest::TaskResult {
@@ -985,7 +1037,7 @@ async fn router_fences_standalone_task_results_by_attempt() {
         })
         .await;
     assert!(
-        tokio::time::timeout(Duration::from_millis(100), sub.recv())
+        tokio::time::timeout(Duration::from_millis(100), result_rx.recv())
             .await
             .is_err(),
         "stale result must not publish a completion"
@@ -1000,49 +1052,19 @@ async fn router_fences_standalone_task_results_by_attempt() {
             channel: DirectResponseChannel::test_stub(),
         })
         .await;
-    let event = tokio::time::timeout(Duration::from_millis(500), sub.recv())
+    let event = tokio::time::timeout(Duration::from_millis(500), result_rx.recv())
         .await
         .expect("current attempt must publish in time")
         .expect("event present");
-    assert!(matches!(event, BusEvent::TaskCompleted(_)));
+    assert!(matches!(event, TaskLifecycleEvent::TaskCompleted(_)));
     assert_eq!(failover.outbound_len(), 0);
 }
 
 #[tokio::test]
-async fn router_handle_direct_request_unknown_returns_error_response() {
-    // 未识别 DirectRequest 变体不再转发到 EventBus，而是直接回送 DirectResponse::Error。
-    let (router, _event_bus, network) = make_router("node-unknown-req");
+async fn router_handle_message_empty_workflow_id_routes_to_result_feed() {
+    let (router, _tap, mut result_rx, _network) = make_router("node-empty-wf");
 
-    let channel = DirectResponseChannel::test_stub();
-
-    router
-        .handle(NetworkEvent::DirectRequest {
-            peer_id: "peer-Z".to_string(),
-            request: Box::new(crate::runtime::network::DirectRequest::QueryWorkflowState {
-                workflow_id: WorkflowId::from("wf-q".to_string()),
-                requesting_node: NodeId::from("node-q".to_string()),
-            }),
-            channel,
-        })
-        .await;
-
-    let responses = network.take_responses();
-    assert_eq!(responses.len(), 1, "should send exactly one error response");
-    match &responses[0].1 {
-        crate::runtime::network::DirectResponse::Error { message } => {
-            assert!(message.contains("no handler for DirectRequest variant"));
-        }
-        other => panic!("expected DirectResponse::Error, got {:?}", other),
-    }
-}
-
-#[tokio::test]
-async fn router_handle_message_empty_workflow_id_routes_to_event_bus() {
-    let (router, event_bus, _network) = make_router("node-empty-wf");
-
-    let mut sub = event_bus.subscribe(BusTopic::TaskFailed);
-
-    // handle_task_result with empty workflow_id should go through publish_remote_completion
+    // handle_task_result with empty workflow_id goes through publish_remote_completion
     let accepted = router
         .handle_task_result(
             WorkflowId::from("".to_string()),
@@ -1055,18 +1077,17 @@ async fn router_handle_message_empty_workflow_id_routes_to_event_bus() {
         .await;
     assert!(accepted, "empty workflow_id should return true");
 
-    let event = tokio::time::timeout(Duration::from_millis(500), sub.recv())
+    let event = tokio::time::timeout(Duration::from_millis(500), result_rx.recv())
         .await
         .expect("event published in time")
         .expect("event present");
-    assert!(matches!(event, BusEvent::TaskFailed(_)));
+    assert!(matches!(event, TaskLifecycleEvent::TaskFailed(_)));
 }
 
 #[tokio::test]
 async fn router_handle_task_result_cancelled_outcome_publishes_event() {
-    let (router, event_bus, _network) = make_router("node-cancel-outcome");
+    let (router, _tap, mut result_rx, _network) = make_router("node-cancel-outcome");
 
-    let mut sub = event_bus.subscribe(BusTopic::TaskCancelled);
     let accepted = router
         .handle_task_result(
             WorkflowId::from("wf-cancel".to_string()),
@@ -1079,16 +1100,16 @@ async fn router_handle_task_result_cancelled_outcome_publishes_event() {
         .await;
     assert!(accepted, "cancelled outcome should return true");
 
-    let event = tokio::time::timeout(Duration::from_millis(500), sub.recv())
+    let event = tokio::time::timeout(Duration::from_millis(500), result_rx.recv())
         .await
         .expect("event published in time")
         .expect("event present");
-    assert!(matches!(event, BusEvent::TaskCancelled(_)));
+    assert!(matches!(event, TaskLifecycleEvent::TaskCancelled(_)));
 }
 
 #[tokio::test]
 async fn router_handle_direct_request_dispatch_task_ack_accepted() {
-    let (router, _event_bus, network) = make_router("node-dispatch-ack");
+    let (router, _tap, _result_rx, network) = make_router("node-dispatch-ack");
 
     let task = make_task_for_completion("t-direct-dispatch", "direct_dispatch");
     router
@@ -1128,19 +1149,11 @@ impl Scheduler for RejectingScheduler {
         Vec::new()
     }
 
-    async fn drain_unrouted(&self) -> Vec<TaskDefinition> {
-        Vec::new()
-    }
-
     async fn is_empty(&self) -> bool {
         true
     }
 
     async fn len(&self) -> usize {
-        0
-    }
-
-    fn total_queued(&self) -> usize {
         0
     }
 
@@ -1154,11 +1167,13 @@ impl Scheduler for RejectingScheduler {
 #[tokio::test]
 async fn router_handle_direct_request_dispatch_task_ack_rejected() {
     let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-A"));
-    let event_bus = EventBus::new();
+    let tap = crate::runtime::events::EventTap::new();
+    let (result_feed, _result_rx) = crate::runtime::events::TaskResultFeed::new();
     let scheduler: Arc<dyn Scheduler> = Arc::new(RejectingScheduler);
     let router = NetworkEventRouter::new(NetworkEventRouterConfig {
         network: network.clone(),
-        event_bus,
+        tap,
+        result_feed,
         scheduler,
         actor_system: None,
         workflow_actor_id: None,
@@ -1200,7 +1215,8 @@ async fn router_handle_message_heads_exchange_dispatches_to_dag_gossip_actor() {
 
     let router = NetworkEventRouter::new(NetworkEventRouterConfig {
         network,
-        event_bus: EventBus::new(),
+        tap: crate::runtime::events::EventTap::new(),
+        result_feed: crate::runtime::events::TaskResultFeed::new().0,
         scheduler: Arc::new(MockScheduler::new()) as Arc<dyn Scheduler>,
         actor_system: Some(actor_system),
         workflow_actor_id: None,
@@ -1243,14 +1259,7 @@ async fn start_pending_result_loop_returns_sendable_channel() {
     let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-delivery"));
     let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
-    let tx = start_pending_result_loop(
-        network,
-        cancel_rx,
-        3,
-        Duration::from_millis(1),
-        16,
-        EventBus::new(),
-    );
+    let tx = start_pending_result_loop(network, cancel_rx, 3, Duration::from_millis(1), 16);
 
     // 通道应可用
     assert!(
@@ -1266,19 +1275,9 @@ async fn start_pending_result_loop_keeps_retrying_after_max_attempts() {
     let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-fail"));
     let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
-    let tx = start_pending_result_loop(
-        network,
-        cancel_rx,
-        1,
-        Duration::from_millis(1),
-        16,
-        EventBus::new(),
-    );
+    let tx = start_pending_result_loop(network, cancel_rx, 1, Duration::from_millis(1), 16);
 
-    let req = crate::runtime::network::DirectRequest::QueryWorkflowState {
-        workflow_id: WorkflowId::from("wf-keep"),
-        requesting_node: NodeId::from("n-test"),
-    };
+    let req = DirectRequest::Ping;
     assert!(
         try_enqueue_pending_result(&tx, "peer-x".to_string(), req, 0, 16).await,
         "enqueue should succeed"
@@ -1296,14 +1295,7 @@ async fn start_pending_result_loop_shutdown_on_cancel() {
     let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-shutdown"));
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
-    let tx = start_pending_result_loop(
-        network,
-        cancel_rx,
-        5,
-        Duration::from_millis(100),
-        16,
-        EventBus::new(),
-    );
+    let tx = start_pending_result_loop(network, cancel_rx, 5, Duration::from_millis(100), 16);
 
     // 发送取消信号
     let _ = cancel_tx.send(true);
@@ -1311,10 +1303,7 @@ async fn start_pending_result_loop_shutdown_on_cancel() {
 
     // 后台任务退出后，pending_rx 被 drop，通道关闭。
     // try_send 应返回 Closed，try_enqueue_pending_result 返回 false。
-    let req = crate::runtime::network::DirectRequest::QueryWorkflowState {
-        workflow_id: WorkflowId::from("wf-cancel"),
-        requesting_node: NodeId::from("n-test"),
-    };
+    let req = DirectRequest::Ping;
     assert!(
         !try_enqueue_pending_result(&tx, "peer-y".to_string(), req, 0, 16).await,
         "enqueue should fail after loop shutdown (receiver dropped)"
@@ -1503,7 +1492,8 @@ impl Transport for ConfigurableMockTransport {
 
 fn make_worker_with_transport(node_id: &str, transport: Arc<dyn Transport>) -> Worker {
     let scheduler: Arc<dyn Scheduler> = Arc::new(MockScheduler::new());
-    let event_bus = EventBus::new();
+    let tap = crate::runtime::events::EventTap::new();
+    let (result_feed, _result_rx) = crate::runtime::events::TaskResultFeed::new();
     let dispatcher = Arc::new(
         crate::runtime::dispatcher::ProcessTaskDispatcher::new(
             0,
@@ -1518,7 +1508,11 @@ fn make_worker_with_transport(node_id: &str, transport: Arc<dyn Transport>) -> W
     Worker::new(
         NodeId::from(node_id.to_string()),
         transport,
-        event_bus,
+        crate::runtime::workflow::runtime::WorkerChannels {
+            tap,
+            result_feed,
+            task_notify: Arc::new(tokio::sync::Notify::new()),
+        },
         scheduler,
         dispatcher,
         &WorkerConfig::default(),
@@ -1881,8 +1875,7 @@ fn make_local_task() -> TaskDefinition {
 
 #[tokio::test]
 async fn publish_task_completion_local_completed_publishes_event() {
-    let event_bus = EventBus::new();
-    let mut sub = event_bus.subscribe(crate::runtime::event_bus::Topic::TaskCompleted);
+    let (result_feed, mut result_rx) = crate::runtime::events::TaskResultFeed::new();
     let (tx, _rx) = tokio::sync::mpsc::channel::<PendingResult>(16);
 
     let completion = TaskCompletion::Completed {
@@ -1898,22 +1891,21 @@ async fn publish_task_completion_local_completed_publishes_event() {
         &make_local_task(),
         &NodeId::from("node-A".to_string()),
         &*Arc::new(ConfigurableMockTransport::new("node-A")),
-        &event_bus,
+        &result_feed,
         &tx,
-        16,
     )
     .await;
 
-    let event = tokio::time::timeout(Duration::from_millis(200), sub.recv())
+    let event = tokio::time::timeout(Duration::from_millis(200), result_rx.recv())
         .await
         .expect("event in time")
         .expect("event present");
-    assert!(matches!(event, BusEvent::TaskCompleted(_)));
+    assert!(matches!(event, TaskLifecycleEvent::TaskCompleted(_)));
 }
 
 #[tokio::test]
 async fn publish_task_completion_remote_ack_accepted_succeeds() {
-    let event_bus = EventBus::new();
+    let (result_feed, _result_rx) = crate::runtime::events::TaskResultFeed::new();
     let (tx, rx) = tokio::sync::mpsc::channel::<PendingResult>(16);
     let transport = Arc::new(
         ConfigurableMockTransport::new("node-A")
@@ -1933,9 +1925,8 @@ async fn publish_task_completion_remote_ack_accepted_succeeds() {
         &make_remote_task("node-B"),
         &NodeId::from("node-A".to_string()),
         &*transport,
-        &event_bus,
+        &result_feed,
         &tx,
-        16,
     )
     .await;
 
@@ -1945,7 +1936,8 @@ async fn publish_task_completion_remote_ack_accepted_succeeds() {
 
 #[tokio::test]
 async fn publish_task_completion_remote_ack_rejected_enqueues_retry() {
-    let event_bus = EventBus::new();
+    let _tap = crate::runtime::events::EventTap::new();
+    let (result_feed, _result_rx) = crate::runtime::events::TaskResultFeed::new();
     let (tx, rx) = tokio::sync::mpsc::channel::<PendingResult>(16);
     let transport = Arc::new(
         ConfigurableMockTransport::new("node-A")
@@ -1965,9 +1957,8 @@ async fn publish_task_completion_remote_ack_rejected_enqueues_retry() {
         &make_remote_task("node-B"),
         &NodeId::from("node-A".to_string()),
         &*transport,
-        &event_bus,
+        &result_feed,
         &tx,
-        16,
     )
     .await;
 
@@ -1976,7 +1967,8 @@ async fn publish_task_completion_remote_ack_rejected_enqueues_retry() {
 
 #[tokio::test]
 async fn publish_task_completion_remote_unexpected_response_enqueues_retry() {
-    let event_bus = EventBus::new();
+    let _tap = crate::runtime::events::EventTap::new();
+    let (result_feed, _result_rx) = crate::runtime::events::TaskResultFeed::new();
     let (tx, rx) = tokio::sync::mpsc::channel::<PendingResult>(16);
     let transport = Arc::new(
         ConfigurableMockTransport::new("node-A")
@@ -1996,9 +1988,8 @@ async fn publish_task_completion_remote_unexpected_response_enqueues_retry() {
         &make_remote_task("node-B"),
         &NodeId::from("node-A".to_string()),
         &*transport,
-        &event_bus,
+        &result_feed,
         &tx,
-        16,
     )
     .await;
 
@@ -2011,7 +2002,8 @@ async fn publish_task_completion_remote_unexpected_response_enqueues_retry() {
 
 #[tokio::test]
 async fn publish_task_completion_remote_network_error_enqueues_retry() {
-    let event_bus = EventBus::new();
+    let _tap = crate::runtime::events::EventTap::new();
+    let (result_feed, _result_rx) = crate::runtime::events::TaskResultFeed::new();
     let (tx, rx) = tokio::sync::mpsc::channel::<PendingResult>(16);
     let transport = Arc::new(
         ConfigurableMockTransport::new("node-A")
@@ -2031,9 +2023,8 @@ async fn publish_task_completion_remote_network_error_enqueues_retry() {
         &make_remote_task("node-B"),
         &NodeId::from("node-A".to_string()),
         &*transport,
-        &event_bus,
+        &result_feed,
         &tx,
-        16,
     )
     .await;
 
@@ -2042,15 +2033,13 @@ async fn publish_task_completion_remote_network_error_enqueues_retry() {
 
 #[tokio::test]
 async fn publish_task_completion_remote_waits_for_queue_capacity() {
-    let event_bus = EventBus::new();
+    let _tap = crate::runtime::events::EventTap::new();
+    let (result_feed, _result_rx) = crate::runtime::events::TaskResultFeed::new();
     // 容量 1，先占满；发布方必须等待而不是丢弃结果或发本地 Failed。
     let (tx, mut rx) = tokio::sync::mpsc::channel::<PendingResult>(1);
     tx.send(PendingResult {
         target: "origin-addr".to_string(),
-        request: DirectRequest::QueryWorkflowState {
-            workflow_id: WorkflowId::from("wf-fill".to_string()),
-            requesting_node: NodeId::from("node-A".to_string()),
-        },
+        request: DirectRequest::Ping,
         attempts: 0,
     })
     .await
@@ -2071,7 +2060,7 @@ async fn publish_task_completion_remote_waits_for_queue_capacity() {
     };
 
     let publish =
-        publish_task_completion(completion, &task, &node_id, &*transport, &event_bus, &tx, 1);
+        publish_task_completion(completion, &task, &node_id, &*transport, &result_feed, &tx);
     tokio::pin!(publish);
 
     assert!(
@@ -2334,19 +2323,11 @@ impl Scheduler for SequenceScheduler {
         Vec::new()
     }
 
-    async fn drain_unrouted(&self) -> Vec<TaskDefinition> {
-        Vec::new()
-    }
-
     async fn is_empty(&self) -> bool {
         true
     }
 
     async fn len(&self) -> usize {
-        0
-    }
-
-    fn total_queued(&self) -> usize {
         0
     }
 
@@ -2468,10 +2449,6 @@ impl Scheduler for RecordingScheduler {
         out
     }
 
-    async fn drain_unrouted(&self) -> Vec<TaskDefinition> {
-        Vec::new()
-    }
-
     async fn is_empty(&self) -> bool {
         self.queue.lock().is_empty()
     }
@@ -2504,14 +2481,19 @@ async fn worker_crash_reenqueues_task_for_failover() {
     let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-A"));
     let scheduler = Arc::new(RecordingScheduler::new());
     let scheduler_trait: Arc<dyn Scheduler> = scheduler.clone();
-    let event_bus = EventBus::new();
+    let tap = crate::runtime::events::EventTap::new();
+    let (result_feed, _result_rx) = crate::runtime::events::TaskResultFeed::new();
     let dispatcher: Arc<dyn crate::runtime::dispatcher::TaskDispatcher> = Arc::new(CrashDispatcher);
     let handle = tokio::runtime::Handle::current();
 
     let worker = Worker::new(
         NodeId::from("node-A".to_string()),
         network,
-        event_bus.clone(),
+        crate::runtime::workflow::runtime::WorkerChannels {
+            tap: tap.clone(),
+            result_feed: result_feed.clone(),
+            task_notify: Arc::new(tokio::sync::Notify::new()),
+        },
         scheduler_trait,
         dispatcher,
         &WorkerConfig::default(),
@@ -2539,7 +2521,7 @@ async fn worker_crash_reenqueues_task_for_failover() {
     });
 
     let pending_tx = worker.start_pending_result_loop();
-    let notify = event_bus.task_enqueued_notify();
+    let notify = Arc::new(tokio::sync::Notify::new());
     let loop_fut = worker.run_task_execution_loop(&pending_tx, &notify);
     tokio::pin!(loop_fut);
 
@@ -2590,7 +2572,7 @@ async fn run_task_execution_loop_enters_drain_and_stops() {
     let handle = tokio::spawn(async move {
         // 先 drain 再进入 loop，loop 开头检测到 Draining 会直接退出。
         worker.drain();
-        let notify = worker.event_bus.task_enqueued_notify();
+        let notify = worker.task_notify.clone();
         worker
             .run_task_execution_loop(&pending_tx, &notify)
             .await
@@ -2611,7 +2593,7 @@ async fn run_task_execution_loop_cancel_signal_triggers_drain() {
     let handle = tokio::spawn(async move {
         // 让 loop 先运行一小段时间，然后 cancel。
         let cancel_tx = worker.cancel.clone();
-        let notify = worker.event_bus.task_enqueued_notify();
+        let notify = worker.task_notify.clone();
         let loop_fut = worker.run_task_execution_loop(&pending_tx, &notify);
         tokio::pin!(loop_fut);
         tokio::select! {
@@ -2723,8 +2705,7 @@ async fn record_reroute_bounce_fails_task_after_limit() {
 
 #[tokio::test]
 async fn publish_drained_task_cancellation_publishes_local_cancelled_event() {
-    let event_bus = EventBus::new();
-    let mut cancelled_rx = event_bus.subscribe(crate::runtime::event_bus::Topic::TaskCancelled);
+    let (result_feed, mut result_rx) = crate::runtime::events::TaskResultFeed::new();
     let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-drain-local"));
     let (pending_tx, _pending_rx) = tokio::sync::mpsc::channel::<PendingResult>(4);
 
@@ -2757,16 +2738,15 @@ async fn publish_drained_task_cancellation_publishes_local_cancelled_event() {
         &DrainNotifyCtx {
             node_id: &node_id,
             network: network.as_ref(),
-            event_bus: &event_bus,
+            result_feed: &result_feed,
             pending_results: &pending_tx,
-            pending_capacity: 4,
         },
     )
     .await;
 
-    let event = cancelled_rx.recv().await.expect("event published");
+    let event = result_rx.recv().await.expect("event published");
     match event {
-        BusEvent::TaskCancelled(completion) => {
+        TaskLifecycleEvent::TaskCancelled(completion) => {
             assert_eq!(completion.task_id().to_string(), "t-drain-local");
             assert_eq!(completion.workflow_id().as_str(), "wf-drain");
         }
@@ -2778,7 +2758,7 @@ async fn publish_drained_task_cancellation_publishes_local_cancelled_event() {
 async fn publish_drained_task_cancellation_enqueues_remote_result_for_origin() {
     // 远端任务（origin != 本节点）：Cancelled 完成经 publish_task_completion
     // 走直连回传；MockTransport 直连失败时结果进入重试队列（不静默丢失）。
-    let event_bus = EventBus::new();
+    let (result_feed, _result_rx) = crate::runtime::events::TaskResultFeed::new();
     let network: Arc<dyn Transport> = Arc::new(MockTransport::new("node-drain-remote"));
     let (pending_tx, mut pending_rx) = tokio::sync::mpsc::channel::<PendingResult>(4);
 
@@ -2810,9 +2790,8 @@ async fn publish_drained_task_cancellation_enqueues_remote_result_for_origin() {
         &DrainNotifyCtx {
             node_id: &node_id,
             network: network.as_ref(),
-            event_bus: &event_bus,
+            result_feed: &result_feed,
             pending_results: &pending_tx,
-            pending_capacity: 4,
         },
     )
     .await;
@@ -2831,8 +2810,7 @@ async fn publish_drained_task_cancellation_enqueues_remote_result_for_origin() {
 #[tokio::test]
 async fn pending_result_loop_does_not_publish_local_compensation_on_max_attempts() {
     let transport = Arc::new(MockTransport::new("node-comp"));
-    let event_bus = EventBus::new();
-    let mut failed_rx = event_bus.subscribe(crate::runtime::event_bus::Topic::TaskFailed);
+    let (_result_feed, mut result_rx) = crate::runtime::events::TaskResultFeed::new();
     let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
     let pending_tx = start_pending_result_loop(
         transport,
@@ -2840,7 +2818,6 @@ async fn pending_result_loop_does_not_publish_local_compensation_on_max_attempts
         1, // 超限后不再丢弃，也不在本地发补偿事件
         Duration::from_millis(1),
         10,
-        event_bus,
     );
 
     let req = crate::runtime::network::DirectRequest::TaskResult {
@@ -2861,7 +2838,7 @@ async fn pending_result_loop_does_not_publish_local_compensation_on_max_attempts
         .unwrap();
 
     // origin 在远端，本地 TaskFailed 无法终止它的等待；必须继续重试。
-    let event = tokio::time::timeout(Duration::from_millis(100), failed_rx.recv()).await;
+    let event = tokio::time::timeout(Duration::from_millis(100), result_rx.recv()).await;
     assert!(
         event.is_err(),
         "executor must not publish a local compensation event"
@@ -2871,54 +2848,51 @@ async fn pending_result_loop_does_not_publish_local_compensation_on_max_attempts
 // ───────────────────────── detached re-enqueue 终态回退 ─────────────────────────
 
 fn reenqueue_ctx(
-    event_bus: &EventBus,
+    result_feed: &crate::runtime::events::TaskResultFeed,
     state: tokio::sync::watch::Receiver<WorkerState>,
 ) -> super::completion::ReenqueueCtx {
     let (pending_tx, _pending_rx) = tokio::sync::mpsc::channel(4);
     super::completion::ReenqueueCtx {
         node_id: NodeId::from("node-requeue".to_string()),
         network: Arc::new(MockTransport::new("node-requeue")),
-        event_bus: event_bus.clone(),
+        result_feed: result_feed.clone(),
         pending_results: pending_tx,
-        pending_capacity: 4,
         state,
     }
 }
 
 #[tokio::test]
 async fn reenqueue_cancels_pending_task_when_worker_draining() {
-    let event_bus = EventBus::new();
-    let mut cancelled = event_bus.subscribe(crate::runtime::event_bus::Topic::TaskCancelled);
+    let (result_feed, mut result_rx) = crate::runtime::events::TaskResultFeed::new();
     let (_state_tx, state_rx) = tokio::sync::watch::channel(WorkerState::Draining);
-    let ctx = reenqueue_ctx(&event_bus, state_rx);
+    let ctx = reenqueue_ctx(&result_feed, state_rx);
     let scheduler: Arc<dyn Scheduler> = Arc::new(RejectingScheduler);
     let mut task = unrouted_task();
     task.id = TaskId::from("t-requeue-drain".to_string());
 
     super::completion::reenqueue_with_retry(scheduler, task, &ctx, "test re-enqueue").await;
 
-    let event = tokio::time::timeout(Duration::from_millis(500), cancelled.recv())
+    let event = tokio::time::timeout(Duration::from_millis(500), result_rx.recv())
         .await
         .expect("cancellation must be published before drain")
         .expect("event present");
-    assert!(matches!(event, BusEvent::TaskCancelled(_)));
+    assert!(matches!(event, TaskLifecycleEvent::TaskCancelled(_)));
 }
 
 #[tokio::test]
 async fn reenqueue_publishes_failed_after_scheduler_keeps_rejecting() {
-    let event_bus = EventBus::new();
-    let mut failed = event_bus.subscribe(crate::runtime::event_bus::Topic::TaskFailed);
+    let (result_feed, mut result_rx) = crate::runtime::events::TaskResultFeed::new();
     let (_state_tx, state_rx) = tokio::sync::watch::channel(WorkerState::Running);
-    let ctx = reenqueue_ctx(&event_bus, state_rx);
+    let ctx = reenqueue_ctx(&result_feed, state_rx);
     let scheduler: Arc<dyn Scheduler> = Arc::new(RejectingScheduler);
     let mut task = unrouted_task();
     task.id = TaskId::from("t-requeue-fail".to_string());
 
     super::completion::reenqueue_with_retry(scheduler, task, &ctx, "test re-enqueue").await;
 
-    let event = tokio::time::timeout(Duration::from_secs(2), failed.recv())
+    let event = tokio::time::timeout(Duration::from_secs(2), result_rx.recv())
         .await
         .expect("failure must be published after retries")
         .expect("event present");
-    assert!(matches!(event, BusEvent::TaskFailed(_)));
+    assert!(matches!(event, TaskLifecycleEvent::TaskFailed(_)));
 }

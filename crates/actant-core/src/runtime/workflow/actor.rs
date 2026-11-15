@@ -23,7 +23,6 @@ use crate::common::{
     TaskDefinition, TaskId, WorkflowId, WorkflowInvocation,
 };
 use crate::runtime::actor::Actor;
-use crate::runtime::event_bus::{BusEvent, EventBus};
 use crate::runtime::workflow::messaging::{decode, encode, ok_result, payload_result};
 use crate::runtime::workflow::{
     Dag, DagGossip, DagNode, FailoverManager, Orchestrator, WaitCondition,
@@ -41,14 +40,36 @@ pub const WORKFLOW_ACTOR_TYPE: &str = "WorkflowActor";
 /// 任务结果回灌的裁决结果（[`WorkflowActor::on_task_result`] 的返回）。
 ///
 /// 调用方据此决定后续动作：本地完成通道取完成响应；结果回灌路径取重试
-/// 任务（入队调度器）或终局标志（发布结果事件）。
+/// 任务（入队调度器）或终局/忽略标志（是否向提交方发布结果事件）。
 enum TaskResultIngest {
     /// 任务完成且未被 fencing 拒绝：legacy `COMPLETE_TASK` 消息的响应载荷。
     Completed(TaskCompletionResponse),
     /// orchestrator 驱动重试：调用方须把任务入队调度器（延迟 `1` 毫秒）。
     Retry(Box<TaskDefinition>, u64),
-    /// 失败终局 / 取消 / fencing 拒绝：无派发动作。
+    /// 终局失败：调用方应向提交方发布失败终态。
+    FinalFailure,
+    /// 忽略的迟到重复失败：不得发布终态、不得结算句柄（结果回灌是
+    /// at-least-once，重复失败是常态——与终局的区分见 `FailureOutcome`）。
+    Ignored,
+    /// 完成 / 取消已入账，或迟到结果被 fencing / 淘汰守卫丢弃：无动作。
     Settled,
+}
+
+/// `ON_TASK_RESULT` 消息的响应裁决（跨 actor 消息边界，postcard 编码）。
+///
+/// 结果回灌是 at-least-once：迟到重复失败（重试在途 / 已终态）必须与
+/// 终局失败可区分，否则重复投递会把提交方句柄在重试在途时错误置为失败
+/// （甚至已 Completed 之后被翻转）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TaskResultVerdict {
+    /// 结果已入账且无需发布动作：完成 / 取消已结算，或迟到结果被丢弃。
+    Settled,
+    /// orchestrator 已裁决重试：调用方按 `delay_ms` 延迟入队重派发定义。
+    Retry(Box<TaskDefinition>, u64),
+    /// 终局失败：调用方应向提交方发布失败终态。
+    FinalFailure,
+    /// 忽略的迟到重复失败：不得发布终态（重投仍可能到达）。
+    Ignored,
 }
 
 /// 任务终态结果载荷：[`WorkflowActor::on_task_result`] 唯一入口的 `outcome` 参数。
@@ -80,9 +101,7 @@ pub enum ResultSource {
 pub mod workflow_methods {
     pub const SUBMIT: &str = "submit";
     pub const SUBMIT_WITH_TIMEOUT: &str = "submit_with_timeout";
-    pub const START: &str = "start";
     pub const COMPLETE_TASK: &str = "complete_task";
-    pub const CANCEL_TASK: &str = "cancel_task";
     /// 增量加入单个节点（flow 提交路径）。
     pub const ADD_NODE: &str = "add_node";
     /// 取消整个工作流（flow 失败兜底 / 控制面出口）。
@@ -174,7 +193,8 @@ impl WorkflowActor {
     ///
     /// 返回 `TaskResultIngest::Completed` 仅当 outcome 为 `Completed` 且未被
     /// fencing 拒绝（legacy `COMPLETE_TASK` 消息的响应载荷）；重试裁决返回
-    /// `Retry`；其余返回 `Settled`。
+    /// `Retry`；终局失败返回 `FinalFailure`；被忽略的迟到重复失败返回
+    /// `Ignored`；其余（取消入账 / fencing 拒绝 / 淘汰守卫）返回 `Settled`。
     async fn on_task_result(
         &mut self,
         workflow_id: &WorkflowId,
@@ -232,8 +252,15 @@ impl WorkflowActor {
                     .handle_task_failure(workflow_id, task_id, error)
                     .await?
                 {
-                    Some((task, delay_ms)) => Ok(TaskResultIngest::Retry(Box::new(task), delay_ms)),
-                    None => Ok(TaskResultIngest::Settled),
+                    crate::runtime::workflow::FailureOutcome::Retry(task, delay_ms) => {
+                        Ok(TaskResultIngest::Retry(task, delay_ms))
+                    }
+                    crate::runtime::workflow::FailureOutcome::Final => {
+                        Ok(TaskResultIngest::FinalFailure)
+                    }
+                    crate::runtime::workflow::FailureOutcome::Ignored => {
+                        Ok(TaskResultIngest::Ignored)
+                    }
                 }
             }
             TaskResultOutcome::Cancelled => {
@@ -309,11 +336,6 @@ impl Actor for WorkflowActor {
                     .await?;
                 Ok(ok_result(msg_id))
             }
-            workflow_methods::START => {
-                let workflow_id: WorkflowId = decode(&msg.payload)?;
-                let roots = self.orchestrator.start(&workflow_id)?;
-                Ok(payload_result(msg_id, encode(&roots)?))
-            }
             workflow_methods::COMPLETE_TASK => {
                 let (workflow_id, task_id, result): (WorkflowId, TaskId, Vec<u8>) =
                     decode(&msg.payload)?;
@@ -366,26 +388,24 @@ impl Actor for WorkflowActor {
                     Option<u32>,
                     ResultSource,
                 ) = decode(&msg.payload)?;
-                // 重试裁决：Some((task, delay)) 随响应返回，由调用方入队调度器
-                // （gossip 路径忽略——重复失败已在直连/本地路径裁决）。
-                let retry = match self
+                // 三态裁决随响应返回：Retry 由调用方入队调度器（gossip 路径
+                // 忽略——重复失败已在直连/本地路径裁决）；FinalFailure 触发
+                // 终态发布；Ignored / Settled 无发布动作（迟到重复失败不得
+                // 被当作终局——结果回灌是 at-least-once）。
+                let verdict = match self
                     .on_task_result(&workflow_id, &task_id, outcome, attempt, source)
                     .await?
                 {
-                    TaskResultIngest::Retry(task, delay_ms) => Some((*task, delay_ms)),
-                    _ => None,
+                    TaskResultIngest::Retry(task, delay_ms) => {
+                        TaskResultVerdict::Retry(task, delay_ms)
+                    }
+                    TaskResultIngest::FinalFailure => TaskResultVerdict::FinalFailure,
+                    TaskResultIngest::Ignored => TaskResultVerdict::Ignored,
+                    TaskResultIngest::Completed(_) | TaskResultIngest::Settled => {
+                        TaskResultVerdict::Settled
+                    }
                 };
-                Ok(payload_result(msg_id, encode(&retry)?))
-            }
-            workflow_methods::CANCEL_TASK => {
-                // 取消指令路径（用户 / 控制面发起）与结果回灌分离；gossip /
-                // 远端的 Cancelled 结果走 ON_TASK_RESULT 单入口，二者最终都
-                // 落到 `Orchestrator::cancel_task` 同一写入路径。
-                let (workflow_id, task_id): (WorkflowId, TaskId) = decode(&msg.payload)?;
-                self.orchestrator
-                    .cancel_task(&workflow_id, &task_id)
-                    .await?;
-                Ok(ok_result(msg_id))
+                Ok(payload_result(msg_id, encode(&verdict)?))
             }
             workflow_methods::MARK_TASK_RUNNING => {
                 let (workflow_id, task_id): (WorkflowId, TaskId) = decode(&msg.payload)?;
@@ -541,6 +561,13 @@ pub const SCHEDULER_ACTOR_TYPE: &str = "SchedulerActor";
 /// `try_dequeue`，不依赖阻塞式 dequeue 的长等待语义。
 const DEQUEUE_ACTOR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// 调度队列软上限（FIFO / Priority 共用）：排队任务数超过该值时 `enqueue`
+/// 显式拒绝，防止上游突发提交（大载荷批量 map）内存无上界增长。执行侧背压
+/// （Worker 信号量、prefetch 上限）都在下游，队列是唯一无界点——有界化后
+/// 与 Actor 邮箱（有界 1024）语义对齐。软上限而非硬背压：入队路径是同步
+/// 快照调用，等待会阻塞 actor；拒绝让调用方（提交方句柄/重试腿）显式失败。
+pub(crate) const DEFAULT_MAX_QUEUED_TASKS: usize = 10_000;
+
 /// SchedulerActor 支持的方法名。
 pub mod scheduler_methods {
     pub const ENQUEUE: &str = "enqueue";
@@ -548,7 +575,6 @@ pub mod scheduler_methods {
     pub const DEQUEUE: &str = "dequeue";
     pub const DEQUEUE_BATCH: &str = "dequeue_batch";
     pub const TRY_DEQUEUE: &str = "try_dequeue";
-    pub const DRAIN_UNROUTED: &str = "drain_unrouted";
     pub const LEN: &str = "len";
     pub const IS_EMPTY: &str = "is_empty";
     pub const CLOSE: &str = "close";
@@ -568,6 +594,7 @@ pub(crate) enum InnerScheduler {
         queue: parking_lot::Mutex<std::collections::VecDeque<TaskDefinition>>,
         notify: Arc<tokio::sync::Notify>,
         closed: std::sync::atomic::AtomicBool,
+        max_queued: usize,
     },
     Priority {
         queues: parking_lot::Mutex<
@@ -578,6 +605,7 @@ pub(crate) enum InnerScheduler {
         >,
         notify: Arc<tokio::sync::Notify>,
         closed: std::sync::atomic::AtomicBool,
+        max_queued: usize,
     },
     /// 注入缝：使用者提供的调度策略实现。所有操作转发给该实现——
     /// fast-path enqueue（SharedInner 直调）与 Actor 消息路径行为一致。
@@ -591,13 +619,14 @@ impl InnerScheduler {
 
     /// 使用共享的唤醒信号构造 FIFO 调度器。
     ///
-    /// `notify` 与 Worker 等待的 `EventBus::task_enqueued_notify` 是同一
+    /// `notify` 与 Worker 等待的调度唤醒信号是同一
     /// `Arc<Notify>`，确保快路径 `enqueue` 的信号能唤醒 Worker。
     fn fifo_with_notify(notify: Arc<tokio::sync::Notify>) -> Self {
         Self::Fifo {
             queue: parking_lot::Mutex::new(std::collections::VecDeque::new()),
             notify,
             closed: std::sync::atomic::AtomicBool::new(false),
+            max_queued: DEFAULT_MAX_QUEUED_TASKS,
         }
     }
 
@@ -610,22 +639,33 @@ impl InnerScheduler {
             queues: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
             notify,
             closed: std::sync::atomic::AtomicBool::new(false),
+            max_queued: DEFAULT_MAX_QUEUED_TASKS,
         }
     }
 
     /// 原地将 FIFO 切换为优先级队列策略。
     ///
     /// 保留 `closed` 标志（若已关闭）和 `notify` 引用（若有等待者），
-    /// 避免丢失与 `EventBus::task_enqueued_notify` 共享的唤醒信号，
+    /// 避免丢失与 Worker 共享的唤醒信号，
     /// 也避免重置 `closed` 导致 drain 状态被静默撤销。
     fn switch_to_priority(&mut self) {
         // 仅在当前为 Fifo 时切换；已是 Priority 或 External 则 no-op。
         if !matches!(self, Self::Fifo { .. }) {
             return;
         }
-        let (notify, closed) = match self {
-            Self::Fifo { notify, closed, .. } => (Arc::clone(notify), closed),
-            Self::Priority { notify, closed, .. } => (Arc::clone(notify), closed),
+        let (notify, closed, max_queued) = match self {
+            Self::Fifo {
+                notify,
+                closed,
+                max_queued,
+                ..
+            } => (Arc::clone(notify), closed, *max_queued),
+            Self::Priority {
+                notify,
+                closed,
+                max_queued,
+                ..
+            } => (Arc::clone(notify), closed, *max_queued),
             Self::External(_) => {
                 return; // 外部实现的策略由实现方持有，切换 no-op
             }
@@ -636,6 +676,7 @@ impl InnerScheduler {
             queues: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
             notify,
             closed,
+            max_queued,
         };
     }
 
@@ -660,26 +701,60 @@ impl InnerScheduler {
         }
     }
 
-    fn check_closed(&self) -> Result<()> {
-        if self.is_closed() {
-            return Err(ActantError::InvalidState(
-                "scheduler is closed (drain mode), rejecting task".into(),
-            ));
-        }
-        Ok(())
-    }
-
     pub(crate) async fn enqueue(&self, mut task: TaskDefinition) -> Result<()> {
-        self.check_closed()?;
         task.enqueued_at_ms = crate::common::epoch_millis();
         match self {
-            Self::Fifo { queue, notify, .. } => {
-                queue.lock().push_back(task);
+            Self::Fifo {
+                queue,
+                notify,
+                closed,
+                max_queued,
+            } => {
+                // closed 检查入队列锁：与 close() 的 store 原子化——检查在锁外时，
+                // 通过检查的任务可能被抢占到 drain_finalize 出队之后才入队，
+                // 滞留死队列且无终态通知（提交方挂死）。
+                let mut q = queue.lock();
+                if closed.load(std::sync::atomic::Ordering::Acquire) {
+                    return Err(ActantError::InvalidState(
+                        "scheduler is closed (drain mode), rejecting task".into(),
+                    ));
+                }
+                if q.len() >= *max_queued {
+                    return Err(ActantError::Worker(format!(
+                        "scheduler queue full ({}/{}), rejecting task {}",
+                        q.len(),
+                        max_queued,
+                        task.id.as_str()
+                    )));
+                }
+                q.push_back(task);
+                drop(q);
                 notify.notify_one();
             }
-            Self::Priority { queues, notify, .. } => {
+            Self::Priority {
+                queues,
+                notify,
+                closed,
+                max_queued,
+            } => {
+                let mut q = queues.lock();
+                if closed.load(std::sync::atomic::Ordering::Acquire) {
+                    return Err(ActantError::InvalidState(
+                        "scheduler is closed (drain mode), rejecting task".into(),
+                    ));
+                }
+                let queued: usize = q.values().map(|v| v.len()).sum();
+                if queued >= *max_queued {
+                    return Err(ActantError::Worker(format!(
+                        "scheduler queue full ({}/{}), rejecting task {}",
+                        queued,
+                        max_queued,
+                        task.id.as_str()
+                    )));
+                }
                 let key = std::cmp::Reverse(task.priority);
-                queues.lock().entry(key).or_default().push_back(task);
+                q.entry(key).or_default().push_back(task);
+                drop(q);
                 notify.notify_one();
             }
             // 外部调度器是 async：在 async 调用链内直接 await，绝不
@@ -692,14 +767,33 @@ impl InnerScheduler {
     }
 
     pub(crate) async fn enqueue_batch(&self, tasks: Vec<TaskDefinition>) -> Result<()> {
-        self.check_closed()?;
         if tasks.is_empty() {
             return Ok(());
         }
         let now_ms = crate::common::epoch_millis();
         match self {
-            Self::Fifo { queue, notify, .. } => {
+            Self::Fifo {
+                queue,
+                notify,
+                closed,
+                max_queued,
+            } => {
+                // closed 检查与软上限计量在队列锁内：与 [`Self::enqueue`] 同一
+                // 防护（检查在锁外时任务可滞留死队列且无终态通知）。
                 let mut q = queue.lock();
+                if closed.load(std::sync::atomic::Ordering::Acquire) {
+                    return Err(ActantError::InvalidState(
+                        "scheduler is closed (drain mode), rejecting task".into(),
+                    ));
+                }
+                let queued = q.len();
+                if queued + tasks.len() > *max_queued {
+                    return Err(ActantError::Worker(format!(
+                        "scheduler queue full ({queued}/{}), rejecting batch of {}",
+                        max_queued,
+                        tasks.len()
+                    )));
+                }
                 for mut task in tasks {
                     task.enqueued_at_ms = now_ms;
                     q.push_back(task);
@@ -707,8 +801,26 @@ impl InnerScheduler {
                 drop(q);
                 notify.notify_one();
             }
-            Self::Priority { queues, notify, .. } => {
+            Self::Priority {
+                queues,
+                notify,
+                closed,
+                max_queued,
+            } => {
                 let mut qs = queues.lock();
+                if closed.load(std::sync::atomic::Ordering::Acquire) {
+                    return Err(ActantError::InvalidState(
+                        "scheduler is closed (drain mode), rejecting task".into(),
+                    ));
+                }
+                let queued: usize = qs.values().map(|v| v.len()).sum();
+                if queued + tasks.len() > *max_queued {
+                    return Err(ActantError::Worker(format!(
+                        "scheduler queue full ({queued}/{}), rejecting batch of {}",
+                        max_queued,
+                        tasks.len()
+                    )));
+                }
                 for mut task in tasks {
                     task.enqueued_at_ms = now_ms;
                     let key = std::cmp::Reverse(task.priority);
@@ -807,36 +919,6 @@ impl InnerScheduler {
         }
     }
 
-    async fn drain_unrouted(&self) -> Vec<TaskDefinition> {
-        match self {
-            Self::External(scheduler) => scheduler.drain_unrouted().await,
-            Self::Fifo { queue, .. } => {
-                let mut q = queue.lock();
-                let old = std::mem::take(&mut *q);
-                let (unrouted, routed): (Vec<_>, Vec<_>) =
-                    old.into_iter().partition(|t| t.target_node.is_none());
-                *q = routed.into();
-                unrouted
-            }
-            Self::Priority { queues, .. } => {
-                let mut qs = queues.lock();
-                let mut unrouted = Vec::new();
-                for queue in qs.values_mut() {
-                    let old = std::mem::take(queue);
-                    for task in old {
-                        if task.target_node.is_none() {
-                            unrouted.push(task);
-                        } else {
-                            queue.push_back(task);
-                        }
-                    }
-                }
-                qs.retain(|_, q| !q.is_empty());
-                unrouted
-            }
-        }
-    }
-
     async fn len(&self) -> usize {
         match self {
             Self::Fifo { queue, .. } => queue.lock().len(),
@@ -859,45 +941,35 @@ impl InnerScheduler {
 /// `inner` 以 `Arc` 持有，使得 [`crate::runtime::workflow::ActorScheduler`]
 /// 可获取共享引用实现 `enqueue` 快路径——直接调用 [`InnerScheduler::enqueue`]
 /// 的同步方法，绕过 Actor 消息往返（postcard 编解码 + 邮箱调度 + 响应通道）。
-/// 快路径在入队后仍通过 [`Self::notify_task_enqueued`] 的等价路径触发 Worker 唤醒：
-/// `InnerScheduler::enqueue` 内部调用 `notify.notify_one()`，与 Actor 路径一致。
+/// 快路径在入队后经 `InnerScheduler::enqueue` 内部的 `notify_one()` 触发
+/// Worker 唤醒，与 Actor 消息路径一致。
 pub struct SchedulerActor {
     inner: Arc<InnerScheduler>,
-    /// 用于触发 `TaskEnqueued` 唤醒信号（`Notify`）的 EventBus。
-    /// `None` 时（如纯单元测试）退化为无信号触发，Worker 需自行轮询。
-    /// 生产路径由 `init_worker` 注入与 Worker 共享的 EventBus。
-    event_bus: Option<EventBus>,
 }
 
 impl SchedulerActor {
     pub fn fifo() -> Self {
         Self {
             inner: Arc::new(InnerScheduler::fifo()),
-            event_bus: None,
         }
     }
 
     pub fn priority() -> Self {
         Self {
             inner: Arc::new(InnerScheduler::priority()),
-            event_bus: None,
         }
     }
 
-    /// 用给定的 EventBus 构造 FIFO SchedulerActor。
+    /// 用共享的入队唤醒信号构造 FIFO SchedulerActor。
     ///
     /// `enqueue` / `enqueue_batch` / `close` 后会调用
-    /// `notify_task_enqueued()` 触发 `Notify` 信号，使正在
+    /// `InnerScheduler::enqueue` 内部触发 `Notify` 信号，使正在
     /// `.notified().await` 的 Worker 立即被唤醒。
     /// 通过 Notify 信号 + 非阻塞 `try_dequeue` 组合，
     /// 避免直接调用 `dequeue()` 阻塞 Actor 邮箱导致的死锁。
-    pub fn with_event_bus(event_bus: EventBus) -> Self {
-        // 用 EventBus 的唤醒信号构造内部调度器：使快路径 enqueue 与 Worker
-        // 等待的是同一 Arc<Notify>，保证任务一经入队即唤醒 Worker。
-        let notify = event_bus.task_enqueued_notify();
+    pub fn with_notify(task_enqueued_notify: Arc<tokio::sync::Notify>) -> Self {
         Self {
-            inner: Arc::new(InnerScheduler::fifo_with_notify(notify)),
-            event_bus: Some(event_bus),
+            inner: Arc::new(InnerScheduler::fifo_with_notify(task_enqueued_notify)),
         }
     }
 
@@ -925,7 +997,7 @@ impl SchedulerActor {
     ///
     /// 必须在 Actor `spawn` 之前调用：此方法重建内部状态为优先级队列。
     /// 若 `shared_inner()` 已被调用（Arc 已共享），重建会丢弃旧状态——
-    /// 因此调用顺序应为 `with_event_bus(...).with_priority()` → `shared_inner()` → `spawn`。
+    /// 因此调用顺序应为 `with_notify(...).with_priority()` → `shared_inner()` → `spawn`。
     ///
     /// 返回 `Err` 当 `self.inner` 已被共享（`Arc::get_mut` 返回 `None`），
     /// 即调用顺序违反上述约定。调用方应通过 `?` 传播此错误而非 panic，
@@ -961,17 +1033,6 @@ impl SchedulerActor {
     pub(crate) fn shared_inner(&self) -> Arc<InnerScheduler> {
         Arc::clone(&self.inner)
     }
-
-    /// 触发 `TaskEnqueued` 唤醒信号，唤醒等待的 Worker。
-    ///
-    /// 通过 `Notify::notify_waiters()` 唤醒所有正在 `.notified().await` 的 Worker。
-    /// 无队列容量限制、无事件丢弃。无 EventBus（`None`）时为 no-op，
-    /// 仅单元测试路径会落入此分支。
-    fn notify_task_enqueued(&self) {
-        if let Some(ref bus) = self.event_bus {
-            bus.notify_task_enqueued();
-        }
-    }
 }
 
 #[async_trait]
@@ -990,13 +1051,11 @@ impl Actor for SchedulerActor {
                 // 正在 .notified().await 的 Worker 立即被唤醒拉取任务。
                 // notify_waiters() 无队列无丢弃——信号仅唤醒当前等待者，
                 // 无等待者时信号丢失但不影响正确性（Worker 下次 try_dequeue 仍会拉取）。
-                self.notify_task_enqueued();
                 Ok(ok_result(msg_id))
             }
             scheduler_methods::ENQUEUE_BATCH => {
                 let tasks: Vec<TaskDefinition> = decode(&msg.payload)?;
                 self.inner.enqueue_batch(tasks).await?;
-                self.notify_task_enqueued();
                 Ok(ok_result(msg_id))
             }
             scheduler_methods::DEQUEUE => {
@@ -1016,25 +1075,7 @@ impl Actor for SchedulerActor {
             }
             scheduler_methods::TRY_DEQUEUE => {
                 let task = self.inner.try_dequeue().await;
-                // 出队成功后发布 TaskDequeued 事件，供外部观测实际消费速率。
-                // 事件丢失可接受（观测 tap），仅为观测信号。
-                if let Some(ref t) = task {
-                    if let Some(ref bus) = self.event_bus {
-                        let workflow_id = t
-                            .workflow_id
-                            .clone()
-                            .unwrap_or_else(|| WorkflowId::from(""));
-                        bus.publish(BusEvent::TaskDequeued {
-                            workflow_id,
-                            task_id: t.id.clone(),
-                        });
-                    }
-                }
                 Ok(payload_result(msg_id, encode(&task)?))
-            }
-            scheduler_methods::DRAIN_UNROUTED => {
-                let tasks = self.inner.drain_unrouted().await;
-                Ok(payload_result(msg_id, encode(&tasks)?))
             }
             scheduler_methods::LEN => {
                 let len = self.inner.len().await;
@@ -1048,7 +1089,6 @@ impl Actor for SchedulerActor {
                 self.inner.close();
                 // close 后发布事件，唤醒等待的 Worker 使其 try_dequeue
                 // 得到 None 并退出主循环。
-                self.notify_task_enqueued();
                 Ok(ok_result(msg_id))
             }
             scheduler_methods::IS_CLOSED => {

@@ -4,6 +4,12 @@
 use super::*;
 use crate::common::RetryPolicy;
 
+/// 级联取消用邻接表：单元测试的 WorkflowExecution 不构建真实 DAG，
+/// 空图即「失败任务无下游」，不触发级联。
+fn empty_dag() -> Dag {
+    Dag::new()
+}
+
 fn make_node(id: &str, name: &str) -> DagNode {
     DagNode {
         task_id: TaskId::from(id.to_string()),
@@ -140,6 +146,7 @@ fn fail_task_with_fail_fast_strategy() {
     wf.mark_running();
     wf.seal_nodes();
     wf.fail_task(
+        &empty_dag(),
         &TaskId::from("a"),
         "boom".into(),
         FailureScope::WorkflowLevel,
@@ -159,6 +166,7 @@ fn fail_task_with_continue_strategy_keeps_running() {
     wf.mark_running();
     wf.seal_nodes();
     wf.fail_task(
+        &empty_dag(),
         &TaskId::from("a"),
         "boom".into(),
         FailureScope::WorkflowLevel,
@@ -181,6 +189,7 @@ fn fail_task_with_task_only_scope_does_not_trigger_workflow() {
     .with_failure_strategy(FailureStrategy::FailFast);
     wf.mark_running();
     wf.fail_task(
+        &empty_dag(),
         &TaskId::from("a"),
         "boom".into(),
         FailureScope::TaskOnly,
@@ -199,12 +208,14 @@ fn fail_task_idempotent_when_already_terminal() {
     .with_failure_strategy(FailureStrategy::FailFast);
     wf.mark_running();
     wf.fail_task(
+        &empty_dag(),
         &TaskId::from("a"),
         "first".into(),
         FailureScope::WorkflowLevel,
         None,
     );
     wf.fail_task(
+        &empty_dag(),
         &TaskId::from("a"),
         "second".into(),
         FailureScope::WorkflowLevel,
@@ -222,6 +233,7 @@ fn reset_task_from_failed_state() {
     );
     wf.mark_running();
     wf.fail_task(
+        &empty_dag(),
         &TaskId::from("a"),
         "boom".into(),
         FailureScope::WorkflowLevel,
@@ -668,6 +680,7 @@ fn late_completion_after_failure_does_not_revive_workflow() {
     wf.mark_running();
     wf.mark_task_running(&TaskId::from("a".to_string()));
     wf.fail_task(
+        &empty_dag(),
         &TaskId::from("a".to_string()),
         "boom".to_string(),
         FailureScope::WorkflowLevel,
@@ -807,6 +820,7 @@ fn stale_attempt_failure_report_is_dropped() {
 
     let applied_before = wf.tasks[&TaskId::from("a".to_string())].clone();
     wf.fail_task(
+        &empty_dag(),
         &TaskId::from("a".to_string()),
         "stale boom".to_string(),
         FailureScope::TaskOnly,
@@ -820,6 +834,7 @@ fn stale_attempt_failure_report_is_dropped() {
     assert!(task.error.is_none(), "stale failure must not record error");
 
     wf.fail_task(
+        &empty_dag(),
         &TaskId::from("a".to_string()),
         "fresh boom".to_string(),
         FailureScope::TaskOnly,

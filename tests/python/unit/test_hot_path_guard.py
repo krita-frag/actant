@@ -25,8 +25,14 @@ _HOT_PATH_FILES = (
     "crates/actant-core/src/runtime/workflow/failover.rs",
     "crates/actant-core/src/runtime/workflow/runtime/network_router.rs",
     "crates/actant-core/src/runtime/workflow/runtime/completion.rs",
+    "crates/actant-core/src/runtime/workflow/runtime/result_delivery.rs",
     "crates/actant-core/src/runtime/dispatcher.rs",
     "crates/actant-core/src/runtime/workflow/scheduler.rs",
+    # 每任务执行一次 select_target（路由）与 enqueue/dequeue（调度器 actor）。
+    "crates/actant-core/src/runtime/workflow/route.rs",
+    "crates/actant-core/src/runtime/workflow/actor.rs",
+    # 任务结果 correctness 通道：feed.send 每任务一次（终态事件发布路径）。
+    "crates/actant-core/src/runtime/events.rs",
     "crates/actant-core/src/runtime/context.rs",
 )
 

@@ -51,6 +51,8 @@ from collections.abc import Awaitable, Callable, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from typing import TYPE_CHECKING, Any, Literal, cast
 
+import cloudpickle
+
 from actant._internal.persistence import IdempotencyLedger, TerminalRecordStore
 from actant._internal.runtime_base import (
     _CONTINUED_TO_CONTEXT_KEY,
@@ -517,19 +519,25 @@ class _RuntimeTaskMixin(_RuntimeBase):
         *,
         result: bytes | None = None,
         error: str | None = None,
-    ) -> bool:
-        """把编排任务终态上报 orchestrator，返回「orchestrator 是否已排定重试」。
+    ) -> str:
+        """把编排任务终态上报 orchestrator，返回三态裁决字符串。
 
-        非编排任务（``workflow_id`` 为空）直接返回 ``False``——任务队列语义下
+        - ``"retry"``：orchestrator 已排定重试（按 ``delay_ms`` 延迟入队），
+          句柄保持等待。
+        - ``"final"``：终局失败，句柄应结算为失败。
+        - ``"none"``：无裁决动作——完成/取消入账、迟到重复失败被忽略（重试
+          在途，句柄应保持等待等真实终态）或编排未绑定。
+
+        非编排任务（``workflow_id`` 为空）直接返回 ``"none"``——任务队列语义下
         orchestrator 不持有该任务。
 
         上报失败（workflow 已终态/被淘汰、actor 不可用）**不向上抛**：句柄侧仍有
         既有事件路径兜底，编排信息缺失不应让提交方永久悬挂。此时按「无裁决」
-        （``False``）处理，调用方照常终结句柄。
+        （``"none"``）处理，调用方按既有语义终结句柄。
         """
         workflow_id = getattr(handle, "workflow_id", "") or ""
         if not workflow_id:
-            return False
+            return "none"
         try:
             verdict = self._report_task_result(
                 workflow_id,
@@ -547,11 +555,11 @@ class _RuntimeTaskMixin(_RuntimeBase):
                 workflow_id,
                 exc_info=True,
             )
-            return False
-        return bool(verdict.get("retry"))
+            return "none"
+        return str(verdict.get("verdict", "none"))
 
     def _on_task_result(self, completion: Any) -> None:
-        """任务结果回调：由 Rust event_bus 触发，解析对应的 ``AsyncResult``。
+        """任务结果回调：由 Rust 结果通道泵触发，解析对应的 ``AsyncResult``。
 
         ``completion`` 是 ``_TaskCompletion``，含 task_id / state / result / error。
         ``result`` 是 dispatch handler 返回的字节，编码为
@@ -629,12 +637,10 @@ class _RuntimeTaskMixin(_RuntimeBase):
         try:
             if state == TASK_STATE_COMPLETED:
                 raw = completion.result or b""
-                import cloudpickle as _cp
-
                 from actant.exceptions import TaskCancelledError as _TCE
 
                 try:
-                    success, payload_obj = _cp.loads(raw)
+                    success, payload_obj = cloudpickle.loads(raw)
                 except (pickle.UnpicklingError, ValueError, TypeError) as e:
                     self._report_task_result(
                         workflow_id,
@@ -681,10 +687,8 @@ class _RuntimeTaskMixin(_RuntimeBase):
         started/completed/failed 事件改由父进程侧依据 completion 状态发布，
         保持进程隔离前后可观测性契约一致。
         """
-        import cloudpickle as _cp
-
         try:
-            success, payload_obj = _cp.loads(raw)
+            success, payload_obj = cloudpickle.loads(raw)
         except (pickle.UnpicklingError, ValueError, TypeError) as e:
             # 无法解码：当作失败处理（同样上报——否则编排节点会永久停留在
             # Running，工作流无法封口收尾）。
@@ -794,16 +798,25 @@ class _RuntimeTaskMixin(_RuntimeBase):
     ) -> bool:
         """失败终态统一出口：先经 orchestrator 裁决，返回「是否保持句柄等待」。
 
-        裁决为重试时句柄保持 pending、不发失败事件、不移出注册表——重试结果
-        到达时经同一回调解析，与 worker 层重试语义一致（重试耗尽前提交方见不到
-        失败）。
-        """
-        if self._report_task_result_to_orchestrator(handle, "Failed", error=error_text):
-            _logger.info(
-                "task %s: orchestrator scheduled retry; handle stays pending",
-                task_id,
-            )
-            return True
+        编排任务的裁决为 ``"retry"``（重试已排定）时句柄保持 pending、不发失败
+        事件、不移出注册表——重试结果到达时经同一回调解析，与 worker 层重试
+        语义一致（重试耗尽前提交方见不到失败）。``"final"`` 照常终结句柄。
+
+        非编排任务（无 workflow_id）不经过裁决，直接终结——任务队列语义下
+        orchestrator 不持有该任务，等待不会有任何后续。"""
+        if getattr(handle, "workflow_id", ""):
+            verdict = self._report_task_result_to_orchestrator(handle, "Failed", error=error_text)
+            if verdict == "retry":
+                _logger.info(
+                    "task %s: orchestrator scheduled retry; handle stays pending",
+                    task_id,
+                )
+                return True
+            if verdict == "final":
+                _logger.info(
+                    "task %s: orchestrator finalized failure; handle settles as failed",
+                    task_id,
+                )
         # _set_error 接受 BaseException（含 reconstruct 后的异常对象），内部
         # dumps 存入 _error_payload。先落记录再唤醒等待者（同成功路径）。
         if not handle.workflow_id:
@@ -844,9 +857,10 @@ class _RuntimeTaskMixin(_RuntimeBase):
             error: ``Failed`` 时的错误信息。
 
         Returns:
-            ``{"retry": bool, "delay_ms": int}``：``retry`` 为真表示 orchestrator
-            已排定重试（Rust 已按 ``delay_ms`` 延迟把重试任务入队调度器），提交方
-            句柄应继续等待。
+            ``{"verdict": str, "delay_ms": int}``：``verdict`` 为
+            ``"retry"``（orchestrator 已按 ``delay_ms`` 延迟把重试任务入队调度器，
+            提交方句柄应继续等待）、``"final"``（终局失败）或 ``"none"``
+            （完成/取消入账、迟到重复失败被忽略或编排未绑定，无裁决动作）。
 
         Raises:
             InvalidStateError: Runtime 未启动。
@@ -930,7 +944,7 @@ class _RuntimeTaskMixin(_RuntimeBase):
         """查询 batch/array job 进度；未注册返回 ``None``。
 
         进度由核心 `BatchTracker` 计数，但终态由 Python 结果泵在解析 payload
-        后经 ``_record_batch_terminal`` 上报（Rust EventBus 无法区分协议成功与
+        后经 ``_record_batch_terminal`` 上报（Rust 结果通道无法区分协议成功与
         业务失败）：Completed / Failed / Cancelled 各计一档，
         `pending` 为未结算项。
         """
@@ -1980,7 +1994,7 @@ class Runtime(
         self._idempotency: IdempotencyLedger[AsyncResult] = IdempotencyLedger(self)
         # TaskLifecycle 事件批处理器：start() 时创建、stop() 时关闭。
         # 父进程侧每任务 2 次 emit（started/completed/failed）在后台线程批量派发，
-        # 降低高吞吐下 event_bus 的 publish 次数。未创建（未 start）时为 None。
+        # 降低高吞吐下的回调次数。未创建（未 start）时为 None。
         self._event_batcher: Any = None
         # 终态记录与 workflow 返回值的持久化：start() 时创建、stop() 时关闭。
         # 未 start（或已 stop）时为 None，此时持久化调用被跳过。

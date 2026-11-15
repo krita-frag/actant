@@ -8,7 +8,7 @@ use crate::runtime::actor::ActorSystem;
 use crate::runtime::capability::CapabilityRuntime;
 use crate::runtime::dispatcher::WorkerLaunchSpec;
 use crate::runtime::dispatcher::{ProcessTaskDispatcher, TaskDispatcher};
-use crate::runtime::event_bus::EventBus;
+use crate::runtime::events::EventTap;
 use crate::runtime::state::{LmdbStore, Store};
 use crate::test_support::MockTransport;
 use tempfile::tempdir;
@@ -31,7 +31,8 @@ fn make_runtime(node_id: &str) -> (Runtime, Arc<MockTransport>) {
     let actor_system = Arc::new(ActorSystem::new());
     let workflow_actor_id = ActorId::workflow(&NodeId::from(node_id.to_string()));
     let capability = Arc::new(CapabilityRuntime::new());
-    let event_bus = EventBus::new();
+    let tap = EventTap::new();
+    let (result_feed, result_rx) = crate::runtime::events::TaskResultFeed::new();
     let dispatcher = hermetic_dispatcher();
     let rt = Runtime::new(
         NodeId::from(node_id.to_string()),
@@ -42,7 +43,9 @@ fn make_runtime(node_id: &str) -> (Runtime, Arc<MockTransport>) {
         workflow_actor_id,
         None,
         capability,
-        event_bus,
+        tap,
+        result_feed,
+        result_rx,
         dispatcher,
         None,
     );
@@ -64,6 +67,34 @@ fn getters_return_configured_values() {
     assert_eq!(rt.workflow_actor_id().as_str(), "workflow-node-X");
     assert!(rt.worker().is_none());
     assert!(rt.network().node_id().as_str() == "node-X");
+}
+
+#[test]
+fn take_result_receiver_is_exactly_once() {
+    let rt = make_runtime_only("node-take");
+    // 原件可取走唯一接收端。
+    let mut rx = rt
+        .take_result_receiver()
+        .expect("original runtime must yield the receiver");
+    // 二次取取得 None——单消费者契约由类型与状态共同保证。
+    assert!(
+        rt.take_result_receiver().is_none(),
+        "second take must return None"
+    );
+    // 克隆体同样取不到（result_rx 不参与 Clone）。
+    let clone = rt.clone();
+    assert!(clone.take_result_receiver().is_none());
+    // 取走的接收端功能完好。
+    rt.result_feed()
+        .send(crate::runtime::events::TaskLifecycleEvent::TaskStarted {
+            workflow_id: crate::common::WorkflowId::from("wf-take"),
+            task_id: crate::common::TaskId::from("t-take"),
+        });
+    let ev = rx.try_recv().expect("event delivered to taken receiver");
+    assert!(matches!(
+        ev,
+        crate::runtime::events::TaskLifecycleEvent::TaskStarted { .. }
+    ));
 }
 
 #[test]

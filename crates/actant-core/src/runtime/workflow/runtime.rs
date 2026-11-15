@@ -16,9 +16,11 @@ use crate::common::{
 };
 use crate::runtime::actor::ActorSystem;
 use crate::runtime::dispatcher::{new_cancel_flag, CancelFlag, TaskDispatcher};
-use crate::runtime::event_bus::{BusEvent, EventBus};
+use crate::runtime::events::{EventTap, TapEvent, TaskLifecycleEvent, TaskResultFeed};
 use crate::runtime::network::Transport;
-use crate::runtime::workflow::actor::{InnerScheduler, ResultSource, TaskResultOutcome};
+use crate::runtime::workflow::actor::{
+    InnerScheduler, ResultSource, TaskResultOutcome, TaskResultVerdict,
+};
 use crate::runtime::workflow::messaging::{decode, encode};
 use crate::runtime::workflow::workflow_methods;
 use crate::runtime::workflow::Scheduler;
@@ -35,9 +37,9 @@ use crate::runtime::network::DirectResponseChannel;
 
 /// 信号驱动的任务拉取。
 ///
-/// 先 ``try_dequeue`` 拉取已入队任务；无任务时在 EventBus 的
+/// 先 ``try_dequeue`` 拉取已入队任务；无任务时在调度唤醒信号的
 /// ``TaskEnqueued`` 专用 ``Notify`` 信号上 await，由 SchedulerActor 在
-/// ``enqueue`` 后调用 ``notify_task_enqueued()`` 唤醒。
+/// ``enqueue`` 后经 ``InnerScheduler`` 内部的 ``notify_one()`` 唤醒。
 /// 无 sleep、无固定延迟、无 CPU 浪费。
 ///
 /// # 为什么不直接调用 ``dequeue()``
@@ -81,7 +83,8 @@ async fn wait_for_task(
             return task;
         }
         // 无任务时等待 Notify 信号。信号由 SchedulerActor 在
-        // enqueue/enqueue_batch 后通过 notify_task_enqueued() 触发。
+        // enqueue/enqueue_batch 后经 InnerScheduler::enqueue 内部的
+        // notify_one() 触发。
         // notified().await 在收到 notify_waiters() 时返回，否则永久阻塞——
         // shutdown 时 select! 的 cancel 分支会取消此 future。
         //
@@ -191,7 +194,12 @@ pub struct Worker {
     /// SchedulerActor 的 id，用于 shutdown 时同步等待 Actor 退出。
     /// `None` 表示 Worker 未绑定 SchedulerActor（仅用于不启动 Actor 系统的测试路径）。
     scheduler_actor_id: Option<crate::common::ActorId>,
-    event_bus: EventBus,
+    /// 观测 tap：Worker 生命周期事件（draining/drained/stopped）。
+    tap: EventTap,
+    /// 任务结果 correctness 通道：TaskStarted 与终态事件发布端。
+    result_feed: TaskResultFeed,
+    /// 入队唤醒信号（与 SchedulerActor 的 InnerScheduler 共享同一实例）。
+    task_notify: Arc<tokio::sync::Notify>,
     task_dispatcher: Arc<dyn TaskDispatcher>,
     actor_system: Option<Arc<ActorSystem>>,
     /// 本地 WorkflowActor 的 id。用于将远程 task result 路由到编排器。
@@ -271,14 +279,31 @@ pub struct Worker {
     quota_tracker: Arc<crate::runtime::quota::QuotaTracker>,
 }
 
-/// [`Worker::report_task_result`] 的返回值（回传 Python 事件泵的重试裁决）。
-#[derive(Debug, Clone, Copy, Default)]
-pub struct TaskReportResponse {
-    /// orchestrator 是否裁决为「重试」。为 `true` 时本节点已按 `delay_ms`
-    /// 延迟把重试任务重新入队调度器，提交方句柄应保持等待。
-    pub retry: bool,
-    /// 重试前的延迟（毫秒）。`retry == false` 时为 0。
-    pub delay_ms: u64,
+/// [`Worker::report_task_result`] 的返回裁决（回传 Python 事件泵）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TaskReportVerdict {
+    /// orchestrator 已排定重试：本节点已按 `delay_ms` 延迟把重试任务入队
+    /// 调度器，提交方句柄应保持等待。
+    Retry { delay_ms: u64 },
+    /// 终局失败：句柄应结算为失败并发布失败终态。
+    FinalFailure,
+    /// 无动作：完成 / 取消已入账、迟到重复失败被忽略、或编排未绑定
+    ///（降级）。句柄由既有事件路径结算，迟到重复失败下保持等待。
+    #[default]
+    NoAction,
+}
+
+/// Worker 的进程内事件通道三元组（构造时一次性注入）。
+///
+/// 把三条通道打包为单一参数：构造器签名保持在 clippy 参数数阈值内，
+/// 且新增通道时不必改动所有调用点的参数顺序。
+pub struct WorkerChannels {
+    /// 观测 tap：Worker 生命周期事件（draining/drained/stopped）。
+    pub tap: EventTap,
+    /// 任务结果 correctness 通道：TaskStarted 与终态事件发布端。
+    pub result_feed: TaskResultFeed,
+    /// 入队唤醒信号（与 SchedulerActor 的 InnerScheduler 共享同一实例）。
+    pub task_notify: Arc<tokio::sync::Notify>,
 }
 
 impl Worker {
@@ -289,7 +314,7 @@ impl Worker {
     pub fn new(
         node_id: NodeId,
         network: Arc<dyn Transport>,
-        event_bus: EventBus,
+        channels: WorkerChannels,
         scheduler: Arc<dyn Scheduler>,
         task_dispatcher: Arc<dyn TaskDispatcher>,
         config: &WorkerConfig,
@@ -308,7 +333,9 @@ impl Worker {
             scheduler,
             fast_scheduler: None,
             scheduler_actor_id: None,
-            event_bus,
+            tap: channels.tap,
+            result_feed: channels.result_feed,
+            task_notify: channels.task_notify,
             task_dispatcher,
             actor_system: None,
             workflow_actor_id: None,
@@ -515,6 +542,100 @@ impl Worker {
 
     /// 返回 scheduler 的 `Arc` 克隆，供其他子系统（如 FailoverManager）共享调度入口。
     /// drain/关闭路径的出队：优先直连共享队列（大载荷安全），否则退化 trait。
+    /// 等待全部在途任务完成（领满并发槽位信号量），受 `drain_timeout` 钳制。
+    ///
+    /// 排空的公共前置：busy Worker 关闭时必须等在途任务结束再宣告
+    /// `WorkerDrained`——不等就宣告会让 failover 侧提前认定节点清空并触发
+    /// 工作流接管，与仍在执行的任务形成重复执行窗口。
+    async fn wait_running_tasks_drain(&self) {
+        let running = self.running_task_count();
+        tracing::info!(
+            running_tasks = running,
+            drain_timeout_ms = self.drain_timeout.as_millis(),
+            "worker entering drain mode, waiting for running tasks"
+        );
+        let drain_result = tokio::time::timeout(self.drain_timeout, async {
+            // max_concurrent_tasks 理论上为 usize，semaphore::acquire_many
+            // 接收 u32。实际值受 CPU 核数限制不会溢出，但显式截断
+            // 比 `as u32` 静默截断更安全——溢出时取 u32::MAX 仍能
+            // 正确 drain（等待所有 permit）。
+            let max = u32::try_from(
+                self.max_concurrent_tasks
+                    .load(std::sync::atomic::Ordering::Acquire),
+            )
+            .unwrap_or(u32::MAX);
+            let permit = self.running_tasks.acquire_many(max).await;
+            drop(permit);
+        })
+        .await;
+        if drain_result.is_err() {
+            tracing::warn!("drain timeout exceeded, forcing shutdown");
+        } else {
+            tracing::info!("all running tasks completed, shutting down");
+        }
+    }
+
+    /// 排空收尾的唯一实现：关闭 scheduler、丢弃排队/inflight 任务（逐个补发
+    /// Cancelled 终态通知 origin）、发布 `WorkerDrained`、置 `Stopped`。
+    ///
+    /// drain 的两条触发路径（loop-top 状态检查 / cancel 监视分支）共用本方法，
+    /// 保证 busy 与 idle Worker 的关闭语义一致。
+    async fn drain_finalize(
+        &self,
+        network: &dyn crate::runtime::network::Transport,
+        pending_tx: &tokio::sync::mpsc::Sender<PendingResult>,
+        inflight: &mut std::collections::VecDeque<TaskDefinition>,
+    ) {
+        // 关闭 scheduler，使新 task 无法入队。
+        self.scheduler.close();
+        let ctx = DrainNotifyCtx {
+            node_id: &self.node_id,
+            network,
+            result_feed: &self.result_feed,
+            pending_results: pending_tx,
+        };
+        // 排空剩余排队 task — 由于 scheduler 已关闭，新入队会被拒绝，
+        // 已排队任务直接丢弃。每个被丢弃任务必须发布 Cancelled 完成事件：
+        // 排队任务不会被执行，若不通知 origin，远端提交方会永久等待结果。
+        //
+        // 整个回传循环受 drain 剩余预算钳制：逐任务直连回传 origin 慢/失联时
+        // 无上界会让 Stopped 置位遥遥无期（Runtime::shutdown 等它）。超时后
+        // 残余任务放弃回传，交由 origin 的失联接管/租约重投兜底（与
+        // pending-result 超限后的语义一致）。
+        let drain_deadline = tokio::time::Instant::now() + self.drain_timeout;
+        let mut notified = 0usize;
+        let mut dropped_unnotified = 0usize;
+        while let Some(dropped) = self.try_dequeue_drain().await {
+            if tokio::time::Instant::now() >= drain_deadline {
+                dropped_unnotified += 1;
+                continue;
+            }
+            publish_drained_task_cancellation(dropped, &ctx).await;
+            notified += 1;
+        }
+        // inflight 中已 prefetch 但未 dispatch 的任务同样被丢弃，逐个通知。
+        for dropped in inflight.drain(..) {
+            if tokio::time::Instant::now() >= drain_deadline {
+                dropped_unnotified += 1;
+                continue;
+            }
+            publish_drained_task_cancellation(dropped, &ctx).await;
+            notified += 1;
+        }
+        if dropped_unnotified > 0 {
+            tracing::warn!(
+                node = %self.node_id.as_str(),
+                dropped_unnotified,
+                notified,
+                "drain deadline exceeded; residual drained tasks are left to origin's                  lease re-dispatch instead of direct cancellation notices"
+            );
+        }
+        self.publish_lifecycle(TapEvent::WorkerDrained {
+            node_id: self.node_id.clone(),
+        });
+        self.mark_stopped();
+    }
+
     async fn try_dequeue_drain(&self) -> Option<TaskDefinition> {
         if let Some(inner) = &self.fast_scheduler {
             return inner.try_dequeue().await;
@@ -653,16 +774,20 @@ impl Worker {
     /// 结果经 `ON_TASK_RESULT` 回灌本地 `WorkflowActor`，随后落实
     /// orchestrator 的裁决：
     /// - 裁决为「重试」→ 按 `delay_ms` 延迟把重试任务入队本节点调度器，返回
-    ///   `retry = true`（Python 侧据此保持提交方句柄等待，不发布失败事件）；
-    /// - 终局（完成 / 重试耗尽 / 取消 / fencing 拒绝）→ 返回 `retry = false`。
+    ///   [`TaskReportVerdict::Retry`]（Python 侧据此保持提交方句柄等待，不发布
+    ///   失败事件）；
+    /// - 终局失败 → [`TaskReportVerdict::FinalFailure`]（句柄结算为失败）；
+    /// - 迟到重复失败被忽略 → [`TaskReportVerdict::NoAction`]（结果回灌是
+    ///   at-least-once，重复失败不得翻转已裁决状态，句柄保持等待）；
+    /// - 完成 / 取消入账 → [`TaskReportVerdict::NoAction`]。
     ///
     /// `workflow_id` 为空（独立 `@task` 直调，非编排任务）时不做任何事。
     ///
     /// # 降级
     ///
     /// 未绑定 `ActorSystem` / `WorkflowActor`（不启动 Actor 系统的 Worker 测试
-    /// 路径）时返回无裁决（`retry = false`）：编排是可选能力，缺失不应让任务
-    /// 本身失败——与本地事件发布路径的降级语义一致。
+    /// 路径）时返回无裁决（[`TaskReportVerdict::NoAction`]）：编排是可选能力，
+    /// 缺失不应让任务本身失败——与本地事件发布路径的降级语义一致。
     ///
     /// # Errors
     ///
@@ -673,9 +798,9 @@ impl Worker {
         workflow_id: &WorkflowId,
         task_id: &TaskId,
         outcome: TaskResultOutcome,
-    ) -> Result<TaskReportResponse> {
+    ) -> Result<TaskReportVerdict> {
         if workflow_id.as_str().is_empty() {
-            return Ok(TaskReportResponse::default());
+            return Ok(TaskReportVerdict::NoAction);
         }
         let (Some(actor_system), Some(workflow_actor_id)) =
             (self.actor_system.as_ref(), self.workflow_actor_id.as_ref())
@@ -684,7 +809,7 @@ impl Worker {
                 task_id = %task_id.as_str(),
                 "report_task_result: no workflow actor bound; skipping orchestration ingest"
             );
-            return Ok(TaskReportResponse::default());
+            return Ok(TaskReportVerdict::NoAction);
         };
         // wire 协议尚未携带派发代数，attempt 传 `None`（入口 fencing 放行）；
         // DAG 写入方法内部的 fencing 校验仍是最终防线。
@@ -701,21 +826,23 @@ impl Worker {
         if let Some(error) = result.error {
             return Err(ActantError::from(error));
         }
-        // 响应载荷是编码后的 `Option<(TaskDefinition, u64)>`：`None`
-        // 表示终局（无重试任务），`Some` 才是 orchestrator 的重试裁决。注意
-        // postcard 下 `None` 仍占一个判别字节（`[0x00]`）而非空 payload，
-        // 因此必须按 `Option` 解码——直接解码成二元组会读到判别字节当结构体
-        // 头部而报 "Hit the end of buffer"。
-        let verdict: Option<(TaskDefinition, u64)> = if result.payload.is_empty() {
-            // 生产 handler 总是 encode（None 也有判别字节）；空载荷意味着
-            // 协议被破坏，显性化「可能丢失的重试裁决」而不是静默当终局。
-            tracing::warn!("empty ON_TASK_RESULT response payload; treating verdict as terminal");
-            None
+        // 响应载荷是编码后的 `TaskResultVerdict`（三态裁决）。空载荷意味着
+        // 协议被破坏（生产 handler 总是 encode），显性化「裁决丢失」而不是
+        // 静默当终局——按无动作处理，句柄由既有事件路径兜底。
+        let verdict: TaskResultVerdict = if result.payload.is_empty() {
+            tracing::warn!("empty ON_TASK_RESULT response payload; treating verdict as no-action");
+            return Ok(TaskReportVerdict::NoAction);
         } else {
             decode(&result.payload)?
         };
-        let Some((task, delay_ms)) = verdict else {
-            return Ok(TaskReportResponse::default());
+        let (task, delay_ms) = match verdict {
+            TaskResultVerdict::Retry(task, delay_ms) => (*task, delay_ms),
+            TaskResultVerdict::FinalFailure => return Ok(TaskReportVerdict::FinalFailure),
+            // Settled（完成/取消入账）与 Ignored（迟到重复失败）对句柄
+            // 均无动作：前者由事件路径结算，后者保持等待等真实终态。
+            TaskResultVerdict::Settled | TaskResultVerdict::Ignored => {
+                return Ok(TaskReportVerdict::NoAction)
+            }
         };
         let scheduler = self.scheduler.clone();
         // 延迟入队由独立 task 承担：调用方（Python 事件泵）不阻塞，句柄等待
@@ -731,10 +858,7 @@ impl Worker {
                 );
             }
         });
-        Ok(TaskReportResponse {
-            retry: true,
-            delay_ms,
-        })
+        Ok(TaskReportVerdict::Retry { delay_ms })
     }
 
     /// 查询当前网络视图中的 peer 节点。
@@ -769,7 +893,7 @@ impl Worker {
         // .notified().await 的 Worker。ready 信号前获取确保：
         // serve() 返回后 Python submit() 触发的 notify 不会错过——
         // Worker 进入 run_task_execution_loop 后立即在 notify 上 await。
-        let task_enqueued_notify = self.event_bus.task_enqueued_notify();
+        let task_enqueued_notify = self.task_notify.clone();
         // 进入任务执行循环前发送就绪信号：``serve()`` 据此返回。
         // ``send_replace`` 写入持久状态，即使等待者晚于 ``run()`` 启动
         // 也能立即观察到 true。返回的旧值无意义（始终是 false）。
@@ -838,7 +962,8 @@ impl Worker {
     fn start_network_event_loop(&self) {
         let router = NetworkEventRouter::new(NetworkEventRouterConfig {
             network: self.network.clone(),
-            event_bus: self.event_bus.clone(),
+            tap: self.tap.clone(),
+            result_feed: self.result_feed.clone(),
             scheduler: self.scheduler.clone(),
             actor_system: self.actor_system.clone(),
             workflow_actor_id: self.workflow_actor_id.clone(),
@@ -877,13 +1002,14 @@ impl Worker {
     }
 
     fn start_pending_result_loop(&self) -> tokio::sync::mpsc::Sender<PendingResult> {
+        // retry 通道容量是本函数的合法参数（背压队列），与已删除的
+        // publish_task_completion 死参数无关。
         start_pending_result_loop(
             self.network.clone(),
             self.cancel_rx.clone(),
             self.broadcast_retry_attempts,
             self.broadcast_retry_base_delay,
             self.pending_result_channel_capacity,
-            self.event_bus.clone(),
         )
     }
 
@@ -896,11 +1022,10 @@ impl Worker {
         let network = self.network.clone();
         let task_dispatcher = self.task_dispatcher.clone();
         let semaphore = self.running_tasks.clone();
-        let event_bus = self.event_bus.clone();
+        let result_feed = self.result_feed.clone();
         let task_timeout = self.task_timeout;
         let mut task_cancel = self.cancel_rx.clone();
         let state_sender = self.state.clone();
-        let drain_timeout = self.drain_timeout;
         let cancel_flags = self.cancel_flags.clone();
         let cancelled_tasks = self.cancelled_tasks.clone();
 
@@ -923,52 +1048,22 @@ impl Worker {
 
         loop {
             if *self.state.subscribe().borrow() == WorkerState::Draining {
-                // 关闭 scheduler，使新 task 无法入队。
-                self.scheduler.close();
-                // 排空剩余排队 task — 由于 scheduler 已关闭，新入队会被拒绝，
-                // 已排队任务直接丢弃。每个被丢弃任务必须发布 Cancelled 完成事件：
-                // 排队任务不会被执行，若不通知 origin，远端提交方会永久等待结果。
-                while let Some(dropped) = self.try_dequeue_drain().await {
-                    publish_drained_task_cancellation(
-                        dropped,
-                        &DrainNotifyCtx {
-                            node_id: &node_id,
-                            network: network.as_ref(),
-                            event_bus: &event_bus,
-                            pending_results: pending_tx,
-                            pending_capacity: self.pending_result_channel_capacity,
-                        },
-                    )
+                // 与 cancel 监视分支同一语义：先等在途任务结束（不等就宣告
+                // WorkerDrained 会让 failover 侧提前接管，形成重复执行窗口），
+                // 再统一收尾。主循环处于迭代中（在途任务非空）时也会走到这里。
+                self.wait_running_tasks_drain().await;
+                self.drain_finalize(network.as_ref(), pending_tx, &mut inflight)
                     .await;
-                }
-                // inflight 中已 prefetch 但未 dispatch 的任务同样被丢弃，逐个通知。
-                for dropped in inflight.drain(..) {
-                    publish_drained_task_cancellation(
-                        dropped,
-                        &DrainNotifyCtx {
-                            node_id: &node_id,
-                            network: network.as_ref(),
-                            event_bus: &event_bus,
-                            pending_results: pending_tx,
-                            pending_capacity: self.pending_result_channel_capacity,
-                        },
-                    )
-                    .await;
-                }
                 // 通知子任务（network event loop、retry loop）退出。
                 // 否则 rt.shutdown_timeout 会等待完整的 5s。
                 // cancel.send 失败仅当所有 receiver 已 drop（子任务已退出）。
                 let _ = self.cancel.send(true);
-                self.publish_lifecycle(BusEvent::WorkerDrained {
-                    node_id: self.node_id.clone(),
-                });
-                self.mark_stopped();
                 return Ok(());
             }
 
             // 直提任务租约检查点：远端执行超时未回结果则重新入队。
             // 放在循环顶部，保证有 inflight 任务持续 dispatch 时也按期检查。
-            self.expire_standalone_leases(&node_id, network.clone(), &event_bus, pending_tx)
+            self.expire_standalone_leases(&node_id, network.clone(), pending_tx)
                 .await;
 
             // 取下一个任务：优先从 inflight 队列取（避免 dequeue 调用）；
@@ -979,70 +1074,14 @@ impl Worker {
             } else {
                 let prefetch_result = tokio::select! {
                     _ = task_cancel.changed() => {
-                        // state_sender.send_replace 返回旧值无意义。
-                        let _ = state_sender.send_replace(WorkerState::Draining);
-                        let running = self.running_task_count();
-                        tracing::info!(
-                            running_tasks = running,
-                            drain_timeout_ms = drain_timeout.as_millis(),
-                            "worker entering drain mode, waiting for running tasks"
-                        );
-
-                        let drain_result = tokio::time::timeout(
-                            drain_timeout,
-                            async {
-                                let sem = semaphore.clone();
-                                // max_concurrent_tasks 理论上为 usize，semaphore::acquire_many
-                                // 接收 u32。实际值受 CPU 核数限制不会溢出，但显式截断
-                                // 比 `as u32` 静默截断更安全——溢出时取 u32::MAX 仍能
-                                // 正确 drain（等待所有 permit）。
-                                let max = u32::try_from(
-                                    self.max_concurrent_tasks.load(std::sync::atomic::Ordering::Acquire)
-                                ).unwrap_or(u32::MAX);
-                                let permit = sem.acquire_many(max).await;
-                                drop(permit);
-                            },
-                        ).await;
-
-                        if drain_result.is_err() {
-                            tracing::warn!("drain timeout exceeded, forcing shutdown");
-                        } else {
-                            tracing::info!("all running tasks completed, shutting down");
-                        }
-
-                        // 与 Draining 主循环分支一致：关闭 scheduler 并排空残留
-                        // 排队/inflight 任务，逐个发布 Cancelled 完成事件通知 origin。
-                        self.scheduler.close();
-                        while let Some(dropped) = self.try_dequeue_drain().await {
-                            publish_drained_task_cancellation(
-                                dropped,
-                                &DrainNotifyCtx {
-                                    node_id: &node_id,
-                                    network: network.as_ref(),
-                                    event_bus: &event_bus,
-                                    pending_results: pending_tx,
-                                    pending_capacity: self.pending_result_channel_capacity,
-                                },
-                            )
+                        // 与 shutdown()/drain() 同源：首次翻转发 Draining 事件。
+                        self.mark_draining();
+                        // 与 loop-top Draining 分支共用同一收尾（等待 + 排空 +
+                        // 宣告），busy 与 idle Worker 的关闭语义一致。
+                        self.wait_running_tasks_drain().await;
+                        self.drain_finalize(network.as_ref(), pending_tx, &mut inflight)
                             .await;
-                        }
-                        for dropped in inflight.drain(..) {
-                            publish_drained_task_cancellation(
-                                dropped,
-                                &DrainNotifyCtx {
-                                    node_id: &node_id,
-                                    network: network.as_ref(),
-                                    event_bus: &event_bus,
-                                    pending_results: pending_tx,
-                                    pending_capacity: self.pending_result_channel_capacity,
-                                },
-                            )
-                            .await;
-                        }
-                        self.publish_lifecycle(BusEvent::WorkerDrained {
-                            node_id: self.node_id.clone(),
-                        });
-                        self.mark_stopped();
+                        let _ = self.cancel.send(true);
                         return Ok(());
                     }
                     batch = prefetch_tasks(&self.scheduler, self.fast_scheduler.as_ref(), task_enqueued_notify, prefetch_limit) => Some(batch),
@@ -1064,6 +1103,14 @@ impl Worker {
             let Some(task) = task_opt else {
                 continue;
             };
+
+            // 派发前复查 WorkerState：迭代期间进入 Draining 时不把手中任务派发
+            // 出去（Draining 置位后仍派发会让任务在关闭路径外执行）。任务塞回
+            // inflight，由 loop-top 的 drain_finalize 统一补发 Cancelled。
+            if *self.state.subscribe().borrow() == WorkerState::Draining {
+                inflight.push_front(task);
+                continue;
+            }
 
             let mut task = task;
             if task.target_node.is_none() {
@@ -1092,6 +1139,32 @@ impl Worker {
                             "deferring task: no eligible node for placement requirements"
                         );
                         if self.starvation_exceeded(task.id.as_str()) {
+                            // defer 等待期间被取消的任务按 Cancelled 结算：以
+                            // Failed 结算会触发 origin 侧无谓的重试裁决，且
+                            // cancelled_tasks 注册表条目要等 TTL 才清。
+                            if cancelled_tasks.lock().remove(task.id.as_str()).is_some() {
+                                crate::metrics::dec_cancelled_tasks_pending();
+                                let completion = TaskCompletion::Cancelled {
+                                    workflow_id: task
+                                        .workflow_id
+                                        .clone()
+                                        .unwrap_or_else(|| WorkflowId::from(String::new())),
+                                    task_id: task.id.clone(),
+                                    task_name: task.name.clone(),
+                                    target_node: task.target_node.clone(),
+                                };
+                                publish_task_completion(
+                                    completion,
+                                    &task,
+                                    &node_id,
+                                    network.as_ref(),
+                                    &result_feed,
+                                    pending_tx,
+                                )
+                                .await;
+                                self.clear_task_tracking(task.id.as_str());
+                                continue;
+                            }
                             self.clear_task_tracking(task.id.as_str());
                             crate::metrics::inc_tasks_failed();
                             let completion = TaskCompletion::Failed {
@@ -1116,9 +1189,8 @@ impl Worker {
                                 &task,
                                 &node_id,
                                 network.as_ref(),
-                                &event_bus,
+                                &result_feed,
                                 pending_tx,
-                                self.pending_result_channel_capacity,
                             )
                             .await;
                             continue;
@@ -1128,9 +1200,8 @@ impl Worker {
                         let ctx = ReenqueueCtx {
                             node_id: node_id.clone(),
                             network: network.clone(),
-                            event_bus: event_bus.clone(),
+                            result_feed: self.result_feed.clone(),
                             pending_results: pending_tx.clone(),
-                            pending_capacity: self.pending_result_channel_capacity,
                             state: self.state.subscribe(),
                         };
                         tokio::spawn(reenqueue_after_delay(
@@ -1171,9 +1242,8 @@ impl Worker {
                     &task,
                     &node_id,
                     network.as_ref(),
-                    &event_bus,
+                    &result_feed,
                     pending_tx,
-                    self.pending_result_channel_capacity,
                 )
                 .await;
                 continue;
@@ -1202,15 +1272,14 @@ impl Worker {
                     target_node: task.target_node.clone(),
                 };
                 // 走统一完成投递：远端 origin 直连回传 Cancelled，本地任务
-                // 发布 `BusEvent::TaskCancelled`，避免远端提交方永久等待。
+                // 发布 `TaskLifecycleEvent::TaskCancelled`，避免远端提交方永久等待。
                 publish_task_completion(
                     completion,
                     &task,
                     &node_id,
                     network.as_ref(),
-                    &event_bus,
+                    &result_feed,
                     pending_tx,
-                    self.pending_result_channel_capacity,
                 )
                 .await;
                 cancelled_tasks.lock().remove(task.id.as_str());
@@ -1278,9 +1347,8 @@ impl Worker {
                                     &task,
                                     &node_id,
                                     network.as_ref(),
-                                    &event_bus,
+                                    &result_feed,
                                     pending_tx,
-                                    self.pending_result_channel_capacity,
                                 )
                                 .await;
                                 continue;
@@ -1293,9 +1361,8 @@ impl Worker {
                             let ctx = ReenqueueCtx {
                                 node_id: node_id.clone(),
                                 network: network.clone(),
-                                event_bus: event_bus.clone(),
+                                result_feed: self.result_feed.clone(),
                                 pending_results: pending_tx.clone(),
-                                pending_capacity: self.pending_result_channel_capacity,
                                 state: self.state.subscribe(),
                             };
                             tokio::spawn(reenqueue_after_delay(
@@ -1348,9 +1415,8 @@ impl Worker {
                         &task,
                         &node_id,
                         network.as_ref(),
-                        &event_bus,
+                        &result_feed,
                         pending_tx,
-                        self.pending_result_channel_capacity,
                     )
                     .await;
                     continue;
@@ -1359,9 +1425,8 @@ impl Worker {
                 let ctx = ReenqueueCtx {
                     node_id: node_id.clone(),
                     network: network.clone(),
-                    event_bus: event_bus.clone(),
+                    result_feed: self.result_feed.clone(),
                     pending_results: pending_tx.clone(),
-                    pending_capacity: self.pending_result_channel_capacity,
                     state: self.state.subscribe(),
                 };
                 tokio::spawn(reenqueue_after_delay(
@@ -1377,16 +1442,34 @@ impl Worker {
             // 任务被接受本地执行：清零弹跳计数。
             self.reroute_counts.lock().remove(task.id.as_str());
 
-            let event_bus = event_bus.clone();
+            let result_feed = result_feed.clone();
             let network = network.clone();
             let pending_results = pending_tx.clone();
-            let pending_capacity = self.pending_result_channel_capacity;
 
-            let permit = semaphore
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|_| ActantError::Internal("semaphore closed".into()))?;
+            // 并发槽位等待必须在 cancel 监视下：满载且在途任务全部卡死时，
+            // 无监视的 acquire 会让主循环无限期阻塞、永不回到 drain 检查
+            // （最终只能靠 Runtime::shutdown 的 stop_timeout 强制收尾）。
+            // 取消时把手中任务塞回 inflight，loop-top 的 drain_finalize 统一收尾。
+            let permit = tokio::select! {
+                permit = semaphore.clone().acquire_owned() => {
+                    permit.map_err(|_| ActantError::Internal("semaphore closed".into()))?
+                }
+                _ = task_cancel.changed() => {
+                    self.mark_draining();
+                    inflight.push_front(task);
+                    continue;
+                }
+            };
+
+            // permit 后补复查：acquire 等待期间进入 Draining 时任务不得再被
+            // spawn（dispatcher 可能已 shutdown，dispatch 会以 Failed 而非
+            // Cancelled 结算——spurious 失败会触发 origin 侧无谓的重试裁决）。
+            // 任务塞回 inflight，由 loop-top 的 drain_finalize 统一补发 Cancelled。
+            if *self.state.subscribe().borrow() == WorkerState::Draining {
+                drop(permit);
+                inflight.push_front(task);
+                continue;
+            }
 
             // 命名配额准入（分布式信号量）：在拿到并发槽位后、派发前原子扣减。
             // 容量耗尽时归还槽位并延后重入队——配额是"等待"而不是"失败"，
@@ -1402,6 +1485,33 @@ impl Worker {
                         "quota exhausted, deferring task"
                     );
                     if self.starvation_exceeded(task.id.as_str()) {
+                        // defer 等待期间被取消的任务按 Cancelled 结算（理由同
+                        // 路由 Defer 分支：Failed 会触发无谓的重试裁决）。
+                        if cancelled_tasks.lock().remove(task.id.as_str()).is_some() {
+                            crate::metrics::dec_cancelled_tasks_pending();
+                            let completion = TaskCompletion::Cancelled {
+                                workflow_id: task
+                                    .workflow_id
+                                    .clone()
+                                    .unwrap_or_else(|| WorkflowId::from(String::new())),
+                                task_id: task.id.clone(),
+                                task_name: task.name.clone(),
+                                target_node: task.target_node.clone(),
+                            };
+                            publish_task_completion(
+                                completion,
+                                &task,
+                                &node_id,
+                                network.as_ref(),
+                                &result_feed,
+                                pending_tx,
+                            )
+                            .await;
+                            drop(permit);
+                            self.notify_capacity();
+                            self.clear_task_tracking(task.id.as_str());
+                            continue;
+                        }
                         self.clear_task_tracking(task.id.as_str());
                         crate::metrics::inc_tasks_failed();
                         let completion = TaskCompletion::Failed {
@@ -1419,9 +1529,8 @@ impl Worker {
                             &task,
                             &node_id,
                             network.as_ref(),
-                            &event_bus,
+                            &result_feed,
                             pending_tx,
-                            self.pending_result_channel_capacity,
                         )
                         .await;
                         drop(permit);
@@ -1441,9 +1550,8 @@ impl Worker {
                     let ctx = ReenqueueCtx {
                         node_id: node_id.clone(),
                         network: network.clone(),
-                        event_bus: event_bus.clone(),
+                        result_feed: self.result_feed.clone(),
                         pending_results: pending_tx.clone(),
-                        pending_capacity: self.pending_result_channel_capacity,
                         state: self.state.subscribe(),
                     };
                     tokio::spawn(async move {
@@ -1467,6 +1575,8 @@ impl Worker {
 
             let node_id_for_spawn = node_id.clone();
             let task_name = task.name.clone();
+            // payload 克隆而非 move：崩溃故障转移分支会用原 task 重入队，
+            // payload 必须保持完整（调度闭包与重入队路径各持一份是必要成本）。
             let task_payload = task.payload.clone();
             let dispatcher = task_dispatcher.clone();
             let dispatch_start_ms = crate::common::epoch_millis();
@@ -1497,13 +1607,14 @@ impl Worker {
             let crash_failover_max = self.crash_failover_max_attempts;
             let failover_delay = self.remote_fallback_delay;
 
-            // Publish TaskStarted to EventBus (所有任务，使 Python @task 也能收到 running 状态)
+            // TaskStarted 进 correctness 通道：与终态同一条 FIFO，Python 结果泵
+            // 据此置 running 并发布 started 生命周期事件。
             {
                 let wf_id = task
                     .workflow_id
                     .clone()
                     .unwrap_or_else(|| WorkflowId::from("".to_string()));
-                event_bus.publish(BusEvent::TaskStarted {
+                self.result_feed.send(TaskLifecycleEvent::TaskStarted {
                     workflow_id: wf_id,
                     task_id: task.id.clone(),
                 });
@@ -1675,9 +1786,8 @@ impl Worker {
                         &task,
                         &node_id_for_spawn,
                         network.as_ref(),
-                        &event_bus,
+                        &result_feed,
                         &pending_results,
-                        pending_capacity,
                         orchestrator_bridge.as_ref(),
                     )
                     .await;
@@ -1744,9 +1854,8 @@ impl Worker {
                     let ctx = ReenqueueCtx {
                         node_id: node_id_for_spawn.clone(),
                         network: network.clone(),
-                        event_bus: event_bus.clone(),
+                        result_feed: result_feed.clone(),
                         pending_results: pending_results.clone(),
-                        pending_capacity,
                         state: reenqueue_state.clone(),
                     };
                     tokio::spawn(reenqueue_after_delay(
@@ -1774,9 +1883,8 @@ impl Worker {
                     &task,
                     &node_id_for_spawn,
                     network.as_ref(),
-                    &event_bus,
+                    &result_feed,
                     &pending_results,
-                    pending_capacity,
                     orchestrator_bridge.as_ref(),
                 )
                 .await;
@@ -1805,9 +1913,25 @@ impl Worker {
     /// [`crate::runtime::Runtime::shutdown`] 编排。
     ///
     /// 幂等：`Runtime::shutdown` 之后再次调用是 no-op（`free_workers` 已被取空）。
+    /// 将状态置为 `Draining`，首次进入时发布 `WorkerDraining` 生命周期事件。
+    ///
+    /// 四处 Draining 翻转（`shutdown` / `drain` / 主循环 cancel 分支 /
+    /// acquire-cancel 分支）共用：状态与事件必须同源——shutdown 路径只翻状态
+    /// 不发事件时，Python 侧等待者会错过 draining（观察到 drained 而无
+    /// draining，序列不完整）。`send_replace` 返回的旧值判定首次进入，重复
+    /// 翻转幂等不重发。
+    fn mark_draining(&self) -> WorkerState {
+        let previous = self.state.send_replace(WorkerState::Draining);
+        if previous != WorkerState::Draining {
+            self.publish_lifecycle(TapEvent::WorkerDraining {
+                node_id: self.node_id.clone(),
+            });
+        }
+        previous
+    }
+
     pub fn shutdown(&self) {
-        // state_sender.send_replace 返回旧值无意义。
-        let _ = self.state.send_replace(WorkerState::Draining);
+        self.mark_draining();
         if let Err(e) = self.cancel.send(true) {
             tracing::warn!("failed to send shutdown signal: {}", e);
         }
@@ -1831,30 +1955,26 @@ impl Worker {
     fn mark_stopped(&self) {
         let previous = self.state.send_replace(WorkerState::Stopped);
         if previous != WorkerState::Stopped {
-            self.publish_lifecycle(BusEvent::WorkerStopped {
+            self.publish_lifecycle(TapEvent::WorkerStopped {
                 node_id: self.node_id.clone(),
             });
         }
     }
 
     pub fn drain(&self) {
-        // state_sender.send_replace 返回旧值无意义。
-        let _ = self.state.send_replace(WorkerState::Draining);
+        self.mark_draining();
         self.scheduler.close();
         if let Some(ref cb) = self.capacity_callback {
             cb(0, 0);
         }
-        self.publish_lifecycle(BusEvent::WorkerDraining {
-            node_id: self.node_id.clone(),
-        });
         tracing::info!("node {} entering drain mode", self.node_id.as_str());
     }
 
-    /// Publish a worker lifecycle event.
+    /// Publish a worker lifecycle event（观测 tap，可丢）。
     ///
     /// `publish` 是同步非阻塞的，可在任意线程（含 Python GIL 线程）直接调用。
-    fn publish_lifecycle(&self, event: BusEvent) {
-        self.event_bus.publish(event);
+    fn publish_lifecycle(&self, event: crate::runtime::events::TapEvent) {
+        self.tap.publish_lifecycle(event);
     }
 
     pub fn running_task_count(&self) -> usize {
@@ -2000,7 +2120,6 @@ impl Worker {
         &self,
         node_id: &NodeId,
         network: Arc<dyn Transport>,
-        event_bus: &EventBus,
         pending_results: &tokio::sync::mpsc::Sender<PendingResult>,
     ) {
         let Some(failover) = self.failover.as_ref() else {
@@ -2043,9 +2162,8 @@ impl Worker {
                     &task,
                     node_id,
                     network.as_ref(),
-                    event_bus,
+                    &self.result_feed,
                     pending_results,
-                    self.pending_result_channel_capacity,
                 )
                 .await;
                 continue;
@@ -2069,9 +2187,8 @@ impl Worker {
             let ctx = ReenqueueCtx {
                 node_id: node_id.clone(),
                 network: network.clone(),
-                event_bus: event_bus.clone(),
+                result_feed: self.result_feed.clone(),
                 pending_results: pending_results.clone(),
-                pending_capacity: self.pending_result_channel_capacity,
                 state: self.state.subscribe(),
             };
             reenqueue_with_retry(

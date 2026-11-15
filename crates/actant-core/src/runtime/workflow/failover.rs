@@ -19,7 +19,7 @@ use crate::common::{
     TOPIC_HEARTBEAT,
 };
 use crate::runtime::actor::ActorSystem;
-use crate::runtime::event_bus::{BusEvent, EventBus};
+use crate::runtime::events::{TaskLifecycleEvent, TaskResultFeed};
 use crate::runtime::state::{HybridLogicalClock, LmdbStore};
 use crate::runtime::workflow::actor::workflow_methods;
 use crate::runtime::workflow::messaging;
@@ -78,6 +78,10 @@ pub struct OutboundTask {
     pub target_endpoint_addr: Option<String>,
     /// 登记时刻，用于诊断"在途过久"。
     pub forwarded_at: Instant,
+    /// 探测豁免：失联处置时被归还给 origin 的直提条目置位。其存活性由
+    /// origin 的租约检查点兜底，探测无信息增量——豁免使后续每轮检测腿
+    /// 跳过对已知死目标的重复 2s 直连超时。
+    pub probe_exempt: bool,
     /// 转发时的任务快照。直提任务租约到期后用它重新入队；编排任务仅用于
     /// 失败完成事件字段。
     pub task: TaskDefinition,
@@ -235,7 +239,7 @@ pub struct FailoverManager {
     outbound: Arc<DashMap<String, OutboundTask>>,
     /// 本地事件总线：失联时把在途任务终结为 `TaskFailed` 发布出去，让提交方
     /// `AsyncResult` 得以终止。`None` 时（极简测试桩）该腿只清理登记表并告警。
-    event_bus: Option<EventBus>,
+    result_feed: Option<TaskResultFeed>,
     /// 本节点平台信息，随心跳广播。
     platform: Option<PlatformInfo>,
     /// 本节点用户自定义标签，随心跳广播。运行时可整体替换。
@@ -331,7 +335,7 @@ impl FailoverManager {
             local_available_capacity: Arc::new(AtomicU32::new(0)),
             local_max_capacity: Arc::new(AtomicU32::new(0)),
             outbound: Arc::new(DashMap::new()),
-            event_bus: None,
+            result_feed: None,
             platform: None,
             labels: parking_lot::RwLock::new(BTreeMap::new()),
             role: crate::common::NodeRole::default(),
@@ -526,8 +530,8 @@ impl FailoverManager {
     ///
     /// 采用 builder 方法而非构造参数，是为了让既有 11 处
     /// `FailoverManager::new` 调用点（多为不需要该腿的单元测试桩）保持不变。
-    pub fn with_event_bus(mut self, event_bus: EventBus) -> Self {
-        self.event_bus = Some(event_bus);
+    pub fn with_result_feed(mut self, result_feed: TaskResultFeed) -> Self {
+        self.result_feed = Some(result_feed);
         self
     }
 
@@ -552,6 +556,7 @@ impl FailoverManager {
                 target_node: target_node.clone(),
                 target_endpoint_addr: target_endpoint_addr.map(str::to_string),
                 forwarded_at: Instant::now(),
+                probe_exempt: false,
                 task: task.clone(),
             },
         );
@@ -651,7 +656,9 @@ impl FailoverManager {
         let mut targets: HashMap<NodeId, Option<String>> = HashMap::new();
         for entry in self.outbound.iter() {
             let target = entry.value().target_node.clone();
-            if skip.contains(&target) || self.is_peer_fresh(&target) {
+            // 探测豁免条目（已归还 origin 的直提任务）直接跳过：其目标大概率
+            // 已死，每轮 2s 直连超时只会拖延同循环内的接管/仲裁/重调度腿。
+            if entry.value().probe_exempt || skip.contains(&target) || self.is_peer_fresh(&target) {
                 continue;
             }
             targets
@@ -703,7 +710,7 @@ impl FailoverManager {
         if drained.is_empty() {
             return 0;
         }
-        let event_bus = self.event_bus.as_ref();
+        let result_feed = self.result_feed.as_ref();
         let mut failed = 0usize;
         let mut resent = 0usize;
         for (task_id, mut entry) in drained {
@@ -712,15 +719,16 @@ impl FailoverManager {
                 // （`expire_standalone_leases`）下一 tick 取走并重投——重投权在
                 // origin 手上，这里只负责把任务交还。
                 entry.task.relinquish_lease();
+                entry.probe_exempt = true;
                 self.outbound.insert(task_id, entry);
                 resent += 1;
                 continue;
             }
-            let Some(event_bus) = event_bus else {
+            let Some(result_feed) = result_feed else {
                 tracing::warn!(
                     node = %dead.as_str(),
                     task_id = %task_id,
-                    "no event_bus on FailoverManager; in-flight task cannot be settled"
+                    "no result feed on FailoverManager; in-flight task cannot be settled"
                 );
                 continue;
             };
@@ -751,7 +759,7 @@ impl FailoverManager {
                 ),
                 target_node: Some(dead.clone()),
             };
-            event_bus.publish(BusEvent::TaskFailed(completion));
+            result_feed.send(TaskLifecycleEvent::TaskFailed(completion));
             failed += 1;
         }
         if resent > 0 {
@@ -1076,20 +1084,7 @@ impl FailoverManager {
             workflow_id: workflow_id.clone(),
             timestamp_ms: now_ms,
         };
-        let signature = self
-            .signing_key
-            .as_ref()
-            .map(|key| {
-                key.sign(&Self::claim_signing_payload(&claim))
-                    .to_bytes()
-                    .to_vec()
-            })
-            .unwrap_or_default();
-        let msg =
-            WireMessage::SignedOrchestratorClaim(SignedOrchestratorClaim { claim, signature });
-        let data = postcard::to_allocvec(&WireEnvelope::wrap(msg)?)
-            .map_err(|e| crate::common::ActantError::Serialization(e.to_string()))?;
-        if let Err(e) = self.network.broadcast(TOPIC_FAILOVER, data).await {
+        if let Err(e) = self.broadcast_claim(&claim).await {
             tracing::warn!(
                 workflow = %workflow_id.0,
                 error = %e,
@@ -1097,6 +1092,29 @@ impl FailoverManager {
             );
         }
         Ok(ClaimOutcome::Adopted)
+    }
+
+    /// 构造（含签名）并广播一条 `SignedOrchestratorClaim`。
+    ///
+    /// 完整接管（`claim_workflow`）与分区恢复仲裁（`arbitrate_lease_overlaps`）
+    /// 共用：两条路径的 claim 都必须经同一签名/封装/广播管线，避免旁路。
+    async fn broadcast_claim(&self, claim: &OrchestratorClaim) -> Result<()> {
+        let signature = self
+            .signing_key
+            .as_ref()
+            .map(|key| {
+                key.sign(&Self::claim_signing_payload(claim))
+                    .to_bytes()
+                    .to_vec()
+            })
+            .unwrap_or_default();
+        let msg = WireMessage::SignedOrchestratorClaim(SignedOrchestratorClaim {
+            claim: claim.clone(),
+            signature,
+        });
+        let data = postcard::to_allocvec(&WireEnvelope::wrap(msg)?)
+            .map_err(|e| crate::common::ActantError::Serialization(e.to_string()))?;
+        self.network.broadcast(TOPIC_FAILOVER, data).await
     }
 
     /// 验签后处理远端 claim。
@@ -1184,6 +1202,23 @@ impl FailoverManager {
             }
         }
 
+        // 未来时间戳上界：claim 时间戳超前本地时钟超过 failure_timeout
+        // （与心跳新鲜度窗口同源的偏移容差）一律拒绝。无上界时，恶意或严重
+        // 时钟偏移节点发出的 `now + 一年` claim 会在无有效租约分支被接受，
+        // 持久化的 `expires_at_ms` 随之巨大；节点重启后走墙钟恢复
+        // （`recover_leases_from_store`，无单调 deadline），该租约"永久有效"，
+        // 任何正常时间戳的 claim 都无法胜出——工作流接管被单条消息锁死。
+        if claim.timestamp_ms.saturating_sub(now_ms) > self.failure_timeout_ms {
+            tracing::warn!(
+                workflow = %claim.workflow_id.0,
+                claimant = %claim.node_id.0,
+                claim_ts = claim.timestamp_ms,
+                now_ms,
+                "rejecting claim with future timestamp beyond drift tolerance"
+            );
+            return;
+        }
+
         // claim 必须按 (timestamp_ms, node_id) 全序仲裁，不能无条件覆盖。
         // 否则延迟/重放的旧 claim 会夺走正在驱动的 workflow；并发 claim
         // 也可能让双方互相让位，最终无人驱动。
@@ -1193,15 +1228,37 @@ impl FailoverManager {
         // leases_survive_manager_rebuild_from_store），但这也意味着签名
         // 关闭的开放部署里，被重放的陈旧 claim 可在过期窗口内写入租约表；
         // require_signed_records 模式下有 claimant 心跳新鲜度校验兜底。
-        let supersedes = match self.leases.get(&claim.workflow_id) {
-            Some(existing) if existing.is_valid(now_ms, now_monotonic) => {
-                claim.timestamp_ms > existing.claimed_at_ms
-                    || (claim.timestamp_ms == existing.claimed_at_ms
-                        && claim.node_id.0 > existing.node_id.0)
-            }
-            _ => true,
-        };
-        if !supersedes {
+        //
+        // 仲裁与写入在 DashMap entry 的分片写锁内一次完成：check-then-insert
+        // 两步分离时，并发 claim(ts=200/210) 都可能基于旧租约判胜、后写者胜，
+        // 旧 claim 覆盖新 claim，仲裁全序被破坏。胜出时在锁内写入租约，锁外
+        // 仅补落盘（持久化失败不回滚内存侧租约，与既有语义一致）。
+        let lease_to_persist: Option<LeaseEntry> =
+            match self.leases.entry(claim.workflow_id.clone()) {
+                dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
+                    let existing = occupied.get();
+                    let supersedes = if existing.is_valid(now_ms, now_monotonic) {
+                        claim.timestamp_ms > existing.claimed_at_ms
+                            || (claim.timestamp_ms == existing.claimed_at_ms
+                                && claim.node_id.0 > existing.node_id.0)
+                    } else {
+                        true
+                    };
+                    if supersedes {
+                        let lease = Self::claim_lease_entry(claim, lease_duration_ms);
+                        occupied.insert(lease.clone());
+                        Some(lease)
+                    } else {
+                        None
+                    }
+                }
+                dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                    let lease = Self::claim_lease_entry(claim, lease_duration_ms);
+                    vacant.insert(lease.clone());
+                    Some(lease)
+                }
+            };
+        let Some(lease) = lease_to_persist else {
             tracing::debug!(
                 workflow = %claim.workflow_id.0,
                 claimant = %claim.node_id.0,
@@ -1209,23 +1266,24 @@ impl FailoverManager {
                 "ignoring stale or older orchestrator claim"
             );
             return;
-        }
-
-        // 使用 claimant 的时间戳作为基准，使租期时长
-        // 在所有节点上一致，不受时钟偏差 / 网络
-        // latency 影响。若使用接收方本地时间，
-        // 会因网络传输时间而缩短租期。
-        // 单调 deadline 以本节点接收时刻为起点，避免 NTP 跳变误判。
-        let lease = LeaseEntry::new_with_monotonic(
-            claim.node_id.clone(),
-            claim.timestamp_ms,
-            claim.timestamp_ms + lease_duration_ms,
-            lease_duration_ms,
-        );
+        };
+        // 使用 claimant 的时间戳作为基准，使租期时长在所有节点上一致，不受
+        // 时钟偏差 / 网络 latency 影响。单调 deadline 以本节点接收时刻为起点，
+        // 避免 NTP 跳变误判。
         if let Err(e) = self.persist_lease(&claim.workflow_id, &lease) {
-            tracing::error!("failed to persist lease for {}: {}", claim.workflow_id.0, e);
+            // 持久化失败：撤销本次内存写入（锁外补偿，比对键匹配），使重启
+            // 恢复面与内存面一致——否则旧持久化租约在重启后复活，可能与
+            // 已接管的新主形成双主窗口。撤销失败（期间又被并发写入覆盖）
+            // 保留现值，交由第 5 腿仲裁收敛。
+            tracing::error!(
+                workflow = %claim.workflow_id.0,
+                error = %e,
+                "failed to persist claimed lease; rolling back in-memory write"
+            );
+            self.leases.remove_if(&claim.workflow_id, |_, current| {
+                current.node_id == lease.node_id && current.claimed_at_ms == lease.claimed_at_ms
+            });
         }
-        self.leases.insert(claim.workflow_id.clone(), lease);
 
         if claim.node_id != self.node_id {
             if let Err(e) = self.remove_active_workflow(&claim.workflow_id).await {
@@ -1237,6 +1295,16 @@ impl FailoverManager {
                 claim.workflow_id.0
             );
         }
+    }
+
+    /// 由 claim 构造租约条目（handle_claim / 恢复期共用）。
+    fn claim_lease_entry(claim: &OrchestratorClaim, lease_duration_ms: u64) -> LeaseEntry {
+        LeaseEntry::new_with_monotonic(
+            claim.node_id.clone(),
+            claim.timestamp_ms,
+            claim.timestamp_ms + lease_duration_ms,
+            lease_duration_ms,
+        )
     }
 
     pub async fn reschedule_workflow_tasks(&self, workflow_id: &WorkflowId) -> Result<()> {
@@ -1567,8 +1635,87 @@ impl FailoverManager {
         // 第 3 腿：重试上一轮被退让的接管。入口是本表而不是 peer 视图，
         // 因为触发退让的 peer 当轮已被移出视图（见 `pending_claims` 的文档）。
         self.retry_pending_claims().await;
+        // 第 5 腿：分区恢复收敛——存活 peer 与本节点的活跃工作流重叠时仲裁。
+        self.arbitrate_lease_overlaps().await;
         // 第 4 腿：上一轮 scheduler 拒绝的重调度任务。
         self.retry_pending_reschedules().await;
+    }
+
+    /// 分区恢复收敛（第 5 腿）：存活 peer 的活跃工作流与本节点持有的租约重叠时，
+    /// 双方可能都在驱动同一工作流。
+    ///
+    /// 经典场景：对称分区超过 `lease_duration` 后恢复——claim 广播在分区内丢失
+    /// （gossip 不重放），`expire_leases` 又对本节点活跃租约无条件续租；恢复后
+    /// 双方心跳互见，但 detect 循环只处理已判死的 peer，`handle_heartbeat` 对
+    /// 存活 peer 的重叠不做处置——双方各自续租、各自派发直到一方重启。
+    ///
+    /// 处置：本节点广播当前租约的 claim（时间戳取 `claimed_at_ms`，**不刷新**——
+    /// 续租式刷新会让两侧比较失去稳定基准），对端收到后按
+    /// `(timestamp_ms, node_id)` 全序与本端租约比较，恰好一方胜出；对端的对称
+    /// 扫描保证双向仲裁。输家经 `handle_claim` 移除 active 集合，停止续租与
+    /// 派发，收敛到单主。周期性检测覆盖广播与续租交错的竞态窗口——未决的
+    /// 下一轮心跳重试。
+    async fn arbitrate_lease_overlaps(&self) {
+        let now_ms = crate::common::epoch_millis();
+        let now_monotonic = std::time::Instant::now();
+        let timeout_ms = self.failure_timeout_ms();
+        // 快照本节点持有的租约，避免在 DashMap 迭代期间 await。
+        let mine: Vec<(WorkflowId, LeaseEntry)> = self
+            .leases
+            .iter()
+            .filter(|e| e.value().node_id == self.node_id)
+            .map(|e| (e.key().clone(), e.value().clone()))
+            .collect();
+        for (wf_id, lease) in mine {
+            let overlapped = self.peers.iter().any(|p| {
+                p.value().role.can_orchestrate()
+                    && now_ms.saturating_sub(p.value().last_heartbeat_ms) <= timeout_ms
+                    && p.value().active_workflows.contains(&wf_id)
+            });
+            if !overlapped {
+                continue;
+            }
+            if lease.is_valid(now_ms, now_monotonic) {
+                tracing::warn!(
+                    workflow = %wf_id.0,
+                    "lease overlap with alive peer detected after partition heal;                      re-broadcasting claim for arbitration"
+                );
+                let claim = OrchestratorClaim {
+                    node_id: self.node_id.clone(),
+                    workflow_id: wf_id.clone(),
+                    timestamp_ms: lease.claimed_at_ms,
+                };
+                if let Err(e) = self.broadcast_claim(&claim).await {
+                    tracing::warn!(
+                        workflow = %wf_id.0,
+                        error = %e,
+                        "failed to broadcast overlap arbitration claim"
+                    );
+                }
+            } else {
+                // 租约已失效但工作流仍在驱动（expire_leases 续租窗口内）：走完整
+                // claim 重置租约并广播，让对端参与仲裁。
+                match self.claim_workflow(&wf_id).await {
+                    Ok(ClaimOutcome::Adopted) => {
+                        if let Err(e) = self.reschedule_workflow_tasks(&wf_id).await {
+                            tracing::error!(
+                                "failed to reschedule tasks for workflow {}: {}",
+                                wf_id.0,
+                                e
+                            );
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::error!(
+                            "failed to re-claim lapsed lease for workflow {}: {}",
+                            wf_id.0,
+                            e
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// 重试被退让的接管。
@@ -1751,6 +1898,17 @@ impl FailoverManager {
             );
             let is_new = !self.peers.contains_key(&hb.node_id);
             let received_at_ms = crate::common::epoch_millis();
+            // 快照路由相关字段的旧值：仅当它们变化时才 bump 版本——无条件
+            // bump 会让 N 节点集群每心跳周期做 N 次 O(N) 候选重建。
+            let routing_snapshot = self.peers.get(&hb.node_id).map(|p| {
+                (
+                    p.active_workflows.clone(),
+                    p.available_slots,
+                    p.max_slots,
+                    p.role,
+                    p.draining,
+                )
+            });
             let mut peer = self.peers.entry(hb.node_id.clone()).or_insert(PeerState {
                 node_id: hb.node_id.clone(),
                 last_heartbeat_ms: 0,
@@ -1788,7 +1946,21 @@ impl FailoverManager {
             if is_new {
                 crate::metrics::inc_connected_peers();
             }
-            self.bump_peers_version();
+            // 路由相关字段变化（或新成员）才失效候选缓存；last_heartbeat_ms
+            // 不参与路由，纯保活心跳不触发 O(N) 重建。
+            let routing_changed = is_new
+                || routing_snapshot
+                    .as_ref()
+                    .is_none_or(|(wfs, slots, max, role, draining)| {
+                        *wfs != peer.active_workflows
+                            || *slots != peer.available_slots
+                            || *max != peer.max_slots
+                            || *role != peer.role
+                            || *draining != peer.draining
+                    });
+            if routing_changed {
+                self.bump_peers_version();
+            }
         }
     }
 
@@ -1845,6 +2017,29 @@ impl FailoverManager {
                 now_ms + self.lease_duration_ms,
                 self.lease_duration_ms,
             );
+            // 续租在 entry 分片写锁内复检「仍为本节点持有」：判陈旧与写入
+            // 分离时，并发的远端 claim（handle_claim）可能刚覆盖租约，无条件
+            // 续租会把租约改写回本节点——远端新主与本节点双双驱动（双主）。
+            let renewed = match self.leases.entry(wf_id.clone()) {
+                dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
+                    let current = occupied.get();
+                    if current.node_id != self.node_id {
+                        tracing::info!(
+                            workflow = %wf_id.0,
+                            owner = %current.node_id.0,
+                            "skipping renewal: lease was taken over by remote claim"
+                        );
+                        None
+                    } else {
+                        occupied.insert(renewed.clone());
+                        Some(renewed)
+                    }
+                }
+                dashmap::mapref::entry::Entry::Vacant(_) => None,
+            };
+            let Some(renewed) = renewed else {
+                continue;
+            };
             // 持久化失败保留旧租约记录，下一轮 expire_leases 重试续租。
             if let Err(e) = self.persist_lease(wf_id, &renewed) {
                 tracing::warn!(
@@ -1854,7 +2049,6 @@ impl FailoverManager {
                 );
                 continue;
             }
-            self.leases.insert(wf_id.clone(), renewed);
             tracing::debug!(
                 workflow = %wf_id.0,
                 "renewed lapsed lease for active workflow owned by this node"
@@ -1907,7 +2101,26 @@ impl FailoverManager {
                 let wf_id = WorkflowId(wf_id_str.to_string());
                 match rkyv::from_bytes::<PersistedLease, rkyv::rancor::Error>(&data) {
                     Ok(persisted) => {
-                        if now_ms < persisted.expires_at_ms {
+                        // 恢复期消毒：claimed_at 超前本地时钟超过 failure_timeout
+                        // 的租约（历史未来时间戳 claim 的残留或数据损坏）不恢复
+                        // ——墙钟恢复无单调基线，未来租约重启后"永久有效"，任何
+                        // 正常 claim 都无法胜出。删除而非保留，让接管重新仲裁。
+                        if persisted.claimed_at_ms.saturating_sub(now_ms) > self.failure_timeout_ms
+                        {
+                            tracing::warn!(
+                                workflow = %wf_id_str,
+                                claimed_at_ms = persisted.claimed_at_ms,
+                                now_ms,
+                                "discarding future-dated lease from store beyond drift tolerance"
+                            );
+                            if let Err(e) = store.delete(&key) {
+                                tracing::warn!(
+                                    "failed to delete future-dated lease {}: {}",
+                                    wf_id_str,
+                                    e
+                                );
+                            }
+                        } else if now_ms < persisted.expires_at_ms {
                             // 从持久化恢复的租约无单调基线，回退墙钟比较。
                             self.leases.insert(
                                 wf_id,

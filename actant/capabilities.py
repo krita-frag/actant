@@ -126,38 +126,7 @@ class WorkflowEvent:
     error: str = ""
 
 
-@runtime_checkable
-class RoutingHandler(Protocol):
-    """用户自定义路由 handler 的签名助手（非内置 capability）。
 
-    **仅用于 payload 类型约束，框架不会自动调用。** 路由由 Rust
-    ``RoutePolicy`` 或 ``Runtime(route_policy=...)`` 生效；注册本 handler
-    不会改变任何分派行为。
-    """
-
-    def __call__(self, ctx: RouteCtx) -> str | None: ...
-
-
-@runtime_checkable
-class SchedulingHandler(Protocol):
-    """用户自定义调度 handler 的签名助手（非内置 capability）。
-
-    **仅用于 payload 类型约束，框架不会自动调用。** 调度由 Rust ``Scheduler``
-    或第 3 层外部调度器生效。
-    """
-
-    def __call__(self, ctx: ScheduleCtx) -> str | None: ...
-
-
-@runtime_checkable
-class RetryPolicyHandler(Protocol):
-    """用户自定义重试 handler 的签名助手（非内置 capability）。
-
-    **仅用于 payload 类型约束，框架不会自动调用。** 重试由 Rust
-    ``RetryPolicy``（``@task(retries=...)``）生效。
-    """
-
-    def __call__(self, ctx: RetryCtx) -> bool | None: ...
 
 
 @runtime_checkable
@@ -223,11 +192,8 @@ RUST_BACKED_CAPABILITIES: frozenset[str] = frozenset(
 __all__ = [
     "EffectKind",
     "RetryCtx",
-    "RetryPolicyHandler",
     "RouteCtx",
-    "RoutingHandler",
     "ScheduleCtx",
-    "SchedulingHandler",
     "StoreHandler",
     "StoreReq",
     "TaskEvent",

@@ -145,6 +145,13 @@ class TestWorkerStateCallback:
             assert stopped.wait(timeout=5), f"no stopped event, got {states!r}"
 
         assert states[-1] == "stopped"
+        # 严格序：draining → drained → stopped（生命周期泵独立通道 + 串行回调
+        # 共同保证；缺 draining 说明订阅晚于状态翻转，属注册时序问题）。
+        assert states[0] == "draining", f"first event must be draining, got {states!r}"
+        assert "drained" in states, f"drained event missing, got {states!r}"
+        assert states.index("draining") < states.index("drained") < states.index(
+            "stopped"
+        ), f"lifecycle events out of order: {states!r}"
 
 
 @actant.task(name="wl_slow")

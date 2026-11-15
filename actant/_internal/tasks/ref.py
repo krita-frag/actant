@@ -142,6 +142,10 @@ def _degrade_large_values(
         return value
     if isinstance(value, (_RefArg, Ref)):
         return value
+    # 零成本预筛：str/bytes 的字节数可直接测，远小于阈值时免一次全量
+    # cloudpickle（每任务每个参数都会走到这里，小字符串是最高频形态）。
+    if isinstance(value, (str, bytes)) and len(value) < REF_INLINE_THRESHOLD // 4:
+        return value
     try:
         payload = cloudpickle.dumps(value)
     except (TypeError, AttributeError, ValueError, RecursionError):

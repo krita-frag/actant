@@ -2,7 +2,7 @@
 //! Compiled via `#[path]` attribute — retains `super::` access to private items.
 
 use super::*;
-use crate::common::{ActorId, NodeId, TaskId};
+use crate::common::{ActorId, TaskId};
 use crate::runtime::actor::ActorSystem;
 use crate::runtime::workflow::SchedulerActor;
 
@@ -113,78 +113,46 @@ async fn closed_scheduler_rejects_new_tasks() {
     );
 }
 
+/// 批量入队必须与单条入队共用「软上限」计量。
+///
+/// 上限只在单条路径检查时，批量路径可多批提交无限突破上限：队列无界增长，
+/// 且 drain 期被拒的任务没有任何终态通知。本用例先把队列恰好填满，再验证
+/// 批与单条两路都被拒。
 #[tokio::test]
-async fn drain_unrouted_keeps_routed_tasks() {
+async fn enqueue_batch_respects_queue_soft_limit() {
+    use crate::runtime::workflow::actor::DEFAULT_MAX_QUEUED_TASKS;
+
     let actor_system = Arc::new(ActorSystem::new());
-    let actor_id = ActorId::new("scheduler-drain".to_string());
+    let actor_id = ActorId::new("scheduler-batch-cap".to_string());
     actor_system
-        .spawn(actor_id.clone(), SchedulerActor::priority())
+        .spawn(actor_id.clone(), SchedulerActor::fifo())
         .await
         .unwrap();
-
     let client = ActorScheduler::new(actor_id, actor_system);
-    let mut routed = make_task("routed", 0);
-    routed.target_node = Some(NodeId::from("node-1".to_string()));
-    let unrouted = make_task("unrouted", 0);
 
-    client.enqueue(routed).await.unwrap();
-    client.enqueue(unrouted).await.unwrap();
+    let full: Vec<TaskDefinition> = (0..DEFAULT_MAX_QUEUED_TASKS)
+        .map(|i| make_task(&format!("cap-{i}"), 0))
+        .collect();
+    client
+        .enqueue_batch(full)
+        .await
+        .expect("恰好填满软上限的批次必须被接受");
 
-    let drained = client.drain_unrouted().await;
-    assert_eq!(drained.len(), 1);
-    assert_eq!(drained[0].name, "unrouted");
-    assert_eq!(client.len().await, 1);
-}
-
-// --- Scheduler trait default methods ---
-
-struct MockScheduler;
-
-#[async_trait]
-impl Scheduler for MockScheduler {
-    async fn enqueue(&self, _task: TaskDefinition) -> Result<(), crate::common::ActantError> {
-        Ok(())
-    }
-
-    async fn enqueue_batch(
-        &self,
-        _tasks: Vec<TaskDefinition>,
-    ) -> Result<(), crate::common::ActantError> {
-        Ok(())
-    }
-
-    async fn dequeue(&self) -> Option<TaskDefinition> {
-        None
-    }
-
-    async fn try_dequeue(&self) -> Option<TaskDefinition> {
-        None
-    }
-
-    async fn dequeue_batch(&self, _limit: usize) -> Vec<TaskDefinition> {
-        vec![]
-    }
-
-    async fn drain_unrouted(&self) -> Vec<TaskDefinition> {
-        vec![]
-    }
-
-    async fn is_empty(&self) -> bool {
-        true
-    }
-
-    async fn len(&self) -> usize {
-        0
-    }
-}
-
-#[test]
-fn scheduler_trait_default_methods_return_expected_values() {
-    let s = MockScheduler;
-    assert_eq!(s.total_queued(), 0);
-    assert!(!s.is_closed());
-    s.close(); // default no-op
-    assert!(!s.is_closed());
+    let err = client
+        .enqueue_batch(vec![make_task("over-limit", 0)])
+        .await
+        .expect_err("超出软上限的批次必须被拒绝");
+    assert!(
+        matches!(err, crate::common::ActantError::Worker(_)),
+        "队列满应返回 Worker 错误，实际: {err:?}"
+    );
+    assert!(
+        client
+            .enqueue(make_task("over-limit-single", 0))
+            .await
+            .is_err(),
+        "单条入队必须与批量共用同一上限"
+    );
 }
 
 #[tokio::test]
@@ -210,7 +178,6 @@ async fn slow_path_scheduler_rejects_enqueue_after_close() {
 ///
 /// 在 current_thread runtime 上，旧实现的 `futures::executor::block_on`
 /// 会阻塞唯一线程，使 tokio timer 无法推进而永久挂起；本测试同时覆盖
-/// enqueue / enqueue_batch / try_dequeue / dequeue_batch / drain_unrouted /
 /// len / is_empty 的 External 分支。
 #[tokio::test(flavor = "current_thread")]
 async fn external_scheduler_awaits_without_blocking_runtime() {
@@ -243,10 +210,6 @@ async fn external_scheduler_awaits_without_blocking_runtime() {
             vec![]
         }
 
-        async fn drain_unrouted(&self) -> Vec<TaskDefinition> {
-            vec![]
-        }
-
         async fn is_empty(&self) -> bool {
             true
         }
@@ -268,7 +231,6 @@ async fn external_scheduler_awaits_without_blocking_runtime() {
     client.enqueue_batch(vec![make_task("y", 0)]).await.unwrap();
     assert!(client.try_dequeue().await.is_none());
     assert!(client.dequeue_batch(10).await.is_empty());
-    assert!(client.drain_unrouted().await.is_empty());
     assert!(client.is_empty().await);
     assert_eq!(client.len().await, 0);
 }

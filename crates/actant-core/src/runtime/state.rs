@@ -493,32 +493,6 @@ impl LmdbStore {
         Ok(size)
     }
 
-    /// 启动 LMDB 环境的优雅关闭。
-    ///
-    /// # `Arc::try_unwrap` 的意图
-    ///
-    /// `LmdbStore::env` 是 `Arc<Env>`，因为运行时多个子系统（Orchestrator、
-    /// FailoverManager、SchedulerActor 等）可能持有同一 store 的克隆引用。
-    /// LMDB 的 `Env` 实现了 `Clone`（内部仅增加引用计数），但
-    /// `prepare_for_closing` 消耗 `Env` 并返回 `EnvClosingEvent`——它需要
-    /// 独占访问以等待所有读者退出。
-    ///
-    /// 此处先尝试 `Arc::try_unwrap`：
-    /// - **成功**（`Ok`）：当前调用方是最后一个持有者，直接消耗 `Env` 并启动关闭。
-    /// - **失败**（`Err`）：仍有其他克隆引用存活。此时 fall back 到 `(*arc).clone()`
-    ///   创建一个新的 `Env` 句柄并启动关闭——LMDB 的 `Env` 关闭是基于底层
-    ///   `mdb_env_close` 的引用计数，新句柄的关闭不影响仍存活的读者，但
-    ///   `EnvClosingEvent` 仍会等待所有读者事务完成。
-    ///
-    /// 此设计保证：无论是否仍有其他 `LmdbStore` 克隆存在，调用方都能获得
-    /// `EnvClosingEvent` 以等待读者退出，而不会因 `Arc` 引用计数阻塞关闭流程。
-    pub fn prepare_close(&self) -> heed::EnvClosingEvent {
-        let env = Arc::clone(&self.env);
-        Arc::try_unwrap(env)
-            .unwrap_or_else(|arc| (*arc).clone())
-            .prepare_for_closing()
-    }
-
     /// 强制将 LMDB 的 mmap 脏页刷盘（`mdb_env_sync`）。
     ///
     /// 用于 [`SyncMode::NoSync`] 模式下的周期性显式持久化，或在关键检查点
@@ -967,6 +941,8 @@ impl Store {
     /// - [`SyncMode::Sync`]：独占写事务 + commit + fsync（~2.9ms）。
     /// - [`SyncMode::GroupCommit`]：入队到 [`WriteBatcher`] 即返回（~1-10µs），
     ///   后台周期性合并提交。通道满时退化为同步 `put`（保证不丢写入）。
+    ///   **put 返回不代表可见**：同模式 `get` 直接读 LMDB，读己之写需先
+    ///   `flush()`——嵌入式调用方在写入后立刻读同 key 的场景必须显式 flush。
     /// - [`SyncMode::NoSync`]：独占写事务 + commit（无 fsync，~50µs）。
     ///
     /// 批量写入场景应使用 [`Store::put_batch`]，后者始终单事务批量提交。
@@ -1142,18 +1118,6 @@ impl Store {
         tokio::task::spawn_blocking(move || store.sync())
             .await
             .map_err(|e| ActantError::Storage(format!("store sync task panicked: {e}")))?
-    }
-
-    /// 异步优雅关闭 LMDB 环境。
-    ///
-    /// 返回 `Result` 以便调用方处理 `spawn_blocking` 任务 panic（如 LMDB 内部错误），
-    /// 而非直接 panic 整个进程。
-    pub async fn prepare_close(&self) -> Result<heed::EnvClosingEvent> {
-        let store = self.inner.clone();
-        let event = tokio::task::spawn_blocking(move || store.prepare_close())
-            .await
-            .map_err(|e| ActantError::Storage(format!("store prepare_close task panicked: {e}")))?;
-        Ok(event)
     }
 }
 

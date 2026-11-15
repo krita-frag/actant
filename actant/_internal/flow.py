@@ -855,15 +855,16 @@ def continue_as_new(*args: Any, **kwargs: Any) -> NoReturn:
         new_id.encode(),
     )
     new_id = bytes(recorded_to).decode()
+    # 同一元组只序列化一次：submit 与 carry-over 复用同一字节串。
+    carry = cloudpickle.dumps((args, kwargs))
     runtime._submit_workflow(
         new_id,
         failure_strategy=state.failure_strategy,
         timeout_ms=state.timeout_ms,
         name=state.flow_name,
         version=state.version,
-        args=cloudpickle.dumps((args, kwargs)),
+        args=carry,
     )
-    carry = cloudpickle.dumps((args, kwargs))
     # 携带参数同样幂等：重放旧代时 resolve 返回首次写入的入参，即使调用点
     # 传入不同值也不会改写新代的事实。进程内续跑也使用解析后的记录值，
     # 与"崩溃后按落盘入参恢复"保持同一条事实源。

@@ -13,10 +13,6 @@ def get_version() -> str
 ```
 
 ```python
-def refresh_logger() -> None
-```
-
-```python
 def metrics_text() -> str
 ```
 
@@ -47,18 +43,6 @@ def metrics_text() -> str
 | --- | --- | --- |
 | `task_name` | `str \| None` |  |
 | `task_error` | `str \| None` |  |
-
-### `_WorkflowState`
-
-**属性**
-
-| 属性 | 类型 | 说明 |
-| --- | --- | --- |
-| `PENDING` | `_WorkflowState` |  |
-| `RUNNING` | `_WorkflowState` |  |
-| `COMPLETED` | `_WorkflowState` |  |
-| `FAILED` | `_WorkflowState` |  |
-| `CANCELLED` | `_WorkflowState` |  |
 
 ### `_RetryPolicy`
 
@@ -334,19 +318,11 @@ def registered_capabilities(self) -> list[str]
 ```
 
 ```python
-def ask(self, name: str, request: Any) -> Any | None
-```
-
-```python
 def perform(self, name: str, request: Any) -> Any
 ```
 
 ```python
 def emit(self, name: str, request: Any) -> None
-```
-
-```python
-def ask_async(self, name: str, request: Any) -> Any
 ```
 
 ```python
@@ -626,8 +602,10 @@ def report_task_result(self, workflow_id: str, task_id: str, state: str, result:
 
 `workflow_id` 为空串表示独立 ``@task``（非编排任务），直接返回空裁决。
 `state` 为 ``"Completed"`` / ``"Failed"`` / ``"Cancelled"``；返回
-``{"retry": bool, "delay_ms": int}``——``retry`` 为真表示 orchestrator
-已排定重试并按延迟重新入队，提交方句柄应继续等待；为假表示终局。
+``{"verdict": str, "delay_ms": int}``——``verdict`` 为 ``"retry"``
+（orchestrator 已排定重试并按 ``delay_ms`` 重新入队，提交方句柄应继续
+等待）、``"final"``（终局失败）或 ``"none"``（完成/取消入账、迟到重复
+失败被忽略或编排未绑定，无裁决动作）。
 
 ```python
 def get_workflow_state(self, workflow_id: str) -> dict[str, Any] | None

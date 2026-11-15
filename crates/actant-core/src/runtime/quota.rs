@@ -76,10 +76,6 @@ impl QuotaTracker {
     }
 
     /// 本节点声明的配额容量表快照。
-    pub fn capacities(&self) -> BTreeMap<String, u32> {
-        self.capacities.lock().clone()
-    }
-
     /// 运行时整表替换配额容量。
     ///
     /// 已在用的单元按旧容量与旧剩余量之差保留：扩容立刻增加可用量，缩容

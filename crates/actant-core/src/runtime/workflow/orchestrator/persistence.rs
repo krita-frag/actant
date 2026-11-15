@@ -483,6 +483,12 @@ impl Orchestrator {
         // 补建出的工作流只重放**当前代**的事件：同一 workflow_id 被重用后，
         // topic 里仍有上一代的事件，从头重放会把旧节点插入新 DAG。
         let mut generation_starts: HashMap<WorkflowId, EventId> = HashMap::new();
+        // 全量 journal 扫描缓存：recover 内对同一 topic 的多次 `read_after(None)`
+        // （代际定位 → 无水位重放起点定位 → 重放）共享一次磁盘读，避免启动期
+        // 对长历史 topic 反复全量反序列化。仅缓存 None 起点的全量扫描；带
+        // 水位的增量读取不经过此缓存。
+        let mut journal_cache: HashMap<String, Vec<crate::runtime::state::event_log::LogEntry>> =
+            HashMap::new();
         if let Some(log) = event_log.as_deref() {
             match log.list_topics() {
                 Ok(topics) => {
@@ -499,26 +505,33 @@ impl Orchestrator {
                         }
                         // 一次扫描同时定位最后一个 Submitted（新一代起点）与
                         // 最后一个 Evicted（淘汰墓碑）的事件序号。
-                        let (last_submitted, last_evicted) = match log.read_after(&topic, None) {
-                            Ok(entries) => entries.iter().fold(
-                                (None, None),
-                                |(sub, ev): (Option<EventId>, Option<EventId>), entry| {
-                                    match postcard::from_bytes::<JournalEvent>(&entry.payload) {
-                                        Ok(JournalEvent::Submitted { .. }) => (Some(entry.id), ev),
-                                        Ok(JournalEvent::Evicted { .. }) => (sub, Some(entry.id)),
-                                        _ => (sub, ev),
-                                    }
-                                },
-                            ),
-                            Err(e) => {
-                                tracing::warn!(
-                                    workflow = %wf_id_str,
-                                    error = %e,
-                                    "recover: failed to read journal topic for generation markers"
-                                );
-                                (None, None)
-                            }
+                        let entries = match journal_cache.get(&topic) {
+                            Some(cached) => cached.clone(),
+                            None => match log.read_after(&topic, None) {
+                                Ok(entries) => {
+                                    journal_cache.insert(topic.clone(), entries.clone());
+                                    entries
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        workflow = %wf_id_str,
+                                        error = %e,
+                                        "recover: failed to read journal topic for generation markers"
+                                    );
+                                    continue;
+                                }
+                            },
                         };
+                        let (last_submitted, last_evicted) = entries.iter().fold(
+                            (None, None),
+                            |(sub, ev): (Option<EventId>, Option<EventId>), entry| {
+                                match postcard::from_bytes::<JournalEvent>(&entry.payload) {
+                                    Ok(JournalEvent::Submitted { .. }) => (Some(entry.id), ev),
+                                    Ok(JournalEvent::Evicted { .. }) => (sub, Some(entry.id)),
+                                    _ => (sub, ev),
+                                }
+                            },
+                        );
                         // 墓碑只代表写下它之前的那一代。若其后又出现新的
                         // Submitted，说明 id 已被重用，必须允许补建。
                         let current_generation_evicted = match (last_evicted, last_submitted) {
@@ -576,8 +589,15 @@ impl Orchestrator {
                     continue;
                 }
                 let topic = format!("workflow:{}", wf_id.as_str());
-                let Ok(entries) = log.read_after(&topic, None) else {
-                    continue;
+                let entries = match journal_cache.get(&topic) {
+                    Some(cached) => cached.clone(),
+                    None => match log.read_after(&topic, None) {
+                        Ok(entries) => {
+                            journal_cache.insert(topic.clone(), entries.clone());
+                            entries
+                        }
+                        Err(_) => continue,
+                    },
                 };
                 if let Some(last) = entries.iter().rev().find(|entry| {
                     postcard::from_bytes::<JournalEvent>(&entry.payload)
@@ -831,9 +851,16 @@ impl Orchestrator {
                     _ => return,
                 };
                 // 与 on_task_result 单入口一致：失败一律按工作流级语义处理。
+                // 重组期重放与在线路径共用同一 DAG 层 `fail_task`（Continue
+                // 级联取消需要邻接表），故此处必须解构 `WorkflowSlot`——
+                // 整体借用 `slot` 无法同时给出 execution（可变）与 dag（只读）。
                 if slot.execution.can_transition_task(&task_id) {
-                    slot.execution
-                        .fail_task(&task_id, error, FailureScope::WorkflowLevel, None);
+                    let crate::runtime::workflow::orchestrator::types::WorkflowSlot {
+                        dag,
+                        execution,
+                        ..
+                    } = &mut *slot;
+                    execution.fail_task(dag, &task_id, error, FailureScope::WorkflowLevel, None);
                     self.state.mark_dirty(&workflow_id);
                     if slot.execution.is_terminal() {
                         drop(slot);

@@ -8,7 +8,6 @@ pub mod types;
 
 pub use config::{
     PyActantConfig, PyFailoverConfig, PyGossipConfig, PyNetworkConfig, PyRetryPolicy,
-    PyWorkflowState,
 };
 pub use runtime::{PyNode, PyRuntimeCore, PyTask};
 pub use types::PyTaskCompletion;
@@ -41,7 +40,6 @@ pub fn actant(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     register(m)?;
     m.add_function(pyo3::wrap_pyfunction!(get_version, m)?)?;
-    m.add_function(pyo3::wrap_pyfunction!(refresh_logger, m)?)?;
     Ok(())
 }
 
@@ -52,34 +50,4 @@ pub fn actant(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[pyfunction]
 fn get_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
-}
-
-/// 将 Python 根 logger 级别同步到 Rust `log` crate 的最大级别。
-///
-/// 在更改 Python 日志级别后调用（如通过 `logging.basicConfig(level=...)` 或
-/// `logging.getLogger().setLevel(...)`）。Rust `log` 最大级别过滤器会被设为匹配值，
-/// 以便 `tracing` 事件（转发到 `log`）在到达 `pyo3_log` 前不被过滤掉。
-#[pyfunction]
-fn refresh_logger(py: Python<'_>) -> PyResult<()> {
-    use log::LevelFilter;
-
-    let logging = py.import(pyo3::intern!(py, "logging"))?;
-    let python_level: usize = logging
-        .getattr(pyo3::intern!(py, "getLogger"))?
-        .call0()?
-        .getattr(pyo3::intern!(py, "level"))?
-        .extract()
-        .unwrap_or(0);
-
-    let level_filter = match python_level {
-        0 => LevelFilter::Off,
-        1..=10 => LevelFilter::Debug,
-        11..=20 => LevelFilter::Info,
-        21..=30 => LevelFilter::Warn,
-        31..=40 => LevelFilter::Error,
-        _ => LevelFilter::Error,
-    };
-
-    log::set_max_level(level_filter);
-    Ok(())
 }

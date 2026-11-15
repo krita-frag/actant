@@ -77,7 +77,8 @@ fn incremental_registration_accumulates_members() {
     tracker.register("b-1", [tid("t-1")]);
     let p = tracker.register("b-1", [tid("t-2"), tid("t-1")]);
     assert_eq!(p.total, 2);
-    assert_eq!(tracker.len(), 1);
+    // len() 读出口已随 API 收缩移除：经 progress 验证批次仍单批次存在。
+    assert_eq!(tracker.progress("b-1").unwrap().total, 2);
 }
 
 #[test]

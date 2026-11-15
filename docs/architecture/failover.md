@@ -6,27 +6,66 @@
 
 ## 时间参数
 
-`FailoverConfig` 要求：
+`FailoverConfig` 有**四个**时间参数，其中一个是秒、其余是毫秒：
+
+| 字段 | 默认值 | 单位 | 作用 |
+|---|---|---|---|
+| `heartbeat_interval_ms` | 2000 | 毫秒 | 心跳发送间隔 |
+| `failure_timeout_ms` | 8000 | 毫秒 | 失联判定阈值（超过即判故障） |
+| `lease_duration_ms` | 16000 | 毫秒 | 工作流租约时长（固定值，不由前两项推导） |
+| `lease_expiry_check_interval_secs` | 4 | **秒** | 失效租约扫描周期 |
+
+`FailoverConfig::validate()`（`ActantConfig::validate()` 在启动时调用）强制五条约束，
+任一不满足即启动失败，不留「跑起来才发现」的窗口：
+
+1. `heartbeat_interval_ms > 0`；
+2. `failure_timeout_ms > heartbeat_interval_ms`——至少容忍一次心跳丢失，不会因单次延迟被误判；
+3. `lease_duration_ms > failure_timeout_ms`——故障判定完成前旧租约不会先过期；
+4. `lease_expiry_check_interval_secs > 0`；
+5. `lease_expiry_check_interval_secs * 1000 <= lease_duration_ms / 2`——扫描周期超过半个租期时，
+   失效租约滞留期与本节点「无有效租约仍在驱动」的双主窗口都被放大，故从字段文档升级为强制校验。
+
+主动探测的单次上界不是配置项，而是常量 `OUTBOUND_PROBE_TIMEOUT = 2s`（见第 2 腿之二）。
+
+## 五条处置腿
+
+`detect_and_claim_failed_nodes()` 每轮推进五条腿，对应「编排器死」「执行器死」「心跳视图盲区」
+「分区恢复」四类形态。**编号是语义分类，不是执行顺序**（顺序见本节末尾）。
+
+- **第 1 腿 · 孤儿编排接管**：peer 最后一次心跳携带的 `active_workflows` 即它失联时仍在驱动的 workflow，按一致性哈希 `should_claim_workflow` 在**存活且具备编排角色**的节点间选出接管方，获选节点 `claim` 并 `reschedule_workflow_tasks`。清单必须取自心跳：租约虽然也记录 owner，但远端副本不会随 owner 的续租刷新，`lease_duration` 之后即过期并被清理，按它反查只能看到最近一次 claim 落在窗口内的那部分 workflow。仅有 Worker 角色的节点不进候选集——否则哈希可能把孤儿派给一个永不 claim 的节点。
+- **第 2 腿 · 在途转发处置**：peer 没有在跑任何 workflow，但它身上跑着本节点转发过去的任务。这些任务登记在 `FailoverManager::outbound`，按任务类型分流：
+
+  - **编排任务**（`workflow_id` 非空）：终结为 `TaskCompletion::Failed`，经任务结果 correctness 通道发布（与远端结果回灌同一条路），由工作流自身的失败策略决定是否重试。
+  - **直提任务**（`workflow_id` 为空）：不就地失败，登记条目经 `relinquish_lease()` 放弃租约（`lease_deadline_ms` 归零 = 无有效租约，判定上等同立即到期）；Worker 的租约检查点取出后递增 `attempt`、清空路由并重新入队。旧执行节点的迟到结果因 `attempt` 不一致被拒绝（见下节）。
+
+- **第 2 腿之二 · 主动探测**：心跳视图有天然盲区——目标在发出第一个可被观测的心跳前就失联，或只按 `endpoint_addr` 直投、从未建立心跳关系。此时 `peers` 里既无条目也无超时基线，第 1／2 腿都无从触发，在途任务会永久挂起。对**已经成功转发过任务**的目标，本节点持有直连通道，用 `DirectRequest::Ping` 探测：
+
+  - 探测成功即认为对端仍在服务，**不**终结其任务（避免误杀健康任务）；失败或超时才终结；
+  - 仅对不在新鲜心跳窗口内的目标探测，正常拓扑下每轮通常零探测；`probe_exempt` 条目（已归还 origin 的直提任务）与本轮已判死的节点直接跳过；
+  - 多目标**并发**探测，单次上界 `OUTBOUND_PROBE_TIMEOUT = 2s`；串行时 K 个不可达目标会让一轮检测线性膨胀到 K×2s，并推迟同轮其余腿。
+
+- **第 3 腿 · 退让接管重试**：入口是 `pending_claims` 表而不是 peer 视图——触发退让的 peer 当轮已被 `expire_stale_peers` 清出视图，没有扫描入口。每轮重新参加一致性哈希选举（失效 peer 已移出候选集，职责可能已转给本节点），三种结局：接管成功则重调度并移除、仍退让则保留、原 owner 心跳复活则移除（不再是孤儿）。
+
+- **第 4 腿 · 重调度任务重试**：接管时 `enqueue` 失败的任务（调度器未注入或临时拒绝）留在 `pending_reschedules`，每轮重投。没有这条腿，接管方会「租约拿到了、任务却一个也没入队」，工作流停在 Running。
+
+- **第 5 腿 · 分区恢复仲裁**：分区愈合后两侧可能同时在驱动同一工作流（对称分区超过 `lease_duration` 后恢复，claim 广播在分区内丢失、`expire_leases` 又对本节点活跃租约续租）。处理对象是"本节点持有租约、且**存活** peer 的 `active_workflows` 也含该工作流"：
+
+  - 租约仍有效 → 重播 `OrchestratorClaim`，时间戳取 `claimed_at_ms` 而**不刷新**（续租式刷新会让两侧比较失去稳定基准）；对端按 `(timestamp_ms, node_id)` 全序比较，恰好一方胜出，输家移除 active 集合、停止续租与派发。对端的对称扫描保证双向仲裁。
+  - 租约已失效但工作流仍在驱动（`expire_leases` 续租窗口内）→ 走完整 `claim_workflow` 重置租约并重调度。
+
+### 一轮里的执行顺序
 
 ```text
-heartbeat_interval_ms < failure_timeout_ms < lease_duration_ms
+逐 peer 扫描： 第 2 腿（在途处置） → 第 1 腿（孤儿接管）
+           → 第 2 腿之二（主动探测，跳过本轮已判死的节点）
+           → 第 3 腿（退让接管重试）
+           → 第 5 腿（分区恢复仲裁）
+           → 第 4 腿（重调度任务重投）
 ```
 
-该关系保证：
-
-- 节点有足够心跳机会，不会因单次延迟被误判；
-- 故障判定完成前旧租约不会先过期；
-- claim 后的租约有明确过期时间，避免永久双主。
-
-## 两条失联处置腿
-
-判失效后按“谁的账谁认”分两腿，覆盖执行器与编排器两种死亡形态：
-
-1. **孤儿编排**：peer 最后一次心跳携带的 `active_workflows` 即它失联时仍在驱动的 workflow，按一致性哈希 `claim` 接管并 `reschedule_incomplete_tasks`。清单必须取自心跳：租约虽然也记录 owner，但远端副本不会随 owner 的续租刷新，`lease_duration` 之后即过期并被清理，按它反查只能看到最近一次 claim 落在窗口内的那部分 workflow。
-2. **在途转发**：peer 没有在跑任何 workflow，但它身上跑着本节点转发过去的任务。这些任务登记在 `FailoverManager::outbound`，按任务类型分流：
-
-   - **编排任务**（`workflow_id` 非空）：终结为 `TaskCompletion::Failed`，经 event_bus 发布（与远端结果回灌同一条路），由工作流自身的失败策略决定是否重试。
-   - **直提任务**（`workflow_id` 为空）：不就地失败，登记条目经 `relinquish_lease()` 放弃租约（`lease_deadline_ms` 归零 = 无有效租约，判定上等同立即到期）；Worker 的租约检查点取出后递增 `attempt`、清空路由并重新入队。旧执行节点的迟到结果因 `attempt` 不一致被拒绝（见下节）。
+理由：第 2 腿排在第 1 腿之前，因为死亡执行器的 `active_workflows` 为空，只处理孤儿会漏掉在途任务；
+探测放在逐 peer 扫描之后，因为已被判死的 peer 条目在上文已清空，此处只剩「心跳都没来得及观测到」
+的残余目标；第 4 腿放最后，它重投的是前面几条腿新接管时入队失败的任务。
 
 ## 状态副本：接管的前提
 
@@ -57,10 +96,8 @@ heartbeat_interval_ms < failure_timeout_ms < lease_duration_ms
 `NotOrchestrator`）而不是 `Ok(())`：退让与接管都是成功，但只有 `Adopted` /
 `AlreadyOwned` 才允许重调度任务。
 
-获选节点遇到尚未到期的租约时会退让。此时触发退让的 peer 已在本轮被
-`expire_stale_peers` 清出视图，后续轮次没有扫描入口——若就此作罢，租约到期被
-`expire_leases` 删除后工作流永久无人驱动。因此退让项记入 `pending_claims`，
-由每轮故障检测的第三条腿重试：接管成功或原 owner 心跳复活即移除该项。
+获选节点遇到尚未到期的租约时退让，退让项落到 `pending_claims`，由第 3 腿逐轮重试——
+若就此作罢，租约到期被 `expire_leases` 删除后工作流永久无人驱动。
 
 ## 直提任务租约与 attempt fencing
 

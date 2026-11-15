@@ -32,6 +32,7 @@ pub use gossip::DagGossip;
 // 因此按 `python` 特性门控：纯框架构建（`--no-default-features`）下不应产生
 // unused_imports 告警（框架构建必须零告警）。
 pub use orchestrator::types::AddNodeOutcome;
+pub use orchestrator::FailureOutcome;
 pub(crate) use orchestrator::Orchestrator;
 pub use route::{
     labels_match, quota_available, unschedulable_quota_reason, unschedulable_reason,

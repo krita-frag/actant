@@ -94,12 +94,6 @@ harness = false
 required-features = []
 
 [[bench]]
-name = "event_bus"
-path = "../../benches/rust/event_bus.rs"
-harness = false
-required-features = []
-
-[[bench]]
 name = "orchestrator"
 path = "../../benches/rust/orchestrator.rs"
 harness = false

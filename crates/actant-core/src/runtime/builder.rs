@@ -10,7 +10,7 @@ use crate::common::scheduler_kind;
 use crate::common::{ActantConfig, ActantError, ActorId, NodeId};
 use crate::runtime::actor::ActorSystem;
 use crate::runtime::dispatcher::{ProcessTaskDispatcher, TaskDispatcher, WorkerLaunchSpec};
-use crate::runtime::event_bus::EventBus;
+use crate::runtime::events::EventTap;
 use crate::runtime::network::Transport;
 use crate::runtime::state::{LmdbStore, Store};
 use crate::runtime::workflow::orchestrator::Orchestrator;
@@ -101,12 +101,12 @@ pub fn validate_data_dir(data_dir: &str) -> Result<(), ActantError> {
 /// 均为进程内存活对象，跨重启不保留。
 pub fn init_actor_system(
     node_id: &NodeId,
-    event_bus: &EventBus,
+    tap: &EventTap,
 ) -> Result<Arc<ActorSystem>, ActantError> {
     let system = Arc::new(
         ActorSystem::new()
             .with_node_id(node_id.clone())
-            .with_event_bus(event_bus.clone()),
+            .with_tap(tap.clone()),
     );
     Ok(system)
 }
@@ -257,7 +257,10 @@ pub async fn init_orchestrator(
 pub struct WorkerInitParams<'a> {
     pub node_id: &'a NodeId,
     pub network: &'a Arc<dyn Transport>,
-    pub event_bus: EventBus,
+    /// 观测 tap（Worker 生命周期 / 日志出口）。
+    pub tap: EventTap,
+    /// 任务结果 correctness 通道发布端。
+    pub result_feed: crate::runtime::events::TaskResultFeed,
     /// 本地节点标签，注入 Worker 用于放置适配校验。
     pub node_labels: &'a std::collections::BTreeMap<String, String>,
     /// 预构造远端路由策略。`None` 使用内置 `DefaultRoutePolicy`。
@@ -286,16 +289,18 @@ pub struct WorkerInitParams<'a> {
 /// 调度状态由 Actor 持有。
 pub async fn init_worker(params: WorkerInitParams<'_>) -> Result<Worker, ActantError> {
     let scheduler_actor_id = ActorId::scheduler(params.node_id);
-    // 注入 EventBus 到 SchedulerActor：Actor 在 enqueue 后触发
-    // notify_task_enqueued()，Worker 通过 Notify 信号实现事件驱动唤醒。
+    // 入队唤醒信号由 InnerScheduler 持有：SchedulerActor 与 Worker 共享同一
+    // `Arc<Notify>`——Actor 在 enqueue 后 notify，Worker 在等待新任务时
+    // notified，事件驱动唤醒不经过事件系统。
     // 注入的现成调度器优先；字符串 kind 仅选择内置实现。
+    let task_enqueued_notify = std::sync::Arc::new(tokio::sync::Notify::new());
     let scheduler_actor = if let Some(scheduler) = params.scheduler.clone() {
-        SchedulerActor::with_event_bus(params.event_bus.clone()).with_scheduler(scheduler)?
+        SchedulerActor::with_notify(task_enqueued_notify.clone()).with_scheduler(scheduler)?
     } else {
         match params.scheduler_kind {
-            scheduler_kind::FIFO => SchedulerActor::with_event_bus(params.event_bus.clone()),
+            scheduler_kind::FIFO => SchedulerActor::with_notify(task_enqueued_notify.clone()),
             scheduler_kind::PRIORITY => {
-                SchedulerActor::with_event_bus(params.event_bus.clone()).with_priority()?
+                SchedulerActor::with_notify(task_enqueued_notify.clone()).with_priority()?
             }
             other => {
                 return Err(ActantError::Config(format!(
@@ -327,7 +332,11 @@ pub async fn init_worker(params: WorkerInitParams<'_>) -> Result<Worker, ActantE
     let worker = Worker::new(
         params.node_id.clone(),
         params.network.clone(),
-        params.event_bus,
+        crate::runtime::workflow::runtime::WorkerChannels {
+            tap: params.tap,
+            result_feed: params.result_feed,
+            task_notify: task_enqueued_notify,
+        },
         actor_scheduler,
         params.task_dispatcher,
         params.worker_config,
@@ -526,6 +535,18 @@ impl RuntimeBuilder {
         // 启动前校验所有配置约束：未知 discovery/scheduler、Failover 时序、
         // payload 签名硬失败（require_payload_signing=true 且 key 为空时直接报错）。
         self.config.validate()?;
+        // 注入互斥：`discovery` 的唯一消费者是内置 `NetworkManager`（`with_identity`
+        // 的最后一个参数）。注入 `transport` 时 NetworkManager 根本不构造，
+        // discovery 会被静默丢弃——两组注入同时给出说明调用方对装配有误解，
+        // 启动期直接失败，不留「配了却没生效」的静默行为。
+        if self.transport.is_some() && self.discovery.is_some() {
+            return Err(ActantError::Config(
+                "with_transport and with_discovery are mutually exclusive: an injected \
+                 transport replaces NetworkManager, which is the only consumer of the \
+                 discovery strategy"
+                    .into(),
+            ));
+        }
         // 白名单元素必须是 endpoint id；写成完整地址会让成员校验永远失败，
         // 表现为"启动正常但 peers 恒空"，在启动期直接拒绝。
         self.config.network.allowed_peer_ids =
@@ -612,10 +633,13 @@ impl RuntimeBuilder {
             )));
         }
 
-        let event_bus = EventBus::new();
+        let tap = EventTap::new();
+        // correctness 通道：发布端注入 failover / Worker / Runtime，唯一接收端
+        // 存入 Runtime，由绑定层结果泵经 `take_result_receiver` 取走。
+        let (result_feed, result_rx) = crate::runtime::events::TaskResultFeed::new();
 
         tracing::info!("build: init_actor_system enter");
-        let actor_system = init_actor_system(&self.node_id, &event_bus)?;
+        let actor_system = init_actor_system(&self.node_id, &tap)?;
         tracing::info!("build: init_actor_system done");
 
         let store_path = Path::new(&data_dir).join("store");
@@ -649,7 +673,7 @@ impl RuntimeBuilder {
                     ),
                     self.config.worker.worker_cancel_grace_ms,
                     self.config.payload_signing_key.clone(),
-                    Some(event_bus.clone()),
+                    Some(tap.clone()),
                 )
                 .map_err(|e| {
                     ActantError::Config(format!("failed to create task dispatcher: {}", e))
@@ -735,8 +759,8 @@ impl RuntimeBuilder {
                 self.config.network.require_signed_records,
                 self.config.network.allowed_peer_ids.clone(),
             )
-            // 失联时终结在途任务的发布出口（与远端结果回灌同一 event_bus）。
-            .with_event_bus(event_bus.clone()),
+            // 失联时终结在途任务的发布出口（与远端结果回灌同一 feed）。
+            .with_result_feed(result_feed.clone()),
         );
         let failover_actor_id = ActorId::failover(&self.node_id);
         actor_system
@@ -772,7 +796,9 @@ impl RuntimeBuilder {
             workflow_actor_id.clone(),
             None, // worker 稍后注入
             capability.clone(),
-            event_bus.clone(),
+            tap.clone(),
+            result_feed.clone(),
+            result_rx,
             task_dispatcher.clone(),
             Some(blob_store),
         ));
@@ -786,7 +812,8 @@ impl RuntimeBuilder {
         let worker = init_worker(WorkerInitParams {
             node_id: &self.node_id,
             network: &network,
-            event_bus: event_bus.clone(),
+            tap: tap.clone(),
+            result_feed: result_feed.clone(),
             scheduler: self.scheduler.clone(),
             node_labels: &self.config.node_labels,
             route_policy: self.route_policy.clone(),

@@ -22,7 +22,7 @@ use tokio::sync::Semaphore;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 
 use crate::common::{ActantError, TaskId};
-use crate::runtime::event_bus::{BusEvent, EventBus};
+use crate::runtime::events::{EventTap, TapEvent};
 
 /// 取消标志，用于协调任务分发器和跨进程取消操作。
 ///
@@ -281,7 +281,7 @@ pub struct ProcessTaskDispatcher {
     /// 维持「许可数 == 存活 worker 数」不变量（详见 [`PoolPermitGuard`]）。
     lost_without_replacement: AtomicUsize,
     /// 任务日志边带出口。`None` 时 actant_log 行仅经 tracing 转发。
-    log_bus: Option<EventBus>,
+    log_tap: Option<EventTap>,
 }
 
 /// dispatch 并发许可的守卫：持有期间若有 worker 被永久丢弃且替补失败
@@ -332,8 +332,8 @@ impl ProcessTaskDispatcher {
     /// 核心不解释其中任何语言语义；解释器路径、模块入口与环境变量的拼装由
     /// 绑定层或嵌入方负责（见 [`WorkerLaunchSpec`]）。
     ///
-    /// `log_bus` 是任务日志边带出口：`Some` 时池内 worker 的
-    /// `actant_log:` 行发布为 `BusEvent::TaskLog`（tap 语义）；`None` 时仅经
+    /// `log_tap` 是任务日志边带出口：`Some` 时池内 worker 的
+    /// `actant_log:` 行发布为 `TapEvent::TaskLog`（可丢 tap）；`None` 时仅经
     /// tracing 转发。进程池在构造时即拉起，出口必须在此提供——后置注入会
     /// 错过首批 worker。
     pub fn new(
@@ -341,7 +341,7 @@ impl ProcessTaskDispatcher {
         launch: WorkerLaunchSpec,
         worker_cancel_grace_ms: u64,
         signing_key: Vec<u8>,
-        log_bus: Option<EventBus>,
+        log_tap: Option<EventTap>,
     ) -> crate::common::Result<Self> {
         if launch.program.trim().is_empty() {
             return Err(ActantError::Config(
@@ -358,10 +358,10 @@ impl ProcessTaskDispatcher {
             cancel_grace,
             shutting_down: AtomicBool::new(false),
             lost_without_replacement: AtomicUsize::new(0),
-            log_bus,
+            log_tap,
         };
         for _ in 0..num_workers {
-            match ProcessTaskDispatcher::spawn_one(&dispatcher.launch, dispatcher.log_bus.clone()) {
+            match ProcessTaskDispatcher::spawn_one(&dispatcher.launch, dispatcher.log_tap.clone()) {
                 Ok(worker) => dispatcher.free_workers.lock().push_back(worker),
                 Err(e) => {
                     // 构造失败路径必须回收已拉起的 worker：`WorkerProc` 的
@@ -398,7 +398,7 @@ impl ProcessTaskDispatcher {
             cancel_grace: Duration::from_millis(10),
             shutting_down: AtomicBool::new(false),
             lost_without_replacement: AtomicUsize::new(0),
-            log_bus: None,
+            log_tap: None,
         }
     }
     /// 在 Unix 下从 `ChildStdin` dup 原始 fd 封装回 tokio `File`，作为取消帧独立写端。
@@ -441,7 +441,7 @@ impl ProcessTaskDispatcher {
     /// 拉起单个 worker 子进程并把 stderr 转发到 tracing。
     fn spawn_one(
         launch: &WorkerLaunchSpec,
-        log_bus: Option<EventBus>,
+        log_tap: Option<EventTap>,
     ) -> Result<WorkerProc, ActantError> {
         let mut cmd = Command::new(&launch.program);
         cmd.args(&launch.args);
@@ -473,7 +473,7 @@ impl ProcessTaskDispatcher {
             .take()
             .ok_or_else(|| ActantError::Worker("worker stdout not available".into()))?;
         if let Some(stderr) = child.stderr.take() {
-            tokio::spawn(drain_stderr(stderr, log_bus));
+            tokio::spawn(drain_stderr(stderr, log_tap));
         }
         Ok(WorkerProc {
             child,
@@ -679,7 +679,7 @@ impl ProcessTaskDispatcher {
         if self.shutting_down.load(Ordering::Acquire) {
             return Ok(());
         }
-        let worker = match ProcessTaskDispatcher::spawn_one(&self.launch, self.log_bus.clone()) {
+        let worker = match ProcessTaskDispatcher::spawn_one(&self.launch, self.log_tap.clone()) {
             Ok(worker) => worker,
             Err(e) => {
                 self.lost_without_replacement.fetch_add(1, Ordering::AcqRel);
@@ -711,6 +711,12 @@ impl ProcessTaskDispatcher {
     /// `writing` 由 dispatch 与 poller 共享：poller 进入写帧路径前置位，dispatch
     /// 在 poller 结束后据此判断 worker stdin 是否可能残留 Cancel 帧
     ///（见 [`Self::stop_cancel_poller`]）。
+    ///
+    /// 返回的 shutdown 发送端用于协作结束 poller：poller 在**所有**退出路径
+    /// （观察到取消标志 / 收到 shutdown）都经 oneshot 归还 `cancel_stdin`。
+    /// 归还不可依赖 abort——写端 fd 只存在于 poller future 内，abort 丢弃
+    /// future 即关闭 fd，且复用路径不会重建（仅 `spawn_one` 创建 cancel_stdin），
+    /// 复用 worker 将永久失去协作取消能力。
     fn spawn_cancel_poller(
         cancel_stdin: Option<tokio::fs::File>,
         cancel_flag: CancelFlag,
@@ -719,61 +725,71 @@ impl ProcessTaskDispatcher {
     ) -> (
         tokio::task::JoinHandle<()>,
         tokio::sync::oneshot::Receiver<Option<tokio::fs::File>>,
+        tokio::sync::oneshot::Sender<()>,
     ) {
         // 向 poller task 传入 cancel_stdin 所有权；结束后通过 oneshot 归还给 dispatch。
         // 这样 poller 活在自己的 task 里，dispatch 与 poller 之间无跨 task Arc<Mutex<…>>。
         let (ret_tx, ret_rx) = tokio::sync::oneshot::channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let handle = tokio::spawn(async move {
             let mut cs = cancel_stdin;
+            let mut shutdown_rx = shutdown_rx;
             loop {
-                if cancel_flag.load(Ordering::Relaxed) {
-                    if active.load(Ordering::Relaxed) {
-                        // 先置写帧标记再进入写路径：即使随后被 abort（写帧可能
-                        // 进行到一半），dispatch 也能从标记得知「不能复用」。
-                        writing.store(true, Ordering::Release);
-                        if let Some(c) = cs.as_mut() {
-                            // 取消帧是对已退出/正被 abort 的子进程尽力而为的
-                            // 通知：管道已关闭时写入必然失败，由进程组强杀兜底。
-                            let _ = c.write_all(&CANCEL_FRAME_BYTES).await;
-                            let _ = c.flush().await;
-                        }
+                tokio::select! {
+                    _ = &mut shutdown_rx => {
+                        // 任务已正常结束：未写任何帧，无条件归还写端。
+                        let _ = ret_tx.send(cs);
+                        return;
                     }
-                    // 归还 cancel_stdin；接收端已 abort 时发送失败，File 随之
-                    // Drop 关闭 fd，由下次 ensure_replacement 重建，无需补救。
+                    _ = tokio::time::sleep(Duration::from_millis(15)) => {}
+                }
+                if cancel_flag.load(Ordering::Relaxed) {
+                    if let Some(c) = cs.as_mut().filter(|_| active.load(Ordering::Relaxed)) {
+                        // 先置写帧标记再进入写路径：dispatch 据此得知「不能复用」。
+                        // 标记仅在确有写端时置位——无写端（非 Unix / dup 失败）时
+                        // poller 不可能写帧，置位会让结果臂不必要地回收健康 worker。
+                        writing.store(true, Ordering::Release);
+                        // 取消帧是对正被终止的子进程尽力而为的通知：
+                        // 管道已关闭时写入必然失败，由进程组强杀兜底。
+                        let _ = c.write_all(&CANCEL_FRAME_BYTES).await;
+                        let _ = c.flush().await;
+                    }
+                    // 归还 cancel_stdin；接收端已丢弃时发送失败，File 随之
+                    // Drop 关闭 fd（此路径仅剩 poller panic 的兜底场景）。
                     let _ = ret_tx.send(cs);
                     return;
                 }
-                tokio::time::sleep(Duration::from_millis(15)).await;
             }
         });
-        (handle, ret_rx)
+        (handle, ret_rx, shutdown_tx)
     }
 
-    /// 终止取消轮询任务并等待其退出，返回 `(cancel_stdin, poller 可能已写帧)`。
+    /// 协作结束取消轮询任务并等待其归还写端，返回 `(cancel_stdin, poller 可能已写帧)`。
     ///
-    /// 所有处置 worker 的路径都必须先经过这里再释放/复用：abort 之后**等待
-    /// poller 真正退出**才返回，保证「poller 检查 active → 写 Cancel 帧」与
-    /// 「结果臂释放 worker 复用」互斥——否则 poller 可能已通过 active 检查但尚未
-    /// 写帧，结果臂先 release 了 worker，过期 Cancel 帧随后落入复用 worker 的
-    /// stdin，误杀下一个任务（TOCTOU）。
+    /// 所有处置 worker 的路径都必须先经过这里再释放/复用：poller 收到 shutdown
+    /// 或观察到取消标志后**归还写端并退出**，本函数等待归还完成才返回，保证
+    /// 「poller 检查 active → 写 Cancel 帧」与「结果臂释放 worker 复用」互斥——
+    /// 否则 poller 可能已通过 active 检查但尚未写帧，结果臂先 release 了 worker，
+    /// 过期 Cancel 帧随后落入复用 worker 的 stdin，误杀下一个任务（TOCTOU）。
     ///
     /// 第二个返回值为 `true` 表示 poller 已进入写帧阶段，worker stdin 上可能残留
     /// 完整或部分 Cancel 帧，复用会让残留帧与下一任务的 Dispatch 帧失步——
     /// 调用方应回收该 worker 而非复用。
     async fn stop_cancel_poller(
+        shutdown_tx: tokio::sync::oneshot::Sender<()>,
         canceller: tokio::task::JoinHandle<()>,
         cancel_stdin_rx: tokio::sync::oneshot::Receiver<Option<tokio::fs::File>>,
         writing: &AtomicBool,
     ) -> (Option<tokio::fs::File>, bool) {
-        canceller.abort();
+        // 发送失败说明 poller 已通过取消路径自行退出并归还，无需通知。
+        let _ = shutdown_tx.send(());
         match cancel_stdin_rx.await {
-            // poller 观察到 flag 置位后自行结束并归还写端；写帧是否发生以
-            // writing 标记为准。
+            // poller 归还写端（shutdown 未写帧 / 取消路径已写帧两种可能）；
+            // 写帧是否发生以 writing 标记为准。
             Ok(cancel_stdin) => (cancel_stdin, writing.load(Ordering::Acquire)),
-            // poller 被 abort：等待任务彻底退出后再读 writing——此刻 poller 不可能
-            // 再推进，writing 为 false 即证明从未进入写帧阶段（任务正常完成路径）。
+            // 兜底：poller 在归还前 panic，写端随 future drop 关闭 fd。
+            // 等待任务退出后再读 writing，排除退出后仍推进的可能。
             Err(_) => {
-                // JoinError(Cancelled) 是 abort 的预期结果，仅需等待任务退出。
                 let _ = canceller.await;
                 (None, writing.load(Ordering::Acquire))
             }
@@ -801,9 +817,19 @@ const METRIC_TASK_HANDLER_MS: &str = "task.handler_ms";
 /// 同时识别从属指标边带：以 ``actant_metric:`` 开头、形如
 /// ``<name>=<value_ms>`` 的行，汇入对应 OTel histogram（当前仅
 /// [`METRIC_TASK_HANDLER_MS`]）；其余行原样作为日志透传，不改变可观测性契约。
-async fn drain_stderr(mut stderr: ChildStderr, log_bus: Option<EventBus>) {
+async fn drain_stderr(mut stderr: ChildStderr, log_tap: Option<EventTap>) {
     let mut lines = tokio::io::BufReader::new(&mut stderr).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
+    loop {
+        let line = match lines.next_line().await {
+            Ok(Some(line)) => line,
+            // stderr 断连/IO 异常：日志流静默截断会让排障失去 worker 视角，
+            // 必须留痕（worker 即将退出属正常 EOF，Ok(None) 走既有退出路径）。
+            Ok(None) => break,
+            Err(e) => {
+                tracing::warn!(error = %e, "worker stderr stream failed; log sideband truncated");
+                break;
+            }
+        };
         if let Some(value) = line.strip_prefix(METRIC_LINE_PREFIX) {
             if let Some((name, value_ms)) = value.split_once('=') {
                 if let Ok(ms) = value_ms.trim().parse::<u64>() {
@@ -835,11 +861,11 @@ async fn drain_stderr(mut stderr: ChildStderr, log_bus: Option<EventBus>) {
                 task_id = task_id,
                 "{message}"
             );
-            if let Some(ref bus) = log_bus {
-                bus.publish(BusEvent::TaskLog {
+            if let Some(ref tap) = log_tap {
+                tap.publish(TapEvent::TaskLog {
                     task_id: TaskId::from(task_id.to_string()),
-                    level: level.to_string(),
-                    message: message.to_string(),
+                    level: std::sync::Arc::from(level),
+                    message: std::sync::Arc::from(message),
                 });
             }
             continue;
@@ -879,23 +905,21 @@ impl TaskDispatcher for ProcessTaskDispatcher {
         // 领用 worker 并写入 Dispatch 帧。写失败通常意味着该 worker 在领用后
         // 恰好退出（校验与写之间的 TOCTOU）；此时换一个 worker 重试一次，
         // 而不是把错误冒泡给调用方并消耗 crash failover 配额。
-        let (mut worker, canceller, cancel_stdin_rx, active, writing) = {
+        let (mut worker, shutdown_tx, canceller, cancel_stdin_rx, active, writing) = {
             let mut retried = false;
             loop {
                 let mut worker = self.pop_worker().await?;
 
-                // 取出独立取消写端，交由 poller task 拥有；归还有两种路径：
-                //  1) poller 通过 oneshot 在自己发完 Cancel 后归还（正常/取消分支）；
-                //  2) abort poller 时，cancel_stdin 所有权在 poller 内 → oneshot 被
-                //     close 变为 RecvError → 本函数视为 None，等下次 spawn_one 重建。
-                // 这样 hot-path send_frame（→write_vectored）全程无 Mutex、无 Arc
-                // clone 竞争。
+                // 取出独立取消写端，交由 poller task 拥有；poller 在所有退出路径
+                // （收到 shutdown / 观察到取消标志）都经 oneshot 归还，写端 fd 不会
+                // 因 abort 丢失。这样 hot-path send_frame（→write_vectored）全程无
+                // Mutex、无 Arc clone 竞争。
                 let cancel_stdin = worker.cancel_stdin.take();
                 let active = Arc::new(AtomicBool::new(true));
                 // 与 poller 共享的写帧标记：poller 进入写 Cancel 路径前置位，dispatch
                 // 在 poller 退出后据此判断 worker stdin 是否可能残留过期 Cancel 帧。
                 let writing = Arc::new(AtomicBool::new(false));
-                let (canceller, cancel_stdin_rx) = Self::spawn_cancel_poller(
+                let (canceller, cancel_stdin_rx, shutdown_tx) = Self::spawn_cancel_poller(
                     cancel_stdin,
                     cancel_flag.clone(),
                     active.clone(),
@@ -903,12 +927,26 @@ impl TaskDispatcher for ProcessTaskDispatcher {
                 );
 
                 match worker.send_frame(FRAME_DISPATCH, &verified).await {
-                    Ok(()) => break (worker, canceller, cancel_stdin_rx, active, writing),
+                    Ok(()) => {
+                        break (
+                            worker,
+                            shutdown_tx,
+                            canceller,
+                            cancel_stdin_rx,
+                            active,
+                            writing,
+                        )
+                    }
                     Err(e) => {
                         // 先停 poller 再处置 worker，避免残留 Cancel 帧。
                         active.store(false, Ordering::Relaxed);
-                        let (cancel_stdin, _) =
-                            Self::stop_cancel_poller(canceller, cancel_stdin_rx, &writing).await;
+                        let (cancel_stdin, _) = Self::stop_cancel_poller(
+                            shutdown_tx,
+                            canceller,
+                            cancel_stdin_rx,
+                            &writing,
+                        )
+                        .await;
                         worker.cancel_stdin = cancel_stdin;
                         let cancelled = cancel_flag.load(Ordering::Relaxed);
                         if retried || cancelled {
@@ -953,7 +991,8 @@ impl TaskDispatcher for ProcessTaskDispatcher {
                 // 先等 poller 彻底退出再决定 worker 去留：保证「poller 检查 active →
                 // 写 Cancel 帧」与释放/复用互斥，过期帧不会落入复用的 worker。
                 let (cancel_stdin, cancel_maybe_written) =
-                    Self::stop_cancel_poller(canceller, cancel_stdin_rx, &writing).await;
+                    Self::stop_cancel_poller(shutdown_tx, canceller, cancel_stdin_rx, &writing)
+                        .await;
                 worker.cancel_stdin = cancel_stdin;
                 match result {
                     Ok(Some(body)) => {
@@ -994,8 +1033,13 @@ impl TaskDispatcher for ProcessTaskDispatcher {
                 // 不可中断代码）：发送 `Cancel`、宽限等待协作退出，宽限耗尽才强杀，
                 // 兜底回收槽位与进程池容量。
                 active.store(false, Ordering::Relaxed);
-                let (cancel_stdin, _) =
-                    Self::stop_cancel_poller(canceller, cancel_stdin_rx, &writing).await;
+                let (cancel_stdin, _) = Self::stop_cancel_poller(
+                    shutdown_tx,
+                    canceller,
+                    cancel_stdin_rx,
+                    &writing,
+                )
+                .await;
                 worker.cancel_stdin = cancel_stdin;
                 tracing::warn!("task cancelled, granting grace before killing worker");
                 self.terminate_and_replace(worker).await;
@@ -1003,8 +1047,13 @@ impl TaskDispatcher for ProcessTaskDispatcher {
             }
             _ = tokio::time::sleep(timeout) => {
                 active.store(false, Ordering::Relaxed);
-                let (cancel_stdin, _) =
-                    Self::stop_cancel_poller(canceller, cancel_stdin_rx, &writing).await;
+                let (cancel_stdin, _) = Self::stop_cancel_poller(
+                    shutdown_tx,
+                    canceller,
+                    cancel_stdin_rx,
+                    &writing,
+                )
+                .await;
                 worker.cancel_stdin = cancel_stdin;
                 tracing::warn!(timeout_ms = timeout.as_millis(), "task hard-timeout, killing worker");
                 // 硬超时：任务已失联，立即强杀即时释放资源（不等取消宽限期）。

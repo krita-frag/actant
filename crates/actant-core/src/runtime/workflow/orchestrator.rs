@@ -25,6 +25,7 @@ mod state;
 mod waitpoint;
 
 /// Python 暴露面的序列化形态，由 PyO3 边界层构造。
+pub use execution::FailureOutcome;
 pub use queries::{DagSnapshot, WorkflowStateSummary};
 pub use state::Orchestrator;
 

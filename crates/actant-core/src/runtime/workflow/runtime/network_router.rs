@@ -8,14 +8,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::common::wire::CancelBroadcast;
-use crate::common::TaskDefinition;
 use crate::common::{
     NodeId, TaskCompletion, TaskId, Topic, WireEnvelope, WireMessage, WireTaskOutcome, WorkflowId,
 };
 use crate::runtime::actor::ActorSystem;
 use crate::runtime::dispatcher::CancelFlag;
-use crate::runtime::event_bus::{BusEvent, EventBus};
+use crate::runtime::events::{EventTap, TapEvent, TaskLifecycleEvent, TaskResultFeed};
 use crate::runtime::network::{DirectResponseChannel, NetworkEvent, Transport};
 use crate::runtime::workflow::actor::{ResultSource, TaskResultOutcome};
 use crate::runtime::workflow::messaging::{decode, encode};
@@ -27,7 +25,10 @@ use tracing::Instrument;
 /// 封装了主题匹配和反序列化逻辑，使运行时主循环专注于任务执行。
 pub(crate) struct NetworkEventRouterConfig {
     pub(crate) network: Arc<dyn Transport>,
-    pub(crate) event_bus: EventBus,
+    /// 观测 tap：对端连接事件。
+    pub(crate) tap: EventTap,
+    /// 任务结果 correctness 通道：远端取消 / 远端结果回灌。
+    pub(crate) result_feed: TaskResultFeed,
     pub(crate) scheduler: Arc<dyn Scheduler>,
     pub(crate) actor_system: Option<Arc<ActorSystem>>,
     /// 本地 WorkflowActor 的 id。若存在，远程 TaskResult 会直接路由给它。
@@ -35,7 +36,7 @@ pub(crate) struct NetworkEventRouterConfig {
     /// 本地 DagGossipActor 的 id。若存在，工作流状态请求/响应会直接路由给它。
     pub(crate) dag_gossip_actor_id: Option<crate::common::ActorId>,
     /// 故障转移管理器。若存在，入站 Heartbeat / Claim wire 消息会直连分发到
-    /// `handle_heartbeat` / `handle_claim`（控制面指令不经过 EventBus）。
+    /// `handle_heartbeat` / `handle_claim`（控制面指令不经过事件通道）。
     pub(crate) failover: Option<Arc<crate::runtime::workflow::FailoverManager>>,
     pub(crate) cancel_flags: Arc<parking_lot::Mutex<HashMap<String, CancelFlag>>>,
     pub(crate) cancelled_tasks: Arc<parking_lot::Mutex<HashMap<String, Instant>>>,
@@ -43,7 +44,8 @@ pub(crate) struct NetworkEventRouterConfig {
 
 pub(crate) struct NetworkEventRouter {
     network: Arc<dyn Transport>,
-    event_bus: EventBus,
+    tap: EventTap,
+    result_feed: TaskResultFeed,
     scheduler: Arc<dyn Scheduler>,
     actor_system: Option<Arc<ActorSystem>>,
     workflow_actor_id: Option<crate::common::ActorId>,
@@ -57,7 +59,8 @@ impl NetworkEventRouter {
     pub(crate) fn new(cfg: NetworkEventRouterConfig) -> Self {
         Self {
             network: cfg.network,
-            event_bus: cfg.event_bus,
+            tap: cfg.tap,
+            result_feed: cfg.result_feed,
             scheduler: cfg.scheduler,
             actor_system: cfg.actor_system,
             workflow_actor_id: cfg.workflow_actor_id,
@@ -77,14 +80,14 @@ impl NetworkEventRouter {
             NetworkEvent::PeerConnected { peer_id } => {
                 tracing::info!("peer connected: {}", peer_id);
                 crate::metrics::inc_connected_peers();
-                self.event_bus
-                    .publish(BusEvent::PeerConnected(NodeId(peer_id.clone())));
+                self.tap
+                    .publish(TapEvent::PeerConnected(NodeId(peer_id.clone())));
             }
             NetworkEvent::PeerDisconnected { peer_id } => {
                 tracing::info!("peer disconnected: {}", peer_id);
                 crate::metrics::dec_connected_peers();
-                self.event_bus
-                    .publish(BusEvent::PeerDisconnected(NodeId(peer_id)));
+                self.tap
+                    .publish(TapEvent::PeerDisconnected(NodeId(peer_id)));
             }
             NetworkEvent::DirectRequest {
                 peer_id,
@@ -99,18 +102,9 @@ impl NetworkEventRouter {
     pub(crate) async fn handle_message(&self, topic_str: &str, payload: &[u8]) {
         let topic = Topic::from(topic_str);
         // 解码一次后在整个分发过程中复用。失败时直接返回（避免每个分支重复 decode）。
-        //
-        // 但 `Cancel` 话题不走 `WireEnvelope`：它的载荷是裸 postcard 编码的
-        // `CancelBroadcast`，对它们尝试解包只会得到一条
-        // "failed to deserialize WireEnvelope" 的 WARN——而消息其实会被下面的
-        // 分支正常处理。那是对每一条合法取消广播的恒定误报（本节点自投递的
-        // 取消也走这里，单机路径上同样出现），会让人误以为消息被丢弃。
-        // 故按话题路由决定是否需要解包。
-        let decoded = if matches!(topic.classify(), crate::common::wire::TopicRoute::Cancel) {
-            None
-        } else {
-            WireEnvelope::decode(payload)
-        };
+        // `Cancel` 话题同样走 `WireEnvelope`（签名集群下随 MAC 验证）：取消广播
+        // 若绕过 MAC，任意 mesh 成员可伪造 `(task_id, workflow_id)` 取消任意任务。
+        let decoded = WireEnvelope::decode(payload);
         let traceparent = decoded.as_ref().and_then(|(_, tp)| tp.clone());
         // 解析入站 W3C traceparent，若成功则：
         //   1. 创建 `wire.recv` span，把 traceparent 字符串与解析出的 trace-id/span-id
@@ -173,22 +167,20 @@ impl NetworkEventRouter {
         match topic.classify() {
             crate::common::TopicRoute::Task(_) => {
                 if let Some((WireMessage::TaskDispatch(task), _)) = decoded {
-                    if let Err(e) = self.scheduler.enqueue(task.clone()).await {
-                        // 入队失败即任务被丢弃：必须以 error 级别留下任务标识，
-                        // 否则任务在日志中完全消失（提交方只能观察到永久等待）。
-                        tracing::error!(
-                            task_id = %task.id.as_str(),
-                            task_name = %task.name,
-                            error = %e,
-                            "scheduler rejected task dispatch; task dropped"
-                        );
+                    // task 已按值 move 出消息，无需克隆整份 payload 入队；
+                    // 先留下标识再交出所有权——入队失败即任务被丢弃，必须以
+                    // error 级别留下任务标识，否则任务在日志中完全消失（提交方
+                    // 只能观察到永久等待）。
+                    tracing::debug!(task_id = %task.id.as_str(), "enqueuing gossip-dispatched task");
+                    if let Err(e) = self.scheduler.enqueue(task).await {
+                        tracing::error!(error = %e, "scheduler rejected task dispatch; task dropped");
                     }
                 }
             }
             crate::common::TopicRoute::DagState => {
                 if let Some((WireMessage::DagStateUpdate(update), _)) = decoded {
                     // 控制面直连：DAG 状态 CRDT 更新直接分发给 DagGossipActor，
-                    // 不经 EventBus（观测 tap 有损，不承载正确性语义）。
+                    // 不经观测 tap（有损，不承载正确性语义）。
                     self.handle_workflow_state_event(
                         crate::runtime::workflow::gossip_methods::APPLY_REMOTE_UPDATE,
                         &update,
@@ -277,7 +269,13 @@ impl NetworkEventRouter {
                 }
             }
             crate::common::TopicRoute::Cancel => {
-                if let Ok(msg) = crate::common::decode_postcard::<CancelBroadcast>(payload) {
+                // 经 envelope 解出（MAC 已在 decode 中校验）；裸 postcard 载荷
+                // 是旧旁路格式，一律丢弃。
+                let cancel_msg = decoded.as_ref().and_then(|(msg, _)| match msg {
+                    WireMessage::CancelBroadcast(m) => Some(m.clone()),
+                    _ => None,
+                });
+                if let Some(msg) = cancel_msg {
                     tracing::info!(
                         task_id = %msg.task_id,
                         workflow_id = %msg.workflow_id,
@@ -301,14 +299,12 @@ impl NetworkEventRouter {
                             crate::metrics::inc_tasks_cancelled();
                         }
                     }
-                    let tid = msg.task_id.clone();
-                    self.event_bus
-                        .publish(BusEvent::TaskCancelled(TaskCompletion::Cancelled {
-                            workflow_id: msg.workflow_id,
-                            task_id: tid.clone(),
-                            task_name: tid.0,
-                            target_node: None,
-                        }));
+                    // 请求腿到此为止：取消的**终态结算**由各执行路径统一承担——
+                    // 在途任务经 cancel_flag 协作检查点走 publish_task_completion
+                    //（远端直连回传 origin / 本地 correctness 通道），排队任务经
+                    // cancelled_tasks 注册表被派发前短路后同样补发终态。此处再发
+                    // 一条 TaskCancelled 会产生重复终态事件，且 CancelBroadcast
+                    // 不携带 task_name（塞 task_id 顶替会污染下游日志）。
                 }
             }
             crate::common::TopicRoute::Unknown => {}
@@ -317,20 +313,23 @@ impl NetworkEventRouter {
 
     async fn handle_direct_request(
         &self,
-        peer_id: String,
+        _peer_id: String,
         request: crate::runtime::network::DirectRequest,
         channel: DirectResponseChannel,
     ) {
         match request {
             crate::runtime::network::DirectRequest::DispatchTask { task } => {
-                let accepted = match self.scheduler.enqueue(task.clone()).await {
+                // 先留标识再交出所有权（无需为日志克隆整份 payload）。
+                let (task_id_dbg, task_name_dbg) =
+                    (task.id.as_str().to_string(), task.name.clone());
+                let accepted = match self.scheduler.enqueue(task).await {
                     Ok(()) => true,
                     Err(e) => {
                         // 直连派发被拒即任务丢弃：以 error 级别记录任务标识，
                         // 便于与提交方的"任务永久等待"告警关联排查。
                         tracing::error!(
-                            task_id = %task.id.as_str(),
-                            task_name = %task.name,
+                            task_id = %task_id_dbg,
+                            task_name = %task_name_dbg,
                             error = %e,
                             "scheduler rejected direct task dispatch; task dropped"
                         );
@@ -374,30 +373,6 @@ impl NetworkEventRouter {
                     .await
                 {
                     tracing::warn!("failed to send Pong: {}", e);
-                }
-            }
-            other => {
-                // 点对点请求-响应不走 EventBus：直接由接收方处理或回送 Error 响应，
-                // 避免独占投递分支在无订阅者时让调用方永久阻塞。
-                // 未识别的 DirectRequest 变体直接回送 Error，让调用方立即
-                // 收到明确错误，依赖其自身超时 fallback。
-                tracing::warn!(
-                    peer = %peer_id,
-                    request = ?other,
-                    "no handler for DirectRequest variant, returning DirectResponse::Error",
-                );
-                let response = crate::runtime::network::DirectResponse::Error {
-                    message: format!(
-                        "no handler for DirectRequest variant on this node: {:?}",
-                        other
-                    ),
-                };
-                if let Err(e) = self.network.send_direct_response(channel, response).await {
-                    tracing::warn!(
-                        peer = %peer_id,
-                        error = %e,
-                        "failed to send DirectResponse::Error for unhandled DirectRequest",
-                    );
                 }
             }
         }
@@ -497,7 +472,7 @@ impl NetworkEventRouter {
         }
 
         let Some(ref actor_system) = self.actor_system else {
-            tracing::debug!("no actor system; publishing remote task result to event_bus");
+            tracing::debug!("no actor system; publishing remote task result to result feed");
             self.publish_remote_completion(
                 &workflow_id,
                 &task_id,
@@ -509,7 +484,7 @@ impl NetworkEventRouter {
             return true;
         };
         let Some(ref workflow_actor_id) = self.workflow_actor_id else {
-            tracing::debug!("no workflow actor; publishing remote task result to event_bus");
+            tracing::debug!("no workflow actor; publishing remote task result to result feed");
             self.publish_remote_completion(
                 &workflow_id,
                 &task_id,
@@ -566,30 +541,31 @@ impl NetworkEventRouter {
                 if let Some(failover) = self.failover.as_ref() {
                     failover.take_outbound_if_not_stale(task_id.as_str(), attempt);
                 }
-                // 重试裁决：orchestrator 判定重试时随响应返回重派发任务，
-                // 由本节点调度器延迟入队（远端执行的 flow 任务其编排者在本
-                // 节点）；终局结果发布到 event_bus，使提交方 `AsyncResult`
-                // 解析（远端执行路径若无事件，flow 句柄无法跨节点解析）。
-                let retry: Option<(TaskDefinition, u64)> = if result.payload.is_empty() {
-                    tracing::warn!(
-                        workflow_id = %workflow_id.as_str(),
-                        task_id = %task_id.as_str(),
-                        "empty ON_TASK_RESULT response payload; treating verdict as terminal"
-                    );
-                    None
-                } else {
-                    decode(&result.payload).unwrap_or_else(|e| {
-                        tracing::error!(
+                // 三态裁决：orchestrator 判定重试时随响应返回重派发任务，由
+                // 本节点调度器延迟入队（远端执行的 flow 任务其编排者在本节点）；
+                // 终局结果发布到 correctness 通道，使提交方 `AsyncResult` 解析（远端
+                // 执行路径若无事件，flow 句柄无法跨节点解析）。结果回灌是
+                // at-least-once：Failed 的 `Ignored` / `Settled` 是迟到重复或
+                // 过期代数，不得发布（否则提交方句柄在重试在途时被错误置为
+                // 失败）；Completed / Cancelled 的 `Settled` 仍须发布——事件
+                // 发布是远端结果抵达提交方的唯一通道。
+                let verdict: Option<crate::runtime::workflow::actor::TaskResultVerdict> =
+                    if result.payload.is_empty() {
+                        tracing::warn!(
                             workflow_id = %workflow_id.as_str(),
                             task_id = %task_id.as_str(),
-                            error = %e,
-                            "failed to decode retry verdict from workflow actor"
+                            "empty ON_TASK_RESULT response payload; treating verdict as ignored"
                         );
                         None
-                    })
-                };
-                match retry {
-                    Some((task, delay_ms)) => {
+                    } else {
+                        decode(&result.payload).ok()
+                    };
+                let is_failure = matches!(outcome_wire, WireTaskOutcome::Failed(_));
+                match verdict {
+                    Some(crate::runtime::workflow::actor::TaskResultVerdict::Retry(
+                        task,
+                        delay_ms,
+                    )) => {
                         let scheduler = self.scheduler.clone();
                         tokio::spawn(async move {
                             if delay_ms > 0 {
@@ -599,7 +575,7 @@ impl NetworkEventRouter {
                             const MAX_ENQUEUE_ATTEMPTS: usize = 3;
                             let mut backoff = std::time::Duration::from_millis(100);
                             for attempt in 1..=MAX_ENQUEUE_ATTEMPTS {
-                                match scheduler.enqueue(task.clone()).await {
+                                match scheduler.enqueue((*task).clone()).await {
                                     Ok(()) => return,
                                     Err(e) if attempt < MAX_ENQUEUE_ATTEMPTS => {
                                         tracing::warn!(
@@ -622,7 +598,7 @@ impl NetworkEventRouter {
                             }
                         });
                     }
-                    None => {
+                    Some(crate::runtime::workflow::actor::TaskResultVerdict::FinalFailure) => {
                         self.publish_remote_completion(
                             &workflow_id,
                             &task_id,
@@ -631,6 +607,35 @@ impl NetworkEventRouter {
                             &worker_node,
                         )
                         .await;
+                    }
+                    Some(crate::runtime::workflow::actor::TaskResultVerdict::Settled) => {
+                        // 失败被守卫丢弃（过期代数 / 淘汰工作流）→ 不发布；
+                        // 完成 / 取消入账 → 事件发布是提交方解析的唯一通道。
+                        if !is_failure {
+                            self.publish_remote_completion(
+                                &workflow_id,
+                                &task_id,
+                                &task_name,
+                                &outcome_wire,
+                                &worker_node,
+                            )
+                            .await;
+                        }
+                    }
+                    // 迟到重复失败（重试在途 / 已终态）或裁决解码失败：
+                    // 不发布终态——重投仍可能到达，真实终态随后会来。
+                    other => {
+                        tracing::debug!(
+                            workflow_id = %workflow_id.as_str(),
+                            task_id = %task_id.as_str(),
+                            verdict = ?other.map(|v| match v {
+                                crate::runtime::workflow::actor::TaskResultVerdict::Retry(..) => "retry",
+                                crate::runtime::workflow::actor::TaskResultVerdict::FinalFailure => "final",
+                                crate::runtime::workflow::actor::TaskResultVerdict::Settled => "settled",
+                                crate::runtime::workflow::actor::TaskResultVerdict::Ignored => "ignored",
+                            }),
+                            "ignored duplicate failure report; not publishing terminal event"
+                        );
                     }
                 }
                 true
@@ -647,7 +652,7 @@ impl NetworkEventRouter {
         }
     }
 
-    /// 将远程任务结果转换为 `TaskCompletion` 并发布到 `event_bus`。
+    /// 将远程任务结果转换为 `TaskCompletion` 并发布到 correctness 通道。
     ///
     /// 当本地无 `WorkflowActor`（如 Python `@task` 无工作流）时，
     /// 远程任务结果通过事件总线投递给 Python 层订阅者。
@@ -681,12 +686,12 @@ impl NetworkEventRouter {
                 target_node: Some(worker_node.clone()),
             },
         };
-        let bus_event = match &completion {
-            TaskCompletion::Failed { .. } => BusEvent::TaskFailed(completion),
-            TaskCompletion::Cancelled { .. } => BusEvent::TaskCancelled(completion),
-            TaskCompletion::Completed { .. } => BusEvent::TaskCompleted(completion),
+        let lifecycle_event = match completion {
+            TaskCompletion::Failed { .. } => TaskLifecycleEvent::TaskFailed(completion),
+            TaskCompletion::Cancelled { .. } => TaskLifecycleEvent::TaskCancelled(completion),
+            TaskCompletion::Completed { .. } => TaskLifecycleEvent::TaskCompleted(completion),
         };
-        self.event_bus.publish(bus_event);
+        self.result_feed.send(lifecycle_event);
     }
 }
 

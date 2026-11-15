@@ -3,7 +3,6 @@
 
 use super::*;
 use crate::common::{ActantError, NodeId, Result};
-use crate::runtime::event_bus::EventBus;
 use crate::runtime::network::{
     DirectRequest, DirectResponse, DirectResponseChannel, ListenAddresses, NetworkEvent, PeerId,
     Transport,
@@ -155,7 +154,6 @@ async fn pending_result_loop_delivers_and_stops_on_cancel() {
         3,
         Duration::from_millis(1),
         10,
-        EventBus::new(),
     );
 
     pending_tx
@@ -191,7 +189,6 @@ async fn pending_result_loop_keeps_retrying_until_accepted() {
         2,
         Duration::from_millis(1),
         10,
-        EventBus::new(),
     );
 
     pending_tx
@@ -228,7 +225,6 @@ async fn pending_result_loop_retries_even_when_attempts_exceed_max() {
         1,
         Duration::from_millis(1),
         10,
-        EventBus::new(),
     );
 
     pending_tx

@@ -34,7 +34,7 @@ use super::gil_thread::GilThread;
 pub struct PyCapabilityRuntime {
     pub(crate) inner: Arc<CapabilityRuntime>,
     pub(crate) tokio: Arc<tokio::runtime::Runtime>,
-    /// 用于 `perform_async` / `ask_async` 的 GIL 线程池，
+    /// 用于 `perform_async` 的 GIL 线程池，
     /// 将 tokio 任务结果安全地回调到 Python asyncio loop。
     gil_thread: GilThread,
 }
@@ -100,17 +100,6 @@ impl PyCapabilityRuntime {
         Ok(list)
     }
 
-    /// 决策型 effect 公开入口（Rust 内置 handler）。
-    #[pyo3(signature = (name, request))]
-    fn ask<'py>(
-        &self,
-        py: Python<'py>,
-        name: &str,
-        request: &Bound<'_, PyAny>,
-    ) -> PyResult<Option<Bound<'py, PyAny>>> {
-        dispatch_ask(py, name, request, self.inner.clone(), &self.tokio)
-    }
-
     /// 副作用型 effect 公开入口（Rust 内置 handler）。
     #[pyo3(signature = (name, request))]
     fn perform<'py>(
@@ -142,26 +131,6 @@ impl PyCapabilityRuntime {
         request: &Bound<'_, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
         dispatch_perform_async(
-            py,
-            name,
-            request,
-            self.inner.clone(),
-            self.tokio.handle().clone(),
-            &self.gil_thread,
-        )
-    }
-
-    /// 决策型 effect **异步**公开入口。
-    ///
-    /// 与 [`Self::ask`] 同理，返回 `asyncio.Future` 而非同步阻塞。
-    #[pyo3(signature = (name, request))]
-    fn ask_async<'py>(
-        &self,
-        py: Python<'py>,
-        name: &str,
-        request: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        dispatch_ask_async(
             py,
             name,
             request,
@@ -215,9 +184,10 @@ impl PyCapabilityRuntime {
     }
 }
 
-// 由 `capability_registry!` 生成 `dispatch_ask` / `dispatch_perform` / `dispatch_emit`。
+// 由 `capability_registry!` 生成 `dispatch_perform` / `dispatch_emit`。
+// ask 型 capability 当前无 Rust 内置 handler，PyO3 层不设分发入口
+// （Python `_ask_chain` 纯 Python handler 链决定结果）。
 crate::capability_registry! {
-    ask: {}
     perform: {
         "Store" => Store => super::types::StoreCodec,
     }

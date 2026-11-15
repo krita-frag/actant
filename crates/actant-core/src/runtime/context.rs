@@ -5,13 +5,13 @@
 
 use std::sync::Arc;
 
-use crate::common::wire::{CancelBroadcast, TOPIC_CANCEL};
+use crate::common::wire::{CancelBroadcast, WireEnvelope, WireMessage, TOPIC_CANCEL};
 use crate::common::{ActantConfig, ActantError, ActorId, NodeId};
 use crate::runtime::actor::ActorSystem;
 use crate::runtime::blobs::BlobStore;
 use crate::runtime::capability::CapabilityRuntime;
 use crate::runtime::dispatcher::TaskDispatcher;
-use crate::runtime::event_bus::EventBus;
+use crate::runtime::events::{EventTap, TaskLifecycleEvent, TaskResultFeed};
 use crate::runtime::network::Transport;
 use crate::runtime::state::Store;
 use crate::runtime::workflow::{Orchestrator, Worker};
@@ -25,7 +25,6 @@ type BackgroundCancels = parking_lot::Mutex<Vec<tokio::sync::watch::Sender<bool>
 /// Actant 统一运行时。
 ///
 /// 持有所有核心子系统的 `Arc` 句柄；本身廉价且 `Clone`。
-#[derive(Clone)]
 pub struct Runtime {
     node_id: NodeId,
     config: ActantConfig,
@@ -35,7 +34,14 @@ pub struct Runtime {
     workflow_actor_id: ActorId,
     worker: Option<Arc<Worker>>,
     capability: Arc<CapabilityRuntime>,
-    event_bus: EventBus,
+    /// 观测事件 tap：可丢、不反压。注入方（builder）创建，与 Worker /
+    /// dispatcher / actor 系统共享同一实例。
+    tap: EventTap,
+    /// 任务结果 correctness 通道发布端：与 Worker / 结果投递 / failover 共享。
+    result_feed: TaskResultFeed,
+    /// correctness 通道的**唯一**接收端。绑定层事件泵经
+    /// [`Self::take_result_receiver`] 一次性取走；二次取取得 `None`。
+    result_rx: parking_lot::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<TaskLifecycleEvent>>>,
     task_dispatcher: Arc<dyn TaskDispatcher>,
     /// blob 原语 facade；未启用 blob 存储时为 `None`。
     blobs: Option<Arc<BlobStore>>,
@@ -44,6 +50,30 @@ pub struct Runtime {
     orchestrator: Option<Orchestrator>,
     /// 非 Actor 化后台任务（如 capability gossip）的取消句柄集合。
     background_loop_cancels: Arc<BackgroundCancels>,
+}
+
+impl Clone for Runtime {
+    fn clone(&self) -> Self {
+        Self {
+            node_id: self.node_id.clone(),
+            config: self.config.clone(),
+            network: self.network.clone(),
+            store: self.store.clone(),
+            actor_system: self.actor_system.clone(),
+            workflow_actor_id: self.workflow_actor_id.clone(),
+            worker: self.worker.clone(),
+            capability: self.capability.clone(),
+            tap: self.tap.clone(),
+            result_feed: self.result_feed.clone(),
+            // 接收端不可克隆也不应克隆（单消费者契约）；克隆体上取接收端
+            // 恒为 None——只有原始实例能向绑定层交接泵接收端。
+            result_rx: parking_lot::Mutex::new(None),
+            task_dispatcher: self.task_dispatcher.clone(),
+            blobs: self.blobs.clone(),
+            orchestrator: self.orchestrator.clone(),
+            background_loop_cancels: self.background_loop_cancels.clone(),
+        }
+    }
 }
 
 impl Runtime {
@@ -91,7 +121,12 @@ impl Runtime {
         workflow_actor_id: ActorId,
         worker: Option<Arc<Worker>>,
         capability: Arc<CapabilityRuntime>,
-        event_bus: EventBus,
+        tap: EventTap,
+        // correctness 通道（发布端 + 唯一接收端）。builder 创建后分三路：
+        // 发布端给 Worker / failover，接收端存入本 Runtime 等待绑定层泵
+        // 经 `take_result_receiver` 取走。
+        result_feed: TaskResultFeed,
+        result_rx: tokio::sync::mpsc::UnboundedReceiver<TaskLifecycleEvent>,
         task_dispatcher: Arc<dyn TaskDispatcher>,
         blobs: Option<Arc<BlobStore>>,
     ) -> Self {
@@ -104,7 +139,9 @@ impl Runtime {
             workflow_actor_id,
             worker,
             capability,
-            event_bus,
+            tap,
+            result_feed,
+            result_rx: parking_lot::Mutex::new(Some(result_rx)),
             task_dispatcher,
             blobs,
             orchestrator: None,
@@ -172,8 +209,23 @@ impl Runtime {
         &self.capability
     }
 
-    pub fn event_bus(&self) -> &EventBus {
-        &self.event_bus
+    pub fn tap(&self) -> &EventTap {
+        &self.tap
+    }
+
+    /// correctness 通道发布端克隆（Worker / failover / 结果投递接线用）。
+    pub fn result_feed(&self) -> TaskResultFeed {
+        self.result_feed.clone()
+    }
+
+    /// 一次性取走 correctness 通道的唯一接收端。
+    ///
+    /// 绑定层事件泵启动时调用；二次调用返回 `None`（correctness 通道语义上
+    /// 只允许一个消费者——多回调 fan-out 由泵内部实现，而不是多接收端）。
+    pub fn take_result_receiver(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<TaskLifecycleEvent>> {
+        self.result_rx.lock().take()
     }
 
     pub fn task_dispatcher(&self) -> &Arc<dyn TaskDispatcher> {
@@ -200,11 +252,13 @@ impl Runtime {
         task_id: &str,
         workflow_id: &str,
     ) -> crate::common::Result<()> {
-        let msg = CancelBroadcast {
+        // 载荷经 `WireEnvelope` 封装：签名集群下随 MAC 验证，与其他控制面
+        // 消息同管线（裸 postcard 旁路可被任意 mesh 成员伪造取消）。
+        let envelope = WireEnvelope::wrap(WireMessage::CancelBroadcast(CancelBroadcast {
             task_id: task_id.into(),
             workflow_id: workflow_id.into(),
-        };
-        let bytes = postcard::to_allocvec(&msg)
+        }))?;
+        let bytes = postcard::to_allocvec(&envelope)
             .map_err(|e| ActantError::Serialization(format!("cancel broadcast encode: {e}")))?;
         self.network.broadcast(TOPIC_CANCEL, bytes).await
     }
@@ -217,9 +271,10 @@ impl Runtime {
     pub async fn shutdown(&self) -> crate::common::Result<()> {
         use crate::common::ActorId;
 
-        // 每个 actor stop 设超时，确保 network.shutdown() 总能被执行。
-        // actor stop 卡住时（如网络阻塞），放弃等待——endpoint.close() 会使
-        // 其网络调用自然失败。超时由 config.actor.stop_timeout_ms 控制。
+        // 每个 actor stop 设超时并**中止**卡死任务（`stop_timeout`：超时后
+        // abort + await，mailbox 已注销，残留 actor 不会继续消费消息），确保
+        // network.shutdown() 总能被执行。超时由 config.actor.stop_timeout_ms
+        // 控制；endpoint.close() 使卡在网络调用上的 actor 自然失败。
         let stop_timeout = std::time::Duration::from_millis(self.config.actor.stop_timeout_ms);
 
         // 0. 先取消非 Actor 化的后台循环（如 capability gossip），
@@ -253,33 +308,38 @@ impl Runtime {
             .await;
             if let Some(sched_id) = worker.scheduler_actor_id() {
                 // 同上：scheduler actor stop 超时由 tokio drop 兜底。
-                let _ = tokio::time::timeout(stop_timeout, self.actor_system.stop(sched_id)).await;
+                let _ = self.actor_system.stop_timeout(sched_id, stop_timeout).await;
             }
         }
 
         // 2. 停止 FailoverActor（停止心跳/故障检测循环）。
         // 超时丢弃：actor 内部 on_stop 已尝试 flush，超时表示卡死，由 tokio drop 收尾。
         let failover_id = ActorId::failover(&self.node_id);
-        let _ = tokio::time::timeout(stop_timeout, self.actor_system.stop(&failover_id)).await;
+        let _ = self
+            .actor_system
+            .stop_timeout(&failover_id, stop_timeout)
+            .await;
 
         // 3. 停止 DagGossipActor。
         // 超时丢弃：gossip actor 无持久化状态，卡死由 tokio drop 收尾。
         let dag_gossip_id = ActorId::dag_gossip(&self.node_id);
-        let _ = tokio::time::timeout(stop_timeout, self.actor_system.stop(&dag_gossip_id)).await;
+        let _ = self
+            .actor_system
+            .stop_timeout(&dag_gossip_id, stop_timeout)
+            .await;
 
         // 4. 停止 WorkflowActor（on_stop 取消 timeout/persist 循环）。
         // 超时丢弃：on_stop 已尝试 flush_dirty，超时表示 IO 卡死，由 tokio drop 收尾。
-        let _ = tokio::time::timeout(
-            stop_timeout,
-            self.actor_system.stop(&self.workflow_actor_id),
-        )
-        .await;
+        let _ = self
+            .actor_system
+            .stop_timeout(&self.workflow_actor_id, stop_timeout)
+            .await;
 
         // 5. 停止所有 CapabilityActor（按注册名）。
         // 超时丢弃：capability actor 通常无副作用，卡死由 tokio drop 收尾。
         for meta in self.capability.capabilities() {
             let cap_id = ActorId::capability(meta.name);
-            let _ = tokio::time::timeout(stop_timeout, self.actor_system.stop(&cap_id)).await;
+            let _ = self.actor_system.stop_timeout(&cap_id, stop_timeout).await;
         }
 
         // 6. 关闭任务分发器线程池（等待在途任务完成或超时放弃 join）。

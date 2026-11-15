@@ -39,6 +39,11 @@ Rust / Python 侧拼装。因此「有哪些缝」直接看 `RuntimeBuilder::wit
 「跨节点可用」只对 Rust 缝成立：实现随引擎部署，workflow failover 后仍在本节点
 可用；Python handler 是进程内对象，不随工作流迁移。
 
+`Transport` 与 `Discovery` **互斥**：`Discovery` 的唯一消费者是内置 `NetworkManager`
+（`with_identity` 的最后一个参数）。注入 `Transport` 后 `NetworkManager` 不再构造，
+`Discovery` 无任何作用点，因此二者同时注入会在 `build()` 启动期返回 `Config` 错误，
+而不是静默丢弃后者。
+
 **统一的是词汇，不是调用路径**。所有扩展共用 capability / handler / effect 词汇，
 但按解析时机分两个执行域：
 
@@ -225,7 +230,7 @@ worker 子进程（或任意语言的自定义 worker）与父进程经 **stdio*
 
 - Rust 核心**不感知**宿主语言的参数语义（args/kwargs/TaskRef 等）；tag 常量仅用于 `unpack_payload` 内部校验，不构成跨语言契约。
 - `pack_group` 供 Python 侧与 Rust orchestrator 构建分组 payload。
-- 所有任务 payload 序列化后签名、反序列化前验证，阻止被攻破的节点向集群投递恶意 cloudpickle payload。
+- payload 签名是**条件性**承诺：配置 `payload_signing_key`（非空）后，所有任务 payload 序列化后签名、反序列化前验证，阻止被攻破的节点向集群投递恶意 cloudpickle payload；`Runtime.production()` 强制开启。**默认配置（空密钥）不签名**——任意来源的 payload 都被接受，多节点/公网部署必须显式启用（cloudpickle 反序列化即任意代码执行）。
 
 ## 四、子工作流组合模式
 
@@ -270,4 +275,4 @@ def parent_step(x):
 | 自动放置 | `TaskDefinition.tags` + `RoutePolicy -> RouteDecision` | `Local` 前强制校验本地 `node_labels ⊇ tags`；不匹配走 `Remote` 或 `Defer`（退避重入队），超过 `starvation_timeout_ms` 失败。路由只是**放置建议**，执行节点的本地闸是硬约束 |
 | batch 进度 | `BatchTracker` / `submit_batch(batch_id=...)` / `Runtime.batch_progress` | 内存态成员索引 + 幂等终态结算；Rust 侧无法区分业务失败（结果正文不透明），终态由能解析 payload 的 Python 结果泵上报；不落盘 |
 | 命名配额 | `TaskDefinition.quota` + `WorkerConfig.node_quotas` + `QuotaTracker` | 单维命名容量（`gpu` / license / 环境名），执行节点本地原子扣减、`QuotaGuard` RAII 归还；剩余容量随心跳广播供路由跳过已满节点；**多维资源准入不进核心**（L3 用 label + 配额组合） |
-| 逐任务日志 | `EventBus::subscribe_task_logs(task_id)` / `Runtime.on_task_log(task_id=...)` | 与全局 `TaskLog` 话题并存的 tap 通道，满即丢；不承载正确性语义 |
+| 逐任务日志 | `Runtime.on_task_log(task_id=...)` | 观测 tap 上的日志流按 `task_id` 在泵内过滤；满即丢（lag 跳过），不承载正确性语义 |

@@ -11,8 +11,6 @@
 //! 该原语不落盘：batch 进度是可重建的观测状态，进程重启后由重新提交方
 //! 重新注册。需要持久化审计的部署应由第 3 层消费事件自行落库。
 
-use std::collections::HashSet;
-
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 
@@ -156,10 +154,6 @@ impl BatchTracker {
     }
 
     /// 当前跟踪的 batch 数量。
-    pub fn len(&self) -> usize {
-        self.batches.len()
-    }
-
     /// 是否没有任何 batch。
     pub fn is_empty(&self) -> bool {
         self.batches.is_empty()
@@ -183,7 +177,6 @@ fn progress_from(batch_id: &str, state: &BatchState) -> BatchProgress {
 }
 
 /// 成员集合类型别名，供调用方构造注册参数。
-pub type BatchMembers = HashSet<TaskId>;
 
 #[cfg(test)]
 #[path = "../../../../tests/rust/unit/runtime/batch.rs"]

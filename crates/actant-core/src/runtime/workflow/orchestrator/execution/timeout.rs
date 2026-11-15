@@ -1,11 +1,10 @@
 //! 时间驱动的后台扫描：工作流级硬超时 + `Timer` 等待点到期。
 //!
 //! 与 `execution.rs` 的状态迁移逻辑分离：本模块只做周期轮询，把到期事实
-//! 转成 `Failed` / `TimerFired` 事件与取消广播，不参与 admission / readiness。
+//! 转成 `Failed` / `TimerFired` 事件与取消广播（双腿广播实现在
+//! [`Orchestrator::broadcast_task_cancel`]），不参与 admission / readiness。
 
-use crate::common::wire::TOPIC_CANCEL;
 use crate::common::{TaskId, WorkflowId};
-use crate::runtime::network::{NetworkEvent, NetworkMessage};
 use crate::runtime::workflow::{Phase, Terminal};
 
 use super::super::Orchestrator;
@@ -21,7 +20,6 @@ impl Orchestrator {
     pub fn start_timeout_watcher(&self) -> tokio::sync::watch::Sender<bool> {
         let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
         let state = self.state.clone();
-        let network = self.network.clone();
         // 等待点到期扫描（`poll_expired_timers`）需要一条不依赖 `&self`
         // 的调用入口——spawn 闭包有 `'static` 约束，无法借用 `self`。这里整体克隆
         // 一个 `Orchestrator` 句柄带进闭包：其字段全是 `Arc`/轻量值（`Store`、
@@ -88,59 +86,13 @@ impl Orchestrator {
                         }
                         // 广播取消消息。即使持久化失败也要尝试取消，否则运行中的
                         // 任务会继续占用 Worker 槽位直到自身完成或超时。
-                        //
-                        // 注意这里有**两条腿**，缺一不可：
-                        // - `broadcast` 走 gossip，只到邻居——管远端执行的任务；
-                        // - `inject_local_event` 把同一份字节投回本节点事件通道，
-                        //   管本节点自己执行的任务。gossip **不会**把消息发回发送者，
-                        //   所以只广播不做自投递时，本节点在途任务不会被取消：工作流
-                        //   已标 Failed，而阻塞在任务等待上的 flow 体永久挂起（实测
-                        //   本地句柄 10s 观察窗内始终 running）。
-                        // 自投递复用 `NetworkEventRouter` 的 `TopicRoute::Cancel`
-                        // 分支，与远端收到广播后的处理**完全同路**，避免本地/远端
-                        // 行为漂移。
-                        if let Some(ref network) = network {
-                            for (wf_id, task_id) in &cancels_to_broadcast {
-                                let msg = crate::common::wire::CancelBroadcast {
-                                    task_id: task_id.clone(),
-                                    workflow_id: wf_id.clone(),
-                                };
-                                let bytes = match postcard::to_allocvec(&msg) {
-                                    Ok(bytes) => bytes,
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            workflow_id = %wf_id,
-                                            task_id = %task_id,
-                                            error = %e,
-                                            "failed to encode CancelBroadcast for timed-out workflow task"
-                                        );
-                                        continue;
-                                    }
-                                };
-                                if let Err(e) =
-                                    network.broadcast(TOPIC_CANCEL, bytes.clone()).await
-                                {
-                                    tracing::warn!(
-                                        workflow_id = %wf_id,
-                                        task_id = %task_id,
-                                        error = %e,
-                                        "failed to broadcast cancel for timed-out workflow task"
-                                    );
-                                }
-                                if !network.inject_local_event(NetworkEvent::Message(
-                                    NetworkMessage {
-                                        topic: TOPIC_CANCEL.to_string(),
-                                        data: bytes,
-                                    },
-                                )) {
-                                    tracing::warn!(
-                                        workflow_id = %wf_id,
-                                        task_id = %task_id,
-                                        "failed to self-deliver cancel for timed-out workflow task; \
-                                         a locally running task may not be released"
-                                    );
-                                }
-                            }
+                        // 双腿广播（gossip + 本地自投递）的实现与语义说明见
+                        // [`Orchestrator::broadcast_task_cancel`]——与用户级
+                        // `cancel` 共用同一实现，避免两类入口行为漂移。
+                        for (wf_id, task_id) in &cancels_to_broadcast {
+                            orchestrator
+                                .broadcast_task_cancel(wf_id, task_id)
+                                .await;
                         }
 
                         // 扫描到期的 `Timer` 等待点。

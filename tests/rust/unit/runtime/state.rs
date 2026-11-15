@@ -147,14 +147,6 @@ fn store_overwrite_existing_key() {
 }
 
 #[test]
-fn store_prepare_close_returns_event() {
-    let dir = tempdir().unwrap();
-    let store = LmdbStore::open(dir.path()).unwrap();
-    let _event = store.prepare_close();
-    // 调用即可，无需等待完成
-}
-
-#[test]
 fn lmdb_store_clone_shares_underlying_env() {
     let dir = tempdir().unwrap();
     let store = LmdbStore::open(dir.path()).unwrap();
@@ -230,13 +222,6 @@ async fn async_store_scan_prefix_last_returns_last() {
     assert!(last.is_some());
     let (key, _) = last.unwrap();
     assert_eq!(key, "p:2");
-}
-
-#[tokio::test]
-async fn async_store_prepare_close_returns_event() {
-    let dir = tempdir().unwrap();
-    let store = Store::open(dir.path()).await.unwrap();
-    let _event = store.prepare_close().await.unwrap();
 }
 
 // ───────────────────────── HlcTimestamp / HybridLogicalClock 扩展测试 ─────────────────────────

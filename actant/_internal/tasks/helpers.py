@@ -575,18 +575,10 @@ def _safe_serialize(
     return envelope
 
 
-def _pickle_exception(exc: BaseException) -> bytes:
-    """序列化异常，不可序列化时退化为携带类型与消息的 RuntimeError。"""
-    try:
-        return cast(bytes, cloudpickle.dumps(exc))
-    except Exception:
-        return cast(bytes, cloudpickle.dumps(RuntimeError(f"{type(exc).__name__}: {exc}")))
-
-
 def _ensure_picklable(exc: BaseException) -> BaseException:
     """确保异常可序列化，不可序列化时退化为携带类型与消息的 RuntimeError。
 
-    与 ``_pickle_exception`` 配套：``_pickle_exception`` 返回 bytes（用于
+    返回 bytes（用于
     直接存入 _error_payload），``_ensure_picklable`` 返回对象（用于
     ``_execute_with_retries`` 的 ``(False, exc_obj)`` 返回值，由调用方
     统一序列化跨 Rust 边界）。
@@ -691,7 +683,7 @@ def _emit_task_event(
         on_error: ``log``（默认）仅记录 warning；``raise`` 立即抛出；
             ``collect`` 记录并返回异常。
         silent: ``True`` 时跳过事件发布。用于 ``@task(silent=True)`` 等场景，
-            避免每个 task 产生 started/completed 事件造成 event_bus 噪声。
+            避免每个 task 产生 started/completed 事件造成结果泵噪声。
             批量提交/低优先级任务可启用此选项以提升吞吐。
             注意作用范围：worker 子进程内恒传 ``True``（子进程独立于父 runtime，
             不能依赖其事件通道）；``@task(silent=True)`` 的抑制由提交方在结果
@@ -741,7 +733,6 @@ __all__ = [
     "_interruptible_sleep",
     "_invoke_callback",
     "_invoke_callbacks",
-    "_pickle_exception",
     "_safe_serialize",
     "_suppress_pickle_errors",
 ]

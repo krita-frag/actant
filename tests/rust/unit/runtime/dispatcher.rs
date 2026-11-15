@@ -277,8 +277,8 @@ mod read_frame {
 //
 // 取消轮询器契约（TOCTOU 防护）：若结果臂在 poller「检查 active 之后、写 Cancel 帧之前」
 // 释放 worker 复用，过期 Cancel 帧会滞留在复用 worker 的 stdin 上误杀下一任务。契约：
-//   1) 所有处置 worker 的路径必须经 `stop_cancel_poller`（abort + 等待退出）后才
-//      释放/复用 worker；
+//   1) 所有处置 worker 的路径必须经 `stop_cancel_poller`（shutdown + 等待写端归还）
+//      后才释放/复用 worker；
 //   2) `stop_cancel_poller` 返回 `maybe_written == false` ⇒ worker stdin 上不可能
 //      残留任何字节；返回 `true` ⇒ 可能残留（完整或部分）Cancel 帧，必须回收。
 // 以下测试用真实 pipe 模拟 worker stdin 验证该不变量（仅 Unix：Cancel 帧走
@@ -322,24 +322,26 @@ mod cancel_poller {
         }
     }
 
-    fn spawn(
-        write_end: tokio::fs::File,
-        flag: &CancelFlag,
-    ) -> (
+    /// poller 测试脚手架的返回元组：shutdown 发送端、poller 句柄、写端归还
+    /// 接收端、active 与 writing 共享标记。
+    type PollerFixture = (
+        tokio::sync::oneshot::Sender<()>,
         tokio::task::JoinHandle<()>,
         tokio::sync::oneshot::Receiver<Option<tokio::fs::File>>,
         Arc<AtomicBool>,
         Arc<AtomicBool>,
-    ) {
+    );
+
+    fn spawn(write_end: tokio::fs::File, flag: &CancelFlag) -> PollerFixture {
         let active = Arc::new(AtomicBool::new(true));
         let writing = Arc::new(AtomicBool::new(false));
-        let (handle, rx) = ProcessTaskDispatcher::spawn_cancel_poller(
+        let (handle, rx, shutdown_tx) = ProcessTaskDispatcher::spawn_cancel_poller(
             Some(write_end),
             flag.clone(),
             active.clone(),
             writing.clone(),
         );
-        (handle, rx, active, writing)
+        (shutdown_tx, handle, rx, active, writing)
     }
 
     /// flag 置位且 active 为真：poller 必须写出完整 Cancel 帧，并通过 writing
@@ -349,7 +351,7 @@ mod cancel_poller {
         let (read_fd, write_end) = pipe_fixture();
         let flag = new_cancel_flag();
         flag.store(true, Ordering::Relaxed);
-        let (handle, rx, _active, writing) = spawn(write_end, &flag);
+        let (_shutdown_tx, handle, rx, _active, writing) = spawn(write_end, &flag);
 
         let (cancel_stdin, maybe_written) = tokio::time::timeout(Duration::from_secs(2), async {
             let cs = rx.await.expect("poller must hand back cancel_stdin");
@@ -377,7 +379,7 @@ mod cancel_poller {
         let (read_fd, write_end) = pipe_fixture();
         let flag = new_cancel_flag();
         flag.store(true, Ordering::Relaxed);
-        let (handle, rx, active, writing) = spawn(write_end, &flag);
+        let (_shutdown_tx, handle, rx, active, writing) = spawn(write_end, &flag);
         active.store(false, Ordering::Relaxed);
 
         let (cancel_stdin, maybe_written) = tokio::time::timeout(Duration::from_secs(2), async {
@@ -406,12 +408,13 @@ mod cancel_poller {
         for _ in 0..200 {
             let (read_fd, write_end) = pipe_fixture();
             let flag = new_cancel_flag();
-            let (canceller, rx, _active, writing) = spawn(write_end, &flag);
+            let (shutdown_tx, canceller, rx, _active, writing) = spawn(write_end, &flag);
 
-            // 结果臂：立即声明会话结束，随后必须等待 poller 退出。
-            //（stop_cancel_poller 内部 abort + await，返回后 poller 不可能再写。）
+            // 结果臂：立即声明会话结束，随后必须等待 poller 归还写端退出。
+            //（stop_cancel_poller 内部 shutdown + await，返回后 poller 不可能再写。）
             let (cancel_stdin, maybe_written) =
-                ProcessTaskDispatcher::stop_cancel_poller(canceller, rx, &writing).await;
+                ProcessTaskDispatcher::stop_cancel_poller(shutdown_tx, canceller, rx, &writing)
+                    .await;
             drop(cancel_stdin);
 
             assert!(
@@ -436,13 +439,14 @@ mod cancel_poller {
         for i in 0..200 {
             let (read_fd, write_end) = pipe_fixture();
             let flag = new_cancel_flag();
-            let (canceller, rx, _active, writing) = spawn(write_end, &flag);
+            let (shutdown_tx, canceller, rx, _active, writing) = spawn(write_end, &flag);
             if i % 2 == 0 {
                 flag.store(true, Ordering::Relaxed);
             }
 
             let (cancel_stdin, maybe_written) =
-                ProcessTaskDispatcher::stop_cancel_poller(canceller, rx, &writing).await;
+                ProcessTaskDispatcher::stop_cancel_poller(shutdown_tx, canceller, rx, &writing)
+                    .await;
             drop(cancel_stdin);
 
             if maybe_written {
@@ -559,6 +563,122 @@ async fn dispatch_retries_once_when_worker_stdin_is_closed() {
     d.shutdown();
     let _ = std::fs::remove_file(&state);
     let _ = std::fs::remove_file(&ready);
+}
+
+/// 回归（cancel_stdin 丢失）：复用 worker 的第二个任务取消时，poller 必须仍持有
+/// 独立取消写端——协作 worker 在宽限期内以结果帧响应（结果臂赢得并发），
+/// worker 复用而非「宽限耗尽 + 杀进程 + 替补」。写端只在 poller future 内，
+/// 若依赖 abort 结束 poller，fd 随 future drop 关闭且复用路径不会重建。
+#[cfg(unix)]
+#[tokio::test]
+async fn reused_worker_keeps_cooperative_cancel() {
+    let base = std::env::temp_dir().join(format!("actant-dispatch-coop-{}", std::process::id()));
+    let counter = base.with_extension("cnt");
+    let seen_prefix = base.with_extension("seen");
+    let seen1 = std::path::PathBuf::from(format!("{}.1", seen_prefix.display()));
+    let seen2 = std::path::PathBuf::from(format!("{}.2", seen_prefix.display()));
+    let _ = std::fs::remove_file(&counter);
+    let _ = std::fs::remove_file(&seen1);
+    let _ = std::fs::remove_file(&seen2);
+
+    // 帧协议 sh worker：每轮消费一个 Dispatch 帧（单次 read 返回整帧）；首个
+    // 任务立即回空结果帧，后续任务等 Cancel 帧（5 字节）到达后再回结果帧
+    // （协作取消的响应路径，与 Python worker 契约一致）。
+    //
+    // `seen.$n` 必须在**消费掉 Dispatch 帧之后**才创建：测试侧据此置取消标志。
+    // 若写在 read 之前，标志可能在派发帧仍留在管道时就已置位，取消帧与派发帧
+    // 会一起被同一次 `dd bs=4096` 吞掉，worker 随后的 5 字节 read 永远等不到
+    // 数据——协作取消退化成「宽限耗尽 + 强杀」，测的就不是生产行为了。
+    let script = r#"
+while : ; do
+  n=$(cat "$ACTANT_COOP_COUNT" 2>/dev/null || echo 0)
+  n=$((n+1)); echo $n > "$ACTANT_COOP_COUNT"
+  dd bs=4096 count=1 of=/dev/null 2>/dev/null
+  : > "$ACTANT_COOP_SEEN.$n"
+  if [ "$n" != "1" ]; then
+    dd bs=5 count=1 of=/dev/null 2>/dev/null
+  fi
+  printf '\001\000\000\000\002'
+done
+"#;
+    let mut env = BTreeMap::new();
+    env.insert(
+        "ACTANT_COOP_COUNT".to_string(),
+        counter.to_string_lossy().into_owned(),
+    );
+    env.insert(
+        "ACTANT_COOP_SEEN".to_string(),
+        seen_prefix.to_string_lossy().into_owned(),
+    );
+    let d = ProcessTaskDispatcher::new(1, sh_worker(script, env), 1500, TEST_KEY.to_vec(), None)
+        .unwrap();
+
+    // 任务一正常完成：worker 经结果臂归还复用，**写端必须一并归还**——
+    // 这是本回归的核心断言（旧实现靠 abort 结束 poller，写端 fd 随 future
+    // drop 关闭，复用 worker 的 cancel_stdin 恒为 None）。
+    d.dispatch(
+        "one",
+        signed(b"payload"),
+        new_cancel_flag(),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("first task completes");
+    assert!(
+        d.free_workers
+            .lock()
+            .front()
+            .is_some_and(|w| w.cancel_stdin.is_some()),
+        "reused worker must retain its cancel_stdin write end"
+    );
+
+    // 任务二：等 worker 消费掉 Dispatch 帧（pipe 干净）后再置取消标志，
+    // 保证 poller 写入的 Cancel 帧是 worker 的下一个输入。
+    let flag = new_cancel_flag();
+    let setter = {
+        let flag = flag.clone();
+        let seen2 = seen2.clone();
+        tokio::spawn(async move {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !seen2.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "worker did not consume the second dispatch frame"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            flag.store(true, Ordering::Relaxed);
+        })
+    };
+    let started = std::time::Instant::now();
+    let result = d
+        .dispatch(
+            "two",
+            signed(b"payload"),
+            flag.clone(),
+            Duration::from_secs(5),
+        )
+        .await;
+    setter.await.expect("flag setter must not panic");
+
+    // 协作取消：worker 以结果帧响应 → dispatch 正常返回，耗时远小于宽限期。
+    // 写过 Cancel 帧的 worker 会被回收替补（无法排除残留帧，既有 TOCTOU 设计），
+    // 因此不断言 pid 复用；「写端归还」已由任务一后的断言锁定。
+    assert!(
+        result.is_ok(),
+        "cooperative cancel must resolve via result frame, got: {:?}",
+        result.err()
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(1000),
+        "cooperative cancel must beat the 1500ms grace window, took {:?}",
+        started.elapsed()
+    );
+
+    d.shutdown();
+    let _ = std::fs::remove_file(&counter);
+    let _ = std::fs::remove_file(&seen1);
+    let _ = std::fs::remove_file(&seen2);
 }
 
 /// 替补失败必须收缩信号量：worker 被永久丢弃而许可照常归还的话，后续

@@ -106,7 +106,7 @@ class _CompletionFuture:
 class AsyncResult:
     """异步任务结果句柄。
 
-    基于 ``_CompletionFuture`` 实现，由 Rust event_bus 回调
+    基于 ``_CompletionFuture`` 实现，由 Rust 结果通道回调
     （``Runtime._on_task_result``）在任务完成时设置结果。
 
     分布式语义：任务由 Worker 执行，结果通过 P2P 网络回传后触发回调。

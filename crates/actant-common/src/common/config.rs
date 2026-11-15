@@ -152,7 +152,6 @@ pub struct ActantConfig {
     pub store: StoreConfig,
     pub failover: FailoverConfig,
     pub gossip: GossipConfig,
-    pub event_bus: EventBusConfig,
     /// 任务 payload 签名密钥。
     ///
     /// - 非空时：所有任务 payload 使用 BLAKE3 keyed hash 签名，反序列化前验证签名，
@@ -416,7 +415,8 @@ pub struct NetworkConfig {
     pub bootstrap_nodes: Vec<String>,
     /// 节点间可接受的最大时钟漂移（毫秒）。
     pub hlc_max_drift_ms: u64,
-    /// 拒绝新请求前允许的最大待处理直连请求-响应调用数。
+    /// 并发直连请求-响应调用的排队上限：超出上限的调用在信号量上等待
+    /// （受调用方超时钳制），不会被拒绝。
     pub max_pending_direct_requests: usize,
     /// 订阅后加入 gossip 话题的对端 endpoint ID 列表。
     /// 建立 gossip 订阅时通过 `GossipSender::join_peers` 自动添加这些对端。
@@ -629,31 +629,6 @@ impl Default for StoreConfig {
     }
 }
 
-/// EventBus 配置（纯配置结构，与 runtime 无依赖）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EventBusConfig {
-    /// 每个订阅者的默认通道容量。
-    #[serde(default = "default_subscriber_capacity")]
-    pub subscriber_capacity: usize,
-}
-
-impl EventBusConfig {
-    /// 默认订阅者通道容量。
-    pub const DEFAULT_SUBSCRIBER_CAPACITY: usize = 256;
-}
-
-fn default_subscriber_capacity() -> usize {
-    EventBusConfig::DEFAULT_SUBSCRIBER_CAPACITY
-}
-
-impl Default for EventBusConfig {
-    fn default() -> Self {
-        Self {
-            subscriber_capacity: EventBusConfig::DEFAULT_SUBSCRIBER_CAPACITY,
-        }
-    }
-}
-
 /// 故障转移相关时序参数。
 ///
 /// # 参数关系
@@ -687,7 +662,7 @@ impl Default for EventBusConfig {
 ///
 /// # 故障转移时序示例
 ///
-/// 默认值（`heartbeat=2s, failure=8s, lease=16s, check=30s`）下的典型流程：
+/// 默认值（`heartbeat=2s, failure=8s, lease=16s, check=4s`）下的典型流程：
 ///
 /// ```text
 /// t=0s    节点 A 持有工作流 W 的租约（有效期至 t=16s）
@@ -713,7 +688,9 @@ pub struct FailoverConfig {
     /// 必须严格大于 `heartbeat_interval_ms`，严格小于 `lease_duration_ms`。
     pub failure_timeout_ms: u64,
     /// 租约过期扫描周期（**秒**）。注意与其他参数的单位差异。
-    /// 建议此值（换算为毫秒）不超过 `lease_duration_ms / 2`。
+    /// 必须满足（换算为毫秒）`* 1000 <= lease_duration_ms / 2`——默认
+    /// 参数下即 ≤ 8s。违反该约束时失效租约滞留、本节点活跃租约过期后
+    /// 长期处于「无有效租约仍在驱动」状态，双主窗口被放大。
     pub lease_expiry_check_interval_secs: u64,
     /// 工作流租约时长（毫秒）。默认 16000ms（固定值，不随
     /// `failure_timeout_ms` 推导）。必须严格大于 `failure_timeout_ms`，
@@ -731,7 +708,9 @@ impl Default for FailoverConfig {
         Self {
             heartbeat_interval_ms: 2000,
             failure_timeout_ms: 8000,
-            lease_expiry_check_interval_secs: 30,
+            // 4s 满足 validate 的 `<= lease_duration_ms / 2` 约束（默认
+            // lease 16s）：失效租约滞留上界被钳在半个租期内。
+            lease_expiry_check_interval_secs: 4,
             lease_duration_ms: default_lease_duration_ms(),
         }
     }
@@ -750,6 +729,9 @@ impl FailoverConfig {
     /// 3. `lease_duration_ms > failure_timeout_ms`：租约时长必须大于故障检测阈值，
     ///    防止双主。
     /// 4. `lease_expiry_check_interval_secs > 0`：扫描周期必须为正。
+    /// 5. `lease_expiry_check_interval_secs * 1000 <= lease_duration_ms / 2`：
+    ///    扫描周期超过半个租期时，失效租约滞留与本节点「无有效租约仍在驱动」
+    ///    的双主窗口被放大（字段文档约束升级为强制）。
     pub fn validate(&self) -> Result<(), crate::common::ActantError> {
         if self.heartbeat_interval_ms == 0 {
             return Err(crate::common::ActantError::Config(format!(
@@ -773,6 +755,16 @@ impl FailoverConfig {
             return Err(crate::common::ActantError::Config(format!(
                 "failover.lease_expiry_check_interval_secs must be > 0, got {}",
                 self.lease_expiry_check_interval_secs
+            )));
+        }
+        if self.lease_expiry_check_interval_secs * 1000 > self.lease_duration_ms / 2 {
+            return Err(crate::common::ActantError::Config(format!(
+                "failover.lease_expiry_check_interval_secs ({}) must satisfy \
+                 {}ms <= lease_duration_ms / 2 ({}), to keep stale-lease latency \
+                 within half a lease period",
+                self.lease_expiry_check_interval_secs,
+                self.lease_expiry_check_interval_secs * 1000,
+                self.lease_duration_ms / 2
             )));
         }
         Ok(())

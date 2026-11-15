@@ -103,7 +103,7 @@ fn set_capacities_keeps_in_use_units_on_shrink() {
     let _held = t.try_acquire(Some("gpu")).unwrap().unwrap();
     // 4 容量扣 1 → 3 剩余；缩到 2 时在用的 1 仍占用，剩余应为 1。
     t.set_capacities([("gpu".to_string(), 2)].into_iter().collect());
-    assert_eq!(t.capacities().get("gpu"), Some(&2));
+    // 通过剩余容量验证配置生效（capacities() 读出口已随 API 收缩移除）。
     assert_eq!(t.available_map().get("gpu"), Some(&1));
 }
 

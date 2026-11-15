@@ -11,7 +11,7 @@ use crate::common::{
     ActantError, ActorConfig, ActorId, ActorMessage, ActorMessageResult, ActorStatus, MessageId,
     NodeId, Result,
 };
-use crate::runtime::event_bus::EventBus;
+use crate::runtime::events::EventTap;
 
 struct EchoActor {
     received: Arc<StdMutex<Vec<String>>>,
@@ -314,6 +314,89 @@ async fn call_times_out_when_actor_handler_hangs() {
     );
 }
 
+/// 邮箱满时 `call` 必须在等待上限内返回，而不是阻塞在投递段。
+///
+/// 与上一条用例的区别：actor 卡死且应答不来，`timeout(rx)` 也能超时——那条
+/// 用例对「投递是否受上限约束」没有判别力。真正的死锁形态是：actor 永久挂起
+/// ⇒ 邮箱不再被取空 ⇒ 有界邮箱填满 ⇒ `registry.send` 在容量释放前无限期
+/// await。绑定层在释放 GIL 后 `block_on` 该调用，此时整个 Python 线程永久挂起。
+#[tokio::test]
+async fn call_times_out_when_mailbox_is_full() {
+    /// 进入处理即置位通知（此后邮箱不再被取空），随即永久挂起。
+    struct StalledActor {
+        entered: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl Actor for StalledActor {
+        fn actor_type(&self) -> &str {
+            "stalled"
+        }
+
+        async fn handle_message(&mut self, _msg: ActorMessage) -> Result<ActorMessageResult> {
+            self.entered.notify_one();
+            std::future::pending::<Result<ActorMessageResult>>().await
+        }
+    }
+
+    let system = ActorSystem::new()
+        .with_config(ActorConfig {
+            mailbox_capacity: 1,
+            ..Default::default()
+        })
+        .with_call_timeout(std::time::Duration::from_millis(50));
+    let actor_id = ActorId::from("full-mailbox-1");
+    let entered = Arc::new(tokio::sync::Notify::new());
+    system
+        .spawn(
+            actor_id.clone(),
+            StalledActor {
+                entered: entered.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+    // 第一条被 actor 取走后永久挂起：邮箱空出，但不再有任何取走动作。
+    system
+        .send(
+            &actor_id,
+            ActorMessage::new(actor_id.clone(), "stall".into(), vec![]),
+        )
+        .await
+        .unwrap();
+    entered.notified().await;
+
+    // 占满唯一的邮箱槽位；这条消息永远不会被取出。
+    system
+        .send(
+            &actor_id,
+            ActorMessage::new(actor_id.clone(), "fill".into(), vec![]),
+        )
+        .await
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    // 外层 2s 兜底：投递段不受上限约束时本用例必须以「永不返回」失败，
+    // 而不是把测试挂死（CI 上表现为整个测试二进制超时）。
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        system.call(&actor_id, "blocked", vec![]),
+    )
+    .await
+    .expect("call 必须在上限内返回，不得阻塞在投递段");
+    let err = outcome.unwrap_err();
+    assert!(
+        matches!(err, ActantError::Timeout(_)),
+        "邮箱满时应返回可诊断超时，实际: {err:?}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "50ms 上限却阻塞了 {:?}",
+        started.elapsed()
+    );
+}
+
 #[tokio::test]
 async fn call_returns_error_when_actor_panics() {
     let system = ActorSystem::new();
@@ -468,26 +551,21 @@ async fn mailbox_send_to_unknown_actor_returns_error() {
 // ───────────────────────── ActorSystem builder 方法测试 ─────────────────────────
 
 #[tokio::test]
-async fn with_event_bus_stores_bus() {
-    let bus = EventBus::new();
-    let system = ActorSystem::new().with_event_bus(bus);
-    // 注入的 bus 应替换默认 bus：经 system.event_bus 发布的生命周期错误
-    // 应能被该 bus 上的订阅者收到。
-    let mut rx = system
-        .event_bus
-        .subscribe(crate::runtime::event_bus::Topic::ActorLifecycleError);
-    system.emit_lifecycle_error(ActorId::from("lc-1"), "boom".into());
-    let event = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+async fn with_tap_stores_tap() {
+    let tap = EventTap::new();
+    let system = ActorSystem::new().with_tap(tap.clone());
+    // 注入的 tap 应替换默认 tap：经 system 发布的生命周期错误
+    // 可被 tap 订阅者收到。
+    let mut rx = tap.subscribe();
+    system.emit_lifecycle_error(crate::common::ActorId::from("a".to_string()), "boom".into());
+    let ev = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
         .await
-        .expect("should receive lifecycle error event")
-        .expect("channel not closed");
-    match event {
-        crate::runtime::event_bus::BusEvent::ActorLifecycleError { actor_id, error } => {
-            assert_eq!(actor_id.as_str(), "lc-1");
-            assert_eq!(error, "boom");
-        }
-        other => panic!("expected ActorLifecycleError, got {:?}", other),
-    }
+        .expect("recv in time")
+        .expect("event present");
+    assert!(matches!(
+        ev,
+        crate::runtime::events::TapEvent::ActorLifecycleError { error, .. } if error.as_ref() == "boom"
+    ));
 }
 
 // ───────────────────────── stop_timeout 测试 ─────────────────────────

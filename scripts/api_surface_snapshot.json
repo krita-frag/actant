@@ -34,8 +34,6 @@
       "__next__"
     ],
     "PyCapabilityRuntime": [
-      "ask",
-      "ask_async",
       "builtin_capabilities",
       "emit",
       "new",
@@ -205,9 +203,6 @@
       "task_id",
       "task_name",
       "workflow_id"
-    ],
-    "PyWorkflowState": [
-      "__repr__"
     ]
   },
   "python_all": [
@@ -243,11 +238,8 @@
     "actant.capabilities": [
       "EffectKind",
       "RetryCtx",
-      "RetryPolicyHandler",
       "RouteCtx",
-      "RoutingHandler",
       "ScheduleCtx",
-      "SchedulingHandler",
       "StoreHandler",
       "StoreReq",
       "TaskEvent",
@@ -392,8 +384,6 @@
       "worker_cancel_grace_ms"
     ],
     "_CapabilityRuntime": [
-      "ask",
-      "ask_async",
       "builtin_capabilities",
       "emit",
       "perform",
@@ -545,13 +535,6 @@
       "task_id",
       "timeout_ms",
       "workflow_id"
-    ],
-    "_WorkflowState": [
-      "CANCELLED",
-      "COMPLETED",
-      "FAILED",
-      "PENDING",
-      "RUNNING"
     ]
   }
 }

@@ -29,6 +29,10 @@ use crate::common::wire::WireTaskOutcome;
 use crate::common::{ActantError, NetworkConfig};
 use crate::runtime::blobs::{BlobFetch, BlobStore};
 
+/// 直连请求帧读取超时：许可在读取期间持有，停滞流（慢速流 DoS）必须在
+/// 该时限内被切断并释放许可。合法请求的最长帧传输远小于此。
+const DIRECT_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// `Transport::listen_addresses()` 的结构化结果。
 #[derive(Debug, Clone)]
 pub struct ListenAddresses {
@@ -69,7 +73,7 @@ impl DirectResponseChannel {
     /// 将响应写入底层 SendStream 并关闭流。
     ///
     /// 提取自 `NetworkManager::send_direct_response`，使 `DirectResponseChannel`
-    /// 可独立于 `NetworkManager` 发送响应——例如 EventBus 在丢弃 DirectRequest
+    /// 可独立于 `NetworkManager` 发送响应——例如事件循环在丢弃 DirectRequest
     /// 时通过此方法回送 `DirectResponse::Error`，避免调用方永久阻塞。
     pub async fn send_response(mut self, response: DirectResponse) -> crate::common::Result<()> {
         let Some(mut send) = self.0.take() else {
@@ -377,11 +381,6 @@ pub enum DirectRequest {
     DispatchTask {
         task: crate::common::model::TaskDefinition,
     },
-    /// 从协调节点查询工作流状态。
-    QueryWorkflowState {
-        workflow_id: WorkflowId,
-        requesting_node: NodeId,
-    },
     /// 存活探测：仅确认对端仍在线，不产生任何副作用。
     ///
     /// 用途是故障转移的**在途转发**腿（见
@@ -400,15 +399,9 @@ pub enum DirectResponse {
     TaskResultAck { accepted: bool },
     /// 任务分发的确认。
     DispatchAck { accepted: bool },
-    /// 工作流状态查询的响应。
-    WorkflowState {
-        dag: Option<Vec<u8>>,
-        execution: Option<Vec<u8>>,
-        pending: Option<Vec<u8>>,
-    },
     /// 服务端无法投递或处理请求时返回的错误响应。
     ///
-    /// 例如：EventBus 上无订阅者接收 DirectRequest 时，会通过此变体
+    /// 例如：事件循环无订阅者接收 DirectRequest 时，会通过此变体
     /// 主动通知调用方，避免其永久阻塞在 `await` 上等待响应。
     Error {
         /// 人类可读的错误描述。
@@ -1075,10 +1068,9 @@ impl NetworkManager {
 
     fn spawn_direct_event_loop(&self, mut rx: mpsc::Receiver<DirectEvent>) {
         let event_tx = self.event_tx.clone();
-        let max_message_size = self.max_message_size;
         tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
-                route_direct_request(&event_tx, max_message_size, event).await;
+                route_direct_request(&event_tx, event).await;
             }
         });
     }
@@ -1194,8 +1186,6 @@ enum DirectEvent {
 enum DirectRouteOutcome {
     /// 请求已转发到 network event channel。
     Forwarded,
-    /// 请求超尺寸被拒绝。
-    RejectedOversize,
     /// network event channel 已满，请求被丢弃。
     ChannelFull,
 }
@@ -1208,7 +1198,6 @@ enum DirectRouteOutcome {
 /// 依赖自身超时，与 [`DirectResponseChannel::send_error`] 的契约一致。
 async fn route_direct_request(
     event_tx: &mpsc::Sender<NetworkEvent>,
-    max_message_size: usize,
     event: DirectEvent,
 ) -> DirectRouteOutcome {
     let DirectEvent::Request {
@@ -1216,23 +1205,6 @@ async fn route_direct_request(
         request,
         channel,
     } = event;
-    let request_size = postcard::to_allocvec(&request)
-        .map(|v| v.len())
-        .unwrap_or(0);
-    if request_size > max_message_size {
-        tracing::warn!(
-            "direct request from {} exceeds size limit: {} > {}, rejecting with error response",
-            peer_id,
-            request_size,
-            max_message_size
-        );
-        channel
-            .send_error(format!(
-                "direct request rejected: size {request_size} exceeds limit {max_message_size}"
-            ))
-            .await;
-        return DirectRouteOutcome::RejectedOversize;
-    }
     let event = NetworkEvent::DirectRequest {
         peer_id,
         request: Box::new(request),
@@ -1374,9 +1346,19 @@ impl DirectProtocolHandler {
                 .await
                 .map_err(|e| ActantError::Internal(format!("semaphore closed: {e}")))?;
 
-            let request_bytes = match read_length_prefixed(&mut recv, self.max_message_size).await {
-                Ok(bytes) => bytes,
-                Err(e) => {
+            // 读取必须在超时内完成：许可在读取期间持有，对端开流后停滞不发
+            // （慢速流 DoS）会永久占住许可——max_pending_direct_requests 个
+            // 停滞流即可让所有直连请求（任务结果投递、Ping 探测、任务转发）
+            // 排队瘫痪，故障转移的探测腿还会因此误判健康在途任务死亡。
+            // 超时值与 `direct_request_timeout` 同量级（10s）：合法请求的最长
+            // 帧传输远小于此，停滞连接不值得占用许可等待。
+            let read_result = tokio::time::timeout(DIRECT_REQUEST_READ_TIMEOUT, async {
+                read_length_prefixed(&mut recv, self.max_message_size).await
+            })
+            .await;
+            let request_bytes = match read_result {
+                Ok(Ok(bytes)) => bytes,
+                Ok(Err(e)) => {
                     tracing::warn!("failed to read direct request from {}: {}", remote_id, e);
                     // 连接尚可写时回送错误，让对端快速失败；发送失败仅记录日志
                     //（连接本身已损坏时对端只能依赖自身超时）。
@@ -1385,7 +1367,39 @@ impl DirectProtocolHandler {
                         .await;
                     continue;
                 }
+                Err(_) => {
+                    tracing::warn!(
+                        peer = %remote_id,
+                        timeout_ms = DIRECT_REQUEST_READ_TIMEOUT.as_millis(),
+                        "direct request read timed out while holding a permit; \
+                         releasing permit and continuing"
+                    );
+                    DirectResponseChannel::new(send)
+                        .send_error("direct request read timed out")
+                        .await;
+                    continue;
+                }
             };
+
+            // 尺寸上限在解码前用原始字节判定（零成本）：旧实现在此之后的
+            // route_direct_request 里重新序列化整个请求仅为测大小——每个
+            // 入站直连请求多一次与载荷等大的序列化。
+            if request_bytes.len() > self.max_message_size {
+                tracing::warn!(
+                    peer = %remote_id,
+                    size = request_bytes.len(),
+                    limit = self.max_message_size,
+                    "direct request exceeds size limit, rejecting"
+                );
+                DirectResponseChannel::new(send)
+                    .send_error(format!(
+                        "direct request rejected: size {} exceeds limit {}",
+                        request_bytes.len(),
+                        self.max_message_size
+                    ))
+                    .await;
+                continue;
+            }
 
             let request: DirectRequest = match crate::common::decode_postcard(&request_bytes) {
                 Ok(req) => req,

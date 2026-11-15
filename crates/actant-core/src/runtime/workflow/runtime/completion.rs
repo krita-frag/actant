@@ -23,7 +23,7 @@ use crate::common::{
 pub(crate) type DispatchResult =
     std::result::Result<std::result::Result<Vec<u8>, ActantError>, PanicPayload>;
 type PanicPayload = Box<dyn std::any::Any + Send>;
-use crate::runtime::event_bus::{BusEvent, EventBus};
+use crate::runtime::events::{TaskLifecycleEvent, TaskResultFeed};
 use crate::runtime::network::Transport;
 use crate::runtime::workflow::actor::{ResultSource, TaskCompletionResponse, TaskResultOutcome};
 use crate::runtime::workflow::messaging::{decode, encode};
@@ -156,14 +156,13 @@ pub(super) fn build_completion_from_dispatch_result(
 ///
 /// drain 后这些任务不会被执行，复用 [`publish_task_completion`] 走既有投递
 /// 路径：远端任务（origin != 本节点）直连回传 Cancelled 结果给 origin 节点，
-/// 本地任务发布 `BusEvent::TaskCancelled` 给事件总线订阅者。
+/// 本地任务发布 `TaskLifecycleEvent::TaskCancelled` 给结果泵。
 /// drain 通知所需的共享依赖集合（`publish_drained_task_cancellation` 参数收敛）。
 pub(super) struct DrainNotifyCtx<'a> {
     pub(super) node_id: &'a NodeId,
     pub(super) network: &'a dyn crate::runtime::network::Transport,
-    pub(super) event_bus: &'a EventBus,
+    pub(super) result_feed: &'a TaskResultFeed,
     pub(super) pending_results: &'a tokio::sync::mpsc::Sender<PendingResult>,
-    pub(super) pending_capacity: usize,
 }
 
 pub(super) async fn publish_drained_task_cancellation(
@@ -190,9 +189,8 @@ pub(super) async fn publish_drained_task_cancellation(
         &task,
         ctx.node_id,
         ctx.network,
-        ctx.event_bus,
+        ctx.result_feed,
         ctx.pending_results,
-        ctx.pending_capacity,
         None,
     )
     .await;
@@ -205,9 +203,8 @@ pub(super) async fn publish_drained_task_cancellation(
 pub(super) struct ReenqueueCtx {
     pub(super) node_id: NodeId,
     pub(super) network: Arc<dyn crate::runtime::network::Transport>,
-    pub(super) event_bus: EventBus,
+    pub(super) result_feed: TaskResultFeed,
     pub(super) pending_results: tokio::sync::mpsc::Sender<PendingResult>,
-    pub(super) pending_capacity: usize,
     pub(super) state: tokio::sync::watch::Receiver<super::WorkerState>,
 }
 
@@ -312,9 +309,8 @@ async fn publish_reenqueue_terminal(
         task,
         &ctx.node_id,
         ctx.network.as_ref(),
-        &ctx.event_bus,
+        &ctx.result_feed,
         &ctx.pending_results,
-        ctx.pending_capacity,
         None,
     )
     .await;
@@ -343,12 +339,11 @@ pub(super) async fn settle_local_completion(
     task: &TaskDefinition,
     node_id: &NodeId,
     network: &dyn Transport,
-    event_bus: &EventBus,
+    result_feed: &TaskResultFeed,
     pending_results: &tokio::sync::mpsc::Sender<PendingResult>,
-    pending_capacity: usize,
     orchestrator_bridge: Option<&OrchestratorBridge>,
 ) {
-    // 本地编排回灌：workflow 任务的完成事件除发布到 EventBus 外，还回灌
+    // 本地编排回灌：workflow 任务的完成事件除发布到 correctness 通道外，还回灌
     // orchestrator——Python 路径的后继派发由「提交方阻塞解析依赖 + 事件泵
     // 回灌」驱动，而 Rust 原生 DAG 提交（submit + start）没有事件泵，若不回灌，
     // 依赖推进产出的后继任务无人入队，DAG 永不推进。core 内补齐：Completed 经
@@ -376,9 +371,8 @@ pub(super) async fn settle_local_completion(
         task,
         node_id,
         network,
-        event_bus,
+        result_feed,
         pending_results,
-        pending_capacity,
     )
     .await;
 }
@@ -580,15 +574,17 @@ impl OrchestratorBridge {
             }
             TaskCompletion::Failed { error, .. } => {
                 let outcome = TaskResultOutcome::Failed(error.clone());
-                let retry = self
+                let verdict = self
                     .ingest_for_retry(workflow_id, &task.id, outcome)
                     .await?;
-                Ok(match retry {
-                    Some((task, delay_ms)) => IngestAction::Retry {
-                        task: Box::new(task),
-                        delay_ms,
-                    },
-                    None => IngestAction::None,
+                Ok(match verdict {
+                    crate::runtime::workflow::FailureOutcome::Retry(task, delay_ms) => {
+                        IngestAction::Retry { task, delay_ms }
+                    }
+                    // 终局失败：失败终态已由 orchestrator 落定并经本地事件路径
+                    // 发布；迟到重复失败（Ignored）不得再次触发终局动作。
+                    crate::runtime::workflow::FailureOutcome::Final
+                    | crate::runtime::workflow::FailureOutcome::Ignored => IngestAction::None,
                 })
             }
             // Cancelled：编排侧由 cancel 路径收敛，事件结算即可。
@@ -597,12 +593,17 @@ impl OrchestratorBridge {
     }
 
     /// Failed 结果的重试裁决通道（ON_TASK_RESULT 单入口）。
+    ///
+    /// 返回三态裁决：`Retry` → 入队重派发；`FinalFailure` → 无入队动作
+    /// （失败终态发布由本地事件路径承担）；`Ignored` → 迟到重复失败，
+    /// 不得触发任何终局动作；`Settled` → 完成/取消入账或 fencing/淘汰
+    /// 守卫丢弃，同样无入队动作。
     async fn ingest_for_retry(
         &self,
         workflow_id: &crate::common::WorkflowId,
         task_id: &crate::common::TaskId,
         outcome: TaskResultOutcome,
-    ) -> crate::common::Result<Option<(TaskDefinition, u64)>> {
+    ) -> crate::common::Result<crate::runtime::workflow::FailureOutcome> {
         let payload = encode(&(
             workflow_id.clone(),
             task_id.clone(),
@@ -621,17 +622,26 @@ impl OrchestratorBridge {
         if let Some(error) = result.error {
             return Err(ActantError::from(error));
         }
-        // 响应载荷是 `Option<(TaskDefinition, u64)>`：`None` = 终局。
-        // postcard 的 `None` 占一个判别字节，必须按 `Option` 解码。
-        let verdict: Option<(TaskDefinition, u64)> = if result.payload.is_empty() {
-            // 生产 handler 总是 encode（None 也有判别字节）；空载荷意味着
-            // 协议被破坏，显性化「可能丢失的重试裁决」而不是静默当终局。
-            tracing::warn!("empty ON_TASK_RESULT response payload; treating verdict as terminal");
-            None
-        } else {
-            decode(&result.payload)?
-        };
-        Ok(verdict)
+        // 响应载荷是编码后的 `TaskResultVerdict`。空载荷意味着协议被破坏
+        // （生产 handler 总是 encode），显性化「裁决丢失」——按忽略处理，
+        // 不把未知裁决当终局。
+        if result.payload.is_empty() {
+            tracing::warn!("empty ON_TASK_RESULT response payload; treating verdict as ignored");
+            return Ok(crate::runtime::workflow::FailureOutcome::Ignored);
+        }
+        let verdict: crate::runtime::workflow::actor::TaskResultVerdict = decode(&result.payload)?;
+        Ok(match verdict {
+            crate::runtime::workflow::actor::TaskResultVerdict::Retry(task, delay_ms) => {
+                crate::runtime::workflow::FailureOutcome::Retry(task, delay_ms)
+            }
+            crate::runtime::workflow::actor::TaskResultVerdict::FinalFailure => {
+                crate::runtime::workflow::FailureOutcome::Final
+            }
+            crate::runtime::workflow::actor::TaskResultVerdict::Settled
+            | crate::runtime::workflow::actor::TaskResultVerdict::Ignored => {
+                crate::runtime::workflow::FailureOutcome::Ignored
+            }
+        })
     }
 }
 
@@ -644,9 +654,8 @@ pub(super) async fn publish_task_completion(
     task: &TaskDefinition,
     node_id: &NodeId,
     network: &dyn crate::runtime::network::Transport,
-    event_bus: &EventBus,
+    result_feed: &TaskResultFeed,
     pending_results: &tokio::sync::mpsc::Sender<PendingResult>,
-    _pending_capacity: usize,
 ) {
     let is_remote_task = task.origin_node.as_ref().is_some_and(|o| o != node_id);
 
@@ -730,13 +739,13 @@ pub(super) async fn publish_task_completion(
             }
         }
     } else {
-        // 本地 task 完成：始终发布到 EventBus（即使无 workflow_id），
-        // 使 Python @task 等非工作流任务也能通过事件总线获取结果。
-        let bus_event = match completion {
-            TaskCompletion::Failed { .. } => BusEvent::TaskFailed(completion),
-            TaskCompletion::Cancelled { .. } => BusEvent::TaskCancelled(completion),
-            TaskCompletion::Completed { .. } => BusEvent::TaskCompleted(completion),
+        // 本地 task 完成：始终发布到 correctness 通道（即使无 workflow_id），
+        // 使 Python @task 等非工作流任务也能经结果泵获取结果。
+        let lifecycle_event = match completion {
+            TaskCompletion::Failed { .. } => TaskLifecycleEvent::TaskFailed(completion),
+            TaskCompletion::Cancelled { .. } => TaskLifecycleEvent::TaskCancelled(completion),
+            TaskCompletion::Completed { .. } => TaskLifecycleEvent::TaskCompleted(completion),
         };
-        event_bus.publish(bus_event);
+        result_feed.send(lifecycle_event);
     }
 }

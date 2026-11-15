@@ -61,7 +61,7 @@ class Task:
         priority: 任务优先级（有符号整数，越大越优先）。
         silent: ``True`` 时跳过 TaskLifecycle 事件发布（started/completed/
             failed/retried/cancelled 均不 emit）。用于高吞吐批量提交场景，
-            避免每个 task 产生两次事件造成 event_bus 噪声。默认 ``False``。
+            避免每个 task 产生两次事件造成结果泵噪声。默认 ``False``。
             抑制发生在提交方（事件唯一的生产方）：任务仍正常执行与回灌结果，
             只是不出现在事件流里。
     """
@@ -147,7 +147,7 @@ class Task:
 
         将函数与参数用 cloudpickle 序列化为 payload，通过
         ``rust_core.submit_task`` 提交到 Rust Worker 调度器。Worker 拉取并
-        调用 dispatch handler 执行任务，结果通过 event_bus 回调解析。
+        调用 dispatch handler 执行任务，结果通过结果通道回调解析。
 
         **任务依赖**：参数中的 ``AsyncResult`` 会自动阻塞解析为其结果，
         使 ``b.submit(a.submit(x))`` 表达依赖关系。
@@ -621,7 +621,7 @@ def task(
         priority: 任务优先级（有符号整数，越大越优先），供 Rust 调度器使用。
             ``None`` 表示使用调度器默认优先级。
         silent: ``True`` 时跳过 TaskLifecycle 事件发布。用于高吞吐批量提交
-            场景，避免 event_bus 噪声。默认 ``False``。
+            场景，避免结果泵噪声。默认 ``False``。
     """
 
     def _make(f: Callable[..., Any]) -> Task:

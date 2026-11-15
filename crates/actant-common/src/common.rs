@@ -41,9 +41,9 @@ pub fn should_claim_workflow(
 
 pub use backoff::{ExponentialBackoff, REMOTE_CALL_MAX_RETRY_DELAY};
 pub use config::{
-    discovery_mode, scheduler_kind, ActantConfig, ActorConfig, DiscoveryMode, EventBusConfig,
-    FailoverConfig, GossipConfig, NetworkConfig, NodeRole, SchedulerKind, StoreConfig, SyncMode,
-    WorkerConfig, WorkflowConfig,
+    discovery_mode, scheduler_kind, ActantConfig, ActorConfig, DiscoveryMode, FailoverConfig,
+    GossipConfig, NetworkConfig, NodeRole, SchedulerKind, StoreConfig, SyncMode, WorkerConfig,
+    WorkflowConfig,
 };
 pub use error::{format_error_kind, ActantError, Result};
 pub use wire::TopicRoute;

@@ -64,11 +64,9 @@ struct Instruments {
     actors_failed: Counter<u64>,
 
     // -- 网络 / 事件总线计数器 --
-    direct_requests_capacity_exceeded: Counter<u64>,
-    event_bus_publish_dropped: Counter<u64>,
     /// 各 topic 订阅者通道当前积压深度（取该 topic 所有订阅者的最大 len）。
     /// 每次 publish 后采样，带 `topic` 标签。用于预警队列堆积。
-    event_bus_subscriber_depth: Gauge<u64>,
+    tap_lagged_total: Counter<u64>,
 
     // -- 存储 gauges --
     store_map_size_bytes: Gauge<u64>,
@@ -202,7 +200,9 @@ impl Instruments {
                 .build(),
             failover_node_lost_tasks: meter
                 .u64_counter("actant.failover.node_lost_tasks")
-                .with_description("In-flight tasks settled as failed because their executor node was lost")
+                .with_description(
+                    "In-flight tasks settled as failed because their executor node was lost",
+                )
                 .build(),
 
             // -- Actor 计数器 --
@@ -220,19 +220,9 @@ impl Instruments {
                 .build(),
 
             // -- 网络 / 事件总线计数器 --
-            direct_requests_capacity_exceeded: meter
-                .u64_counter("actant.network.direct_requests.capacity_exceeded")
-                .with_description("Direct requests rejected due to capacity limit")
-                .build(),
-            event_bus_publish_dropped: meter
-                .u64_counter("actant.event_bus.publish.dropped")
-                .with_description("Event bus events dropped due to full subscriber channel")
-                .build(),
-            event_bus_subscriber_depth: meter
-                .u64_gauge("actant.event_bus.subscriber.depth")
-                .with_description(
-                    "Current max channel depth across subscribers per topic (sampled after publish)",
-                )
+            tap_lagged_total: meter
+                .u64_counter("actant.tap.lagged_total")
+                .with_description("Tap events skipped by lagged subscribers")
                 .build(),
 
             // -- 存储 gauges --
@@ -358,22 +348,25 @@ impl Instruments {
 
 /// 包装为 `Arc`，使 `Instruments` 句柄可从锁中克隆并在不持有锁的情况下使用。
 /// OTel instrument 句柄克隆开销很小。
-static INSTRUMENTS: Mutex<Option<Arc<Instruments>>> = Mutex::new(None);
+static INSTRUMENTS: std::sync::RwLock<Option<Arc<Instruments>>> = std::sync::RwLock::new(None);
 static REGISTRY: Mutex<Option<Arc<Registry>>> = Mutex::new(None);
 
 fn instruments() -> Arc<Instruments> {
-    let guard = INSTRUMENTS.lock();
-    match guard.clone() {
-        Some(inst) => inst,
-        None => {
-            // 兜底：从全局 meter 创建（若未调用 init() 则为 no-op）。
-            drop(guard);
-            let meter = opentelemetry::global::meter("actant");
-            let inst = Arc::new(Instruments::from_meter(&meter));
-            *INSTRUMENTS.lock() = Some(inst.clone());
-            inst
-        }
+    // 读快路径无锁：任务结算热路径（每任务 ≥2 次指标调用）不再过全局互斥。
+    if let Some(inst) = INSTRUMENTS.read().unwrap().clone() {
+        return inst;
     }
+    // 兜底：从全局 meter 创建（若未调用 init() 则为 no-op）。
+    let meter = opentelemetry::global::meter("actant");
+    let inst = Arc::new(Instruments::from_meter(&meter));
+    // 写路径仍互斥；双检防并发兜底重复构造（重复构造也无观测差异，
+    // 因两者都来自同一全局 meter）。
+    let mut guard = INSTRUMENTS.write().unwrap();
+    if guard.is_none() {
+        *guard = Some(inst.clone());
+    }
+    drop(guard);
+    inst
 }
 
 /// 初始化带 Prometheus exporter 的 OpenTelemetry 指标管道，可选启用 OTLP gRPC exporter。
@@ -463,7 +456,7 @@ pub fn init() -> Result<(), crate::common::ActantError> {
 
     // 从已配置的 provider 创建所有 instrument。
     let meter = opentelemetry::global::meter("actant");
-    *INSTRUMENTS.lock() = Some(Arc::new(Instruments::from_meter(&meter)));
+    *INSTRUMENTS.write().unwrap() = Some(Arc::new(Instruments::from_meter(&meter)));
     *REGISTRY.lock() = Some(Arc::new(registry));
     Ok(())
 }
@@ -606,22 +599,8 @@ pub fn inc_actors_failed() {
     instruments().actors_failed.add(1, &[]);
 }
 
-pub fn inc_direct_requests_capacity_exceeded() {
-    instruments().direct_requests_capacity_exceeded.add(1, &[]);
-}
-
-pub fn inc_event_bus_publish_dropped() {
-    instruments().event_bus_publish_dropped.add(1, &[]);
-}
-
-/// 记录某 topic 的订阅者通道当前最大积压深度。
-///
-/// 每次 EventBus `publish` 后采样：遍历该 topic 的所有订阅者，取当前积压深度
-/// （`capacity - sender.capacity()`）的最大值。带 `topic` 标签，便于按话题告警。
-pub fn set_event_bus_subscriber_depth(topic: &str, depth: u64) {
-    instruments()
-        .event_bus_subscriber_depth
-        .record(depth, &[KeyValue::new("topic", topic.to_string())]);
+pub fn inc_tap_lagged(n: u64) {
+    instruments().tap_lagged_total.add(n, &[]);
 }
 
 /// 记录一次存储容量快照。

@@ -1,6 +1,6 @@
 """batch/array job 逐项进度集成测试。
 
-验证核心 `BatchTracker` 经 EventBus 终态事件计数：成功/失败分档、
+验证核心 `BatchTracker` 经结果通道终态事件计数：成功/失败分档、
 `pending` 收敛到 0、`finished` 置位、重复/未知查询的边界行为。
 """
 

@@ -92,22 +92,19 @@ class _RuntimeBase:
         name: str,
         request: Any,
     ) -> Any | None:
-        """逆序调用 handler 链；全部弃权时按需回退 Rust，否则返回 None。"""
+        """逆序调用 handler 链；全部弃权时返回 None（ask 型无 Rust 回退）。"""
         for handler in reversed(handlers):
             result = handler(request)
             if result is not None:
                 return result
-        if self._rust_runtime is not None and name in RUST_BACKED_CAPABILITIES:
-            return self._rust_runtime.ask(name, request)
         _logger.debug("ask %r: all %d handler(s) abstained", name, len(handlers))
         return None
 
     def _dispatch_ask(self, name: str, request: Any) -> Any | None:
         """决策型：逆序调用 handler，第一个返回非 None 的决定结果。
 
-        Python handler 全部弃权时，仅对 `RUST_BACKED_CAPABILITIES` 中的 capability
-        转发到 Rust capability runtime；是否有内置 handler 取决于该 capability。
-        自定义 capability 无 Rust 路径，全部弃权时返回 None。
+        ask 型 capability 无 Rust 回退（Rust 侧无 ask 分发入口）；全部弃权时
+        返回 None。
         """
         with self._lock:
             handlers = list(self._layers.get(name, []))
@@ -197,8 +194,8 @@ class _RuntimeBase:
         """异步决策型 effect：返回 ``asyncio.Future``。
 
         与 ``_dispatch_ask`` 共用 ``_ask_chain``：有 Python handler 时把整条链
-        放到 executor 执行；无 Python handler 时 Rust-backed 走 ``ask_async``，
-        其余立即 resolve 为 ``None``。
+        放到 executor 执行；ask 型无 Rust 回退，无 handler 时立即 resolve 为
+        ``None``。
         """
         loop = self._get_asyncio_loop()
         with self._lock:
@@ -207,8 +204,6 @@ class _RuntimeBase:
             return loop.run_in_executor(
                 None, lambda: self._ask_chain(handlers, name, request)
             )
-        if self._rust_runtime is not None and name in RUST_BACKED_CAPABILITIES:
-            return self._rust_runtime.ask_async(name, request)
         fut = loop.create_future()
         fut.set_result(None)
         return fut

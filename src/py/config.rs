@@ -7,66 +7,6 @@ use actant_core::common::{
     ActantConfig, DiscoveryMode, FailoverConfig, GossipConfig, NetworkConfig, NodeRole,
     RetryPolicy, StoreConfig,
 };
-use actant_core::runtime::workflow::Phase;
-
-#[pyclass(name = "_WorkflowState", from_py_object)]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PyWorkflowState {
-    Pending,
-    Running,
-    Completed,
-    Failed,
-    Cancelled,
-}
-
-#[pymethods]
-impl PyWorkflowState {
-    #[classattr]
-    const PENDING: PyWorkflowState = PyWorkflowState::Pending;
-    #[classattr]
-    const RUNNING: PyWorkflowState = PyWorkflowState::Running;
-    #[classattr]
-    const COMPLETED: PyWorkflowState = PyWorkflowState::Completed;
-    #[classattr]
-    const FAILED: PyWorkflowState = PyWorkflowState::Failed;
-    #[classattr]
-    const CANCELLED: PyWorkflowState = PyWorkflowState::Cancelled;
-
-    fn __repr__(&self) -> &'static str {
-        match self {
-            PyWorkflowState::Pending => "_WorkflowState.PENDING",
-            PyWorkflowState::Running => "_WorkflowState.RUNNING",
-            PyWorkflowState::Completed => "_WorkflowState.COMPLETED",
-            PyWorkflowState::Failed => "_WorkflowState.FAILED",
-            PyWorkflowState::Cancelled => "_WorkflowState.CANCELLED",
-        }
-    }
-}
-
-impl From<Phase> for PyWorkflowState {
-    fn from(s: Phase) -> Self {
-        match s {
-            Phase::Pending => PyWorkflowState::Pending,
-            Phase::Running => PyWorkflowState::Running,
-            Phase::Completed => PyWorkflowState::Completed,
-            Phase::Failed => PyWorkflowState::Failed,
-            Phase::Cancelled => PyWorkflowState::Cancelled,
-        }
-    }
-}
-
-impl From<PyWorkflowState> for Phase {
-    fn from(s: PyWorkflowState) -> Self {
-        match s {
-            PyWorkflowState::Pending => Phase::Pending,
-            PyWorkflowState::Running => Phase::Running,
-            PyWorkflowState::Completed => Phase::Completed,
-            PyWorkflowState::Failed => Phase::Failed,
-            PyWorkflowState::Cancelled => Phase::Cancelled,
-        }
-    }
-}
-
 /// 将用户提供的网络 preset 字符串解析为内部 `DiscoveryMode`。
 ///
 /// 此处接受任何非空字符串；启动时由
@@ -930,7 +870,6 @@ fn python_runtime_description() -> Option<String> {
 
 /// 在 Python 模块上注册所有 config 相关类。
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<PyWorkflowState>()?;
     m.add_class::<PyRetryPolicy>()?;
     m.add_class::<PyNetworkConfig>()?;
     m.add_class::<PyFailoverConfig>()?;

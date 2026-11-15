@@ -1,5 +1,5 @@
 //! PyO3 <-> Rust 类型转换与辅助原语统一入口。
-//! 为每个内置 capability 提供实现 `PyAskCodec` / `PyPerformCodec` / `PyEmitCodec`
+//! 为每个内置 capability 提供实现 `PyPerformCodec` / `PyEmitCodec`
 //! 的 marker 类型。`capability_registry!` 通过声明式映射完成分发。
 
 use std::sync::{atomic, OnceLock};
@@ -19,14 +19,6 @@ use actant_core::runtime::state::StorageStats;
 ///
 /// `Runtime::ask` 返回 `Option<C::Response>`（第一个返回 `Some` 的 handler），
 /// 因此 `encode_response` 接收的是 `Option<C::Response>`。
-pub trait PyAskCodec<C: actant_core::runtime::capability::Capability> {
-    fn decode_request(ob: &Bound<'_, PyAny>) -> PyResult<C::Request>;
-    fn encode_response(
-        py: Python<'_>,
-        resp: Option<C::Response>,
-    ) -> PyResult<Option<Bound<'_, PyAny>>>;
-}
-
 /// `perform` effect 的 PyO3 编解码 trait。
 pub trait PyPerformCodec<C: actant_core::runtime::capability::Capability> {
     fn decode_request(ob: &Bound<'_, PyAny>) -> PyResult<C::Request>;
@@ -445,42 +437,9 @@ pub struct PyTaskCompletion {
 #[macro_export]
 macro_rules! capability_registry {
     (
-        ask: { $( $ask_name:literal => $ask_cap:ty => $ask_codec:path ),* $(,)? }
         perform: { $( $perf_name:literal => $perf_cap:ty => $perf_codec:path ),* $(,)? }
         emit: { $( $emit_name:literal => $emit_cap:ty => $emit_codec:path ),* $(,)? }
     ) => {
-        // ask 注册表为空（Rust 核心当前无 ask 型 capability）时，
-        // 分发函数参数不被任何分支消费，故允许未使用变量。
-        #[allow(unused_variables)]
-        fn dispatch_ask<'py>(
-            py: pyo3::Python<'py>,
-            name: &str,
-            request: &pyo3::Bound<'_, pyo3::PyAny>,
-            inner: std::sync::Arc<actant_core::runtime::capability::CapabilityRuntime>,
-            tokio: &tokio::runtime::Runtime,
-        ) -> pyo3::PyResult<Option<pyo3::Bound<'py, pyo3::PyAny>>> {
-            match name {
-                $(
-                    $ask_name => {
-                        use $crate::py::types::PyAskCodec;
-                        let _t = std::time::Instant::now();
-                        let req = <$ask_codec as PyAskCodec<$ask_cap>>::decode_request(request)?;
-                        // 释放 GIL 期间 block_on：避免 tokio worker pyo3_log 回调死锁。
-                        let resp = py.detach(move || {
-                            tokio.block_on(inner.ask::<$ask_cap>(req))
-                        })
-                            .map_err($crate::py::error::actant_error_to_pyerr)?;
-                        tracing::trace!(cap = $ask_name, ms = _t.elapsed().as_millis() as u64, "dispatch_ask");
-                        <$ask_codec as PyAskCodec<$ask_cap>>::encode_response(py, resp)
-                    }
-                ),*
-                _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "ask capability {} not supported by Rust runtime",
-                    name
-                ))),
-            }
-        }
-
         fn dispatch_perform<'py>(
             py: pyo3::Python<'py>,
             name: &str,
@@ -599,52 +558,6 @@ macro_rules! capability_registry {
 
         /// 异步 ask 分发：返回 `asyncio.Future`，不阻塞 Python 主线程。
         #[allow(unused_variables)]
-        fn dispatch_ask_async<'py>(
-            py: pyo3::Python<'py>,
-            name: &str,
-            request: &pyo3::Bound<'_, pyo3::PyAny>,
-            inner: std::sync::Arc<actant_core::runtime::capability::CapabilityRuntime>,
-            tokio_handle: tokio::runtime::Handle,
-            gil_thread: &$crate::py::gil_thread::GilThread,
-        ) -> pyo3::PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
-            match name {
-                $(
-                    $ask_name => {
-                        use $crate::py::types::{PyAskCodec, future_into_py_iter, FutureResultToPy};
-                        let req = <$ask_codec as PyAskCodec<$ask_cap>>::decode_request(request)?;
-                        future_into_py_iter(
-                            py,
-                            tokio_handle,
-                            gil_thread,
-                            async move {
-                                let _t = std::time::Instant::now();
-                                match inner.ask::<$ask_cap>(req).await {
-                                    Ok(resp) => {
-                                        let ms = _t.elapsed().as_millis() as u64;
-                                        tracing::trace!(cap = $ask_name, ms, "dispatch_ask_async");
-                                        pyo3::Python::attach(|py| {
-                                            match <$ask_codec as PyAskCodec<$ask_cap>>::encode_response(py, resp) {
-                                                Ok(Some(v)) => FutureResultToPy::Value(v.unbind()),
-                                                Ok(None) => FutureResultToPy::Value(py.None()),
-                                                Err(e) => FutureResultToPy::Err(e),
-                                            }
-                                        })
-                                    }
-                                    Err(e) => FutureResultToPy::Err(
-                                        $crate::py::error::actant_error_to_pyerr(e)
-                                    ),
-                                }
-                            },
-                        )
-                    }
-                ),*
-                _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "ask_async capability {} not supported by Rust runtime",
-                    name
-                ))),
-            }
-        }
-
         /// 批量 perform 异步分发：接收 `(name, request)` 列表，返回单个
         /// `asyncio.Future`，resolve 为结果列表（顺序与输入一致）。
         ///

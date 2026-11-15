@@ -103,7 +103,6 @@ pub(super) fn start_pending_result_loop(
     max_attempts: usize,
     base_delay: Duration,
     pending_result_channel_capacity: usize,
-    event_bus: crate::runtime::event_bus::EventBus,
 ) -> tokio::sync::mpsc::Sender<PendingResult> {
     let (pending_tx, mut pending_rx) =
         tokio::sync::mpsc::channel::<PendingResult>(pending_result_channel_capacity);
@@ -116,9 +115,6 @@ pub(super) fn start_pending_result_loop(
     let retry_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_RETRIES));
 
     tokio::spawn(async move {
-        // 保持 EventBus 存活：测试/订阅者依赖它判断重试循环是否仍在运行；
-        // 结果不再在本地发 TaskFailed，但 EventBus 不能提前 drop。
-        let _keepalive = event_bus;
         loop {
             tokio::select! {
                 _ = retry_cancel.changed() => {

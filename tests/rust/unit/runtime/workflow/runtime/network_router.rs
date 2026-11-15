@@ -8,7 +8,7 @@ use crate::common::{
 };
 use crate::runtime::actor::{Actor, ActorSystem};
 use crate::runtime::dispatcher::CancelFlag;
-use crate::runtime::event_bus::{BusEvent, EventBus, Topic as BusTopic};
+use crate::runtime::events::{TapEvent, TaskLifecycleEvent};
 use crate::runtime::network::{
     DirectRequest, DirectResponse, DirectResponseChannel, ListenAddresses, NetworkEvent,
     NetworkMessage, PeerId, Transport,
@@ -156,21 +156,6 @@ impl Scheduler for MockScheduler {
         guard.drain(..count).collect()
     }
 
-    async fn drain_unrouted(&self) -> Vec<TaskDefinition> {
-        let mut guard = self.enqueued.lock().unwrap();
-        let mut routed = Vec::new();
-        let mut unrouted = Vec::new();
-        for task in guard.drain(..) {
-            if task.target_node.is_some() {
-                routed.push(task);
-            } else {
-                unrouted.push(task);
-            }
-        }
-        *guard = routed;
-        unrouted
-    }
-
     async fn is_empty(&self) -> bool {
         self.enqueued.lock().unwrap().is_empty()
     }
@@ -219,7 +204,8 @@ fn make_router(
 ) -> NetworkEventRouter {
     NetworkEventRouter::new(NetworkEventRouterConfig {
         network,
-        event_bus: EventBus::new(),
+        tap: crate::runtime::events::EventTap::new(),
+        result_feed: crate::runtime::events::TaskResultFeed::new().0,
         scheduler,
         actor_system,
         workflow_actor_id: None,
@@ -308,11 +294,13 @@ async fn handle_direct_dispatch_task_sends_ack() {
 async fn handle_direct_task_result_without_actor_publishes_event() {
     let transport = Arc::new(MockTransport::new("node-A", "peer-A"));
     let scheduler: Arc<dyn Scheduler> = Arc::new(MockScheduler::new());
-    let event_bus = EventBus::new();
-    let mut rx = event_bus.subscribe(BusTopic::TaskCompleted);
+    let tap = crate::runtime::events::EventTap::new();
+    let (result_feed, result_rx) = crate::runtime::events::TaskResultFeed::new();
+    let mut rx = result_rx;
     let router = NetworkEventRouter::new(NetworkEventRouterConfig {
         network: transport,
-        event_bus,
+        tap,
+        result_feed,
         scheduler,
         actor_system: None,
         workflow_actor_id: None,
@@ -344,7 +332,7 @@ async fn handle_direct_task_result_without_actor_publishes_event() {
         .expect("event bus should not be closed");
     assert!(matches!(
         event,
-        BusEvent::TaskCompleted(TaskCompletion::Completed { .. })
+        TaskLifecycleEvent::TaskCompleted(TaskCompletion::Completed { .. })
     ));
 }
 
@@ -352,11 +340,13 @@ async fn handle_direct_task_result_without_actor_publishes_event() {
 async fn handle_peer_connected_publishes_event() {
     let transport = Arc::new(MockTransport::new("node-A", "peer-A"));
     let scheduler: Arc<dyn Scheduler> = Arc::new(MockScheduler::new());
-    let event_bus = EventBus::new();
-    let mut rx = event_bus.subscribe(BusTopic::NetworkPeer);
+    let tap = crate::runtime::events::EventTap::new();
+    let (result_feed, _result_rx) = crate::runtime::events::TaskResultFeed::new();
+    let mut rx = tap.subscribe();
     let router = NetworkEventRouter::new(NetworkEventRouterConfig {
         network: transport,
-        event_bus,
+        tap,
+        result_feed,
         scheduler,
         actor_system: None,
         workflow_actor_id: None,
@@ -376,15 +366,15 @@ async fn handle_peer_connected_publishes_event() {
         .await
         .expect("event should be published")
         .expect("event bus should not be closed");
-    assert!(matches!(event, BusEvent::PeerConnected(NodeId(ref s)) if s == "peer-B"));
+    assert!(matches!(event, TapEvent::PeerConnected(ref s) if s.as_str() == "peer-B"));
 }
 
 #[tokio::test]
-async fn handle_cancel_broadcast_sets_cancel_flag_and_publishes_event() {
+async fn handle_cancel_broadcast_sets_cancel_flag_and_registry() {
     let transport = Arc::new(MockTransport::new("node-A", "peer-A"));
     let scheduler: Arc<dyn Scheduler> = Arc::new(MockScheduler::new());
-    let event_bus = EventBus::new();
-    let mut rx = event_bus.subscribe(BusTopic::TaskCancelled);
+    let tap = crate::runtime::events::EventTap::new();
+    let (result_feed, _result_rx) = crate::runtime::events::TaskResultFeed::new();
     let cancel_flags: Arc<parking_lot::Mutex<HashMap<String, CancelFlag>>> =
         Arc::new(parking_lot::Mutex::new(HashMap::new()));
     let flag = Arc::new(AtomicBool::new(false));
@@ -394,7 +384,8 @@ async fn handle_cancel_broadcast_sets_cancel_flag_and_publishes_event() {
 
     let router = NetworkEventRouter::new(NetworkEventRouterConfig {
         network: transport,
-        event_bus,
+        tap,
+        result_feed,
         scheduler,
         actor_system: None,
         workflow_actor_id: None,
@@ -408,7 +399,11 @@ async fn handle_cancel_broadcast_sets_cancel_flag_and_publishes_event() {
         task_id: TaskId::from("t-cancel".to_string()),
         workflow_id: WorkflowId::from("wf-1".to_string()),
     };
-    let payload = postcard::to_allocvec(&broadcast).unwrap();
+    let envelope = crate::common::wire::WireEnvelope::wrap(
+        crate::common::wire::WireMessage::CancelBroadcast(broadcast),
+    )
+    .unwrap();
+    let payload = postcard::to_allocvec(&envelope).unwrap();
 
     router
         .handle(NetworkEvent::Message(NetworkMessage {
@@ -418,11 +413,6 @@ async fn handle_cancel_broadcast_sets_cancel_flag_and_publishes_event() {
         .await;
 
     assert!(flag.load(Ordering::Acquire));
-    let event = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
-        .await
-        .expect("event should be published")
-        .expect("event bus should not be closed");
-    assert!(matches!(event, BusEvent::TaskCancelled(_)));
 }
 
 #[tokio::test]
@@ -438,7 +428,8 @@ async fn handle_workflow_state_request_routes_to_dag_gossip_actor() {
 
     let router = NetworkEventRouter::new(NetworkEventRouterConfig {
         network: transport,
-        event_bus: EventBus::new(),
+        tap: crate::runtime::events::EventTap::new(),
+        result_feed: crate::runtime::events::TaskResultFeed::new().0,
         scheduler,
         actor_system: Some(actor_system.clone()),
         workflow_actor_id: None,
@@ -478,7 +469,8 @@ async fn handle_direct_task_result_routes_to_workflow_actor() {
 
     let router = NetworkEventRouter::new(NetworkEventRouterConfig {
         network: transport.clone(),
-        event_bus: EventBus::new(),
+        tap: crate::runtime::events::EventTap::new(),
+        result_feed: crate::runtime::events::TaskResultFeed::new().0,
         scheduler,
         actor_system: Some(actor_system.clone()),
         workflow_actor_id: Some(workflow_actor_id.clone()),
@@ -516,11 +508,13 @@ async fn handle_direct_task_result_routes_to_workflow_actor() {
 async fn handle_peer_disconnected_publishes_event() {
     let transport = Arc::new(MockTransport::new("node-A", "peer-A"));
     let scheduler: Arc<dyn Scheduler> = Arc::new(MockScheduler::new());
-    let event_bus = EventBus::new();
-    let mut rx = event_bus.subscribe(BusTopic::NetworkPeer);
+    let tap = crate::runtime::events::EventTap::new();
+    let (result_feed, _result_rx) = crate::runtime::events::TaskResultFeed::new();
+    let mut rx = tap.subscribe();
     let router = NetworkEventRouter::new(NetworkEventRouterConfig {
         network: transport,
-        event_bus,
+        tap,
+        result_feed,
         scheduler,
         actor_system: None,
         workflow_actor_id: None,
@@ -540,7 +534,7 @@ async fn handle_peer_disconnected_publishes_event() {
         .await
         .expect("event should be published")
         .expect("event bus should not be closed");
-    assert!(matches!(event, BusEvent::PeerDisconnected(NodeId(ref s)) if s == "peer-B"));
+    assert!(matches!(event, TapEvent::PeerDisconnected(ref s) if s.as_str() == "peer-B"));
 }
 
 #[tokio::test]
@@ -571,7 +565,8 @@ async fn handle_dag_state_topic_dispatches_to_dag_gossip_actor() {
 
     let router = NetworkEventRouter::new(NetworkEventRouterConfig {
         network: transport,
-        event_bus: EventBus::new(),
+        tap: crate::runtime::events::EventTap::new(),
+        result_feed: crate::runtime::events::TaskResultFeed::new().0,
         scheduler,
         actor_system: Some(actor_system),
         workflow_actor_id: None,
@@ -624,7 +619,8 @@ async fn handle_heartbeat_topic_dispatches_to_failover_manager() {
 
     let router = NetworkEventRouter::new(NetworkEventRouterConfig {
         network: transport,
-        event_bus: EventBus::new(),
+        tap: crate::runtime::events::EventTap::new(),
+        result_feed: crate::runtime::events::TaskResultFeed::new().0,
         scheduler,
         actor_system: None,
         workflow_actor_id: None,
@@ -682,7 +678,8 @@ async fn handle_failover_topic_dispatches_claim_to_failover_manager() {
 
     let router = NetworkEventRouter::new(NetworkEventRouterConfig {
         network: transport,
-        event_bus: EventBus::new(),
+        tap: crate::runtime::events::EventTap::new(),
+        result_feed: crate::runtime::events::TaskResultFeed::new().0,
         scheduler,
         actor_system: None,
         workflow_actor_id: None,
@@ -761,7 +758,8 @@ async fn handle_heads_topic_dispatches_exchange_to_dag_gossip_actor() {
 
     let router = NetworkEventRouter::new(NetworkEventRouterConfig {
         network: transport,
-        event_bus: EventBus::new(),
+        tap: crate::runtime::events::EventTap::new(),
+        result_feed: crate::runtime::events::TaskResultFeed::new().0,
         scheduler,
         actor_system: Some(actor_system),
         workflow_actor_id: None,
@@ -801,54 +799,16 @@ async fn handle_heads_topic_dispatches_exchange_to_dag_gossip_actor() {
 }
 
 #[tokio::test]
-async fn handle_direct_request_other_returns_error_response() {
-    // 未识别的 DirectRequest 变体不再走 EventBus，而是直接回送 DirectResponse::Error。
-    let transport = Arc::new(MockTransport::new("node-A", "peer-A"));
-    let scheduler: Arc<dyn Scheduler> = Arc::new(MockScheduler::new());
-    let event_bus = EventBus::new();
-    let router = NetworkEventRouter::new(NetworkEventRouterConfig {
-        network: transport.clone(),
-        event_bus,
-        scheduler,
-        actor_system: None,
-        workflow_actor_id: None,
-        dag_gossip_actor_id: None,
-        failover: None,
-        cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-        cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-    });
-
-    let channel = DirectResponseChannel::test_stub();
-    router
-        .handle(NetworkEvent::DirectRequest {
-            peer_id: "peer-B".to_string(),
-            request: Box::new(DirectRequest::QueryWorkflowState {
-                workflow_id: WorkflowId::from("wf-1".to_string()),
-                requesting_node: NodeId::from("node-B".to_string()),
-            }),
-            channel,
-        })
-        .await;
-
-    let responses = transport.take_responses();
-    assert_eq!(responses.len(), 1, "should send exactly one error response");
-    match &responses[0].1 {
-        DirectResponse::Error { message } => {
-            assert!(message.contains("no handler for DirectRequest variant"));
-        }
-        other => panic!("expected DirectResponse::Error, got {:?}", other),
-    }
-}
-
-#[tokio::test]
 async fn handle_task_result_failed_publishes_event() {
     let transport = Arc::new(MockTransport::new("node-A", "peer-A"));
     let scheduler: Arc<dyn Scheduler> = Arc::new(MockScheduler::new());
-    let event_bus = EventBus::new();
-    let mut rx = event_bus.subscribe(BusTopic::TaskFailed);
+    let tap = crate::runtime::events::EventTap::new();
+    let (result_feed, result_rx) = crate::runtime::events::TaskResultFeed::new();
+    let mut rx = result_rx;
     let router = NetworkEventRouter::new(NetworkEventRouterConfig {
         network: transport,
-        event_bus,
+        tap,
+        result_feed,
         scheduler,
         actor_system: None,
         workflow_actor_id: None,
@@ -878,18 +838,20 @@ async fn handle_task_result_failed_publishes_event() {
         .await
         .expect("event should be published")
         .expect("event bus should not be closed");
-    assert!(matches!(event, BusEvent::TaskFailed(_)));
+    assert!(matches!(event, TaskLifecycleEvent::TaskFailed(_)));
 }
 
 #[tokio::test]
 async fn handle_task_result_cancelled_publishes_event() {
     let transport = Arc::new(MockTransport::new("node-A", "peer-A"));
     let scheduler: Arc<dyn Scheduler> = Arc::new(MockScheduler::new());
-    let event_bus = EventBus::new();
-    let mut rx = event_bus.subscribe(BusTopic::TaskCancelled);
+    let tap = crate::runtime::events::EventTap::new();
+    let (result_feed, result_rx) = crate::runtime::events::TaskResultFeed::new();
+    let mut rx = result_rx;
     let router = NetworkEventRouter::new(NetworkEventRouterConfig {
         network: transport,
-        event_bus,
+        tap,
+        result_feed,
         scheduler,
         actor_system: None,
         workflow_actor_id: None,
@@ -919,7 +881,7 @@ async fn handle_task_result_cancelled_publishes_event() {
         .await
         .expect("event should be published")
         .expect("event bus should not be closed");
-    assert!(matches!(event, BusEvent::TaskCancelled(_)));
+    assert!(matches!(event, TaskLifecycleEvent::TaskCancelled(_)));
 }
 
 // ───────────────────── 直连存活探测（在途转发腿） ─────────────────────
@@ -932,7 +894,8 @@ async fn handle_direct_request_ping_responds_pong() {
     let scheduler: Arc<dyn Scheduler> = Arc::new(MockScheduler::new());
     let router = NetworkEventRouter::new(NetworkEventRouterConfig {
         network: transport.clone(),
-        event_bus: EventBus::new(),
+        tap: crate::runtime::events::EventTap::new(),
+        result_feed: crate::runtime::events::TaskResultFeed::new().0,
         scheduler,
         actor_system: None,
         workflow_actor_id: None,

@@ -18,17 +18,31 @@ use actant_core::common::{
     WorkflowInvocation,
 };
 use actant_core::runtime::builder::RuntimeBuilder;
-use actant_core::runtime::event_bus::{BusEvent, Topic as BusTopic};
+use actant_core::runtime::events::{TapEvent, TaskLifecycleEvent};
+use tokio::sync::broadcast;
+
+/// 结果泵的活体句柄：后续注册经它把回调追加进同一泵的 fan-out 列表。
+type TaskPumpHandle =
+    Option<tokio::sync::mpsc::UnboundedSender<std::sync::Arc<pyo3::Py<pyo3::PyAny>>>>;
+
+/// 泵的 Python 回调并发上限：GIL 全局串行化使更高并发不增吞吐，只会放大
+/// 持有回调载荷的内存；permits 经 spawn_blocking 闭包 Drop 归还。
+const PUMP_BLOCKING_PERMITS: usize = 64;
 use actant_core::runtime::workflow::actor::TaskResultOutcome;
 use actant_core::runtime::workflow::messaging::{decode, encode};
 use actant_core::runtime::workflow::orchestrator::types::JournalEvent;
 use actant_core::runtime::workflow::orchestrator::{DagSnapshot, WorkflowStateSummary};
+use actant_core::runtime::workflow::runtime::TaskReportVerdict;
 use actant_core::runtime::workflow::{
     workflow_methods, AddNodeOutcome, Dag, DagNode, FailureStrategy, WaitCondition,
     WorkflowExecution,
 };
 
 use super::capability::PyCapabilityRuntime;
+
+/// submit 通道容量（单条与批量共用）：满载即对提交方显式背压报错，
+/// 而不是把突发提交无界堆积在内存里（OOM 放大器）。
+const SUBMIT_CHANNEL_CAPACITY: usize = 4096;
 use super::config::PyRetryPolicy;
 use super::route_policy::PyRoutePolicy;
 use super::types::{future_into_py_iter, FutureResultToPy, PyStoreStats, PyTaskCompletion};
@@ -318,12 +332,11 @@ pub struct PyRuntimeCore {
     /// 后台 tokio task 拉取并调用 `scheduler.enqueue().await`，避免每次 submit 都
     /// `tokio.block_on` 跨 GIL 同步阻塞（实测单次 block_on ~12ms）。
     /// `None` 表示 runtime 已 shutdown 或尚未 serve。
-    submit_tx: parking_lot::Mutex<Option<tokio::sync::mpsc::UnboundedSender<TaskDefinition>>>,
+    submit_tx: parking_lot::Mutex<Option<tokio::sync::mpsc::Sender<TaskDefinition>>>,
     /// submit_tasks_batch 的后台投递通道。
     /// 与 `submit_tx` 分离避免单条 submit 与批量 submit 互相阻塞；
     /// 后台 task 批量调用 `scheduler.enqueue_batch().await`，减少 actor 往返次数。
-    submit_batch_tx:
-        parking_lot::Mutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<TaskDefinition>>>>,
+    submit_batch_tx: parking_lot::Mutex<Option<tokio::sync::mpsc::Sender<Vec<TaskDefinition>>>>,
     /// submit 后台 task 句柄；shutdown 时先 close channel 再 await 它。
     submit_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// submit_batch 后台 task 句柄；shutdown 时先 close channel 再 await 它。
@@ -331,16 +344,20 @@ pub struct PyRuntimeCore {
     /// `register_task_result_callback` spawn 的事件消费 task 句柄列表。
     ///
     /// 每次调用 `register_task_result_callback` 都会 spawn 一个独立的 tokio
-    /// task 订阅 event_bus 4 个 task 生命周期 topic 并回调 Python callable。
+    /// task 消费任务结果 correctness 通道并回调 Python callable。
     /// 句柄必须跟踪至 shutdown：abort + 限时 await，
     /// 1. shutdown 时这些 task 仍持有 `Py<PyAny>` callback 引用，阻止 Python
     ///    端对象 GC，直到 tokio runtime 关闭强制 abort。
     /// 2. 多次注册产生多个孤儿 task 同时回调同一事件，行为难以预测。
-    /// 3. event_bus drop 后 recv 返回 None 才退出，但 callback Arc 引用
+    /// 3. correctness 通道关闭后 recv 返回 None 才退出，但 callback Arc 引用
     ///    在 task 内部循环，无法被释放。
     ///
     /// shutdown 时统一 abort + 短超时 await，确保 callback 引用及时释放。
     task_result_callback_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// 结果泵的追加通道与唤醒信号。`Some` = 泵已启动；后续
+    /// `register_task_result_callback` 经该通道把回调追加进同一泵的
+    /// fan-out 列表（correctness 通道单消费者契约：一个泵，多回调）。
+    task_result_pumps: Mutex<TaskPumpHandle>,
     /// 共享的 GIL worker 线程，用于把异步结果设置到 Python awaitable/Future。
     /// 在 `_RuntimeCore` 生命周期内保持存活，避免每次跨语言调用都重新竞争 GIL。
     gil_thread: super::gil_thread::GilThread,
@@ -477,6 +494,7 @@ impl PyRuntimeCore {
             submit_handle: Mutex::new(None),
             submit_batch_handle: Mutex::new(None),
             task_result_callback_handles: Mutex::new(Vec::new()),
+            task_result_pumps: Mutex::new(TaskPumpHandle::default()),
             gil_thread: super::gil_thread::GilThread::new(),
             payload_signing_key,
         })
@@ -618,7 +636,7 @@ impl PyRuntimeCore {
     /// 广播跨节点任务取消消息（P2P 取消广播发送端）。
     ///
     /// 通过 Iroh Gossip topic ``actant:cancel`` 广播，接收方 Worker 将事件发布到
-    /// event_bus。Python 层目前通过监听 ``TaskLifecycle`` capability 的本地事件响应
+    /// 事件通道。Python 层目前通过监听 ``TaskLifecycle`` capability 的本地事件响应
     /// 取消；远端取消消息的完整回调链将在任务接入 Rust Worker 调度后自然贯通。
     #[tracing::instrument(name = "py.broadcast_cancel", level = "info", skip(self, py))]
     fn broadcast_cancel(
@@ -790,7 +808,7 @@ impl PyRuntimeCore {
     ///
     /// 将 ``_TaskDef`` 转换为 Rust ``TaskDefinition`` 并入队到 Worker 的调度器。
     /// 任务由 Worker 的执行循环拉取并调用 ``task_dispatcher.dispatch()`` 执行。
-    /// 完成结果通过 event_bus 发布，Python 层通过 ``register_task_result_callback``
+    /// 完成结果通过 correctness 通道发布，Python 层通过 ``register_task_result_callback``
     /// 注册的回调接收。
     ///
     /// ``origin_node`` 自动设为本节点 ID，使远程结果投递能找到本节点。
@@ -843,10 +861,17 @@ impl PyRuntimeCore {
             .clone();
         // clone sender 后立即释放 lock。
         drop(tx_guard);
-        tx.send(task_def).map_err(|_| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "submit channel closed; runtime may have shut down",
-            )
+        tx.try_send(task_def).map_err(|e| match e {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "submit queue full (capacity {SUBMIT_CHANNEL_CAPACITY});                      worker is backpressured — retry or raise concurrency"
+                ))
+            }
+            _ => {
+                pyo3::exceptions::PyRuntimeError::new_err(
+                    "submit channel closed; runtime may have shut down",
+                )
+            }
         })?;
         // 让出 GIL 一次给后台 tokio worker 处理 enqueue（协作式调度）。
         // 不阻塞等待 enqueue 完成——后台 task 异步处理，Python 立即返回 handle。
@@ -906,10 +931,17 @@ impl PyRuntimeCore {
             })?
             .clone();
         drop(tx_guard);
-        tx.send(task_defs).map_err(|_| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "submit batch channel closed; runtime may have shut down",
-            )
+        tx.try_send(task_defs).map_err(|e| match e {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "submit batch queue full (capacity {SUBMIT_CHANNEL_CAPACITY});                      worker is backpressured — retry or raise concurrency"
+                ))
+            }
+            _ => {
+                pyo3::exceptions::PyRuntimeError::new_err(
+                    "submit batch channel closed; runtime may have shut down",
+                )
+            }
         })?;
         // 让出 GIL 一次给后台 tokio worker 处理 enqueue_batch。
         py.detach(move || {
@@ -1030,10 +1062,17 @@ impl PyRuntimeCore {
                             "submit channel not started; call serve() first",
                         )
                     })?;
-                    tx.send(task_def).map_err(|_| {
-                        pyo3::exceptions::PyRuntimeError::new_err(
-                            "submit channel closed; runtime may have shut down",
-                        )
+                    tx.try_send(task_def).map_err(|e| match e {
+                        tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                                "submit queue full (capacity {SUBMIT_CHANNEL_CAPACITY});                                  worker is backpressured — retry or raise concurrency"
+                            ))
+                        }
+                        _ => {
+                            pyo3::exceptions::PyRuntimeError::new_err(
+                                "submit channel closed; runtime may have shut down",
+                            )
+                        }
                     })?;
                     drop(tx_guard);
                     py.detach(move || {
@@ -1444,9 +1483,11 @@ impl PyRuntimeCore {
     ///     error: Failed 时的错误信息。
     ///
     /// Returns:
-    ///     ``{"retry": bool, "delay_ms": int}``：``retry`` 为真表示 orchestrator
-    ///     已排定重试（任务已按 ``delay_ms`` 延迟重新入队），提交方句柄应保持
-    ///     等待；为假表示终局，句柄按实际终态解析。
+    ///     ``{"verdict": str, "delay_ms": int}``：``verdict`` 为
+    ///     ``"retry"``（orchestrator 已按 ``delay_ms`` 延迟重新入队，提交方
+    ///     句柄应保持等待）、``"final"``（终局失败，句柄按实际终态结算）
+    ///     或 ``"none"``（完成/取消入账、迟到重复失败被忽略或编排未绑定，
+    ///     无裁决动作）。
     ///
     /// Raises:
     ///     ValueError: ``state`` 不是已知终态（fail-fast，避免静默错分）。
@@ -1490,12 +1531,17 @@ impl PyRuntimeCore {
         let tid = TaskId::new(task_id);
         // GIL 在 block_on 期间释放（与其它 actor 调用一致），避免 pyo3_log
         // 回调与持有 GIL 的调用方 block_on 互相等待。
-        let response = py
+        let verdict = py
             .detach(move || tokio.block_on(worker.report_task_result(&wf, &tid, outcome)))
             .map_err(actant_error_to_pyerr)?;
         let dict = pyo3::types::PyDict::new(py);
-        dict.set_item("retry", response.retry)?;
-        dict.set_item("delay_ms", response.delay_ms)?;
+        let (verdict_str, delay_ms) = match verdict {
+            TaskReportVerdict::Retry { delay_ms } => ("retry", delay_ms),
+            TaskReportVerdict::FinalFailure => ("final", 0),
+            TaskReportVerdict::NoAction => ("none", 0),
+        };
+        dict.set_item("verdict", verdict_str)?;
+        dict.set_item("delay_ms", delay_ms)?;
         Ok(dict.into_any().unbind())
     }
 
@@ -1887,7 +1933,7 @@ impl PyRuntimeCore {
     ///
     /// `batch_id` 由调用方生成（Python 层用 uuid）；`task_ids` 为该批任务的
     /// 提交 id。同一 id 重复注册累加成员；终态由 Python 结果泵在解析 payload
-    /// 后经 `record_batch_terminal` 上报——Rust EventBus 无法区分「协议成功」
+    /// 后经 `record_batch_terminal` 上报——Rust 结果通道无法区分「协议成功」
     /// 与「业务失败」，不能自行结算。
     fn register_batch(
         &self,
@@ -1919,7 +1965,7 @@ impl PyRuntimeCore {
 
     /// 记录一个 batch 成员的终态（由 Python 结果泵在解析 payload 后调用）。
     ///
-    /// Rust EventBus 无法区分「协议成功」与「业务失败」（worker 结果正文不透明），
+    /// Rust 结果通道无法区分「协议成功」与「业务失败」（worker 结果正文不透明），
     /// 因此 batch 终态由唯一能解析 payload 的 Python 侧上报；返回更新后的进度快照，
     /// 非 batch 成员或重复上报返回 `None`。
     fn record_batch_terminal(
@@ -1964,11 +2010,13 @@ impl PyRuntimeCore {
 
     /// 注册 Python 任务结果回调。
     ///
-    /// 订阅 event_bus 的 ``TaskCompleted`` / ``TaskFailed`` / ``TaskCancelled`` 话题，
-    /// 收到事件时调用 ``callback(py_task_completion)``。回调在 tokio 后台线程执行，
-    /// 通过 ``Python::attach`` 获取 GIL。
+    /// 从 correctness 通道一次性取走唯一接收端（`take_result_receiver`），
+    /// 启动事件泵：收到事件时调用 ``callback(py_task_completion)``。回调在
+    /// tokio 后台线程执行，通过 ``Python::attach`` 获取 GIL。
     ///
-    /// 用于分布式任务提交后，Python 层接收 Worker 执行完成的通知并解析 ``AsyncResult``。
+    /// correctness 通道语义上只允许一个消费者——多次调用本方法时，后续回调
+    /// 加入**同一泵**的 fan-out 列表（与 fan-out 消费者语义一致），不会出现
+    /// 双泵拆流导致的终态事件错分。
     #[tracing::instrument(
         name = "py.register_task_result_callback",
         level = "info",
@@ -1977,59 +2025,96 @@ impl PyRuntimeCore {
     fn register_task_result_callback(&self, callback: Py<PyAny>) -> PyResult<()> {
         let runtime = self.core()?;
         let tokio = self.tokio_handle()?;
-        let event_bus = runtime.event_bus().clone();
         let callback = Arc::new(callback);
 
-        // 订阅 4 个任务生命周期话题（Started + Completed/Failed/Cancelled）
-        let mut rx_started = event_bus.subscribe(BusTopic::TaskStarted);
-        let mut rx_completed = event_bus.subscribe(BusTopic::TaskCompleted);
-        let mut rx_failed = event_bus.subscribe(BusTopic::TaskFailed);
-        let mut rx_cancelled = event_bus.subscribe(BusTopic::TaskCancelled);
+        // 泵已存在：经追加通道把回调交给泵循环——泵在其本地回调列表上
+        // push（select! 的 add_rx 臂），追加对后续事件投递即时生效。
+        {
+            if let Some(tx) = self.task_result_pumps.lock().as_ref() {
+                tx.send(callback.clone()).map_err(|_| {
+                    pyo3::exceptions::PyRuntimeError::new_err(
+                        "result pump loop has exited; cannot register callback",
+                    )
+                })?;
+                return Ok(());
+            }
+        }
+        let Some(mut rx) = runtime.take_result_receiver() else {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "task result receiver already taken; result pump can only be started once",
+            ));
+        };
+
+        // fan-out 注册表：首次注册的回调由循环持有，后续注册经 mpsc 追加。
+        let (add_tx, mut add_rx) = tokio::sync::mpsc::unbounded_channel::<Arc<Py<PyAny>>>();
+        let mut callbacks: Vec<Arc<Py<PyAny>>> = vec![callback];
+        let blocking_permits = Arc::new(tokio::sync::Semaphore::new(PUMP_BLOCKING_PERMITS));
+        // 泵对追加通道接收端的句柄在闭包内持有；发布端存入 pumps.active，
+        // 后续注册经它追加（recv 唤醒即时生效，无需额外 notify）。
+        *self.task_result_pumps.lock() = Some(add_tx.clone());
 
         let handle = tokio.spawn(async move {
             loop {
-                let event = tokio::select! {
-                    ev = rx_started.recv() => ev,
-                    ev = rx_completed.recv() => ev,
-                    ev = rx_failed.recv() => ev,
-                    ev = rx_cancelled.recv() => ev,
-                };
-                let Some(event) = event else {
-                    break;
-                };
-                let py_completion = match event {
-                    BusEvent::TaskStarted {
-                        workflow_id,
-                        task_id,
-                    } => PyTaskCompletion {
-                        workflow_id: workflow_id.as_str().to_string(),
-                        task_id: task_id.as_str().to_string(),
-                        task_name: String::new(),
-                        state: "Running".to_string(),
-                        result: None,
-                        error: None,
-                        target_node: None,
-                    },
-                    BusEvent::TaskCompleted(c) => task_completion_to_py(&c),
-                    BusEvent::TaskFailed(c) => task_completion_to_py(&c),
-                    BusEvent::TaskCancelled(c) => task_completion_to_py(&c),
-                    _ => continue,
-                };
-                let cb = callback.clone();
-                // 把 Python 回调放到 spawn_blocking 执行，避免慢回调阻塞
-                // event_bus 消费和 tokio worker 线程。
-                tokio::task::spawn_blocking(move || {
-                    Python::attach(|py| {
-                        let t0 = std::time::Instant::now();
-                        let cb_ref = cb.clone_ref(py);
-                        if let Err(e) = cb_ref.call1(py, (py_completion,)) {
-                            tracing::warn!("task result callback error: {}", e);
+                tokio::select! {
+                    event = rx.recv() => {
+                        let Some(event) = event else {
+                            break;
+                        };
+                        let py_completion = match event {
+                            TaskLifecycleEvent::TaskStarted {
+                                workflow_id,
+                                task_id,
+                            } => PyTaskCompletion {
+                                workflow_id: workflow_id.as_str().to_string(),
+                                task_id: task_id.as_str().to_string(),
+                                task_name: String::new(),
+                                state: "Running".to_string(),
+                                result: None,
+                                error: None,
+                                target_node: None,
+                            },
+                            TaskLifecycleEvent::TaskCompleted(c) => task_completion_to_py(&c),
+                            TaskLifecycleEvent::TaskFailed(c) => task_completion_to_py(&c),
+                            TaskLifecycleEvent::TaskCancelled(c) => task_completion_to_py(&c),
+                        };
+                        for cb in &callbacks {
+                            let cb = cb.clone();
+                            let py_completion = py_completion.clone();
+                            // 把 Python 回调放到 spawn_blocking 执行，避免慢回调
+                            // 阻塞 feed 消费和 tokio worker 线程。并发上限 64：
+                            // 终态风暴 + 慢回调（GIL 被占）时无上限会堆积大量
+                            // 持结果字节的阻塞任务——纯内存放大（GIL 串行化后
+                            // 吞吐不变）；permits 在闭包 Drop 时归还，泵循环
+                            // 在 acquire 上等待，事件留在 feed 队列不丢。
+                            let Ok(permit) = blocking_permits.clone().acquire_owned().await
+                            else {
+                                // permits 永不 close；此分支仅剩 runtime drop 竞态，
+                                // 泵退出（事件无消费者）。
+                                break;
+                            };
+                            tokio::task::spawn_blocking(move || {
+                                let _permit = permit;
+                                Python::attach(|py| {
+                                    let t0 = std::time::Instant::now();
+                                    let cb_ref = cb.clone_ref(py);
+                                    if let Err(e) = cb_ref.call1(py, (py_completion,)) {
+                                        tracing::warn!("task result callback error: {}", e);
+                                    }
+                                    actant_core::metrics::observe_event_bridge_ms(
+                                        t0.elapsed().as_millis() as u64
+                                    );
+                                });
+                            });
                         }
-                        actant_core::metrics::observe_event_bridge_ms(
-                            t0.elapsed().as_millis() as u64
-                        );
-                    });
-                });
+                    }
+                    added = add_rx.recv() => {
+                        match added {
+                            Some(cb) => callbacks.push(cb),
+                            // 泵持有者已 drop（不可能：self 持有句柄）——保守退出。
+                            None => break,
+                        }
+                    }
+                }
             }
         });
         // 跟踪 spawned task 句柄：shutdown 时 abort + await，避免孤儿 task
@@ -2040,10 +2125,9 @@ impl PyRuntimeCore {
 
     /// 注册任务日志回调。
     ///
-    /// worker 子进程经 stderr 边带上报的任务日志（tap 语义 best-effort 可丢），
-    /// 收到事件时调用 ``callback(dict)``，dict 为 ``{task_id, level, message}``。
-    /// 指定 ``task_id`` 时走 `EventBus` 的逐任务通道，只接收该任务的日志；
-    /// 省略时订阅全局 ``TaskLog`` 话题，接收所有任务日志。
+    /// 订阅观测 tap 的任务日志流（可丢、不反压），收到事件时调用
+    /// ``callback(dict)``，dict 为 ``{task_id, level, message}``。指定
+    /// ``task_id`` 时由泵内过滤，只回调该任务的日志；省略时回调所有日志。
     /// 回调在 tokio 后台线程执行，通过 ``Python::attach`` 获取 GIL。
     #[tracing::instrument(
         name = "py.register_task_log_callback",
@@ -2058,19 +2142,24 @@ impl PyRuntimeCore {
     ) -> PyResult<()> {
         let runtime = self.core()?;
         let tokio = self.tokio_handle()?;
-        let event_bus = runtime.event_bus().clone();
+        let tap = runtime.tap().clone();
         let callback = Arc::new(callback);
-        let mut rx_log = match task_id {
-            Some(task_id) => event_bus.subscribe_task_logs(TaskId::from(task_id)),
-            None => event_bus.subscribe(BusTopic::TaskLog),
-        };
+        let task_id_filter = task_id.clone();
+        let mut rx = tap.subscribe();
+        let blocking_permits = Arc::new(tokio::sync::Semaphore::new(PUMP_BLOCKING_PERMITS));
 
         let handle = tokio.spawn(async move {
             loop {
-                let Some(event) = rx_log.recv().await else {
-                    break;
+                let event = match rx.recv().await {
+                    Ok(event) => event,
+                    // 慢消费者跳过被丢弃的最旧事件：tap 语义内建，计数后继续。
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        actant_core::metrics::inc_tap_lagged(n);
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
                 };
-                let BusEvent::TaskLog {
+                let TapEvent::TaskLog {
                     task_id,
                     level,
                     message,
@@ -2078,12 +2167,27 @@ impl PyRuntimeCore {
                 else {
                     continue;
                 };
+                if let Some(filter) = &task_id_filter {
+                    if filter != task_id.as_str() {
+                        continue;
+                    }
+                }
                 let cb = callback.clone();
+                let (task_id, level, message) = (
+                    task_id.as_str().to_string(),
+                    level.to_string(),
+                    message.to_string(),
+                );
+                // 并发上限同结果泵（日志事件量级更高，GIL 串行化下无上限纯堆内存）。
+                let Ok(permit) = blocking_permits.clone().acquire_owned().await else {
+                    // 同结果泵：permits close 仅剩关停竞态，泵退出。
+                    break;
+                };
                 tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
                     Python::attach(|py| {
-                        let t0 = std::time::Instant::now();
                         let dict = pyo3::types::PyDict::new(py);
-                        if dict.set_item("task_id", task_id.as_str()).is_err()
+                        if dict.set_item("task_id", task_id).is_err()
                             || dict.set_item("level", level).is_err()
                             || dict.set_item("message", message).is_err()
                         {
@@ -2093,9 +2197,6 @@ impl PyRuntimeCore {
                         if let Err(e) = cb_ref.call1(py, (dict,)) {
                             tracing::warn!("task log callback error: {}", e);
                         }
-                        actant_core::metrics::observe_event_bridge_ms(
-                            t0.elapsed().as_millis() as u64
-                        );
                     });
                 });
             }
@@ -2106,8 +2207,9 @@ impl PyRuntimeCore {
 
     /// 注册 Worker 状态回调。
     ///
-    /// 订阅 event_bus 的 ``WorkerLifecycle`` 话题（draining/drained/stopped），
+    /// 订阅观测 tap 的 Worker 生命周期流（draining/drained/stopped），
     /// 收到事件时调用 ``callback(dict)``，dict 为 ``{state, node_id}``。
+    /// broadcast 单接收端保序；回调串行执行，保证 drained 先于 stopped 送达。
     #[tracing::instrument(
         name = "py.register_worker_state_callback",
         level = "info",
@@ -2116,19 +2218,26 @@ impl PyRuntimeCore {
     fn register_worker_state_callback(&self, callback: Py<PyAny>) -> PyResult<()> {
         let runtime = self.core()?;
         let tokio = self.tokio_handle()?;
-        let event_bus = runtime.event_bus().clone();
+        let tap = runtime.tap().clone();
         let callback = Arc::new(callback);
-        let mut rx = event_bus.subscribe(BusTopic::WorkerLifecycle);
+        // 独立生命周期通道：与通用 tap（日志洪泛源）隔离，draining/drained/
+        // stopped 不会被 Lagged 挤掉；通道内保序 + 串行回调 = 严格序送达。
+        let mut rx = tap.subscribe_lifecycle();
 
         let handle = tokio.spawn(async move {
             loop {
-                let Some(event) = rx.recv().await else {
-                    break;
+                let event = match rx.recv().await {
+                    Ok(event) => event,
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        actant_core::metrics::inc_tap_lagged(n);
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
                 };
                 let (state, node_id) = match &event {
-                    BusEvent::WorkerDraining { node_id } => ("draining", node_id),
-                    BusEvent::WorkerDrained { node_id } => ("drained", node_id),
-                    BusEvent::WorkerStopped { node_id } => ("stopped", node_id),
+                    TapEvent::WorkerDraining { node_id } => ("draining", node_id),
+                    TapEvent::WorkerDrained { node_id } => ("drained", node_id),
+                    TapEvent::WorkerStopped { node_id } => ("stopped", node_id),
                     _ => continue,
                 };
                 let state = state.to_string();
@@ -2152,7 +2261,7 @@ impl PyRuntimeCore {
                         );
                     });
                 });
-                // 生命周期回调必须按事件顺序送达：广播通道本身保序，但每个事件
+                // 生命周期回调必须按事件顺序送达：broadcast 通道本身保序，但每个事件
                 // 各起一个 spawn_blocking 后回调会并发执行，可能出现 stopped
                 // 先于 drained 的乱序。这里串行等待，代价是低频事件各等一次。
                 if let Err(e) = task.await {
@@ -2211,7 +2320,11 @@ impl PyRuntimeCore {
             .worker()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("worker not initialized"))?
             .scheduler_clone();
-        let (submit_tx, mut submit_rx) = tokio::sync::mpsc::unbounded_channel::<TaskDefinition>();
+        // 有界 submit 通道：突发提交（万级大参数批量 map）时显式背压——
+        // 无界通道 + 无界调度队列会让上游突发内存无上界增长（OOM 放大器）。
+        // 满载时 submit_task 向调用方显式报错而非堆积。
+        let (submit_tx, mut submit_rx) =
+            tokio::sync::mpsc::channel::<TaskDefinition>(SUBMIT_CHANNEL_CAPACITY);
         let submit_handle = tokio.spawn(async move {
             while let Some(task_def) = submit_rx.recv().await {
                 if let Err(e) = scheduler_for_submit.enqueue(task_def).await {
@@ -2232,7 +2345,7 @@ impl PyRuntimeCore {
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("worker not initialized"))?
             .scheduler_clone();
         let (batch_tx, mut batch_rx) =
-            tokio::sync::mpsc::unbounded_channel::<Vec<TaskDefinition>>();
+            tokio::sync::mpsc::channel::<Vec<TaskDefinition>>(SUBMIT_CHANNEL_CAPACITY);
         let batch_handle = tokio.spawn(async move {
             while let Some(task_defs) = batch_rx.recv().await {
                 if let Err(e) = scheduler_for_batch.enqueue_batch(task_defs).await {

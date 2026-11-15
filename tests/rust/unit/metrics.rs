@@ -123,8 +123,6 @@ fn all_counter_helpers_do_not_panic() {
     inc_actors_spawned();
     inc_actors_stopped();
     inc_actors_failed();
-    inc_direct_requests_capacity_exceeded();
-    inc_event_bus_publish_dropped();
     inc_task_forward_succeeded();
     inc_task_forward_failed();
     inc_task_forward_fallback_local();

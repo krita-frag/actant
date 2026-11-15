@@ -1309,3 +1309,94 @@ async fn apply_remote_update_registers_seen_after_success() {
         "duplicate replay after success must not grow seen"
     );
 }
+
+/// heads 交换只需计数标量，必须走 `GET_STATE_SUMMARY` 而不是全量 `GET_STATE`。
+///
+/// 全量状态里带着已完成任务的结果字节：任一工作流结果超过 actor 消息解码上限
+/// （4 MiB）时，逐工作流 `decode` 失败会让整轮 heads 检测整体停摆（落后检测、
+/// 补拉全部静默失效，集群两侧永久不同步）。正确语义是跳过该工作流并继续。
+#[tokio::test]
+async fn broadcast_heads_survives_workflow_with_oversized_result() {
+    use crate::common::wire::{WireEnvelope, WireMessage};
+    use crate::common::NodeId as WireNodeId;
+    use crate::runtime::workflow::actor::WorkflowActor;
+    use crate::runtime::workflow::dag::{Dag, DagNode};
+    use crate::runtime::workflow::orchestrator::Orchestrator;
+    use std::collections::HashMap;
+
+    fn two_node_dag() -> Dag {
+        let mut dag = Dag::new();
+        for (id, name) in [("t1", "first"), ("t2", "second")] {
+            dag.add_node(DagNode {
+                task_id: TaskId::from(id.to_string()),
+                name: name.to_string(),
+                payload: Vec::new(),
+                retry_policy: None,
+                timeout_ms: None,
+                priority: 0,
+                metadata: HashMap::new(),
+                tags: Vec::new(),
+                quota: None,
+            })
+            .unwrap();
+        }
+        dag.add_edge(TaskId::from("t1"), TaskId::from("t2"))
+            .unwrap();
+        dag
+    }
+
+    let orch = Orchestrator::new().with_signing_key(b"test-key".to_vec());
+    let node_id = "node-heads-big";
+
+    // 超大结果工作流：t1 带 5 MiB 结果后仍处于 Running（t2 未完成）。
+    let big = WorkflowId::from("wf-big-result");
+    orch.submit(big.clone(), two_node_dag()).await.unwrap();
+    orch.start(&big).unwrap();
+    orch.mark_task_running(&big, &TaskId::from("t1")).unwrap();
+    orch.complete_task(
+        &big,
+        &TaskId::from("t1"),
+        vec![7u8; 5 * 1024 * 1024],
+        Some(0),
+    )
+    .await
+    .unwrap();
+
+    // 普通工作流：证明整轮检测没有因上者中断。
+    let small = WorkflowId::from("wf-small-result");
+    orch.submit(small.clone(), two_node_dag()).await.unwrap();
+    orch.start(&small).unwrap();
+
+    let transport = MockTransport::new(node_id);
+    let network: Arc<dyn Transport> = Arc::new(transport.clone());
+    let actor_system = Arc::new(ActorSystem::new());
+    let actor_id = ActorId::workflow(&WireNodeId::from(node_id.to_string()));
+    actor_system
+        .spawn(actor_id.clone(), WorkflowActor::new(orch))
+        .await
+        .unwrap();
+
+    let gossip = DagGossip::new(network, actor_system, actor_id, GossipConfig::default());
+    gossip
+        .broadcast_heads()
+        .await
+        .expect("单个工作流状态过大不得让整轮 heads 检测失败");
+
+    let (topic, data) = transport.last_broadcast().expect("heads must be broadcast");
+    assert_eq!(topic, super::TOPIC_HEADS);
+    let exchange = match WireEnvelope::decode(&data).expect("valid envelope").0 {
+        WireMessage::HeadsExchange(exchange) => exchange,
+        other => panic!("expected HeadsExchange, got {other:?}"),
+    };
+    let mut ids: Vec<String> = exchange
+        .heads
+        .iter()
+        .map(|h| h.workflow_id.0.clone())
+        .collect();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec!["wf-big-result".to_string(), "wf-small-result".to_string()],
+        "两个活跃工作流都必须出现在 heads 中（大结果工作流也只需计数标量）"
+    );
+}

@@ -444,17 +444,42 @@ impl DagGossip {
         let mut heads = Vec::with_capacity(active_ids.len());
 
         for wf_id in &active_ids {
-            let result = self
-                .call_workflow(workflow_methods::GET_STATE, wf_id)
-                .await?;
-            let exec: Option<crate::runtime::workflow::WorkflowExecution> =
-                crate::runtime::workflow::messaging::decode(&result.payload)?;
-            if let Some(exec) = exec {
+            // heads 只需要计数标量：GET_STATE 全量克隆结果字节（大结果工作流
+            // 会超出 actor 消息 4MiB 上限），必须走 summary。单工作流查询失败
+            // 只跳过该工作流——`?` 中止会让所有工作流的落后检测整体停摆。
+            let result = match self
+                .call_workflow(workflow_methods::GET_STATE_SUMMARY, wf_id)
+                .await
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    tracing::warn!(
+                        workflow = %wf_id.as_str(),
+                        error = %e,
+                        "failed to fetch workflow summary for heads exchange; skipping"
+                    );
+                    continue;
+                }
+            };
+            let summary: Option<
+                crate::runtime::workflow::orchestrator::queries::WorkflowStateSummary,
+            > = match crate::runtime::workflow::messaging::decode(&result.payload) {
+                Ok(summary) => summary,
+                Err(e) => {
+                    tracing::warn!(
+                        workflow = %wf_id.as_str(),
+                        error = %e,
+                        "failed to decode workflow summary for heads exchange; skipping"
+                    );
+                    continue;
+                }
+            };
+            if let Some(summary) = summary {
                 let hlc_ts = self.clock.tick();
                 heads.push(WorkflowHead {
                     workflow_id: wf_id.clone(),
-                    succeeded_count: exec.succeeded_count(),
-                    total_count: exec.total_count(),
+                    succeeded_count: summary.succeeded_count,
+                    total_count: summary.total_count,
                     hlc_timestamp: hlc_ts,
                 });
             }
@@ -480,13 +505,40 @@ impl DagGossip {
         }
 
         for remote_head in &exchange.heads {
-            let result = self
-                .call_workflow(workflow_methods::GET_STATE, &remote_head.workflow_id)
-                .await?;
-            let local_exec: Option<crate::runtime::workflow::WorkflowExecution> =
-                crate::runtime::workflow::messaging::decode(&result.payload)?;
+            // 与发送侧同口径：比较只需计数标量，走 summary 避免 全量克隆 与
+            // 4MiB 解码上限；失败按「未知工作流」不处理（下一轮 heads 重试）。
+            let result = match self
+                .call_workflow(
+                    workflow_methods::GET_STATE_SUMMARY,
+                    &remote_head.workflow_id,
+                )
+                .await
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    tracing::warn!(
+                        workflow = %remote_head.workflow_id.as_str(),
+                        error = %e,
+                        "failed to fetch local summary for heads comparison; skipping"
+                    );
+                    continue;
+                }
+            };
+            let local_summary: Option<
+                crate::runtime::workflow::orchestrator::queries::WorkflowStateSummary,
+            > = match crate::runtime::workflow::messaging::decode(&result.payload) {
+                Ok(summary) => summary,
+                Err(e) => {
+                    tracing::warn!(
+                        workflow = %remote_head.workflow_id.as_str(),
+                        error = %e,
+                        "failed to decode local summary for heads comparison; skipping"
+                    );
+                    continue;
+                }
+            };
 
-            match local_exec {
+            match local_summary {
                 None => {
                     tracing::info!(
                         "discovered unknown workflow {} from node {}, requesting full state",
@@ -506,14 +558,14 @@ impl DagGossip {
                     // 之前不会改变 succeeded_count，只看成功数会让"仍在 Running
                     // 的任务"永远复制不到对端——编排节点失联后接管方手里没有可
                     // 重调度的任务，工作流停摆。
-                    if remote_head.total_count > local.total_count()
-                        || remote_head.succeeded_count > local.succeeded_count()
+                    if remote_head.total_count > local.total_count
+                        || remote_head.succeeded_count > local.succeeded_count
                     {
                         tracing::info!(
                             "workflow {} behind: local {}/{} < remote {}/{}, requesting state",
                             remote_head.workflow_id.as_str(),
-                            local.succeeded_count(),
-                            local.total_count(),
+                            local.succeeded_count,
+                            local.total_count,
                             remote_head.succeeded_count,
                             remote_head.total_count
                         );
