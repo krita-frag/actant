@@ -16,6 +16,8 @@
 4. ``test_out_of_order_results``：并发提交、乱序完成，结果按句柄正确聚合。
 5. ``test_worker_kill_isolated_failure``：worker 子进程被杀属基础设施级失败，
    单任务隔离（重路由成功或终态失败），节点存活、后续任务正常。
+6. ``TestOrchestratorTakeover``：强杀**编排节点**，幸存节点接管其工作流并
+   重新执行在途任务直至 Completed——故障转移真正闭环的形态。
 
 每个用例自带总超时（≤60s）并使用轮询断言避免固定 sleep 时序脆弱。
 """
@@ -46,6 +48,26 @@ if TYPE_CHECKING:
 # 用例总时长上限（秒）：含节点启动、故障注入与收敛等待。
 CASE_BUDGET_S = 60.0
 
+
+def _tuned_config():
+    """故障转移全链路的短周期配置（与子进程节点的取值保持一致）。
+
+    默认值（心跳 2s、失效 8s、heads 广播 30s）下"检测失联 + 状态副本扩散"
+    需要 40s 量级，超出用例预算。约束仍是 ``heartbeat < failure < lease``。
+    """
+    from actant.actant import _ActantConfig, _FailoverConfig, _GossipConfig
+
+    return _ActantConfig(
+        payload_signing_key="",
+        failover=_FailoverConfig(
+            heartbeat_interval_ms=500,
+            failure_timeout_ms=2000,
+            lease_duration_ms=4000,
+            lease_expiry_check_interval_secs=1,
+        ),
+        gossip=_GossipConfig(heads_broadcast_interval_ms=1000),
+    )
+
 # 任务函数统一定义在规范模块：pytest 把本测试模块导入为 ``python.e2e.*``
 # （tests/ 缺少 __init__.py），该非规范名在子进程节点的 worker 中不可导入。
 _touch_and_sleep = rt_tasks.touch_and_sleep
@@ -62,11 +84,20 @@ _quick = rt_tasks.quick
 class ChildNode:
     """子进程节点句柄：进程 + 连接信息 + 强杀/清理。"""
 
-    def __init__(self, proc: subprocess.Popen[bytes], info: dict[str, str]) -> None:
+    def __init__(
+        self,
+        proc: subprocess.Popen[bytes],
+        info: dict[str, str],
+        log_path: str = "",
+    ) -> None:
         self.proc = proc
         self.node_id = info["node_id"]
         self.peer_id = info["peer_id"]
         self.endpoint_addr = info["endpoint_addr"]
+        # 仅编排节点模式（``flow_marker``）下非空。
+        self.workflow_id = info.get("workflow_id", "")
+        # 子进程日志落盘（``workdir/<name>.log``）：失败时唯一能看到的远端视角。
+        self.log_path = log_path
 
     def kill(self) -> None:
         """SIGKILL 强杀节点进程并回收（对应生产中的节点宕机）。"""
@@ -75,32 +106,44 @@ class ChildNode:
         self.proc.wait(timeout=10)
 
 
-def _spawn_child_node(parent_addr: str, workdir: str, name: str) -> ChildNode:
+def _spawn_child_node(
+    parent_addr: str, workdir: str, name: str, flow_marker: str | None = None
+) -> ChildNode:
     """启动一个真实 iroh 子进程节点并 dial 父节点，返回连接信息。
 
     以 ``python -m`` 从仓库根启动，保证 worker 子进程能按模块路径导入
     测试模块内的任务函数（cloudpickle 按引用序列化）。
+
+    ``flow_marker`` 非空时子节点进入编排节点模式：自己提交一个 ``@flow``
+    并上报工作流 ID，用于构造"编排节点被强杀"的接管场景。
     """
     info_path = os.path.join(workdir, f"{name}.json")
     data_dir = os.path.join(workdir, f"data-{name}")
     env = os.environ.copy()
     env["ACTANT_DISCOVERY"] = "none"
     env["RUST_LOG"] = env.get("RUST_LOG", "warn")
-    proc = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "tests.python.e2e._reliability_child",
-            parent_addr,
-            info_path,
-            data_dir,
-            name,
-        ],
-        env=env,
-        cwd=os.getcwd(),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    argv = [
+        sys.executable,
+        "-m",
+        "tests.python.e2e._reliability_child",
+        parent_addr,
+        info_path,
+        data_dir,
+        name,
+    ]
+    if flow_marker is not None:
+        argv.append(flow_marker)
+    # 子进程日志写入 workdir：远端节点的视角（收到什么、拒绝了什么）
+    # 只能从这里看到，DEVNULL 会让跨节点问题的定位完全失去线索。
+    log_path = os.path.join(workdir, f"{name}.log")
+    with open(log_path, "wb") as log_file:
+        proc = subprocess.Popen(
+            argv,
+            env=env,
+            cwd=os.getcwd(),
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+        )
     # 轮询信息文件：子节点 dial 成功后写入连接信息。
     deadline = time.monotonic() + 20.0
     info: dict[str, str] | None = None
@@ -116,7 +159,7 @@ def _spawn_child_node(parent_addr: str, workdir: str, name: str) -> ChildNode:
         proc.kill()
         proc.wait(timeout=10)
         raise RuntimeError(f"child node {name} did not report connection info in 20s")
-    return ChildNode(proc, info)
+    return ChildNode(proc, info, log_path)
 
 
 def _connect_bidirectional(rt: Runtime, child: ChildNode, timeout_s: float = 15.0) -> None:
@@ -249,10 +292,79 @@ class TestNodeKill:
 
 
 # ---------------------------------------------------------------------------
-# 用例 2：节点重启（recover）续跑
+# 用例 1b：编排节点被强杀后的工作流接管
 # ---------------------------------------------------------------------------
 
 
+class TestOrchestratorTakeover:
+    """编排节点死亡：幸存节点接管工作流并把它跑完。
+
+    与 ``TestNodeKill`` 的区别在于死的是**编排者**而非执行者：任务状态、
+    依赖图都在死者本地，幸存节点必须先有状态副本（heads exchange 拉取），
+    再经"失联检测 → 一致性哈希选举 → claim 租约 → 重调度"把在途任务重跑。
+    这是故障转移唯一真正闭环的形态，其余用例都只断言"集群不崩"。
+    """
+
+    def test_workflow_converges_after_orchestrator_kill(self, tmp_path) -> None:
+        marker = str(tmp_path / "takeover.marker")
+        rt = actant.Runtime(
+            name="takeover-survivor",
+            data_dir=str(tmp_path / "data-survivor"),
+            config=_tuned_config(),
+            max_concurrent_tasks=4,
+        )
+        rt.start()
+        victim: ChildNode | None = None
+        try:
+            victim = _spawn_child_node(
+                rt.listen_addresses()["endpoint_addr"],
+                str(tmp_path),
+                "orchestrator",
+                flow_marker=marker,
+            )
+            _connect_bidirectional(rt, victim)
+            wf_id = victim.workflow_id
+            assert wf_id, "编排节点未上报工作流 ID"
+
+            # 接管的前提：幸存节点已持有该工作流的**节点**，而不只是空外壳。
+            # 节点是在 flow 函数体里经 add_node 增量加入的，若副本只到外壳，
+            # 接管后就没有可重调度的在途任务。
+            assert wait_until(
+                lambda: ((rt.get_workflow_state(wf_id) or {}).get("total_count") or 0) >= 1,
+                timeout_s=30.0,
+                interval_s=0.2,
+            ), f"幸存节点始终没有拿到工作流节点副本: {rt.get_workflow_state(wf_id)}"
+
+            # 任务已在编排节点上开跑，此刻强杀。
+            assert wait_until(
+                lambda: _marker_count(marker, "start") >= 1,
+                timeout_s=20.0,
+                interval_s=0.1,
+            ), "工作流任务未在编排节点上开跑"
+            victim.kill()
+
+            # 接管后工作流必须在幸存节点收敛到 Completed。
+            assert wait_until(
+                lambda: (rt.get_workflow_state(wf_id) or {}).get("state") == "Completed",
+                timeout_s=60.0,
+                interval_s=0.5,
+            ), f"工作流未在幸存节点收敛: {rt.get_workflow_state(wf_id)}"
+
+            state = rt.get_workflow_state(wf_id)
+            assert state["succeeded_count"] == state["total_count"] == 1, state
+            # 重调度会重新执行任务体（at-least-once），副作用计数因此 ≥ 2。
+            assert _marker_count(marker, "start") >= 2, (
+                "接管后必须由幸存节点重新执行在途任务"
+            )
+        finally:
+            if victim is not None:
+                victim.kill()
+            rt.stop()
+
+
+# ---------------------------------------------------------------------------
+# 用例 2：节点重启（recover）续跑
+# ---------------------------------------------------------------------------
 class TestNodeRestartResume:
     """节点重启后工作流状态恢复：状态跨重启保持、已完成不重跑。"""
 

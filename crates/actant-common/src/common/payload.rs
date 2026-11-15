@@ -63,6 +63,14 @@ pub fn unpack_payload(data: &[u8]) -> crate::common::Result<Vec<Vec<u8>>> {
                 ));
             }
             let count = u32::from_le_bytes([data[1], data[2], data[3], data[4]]) as usize;
+            // 每个结果至少占 4 字节长度字段；先按剩余字节校验 count，
+            // 避免 5 字节载荷声明 u32::MAX 个结果时触发数 GB 预分配。
+            let max_possible = data.len().saturating_sub(5) / 4;
+            if count > max_possible {
+                return Err(crate::common::ActantError::Serialization(format!(
+                    "group payload count {count} exceeds available bytes ({max_possible} items max)"
+                )));
+            }
             let mut results = Vec::with_capacity(count);
             let mut offset = 5;
             for _ in 0..count {
@@ -243,11 +251,23 @@ pub fn wire_mac(key: &[u8], bytes: &[u8]) -> Option<[u8; WIRE_MAC_LEN]> {
 /// `mac_bytes` 长度必须为 [`WIRE_MAC_LEN`]。空密钥返回 `Ok(())`（禁用签名时
 /// 一切通过，向后兼容）。MAC 不匹配返回 `Err`，调用方应丢弃该消息。
 pub fn verify_wire_mac(key: &[u8], bytes: &[u8], mac_bytes: &[u8]) -> Result<(), String> {
+    verify_wire_mac_incremental(key, &[bytes], mac_bytes)
+}
+
+/// 分段形态的 wire MAC 校验：按顺序喂给同一个 keyed hasher。
+///
+/// 与 [`verify_wire_mac`] 语义一致，但避免调用方为验证拼接与消息等大的
+/// 连续缓冲；段序必须与 [`wire_mac_incremental`] 完全一致。
+pub fn verify_wire_mac_incremental(
+    key: &[u8],
+    segments: &[&[u8]],
+    mac_bytes: &[u8],
+) -> Result<(), String> {
     if key.is_empty() {
         return Ok(());
     }
-    let expected =
-        wire_mac(key, bytes).ok_or_else(|| "verify with non-empty key failed".to_string())?;
+    let expected = wire_mac_incremental(key, segments)
+        .ok_or_else(|| "verify with non-empty key failed".to_string())?;
     if mac_bytes.len() != WIRE_MAC_LEN {
         return Err(format!(
             "wire MAC length mismatch: expected {}, got {}",

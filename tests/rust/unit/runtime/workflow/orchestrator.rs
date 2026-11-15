@@ -280,6 +280,23 @@ async fn cancel_marks_workflow_cancelled() {
 }
 
 #[tokio::test]
+async fn fail_workflow_marks_failed_and_preserves_error() {
+    let orch = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
+    let wf = WorkflowId::from("wf-1");
+    orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
+    orch.start(&wf).unwrap();
+
+    orch.fail_workflow(&wf, "ValueError: boom".into())
+        .await
+        .unwrap();
+
+    let state = orch.get_state(&wf).unwrap();
+    assert!(state.is_terminal());
+    assert_eq!(state.state, Phase::Failed);
+    assert_eq!(state.error.as_deref(), Some("ValueError: boom"));
+}
+
+#[tokio::test]
 async fn cancel_unknown_workflow_returns_not_found() {
     let orch = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
     let err = orch.cancel(&WorkflowId::from("nope")).await.unwrap_err();
@@ -1233,14 +1250,14 @@ async fn handle_task_failure_ignores_late_duplicate_while_retry_pending() {
 
 /// 故障转移重派发：Running 任务重置 Pending 时 attempt 递增并随新派发携带。
 #[tokio::test]
-async fn reschedule_running_tasks_increments_attempt_and_carries_it_on_dispatch() {
+async fn reschedule_incomplete_tasks_increments_attempt_and_carries_it_on_dispatch() {
     let orch = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
     let wf = WorkflowId::from("wf-attempt-resched");
     orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
     orch.start(&wf).unwrap();
     orch.mark_task_running(&wf, &TaskId::from("t1")).unwrap();
 
-    let rescheduled = orch.reschedule_running_tasks(&wf).unwrap();
+    let rescheduled = orch.reschedule_incomplete_tasks(&wf).unwrap();
     assert_eq!(rescheduled.len(), 1);
     assert_eq!(
         rescheduled[0].id,
@@ -1254,12 +1271,49 @@ async fn reschedule_running_tasks_increments_attempt_and_carries_it_on_dispatch(
 
     // 再次重派发（新一轮故障转移）继续递增。
     orch.mark_task_running(&wf, &TaskId::from("t1")).unwrap();
-    let rescheduled = orch.reschedule_running_tasks(&wf).unwrap();
+    let rescheduled = orch.reschedule_incomplete_tasks(&wf).unwrap();
     assert_eq!(rescheduled[0].attempt, 2);
 }
 
-// ───────────────────────── complete_task 入口 attempt fencing 测试 ─────────────────────────
+/// 接管方只拿到远端快照时，恢复出来的 Pending 任务必须被重新派发。
+///
+/// `restore_workflow_from_bytes` 会把非终态任务重置为 Pending 并推进 attempt，
+/// 因此"只认 Running"的重派发逻辑在接管路径上一个任务都拿不到——工作流停在
+/// Running 却永不推进（现象：接管后任务永久 Pending）。
+#[tokio::test]
+async fn reschedule_incomplete_tasks_redispatches_pending_tasks_from_remote_snapshot() {
+    let wf = WorkflowId::from("wf-resched-pending");
 
+    // 源编排器：t1 在途（Running）。
+    let src = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
+    src.submit(wf.clone(), make_linear_dag()).await.unwrap();
+    src.start(&wf).unwrap();
+    src.mark_task_running(&wf, &TaskId::from("t1")).unwrap();
+    let (dag_bytes, exec_bytes, pending_bytes) = src
+        .get_workflow_state_bytes(&wf)
+        .await
+        .expect("source state bytes");
+
+    // 接管方：只有远端快照，没有本地执行历史。
+    let dst = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
+    dst.restore_workflow_from_bytes(&wf, Some(dag_bytes), Some(exec_bytes), Some(pending_bytes))
+        .await;
+    assert_eq!(
+        dst.get_state(&wf).unwrap().tasks[&TaskId::from("t1")].state,
+        Phase::Pending,
+        "恢复后的非终态任务应为 Pending"
+    );
+
+    let rescheduled = dst.reschedule_incomplete_tasks(&wf).unwrap();
+    assert_eq!(rescheduled.len(), 1, "接管方必须拿到可派发的任务");
+    assert_eq!(rescheduled[0].id, TaskId::from("t1"));
+    assert_eq!(
+        rescheduled[0].attempt, 1,
+        "恢复时已推进过 attempt，重派发不得再递增（否则白涨一代）"
+    );
+}
+
+// ───────────────────────── complete_task 入口 attempt fencing 测试 ─────────────────────────
 /// 故障转移重派发后（attempt=1），旧代（attempt=0）在途执行的迟到完成结果在
 /// `complete_task` 入口被丢弃：任务保持 Pending、后继不被调度、无终态推进；
 /// 当代（attempt=1）结果正常接受并调度后继。
@@ -1272,7 +1326,7 @@ async fn complete_task_drops_stale_attempt_result_and_accepts_current() {
     orch.mark_task_running(&wf, &TaskId::from("t1")).unwrap();
 
     // 故障转移：t1 重置 Pending，attempt 0 → 1
-    let rescheduled = orch.reschedule_running_tasks(&wf).unwrap();
+    let rescheduled = orch.reschedule_incomplete_tasks(&wf).unwrap();
     assert_eq!(rescheduled[0].attempt, 1);
 
     // 旧代（attempt 0）迟到完成 → 丢弃：t1 保持 Pending，t2 不 ready。
@@ -1367,6 +1421,10 @@ fn event_names(events: &[JournalEvent]) -> Vec<&'static str> {
             JournalEvent::TimerFired { .. } => "TimerFired",
             JournalEvent::ContextValue { .. } => "ContextValue",
             JournalEvent::Recovered { .. } => "Recovered",
+            JournalEvent::NodesSealed { .. } => "NodesSealed",
+            JournalEvent::DeadlineSet { .. } => "DeadlineSet",
+            JournalEvent::Evicted { .. } => "Evicted",
+            JournalEvent::StartedAt { .. } => "StartedAt",
         })
         .collect()
 }
@@ -1405,6 +1463,27 @@ async fn submit_appends_node_added_event_per_node() {
     assert!(nodes.contains(&"t1".to_string()));
     assert!(nodes.contains(&"t2".to_string()));
     assert!(nodes.contains(&"t3".to_string()));
+
+    // NodeAdded 携带节点定义与实际前驱，journal 可独立重建边与 pending。
+    let deps_by_node: Vec<(String, Vec<String>)> = read_history(&event_log, &wf)
+        .into_iter()
+        .filter_map(|p| match p {
+            JournalEvent::NodeAdded { node, deps, .. } => Some((
+                node.task_id.to_string(),
+                deps.iter().map(|d| d.to_string()).collect(),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert!(deps_by_node
+        .iter()
+        .any(|(id, deps)| id == "t1" && deps.is_empty()));
+    assert!(deps_by_node
+        .iter()
+        .any(|(id, deps)| id == "t2" && deps == &vec!["t1".to_string()]));
+    assert!(deps_by_node
+        .iter()
+        .any(|(id, deps)| id == "t3" && deps == &vec!["t2".to_string()]));
 }
 
 /// recover = 快照 + 其后事件重放：快照水位之后的 TaskCompleted 事件（携带
@@ -1737,6 +1816,78 @@ async fn release_all_wait_point_waiters_unblocks_parked_waiters() {
     );
 }
 
+/// 终态收尾不得被持久化失败打断。
+///
+/// 收尾要做四件事：落盘终态快照、追加终态事件、更新指标、释放等待者。前两者
+/// 依赖 Store，后两者只依赖内存状态。磁盘写满（LMDB MAP_FULL）时若把持久化
+/// 错误直接上抛，等待者会一直 park 到超时、`active_workflows` 永久泄漏。
+///
+/// 触发方式：先用小块数据把 map 写满，再完成末任务，使终态 `put_batch` 必然失败。
+#[tokio::test]
+async fn terminal_settlement_survives_store_write_failure() {
+    let dir = tempdir().unwrap();
+    let store = Store::open_with_config(
+        dir.path(),
+        crate::common::StoreConfig {
+            // 小 map：便于在数十次写入内写满，且与生产走同一条 MAP_FULL 路径。
+            map_size: 2 * 1024 * 1024,
+            ..crate::common::StoreConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let orch = Orchestrator::new()
+        .with_signing_key(TEST_SIGNING_KEY.to_vec())
+        .with_store(store.clone());
+    let wf = WorkflowId::from("wf-terminal-full-map");
+    let mut dag = Dag::new();
+    dag.add_node(make_node("only", "only")).unwrap();
+    orch.submit(wf.clone(), dag).await.unwrap();
+    let roots = orch.start(&wf).unwrap();
+    assert_eq!(roots.len(), 1);
+    orch.mark_task_running(&wf, &roots[0].id).unwrap();
+
+    // 等待点 park 的等待者：终态必须释放它，否则 park 方挂到超时。
+    let rx = orch.register_wait_point_waiter(wf.clone(), "go");
+
+    // 写满 map；写失败即达到目标状态（残留空间 < 32 KiB）。
+    let mut filled = false;
+    for i in 0..4096 {
+        if store
+            .put(&format!("filler-{i}"), &vec![0u8; 32 * 1024])
+            .await
+            .is_err()
+        {
+            filled = true;
+            break;
+        }
+    }
+    assert!(filled, "未能写满小 map，测试前提不成立");
+
+    // 末任务结果远大于残留空间 ⇒ 终态快照 put_batch 必然失败。
+    let outcome = orch
+        .on_task_completed(&wf, &TaskId::from("only"), vec![7u8; 1 << 20])
+        .await;
+    assert!(
+        outcome.is_ok(),
+        "终态收尾不得因快照落盘失败而上抛（等待者与指标已受影响）: {outcome:?}"
+    );
+    assert_eq!(
+        orch.get_state(&wf).unwrap().state,
+        Phase::Completed,
+        "内存中的终态必须已结算"
+    );
+
+    let released = tokio::time::timeout(std::time::Duration::from_millis(500), rx)
+        .await
+        .expect("终态收尾必须释放等待点等待者，不得让其 park 到超时");
+    assert!(
+        released.is_err(),
+        "释放语义是丢弃 sender（receiver 收到 Err），不是投递载荷"
+    );
+}
+
 /// Timer 等待点：仅到期者触发，重复 poll 幂等；未到期的保持 Waiting。
 #[tokio::test]
 async fn poll_expired_timers_fires_only_due_and_is_idempotent() {
@@ -1830,6 +1981,49 @@ async fn waitpoints_survive_recover_and_stay_reachable() {
     recovered
         .register_wait_point(&wf, "go", WaitCondition::Signal { name: "go".into() })
         .unwrap();
+}
+
+/// journal-first 提交在快照落盘前崩溃：快照三键缺失，恢复必须从 journal
+/// topic 发现工作流并重放出完整 DAG、任务与 pending。
+#[tokio::test]
+async fn journal_only_submit_is_recovered_from_event_log() {
+    use crate::common::{STORE_KEY_DAG, STORE_KEY_EXEC, STORE_KEY_PENDING};
+
+    let dir = tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let event_log = Arc::new(MemoryEventLog::default());
+    let wf = WorkflowId::from("wf-journal-only");
+    let expected_nodes = make_linear_dag().node_count();
+
+    let orch = Orchestrator::new()
+        .with_signing_key(TEST_SIGNING_KEY.to_vec())
+        .with_store(store.clone())
+        .with_event_log(event_log.clone());
+    orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
+
+    // 模拟「journal 已落盘、快照尚未写入」的崩溃窗口。
+    for prefix in [STORE_KEY_DAG, STORE_KEY_EXEC, STORE_KEY_PENDING] {
+        for (key, _) in store.scan_prefix(prefix).await.unwrap() {
+            store.delete(&key).await.unwrap();
+        }
+    }
+    drop(orch);
+
+    let recovered = Orchestrator::recover(store, recover_config(), Some(event_log))
+        .await
+        .unwrap();
+    let slot = recovered
+        .state
+        .slots
+        .get(&wf)
+        .expect("journal-only workflow must be discovered from event log");
+    assert_eq!(slot.dag.node_count(), expected_nodes);
+    assert_eq!(slot.execution.tasks.len(), expected_nodes);
+    assert_eq!(
+        slot.pending.get(&TaskId::from("t1")).copied(),
+        Some(0),
+        "root task must be ready to dispatch after journal replay"
+    );
 }
 
 /// recover 后等待点保留（快照路径）：flush 过的等待点经 `orch:wait:` 快照
@@ -2449,4 +2643,992 @@ async fn get_context_value_reads_without_writing_history() {
         .unwrap();
     assert_eq!(again, b"v");
     assert_eq!(ctx_events(), 1);
+}
+
+/// 重试任务的前驱在首次派发前已全部完成，重试后 pending 必须回到 0；
+/// 否则故障转移/接管时该任务永远不会被重新调度。
+#[tokio::test]
+async fn retry_with_predecessors_remains_reschedulable_after_failover() {
+    let orch = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
+    let wf = WorkflowId::from("wf-retry-failover");
+
+    let mut dag = Dag::new();
+    dag.add_node(make_node("a", "root")).unwrap();
+    let mut b = make_node("b", "child");
+    b.retry_policy = Some(RetryPolicy {
+        max_retries: 2,
+        delay_ms: 0,
+        backoff_multiplier: 1.0,
+        max_delay_ms: 0,
+    });
+    dag.add_node(b).unwrap();
+    dag.add_edge(TaskId::from("a"), TaskId::from("b")).unwrap();
+
+    orch.submit(wf.clone(), dag).await.unwrap();
+    let roots = orch.start(&wf).unwrap();
+    assert_eq!(roots.len(), 1);
+
+    orch.mark_task_running(&wf, &TaskId::from("a")).unwrap();
+    let (ready, _) = orch
+        .on_task_completed(&wf, &TaskId::from("a"), b"r".to_vec())
+        .await
+        .unwrap();
+    assert_eq!(ready.len(), 1, "b must become ready after a completes");
+
+    orch.mark_task_running(&wf, &TaskId::from("b")).unwrap();
+    let retry = orch
+        .handle_task_failure(&wf, &TaskId::from("b"), "boom".into())
+        .await
+        .unwrap();
+    assert!(retry.is_some(), "retry budget must schedule b again");
+
+    // 模拟接管：恢复路径只挑 pending == 0 的 Pending 任务。
+    let rescheduled = orch.reschedule_incomplete_tasks(&wf).unwrap();
+    assert!(
+        rescheduled.iter().any(|t| t.id.as_str() == "b"),
+        "retried task must stay reschedulable after failover"
+    );
+}
+
+/// Continue 策略下工作流可以带着 Failed 任务保持非终态；恢复时不得把
+/// Failed 重置为 Pending，否则失败任务会在重启后绕过重试预算重跑。
+#[tokio::test]
+async fn recovery_keeps_failed_tasks_terminal_under_continue() {
+    let dir = tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+
+    let wf = WorkflowId::from("wf-recover-failed");
+    let mut dag = make_linear_dag();
+    dag.failure_strategy = crate::runtime::workflow::dag::FailureStrategy::Continue;
+
+    let orch = Orchestrator::new()
+        .with_signing_key(TEST_SIGNING_KEY.to_vec())
+        .with_store(store.clone());
+    orch.submit(wf.clone(), dag).await.unwrap();
+    orch.start(&wf).unwrap();
+    orch.mark_task_running(&wf, &TaskId::from("t1")).unwrap();
+    orch.fail_task(
+        &wf,
+        &TaskId::from("t1"),
+        "boom".into(),
+        FailureScope::WorkflowLevel,
+    )
+    .await
+    .unwrap();
+    orch.flush_dirty().await.unwrap();
+    drop(orch);
+
+    let recovered = Orchestrator::recover(store, recover_config(), None)
+        .await
+        .unwrap();
+    let state = recovered.get_state(&wf).unwrap();
+    assert!(
+        !state.is_terminal(),
+        "continue strategy keeps workflow non-terminal"
+    );
+    assert_eq!(
+        state.tasks[&TaskId::from("t1")].state,
+        Phase::Failed,
+        "failed task must stay terminal across recovery"
+    );
+
+    let ready: Vec<String> = recovered
+        .recover_ready_tasks()
+        .into_iter()
+        .map(|t| t.id.to_string())
+        .collect();
+    assert!(
+        !ready.contains(&"t1".to_string()),
+        "failed task must not be redispatched after recovery"
+    );
+}
+
+/// 核心层 `timeout_ms = 0` 必须表示“无 deadline”，与 Python 层语义一致；
+/// 写入 Some(0) 会让工作流在提交后立即被 timeout watcher 判定过期。
+#[tokio::test]
+async fn zero_workflow_timeout_means_no_deadline() {
+    let orch = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
+    let wf = WorkflowId::from("wf-timeout-zero");
+
+    orch.submit_with_timeout(wf.clone(), make_linear_dag(), 0)
+        .await
+        .unwrap();
+    let state = orch.get_state(&wf).unwrap();
+    assert!(
+        state.deadline_ms().is_none(),
+        "timeout_ms=0 must not write a deadline"
+    );
+    assert!(!state.is_expired());
+}
+
+/// 远端恢复缺少 pending 快照时，必须按“未完成前驱数”重建：
+/// 已完成前驱不应继续挡住后继，否则恢复后没有任何 ready 任务。
+#[tokio::test]
+async fn restore_without_pending_bytes_rebuilds_from_unfinished_predecessors() {
+    use crate::common::serialization::serialize_rkyv;
+    use crate::runtime::workflow::WorkflowExecution;
+
+    let orch = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
+    let wf = WorkflowId::from("wf-restore-no-pending");
+    let dag = make_linear_dag();
+
+    let mut exec = WorkflowExecution::new(
+        wf.clone(),
+        vec![TaskId::from("t1"), TaskId::from("t2"), TaskId::from("t3")],
+    );
+    exec.mark_task_completed(&TaskId::from("t1"), b"r1".to_vec(), None);
+
+    orch.restore_workflow_from_bytes(
+        &wf,
+        Some(serialize_rkyv(&dag).unwrap()),
+        Some(serialize_rkyv(&exec).unwrap()),
+        None,
+    )
+    .await;
+
+    let ready: Vec<String> = orch
+        .recover_ready_tasks()
+        .into_iter()
+        .map(|t| t.id.to_string())
+        .collect();
+    assert!(
+        ready.contains(&"t2".to_string()),
+        "t2 with completed predecessor t1 must be ready, got {ready:?}"
+    );
+    assert!(!ready.contains(&"t3".to_string()));
+}
+
+/// adopt 从本地快照重建时必须保留 Failed 终态，并用持久化 pending 计数；
+/// 否则失败任务复活，或已完成前驱继续挡住 ready 任务。
+#[tokio::test]
+async fn adopt_workflow_preserves_failed_and_recomputes_pending() {
+    use crate::runtime::workflow::dag::FailureStrategy;
+
+    let dir = tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let wf = WorkflowId::from("wf-adopt-failed");
+
+    let mut dag = make_linear_dag();
+    dag.failure_strategy = FailureStrategy::Continue;
+
+    let orch = Orchestrator::new()
+        .with_signing_key(TEST_SIGNING_KEY.to_vec())
+        .with_store(store.clone());
+    orch.submit(wf.clone(), dag).await.unwrap();
+    orch.start(&wf).unwrap();
+    orch.mark_task_running(&wf, &TaskId::from("t1")).unwrap();
+    orch.fail_task(
+        &wf,
+        &TaskId::from("t1"),
+        "boom".into(),
+        FailureScope::WorkflowLevel,
+    )
+    .await
+    .unwrap();
+    orch.flush_dirty().await.unwrap();
+    drop(orch);
+
+    let fresh = Orchestrator::new()
+        .with_signing_key(TEST_SIGNING_KEY.to_vec())
+        .with_store(store);
+    fresh.adopt_workflow(&wf).await.unwrap();
+
+    let state = fresh.get_state(&wf).unwrap();
+    assert_eq!(
+        state.tasks[&TaskId::from("t1")].state,
+        Phase::Failed,
+        "adopt must not revive a failed task"
+    );
+}
+
+/// adopt 必须使用持久化的 pending 计数：已完成前驱不应继续挡住 ready 任务。
+#[tokio::test]
+async fn adopt_workflow_uses_persisted_pending() {
+    let dir = tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let wf = WorkflowId::from("wf-adopt-pending");
+
+    let orch = Orchestrator::new()
+        .with_signing_key(TEST_SIGNING_KEY.to_vec())
+        .with_store(store.clone());
+    orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
+    orch.start(&wf).unwrap();
+    orch.mark_task_running(&wf, &TaskId::from("t1")).unwrap();
+    let (ready, _) = orch
+        .on_task_completed(&wf, &TaskId::from("t1"), b"r1".to_vec())
+        .await
+        .unwrap();
+    assert_eq!(ready.len(), 1);
+    orch.mark_task_running(&wf, &TaskId::from("t2")).unwrap();
+    orch.flush_dirty().await.unwrap();
+    drop(orch);
+
+    let fresh = Orchestrator::new()
+        .with_signing_key(TEST_SIGNING_KEY.to_vec())
+        .with_store(store);
+    fresh.adopt_workflow(&wf).await.unwrap();
+
+    let state = fresh.get_state(&wf).unwrap();
+    assert_eq!(
+        state.tasks[&TaskId::from("t2")].state,
+        Phase::Pending,
+        "adopt must reset running tasks to pending"
+    );
+    let rescheduled = fresh.reschedule_incomplete_tasks(&wf).unwrap();
+    assert!(
+        rescheduled.iter().any(|t| t.id.as_str() == "t2"),
+        "t2 must be ready after its predecessor completed"
+    );
+    assert!(!rescheduled.iter().any(|t| t.id.as_str() == "t1"));
+}
+
+/// 迟到的全量状态响应不得把本地已完成的进度回退。
+#[tokio::test]
+async fn restore_stale_full_state_does_not_regress_progress() {
+    use crate::runtime::workflow::WorkflowExecution;
+
+    let orch = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
+    let wf = WorkflowId::from("wf-stale-restore");
+
+    orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
+    orch.start(&wf).unwrap();
+    orch.mark_task_running(&wf, &TaskId::from("t1")).unwrap();
+    let (ready, _) = orch
+        .on_task_completed(&wf, &TaskId::from("t1"), b"r1".to_vec())
+        .await
+        .unwrap();
+    assert_eq!(ready.len(), 1);
+
+    // 旧快照：t1 仍在 Running，t2/t3 Pending。
+    let mut stale = WorkflowExecution::new(
+        wf.clone(),
+        vec![TaskId::from("t1"), TaskId::from("t2"), TaskId::from("t3")],
+    );
+    stale.mark_task_running(&TaskId::from("t1"));
+    orch.restore_workflow(&wf, make_linear_dag(), stale, Default::default())
+        .await;
+
+    let state = orch.get_state(&wf).unwrap();
+    assert_eq!(
+        state.tasks[&TaskId::from("t1")].state,
+        Phase::Completed,
+        "stale full-state response must not regress completed task"
+    );
+    assert_eq!(state.tasks[&TaskId::from("t2")].state, Phase::Pending);
+}
+
+/// `completed_retention_count = 0`：终态即淘汰，事件水位不得留下残留。
+///
+/// `remove_workflow` 会清理 `event_seqs`；若终态事件在淘汰**之后**才追加，
+/// `record_event_seq` 会把它重新插回，条目随每个被淘汰的工作流累积且永不回收。
+#[tokio::test]
+async fn zero_retention_eviction_leaves_no_event_seq_residue() {
+    let mut config = ActantConfig {
+        payload_signing_key: TEST_SIGNING_KEY.to_vec(),
+        ..ActantConfig::default()
+    };
+    config.workflow.completed_retention_count = 0;
+    let event_log = Arc::new(MemoryEventLog::default());
+    let orch = Orchestrator::new()
+        .with_config(config)
+        .with_event_log(event_log.clone());
+
+    let wf = WorkflowId::from("wf-zero-retention");
+    let mut dag = Dag::new();
+    dag.add_node(make_node("only", "only")).unwrap();
+    orch.submit(wf.clone(), dag).await.unwrap();
+    let roots = orch.start(&wf).unwrap();
+    orch.mark_task_running(&wf, &roots[0].id).unwrap();
+    orch.on_task_completed(&wf, &TaskId::from("only"), b"r".to_vec())
+        .await
+        .unwrap();
+
+    assert!(!orch.has_workflow(&wf), "retention=0 时终态必须被淘汰");
+    assert!(
+        orch.state.event_seq(&wf).is_none(),
+        "淘汰后不得因终态事件重新写入事件水位"
+    );
+}
+
+// ─────────────── 恢复语义回归：淘汰复活 / journal-only 封口 ───────────────
+
+/// 已淘汰的工作流不能因其 journal topic 仍在而被恢复期误判为
+/// 「快照缺失的崩溃窗口」重新补建 slot —— 那会让已完成的任务再次派发。
+#[tokio::test]
+async fn evicted_workflow_is_not_resurrected_by_recover() {
+    use crate::runtime::state::event_log::MemoryEventLog;
+
+    let dir = tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let event_log = Arc::new(MemoryEventLog::default());
+    let mut config = ActantConfig {
+        payload_signing_key: TEST_SIGNING_KEY.to_vec(),
+        ..ActantConfig::default()
+    };
+    config.workflow.completed_retention_count = 0;
+    let orch = Orchestrator::new()
+        .with_config(config.clone())
+        .with_store(store.clone())
+        .with_event_log(event_log.clone());
+
+    let wf = WorkflowId::from("wf-evicted-not-resurrected");
+    let mut dag = Dag::new();
+    dag.add_node(make_node("only", "only")).unwrap();
+    orch.submit(wf.clone(), dag).await.unwrap();
+    let roots = orch.start(&wf).unwrap();
+    orch.mark_task_running(&wf, &roots[0].id).unwrap();
+    orch.on_task_completed(&wf, &TaskId::from("only"), b"r".to_vec())
+        .await
+        .unwrap();
+    assert!(!orch.has_workflow(&wf), "retention=0 时终态必须已淘汰");
+    drop(orch);
+
+    let recovered = Orchestrator::recover(store, config, Some(event_log))
+        .await
+        .unwrap();
+    assert!(
+        !recovered.has_workflow(&wf),
+        "evicted workflow must not be rebuilt from its residual journal topic"
+    );
+    assert!(!recovered.active_workflow_ids().contains(&wf));
+}
+
+/// journal-first 提交在快照落盘前崩溃：恢复不仅要重建 DAG 与任务，
+/// 还必须恢复「节点集已封口」，否则全部任务完成后终态判定永远早退。
+#[tokio::test]
+async fn journal_only_submit_restores_seal_and_reaches_terminal() {
+    use crate::common::{STORE_KEY_DAG, STORE_KEY_EXEC, STORE_KEY_PENDING};
+    use crate::runtime::state::event_log::MemoryEventLog;
+
+    let dir = tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let event_log = Arc::new(MemoryEventLog::default());
+    let wf = WorkflowId::from("wf-journal-only-seal");
+    let orch = Orchestrator::new()
+        .with_signing_key(TEST_SIGNING_KEY.to_vec())
+        .with_store(store.clone())
+        .with_event_log(event_log.clone());
+    orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
+    for prefix in [STORE_KEY_DAG, STORE_KEY_EXEC, STORE_KEY_PENDING] {
+        for (key, _) in store.scan_prefix(prefix).await.unwrap() {
+            store.delete(&key).await.unwrap();
+        }
+    }
+    drop(orch);
+
+    let recovered = Orchestrator::recover(store, recover_config(), Some(event_log))
+        .await
+        .unwrap();
+    assert!(
+        recovered
+            .state
+            .slots
+            .get(&wf)
+            .expect("journal-only workflow must be discovered")
+            .execution
+            .nodes_sealed(),
+        "整图提交的封口状态必须随 journal 恢复"
+    );
+    for id in ["t1", "t2", "t3"] {
+        recovered
+            .on_task_completed(&wf, &TaskId::from(id), b"r".to_vec())
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        recovered.get_state(&wf).unwrap().state,
+        Phase::Completed,
+        "恢复后全部任务完成必须收敛到终态"
+    );
+}
+
+/// `fail_task` 的终态分支必须与其它终态入口共用 `complete_terminal`：
+/// retention=0 的淘汰、终态事件与等待者释放不能因走了另一条路径而缺失。
+#[tokio::test]
+async fn task_failure_terminal_path_shares_terminal_settlement() {
+    use crate::runtime::state::event_log::{EventLog, MemoryEventLog};
+    use crate::runtime::workflow::orchestrator::types::JournalEvent;
+
+    let mut config = ActantConfig {
+        payload_signing_key: TEST_SIGNING_KEY.to_vec(),
+        ..ActantConfig::default()
+    };
+    config.workflow.completed_retention_count = 0;
+    let event_log = Arc::new(MemoryEventLog::default());
+    let orch = Orchestrator::new()
+        .with_config(config)
+        .with_event_log(event_log.clone());
+    let wf = WorkflowId::from("wf-fail-task-settlement");
+    let mut dag = Dag::new();
+    dag.add_node(make_node("only", "only")).unwrap();
+    orch.submit(wf.clone(), dag).await.unwrap();
+    let roots = orch.start(&wf).unwrap();
+    orch.mark_task_running(&wf, &roots[0].id).unwrap();
+
+    orch.fail_task(
+        &wf,
+        &TaskId::from("only"),
+        "boom".into(),
+        FailureScope::WorkflowLevel,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        !orch.has_workflow(&wf),
+        "fail_task 终态必须复用 complete_terminal 的淘汰语义"
+    );
+    let topic = format!("workflow:{}", wf.as_str());
+    let entries = event_log.read_after(&topic, None).unwrap();
+    assert!(entries.iter().any(|entry| {
+        postcard::from_bytes::<JournalEvent>(&entry.payload)
+            .is_ok_and(|p| matches!(p, JournalEvent::Failed { .. }))
+    }));
+}
+
+/// 工作流级硬超时是第四个终态入口：置 Failed 后同样要释放等待点 park 的等待者。
+#[tokio::test]
+async fn workflow_timeout_releases_parked_wait_point_waiters() {
+    let mut config = ActantConfig::default();
+    config.workflow.state_poll_interval_ms = 20;
+    let orch = Orchestrator::new()
+        .with_signing_key(TEST_SIGNING_KEY.to_vec())
+        .with_config(config);
+    let wf = WorkflowId::from("wf-timeout-release-waiters");
+    orch.submit_with_timeout(wf.clone(), make_linear_dag(), 10)
+        .await
+        .unwrap();
+    let roots = orch.start(&wf).unwrap();
+    orch.mark_task_running(&wf, &roots[0].id).unwrap();
+    orch.register_wait_point(&wf, "go", WaitCondition::Signal { name: "go".into() })
+        .unwrap();
+    let rx = orch.register_wait_point_waiter(wf.clone(), "go");
+
+    let cancel_tx = orch.start_timeout_watcher();
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+        .await
+        .expect("超时收尾必须释放 park 中的等待点等待者");
+    assert!(
+        outcome.is_err(),
+        "终态释放是丢弃 sender 使 receiver 收到 Err，而非投递信号"
+    );
+    let _ = cancel_tx.send(true);
+}
+
+/// `completed_retention_count = N > 0`：按终态结算顺序保留最近 N 个工作流，
+/// 超出的最旧工作流被淘汰。
+#[tokio::test]
+async fn retention_count_evicts_oldest_terminal_workflows() {
+    let mut config = ActantConfig {
+        payload_signing_key: TEST_SIGNING_KEY.to_vec(),
+        ..ActantConfig::default()
+    };
+    config.workflow.completed_retention_count = 1;
+    let orch = Orchestrator::new().with_config(config);
+
+    for name in ["wf-retention-old", "wf-retention-new"] {
+        let wf = WorkflowId::from(name);
+        let mut dag = Dag::new();
+        dag.add_node(make_node("only", "only")).unwrap();
+        orch.submit(wf.clone(), dag).await.unwrap();
+        let roots = orch.start(&wf).unwrap();
+        orch.mark_task_running(&wf, &roots[0].id).unwrap();
+        orch.on_task_completed(&wf, &TaskId::from("only"), b"r".to_vec())
+            .await
+            .unwrap();
+    }
+
+    assert!(
+        !orch.has_workflow(&WorkflowId::from("wf-retention-old")),
+        "超出保留数的最旧终态工作流必须被淘汰"
+    );
+    assert!(orch.has_workflow(&WorkflowId::from("wf-retention-new")));
+}
+
+/// deadline 与启动时刻都必须能从 journal 恢复，否则后台 flush 前崩溃后
+/// 工作流级硬超时形同虚设。
+#[tokio::test]
+async fn journal_only_deadline_and_start_time_are_restored() {
+    use crate::common::{STORE_KEY_DAG, STORE_KEY_EVENT_SEQ, STORE_KEY_EXEC, STORE_KEY_PENDING};
+    use crate::runtime::state::event_log::MemoryEventLog;
+
+    let dir = tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let event_log = Arc::new(MemoryEventLog::default());
+    let wf = WorkflowId::from("wf-journal-deadline");
+    let orch = Orchestrator::new()
+        .with_signing_key(TEST_SIGNING_KEY.to_vec())
+        .with_store(store.clone())
+        .with_event_log(event_log.clone());
+    orch.submit_with_timeout(wf.clone(), make_linear_dag(), 5000)
+        .await
+        .unwrap();
+    orch.start(&wf).unwrap();
+    let original_start = orch
+        .get_state(&wf)
+        .unwrap()
+        .started_at_ms()
+        .expect("start 必须记录启动时刻");
+    for prefix in [
+        STORE_KEY_DAG,
+        STORE_KEY_EXEC,
+        STORE_KEY_PENDING,
+        STORE_KEY_EVENT_SEQ,
+    ] {
+        for (key, _) in store.scan_prefix(prefix).await.unwrap() {
+            store.delete(&key).await.unwrap();
+        }
+    }
+    drop(orch);
+    // 拉开时间差：重放 Started 时 mark_running 会填入「当前时刻」，若没有
+    // StartedAt 覆盖，硬超时就会从重启时刻重新计时。
+    tokio::time::sleep(std::time::Duration::from_millis(8)).await;
+
+    let recovered = Orchestrator::recover(store, recover_config(), Some(event_log))
+        .await
+        .unwrap();
+    let state = recovered
+        .get_state(&wf)
+        .expect("journal-only workflow must be recovered");
+    assert_eq!(state.deadline_ms(), Some(5000));
+    assert_eq!(
+        state.started_at_ms(),
+        Some(original_start),
+        "启动时刻必须是 journal 里的原始值，而不是恢复时刻"
+    );
+}
+
+// ─────────────── 淘汰语义复查：查询面 / 重启 / id 重用 / 墓碑失败 ───────────────
+
+/// 淘汰是「终态后由别的工作流结算触发」的异步事件。若被淘汰工作流的终态摘要
+/// 随之消失，`FlowHandle.result()` 的轮询会抛 NotFound，驱动方会把 Failed
+/// 误报成 completed。
+#[tokio::test]
+async fn evicted_terminal_summary_stays_queryable() {
+    let mut config = ActantConfig {
+        payload_signing_key: TEST_SIGNING_KEY.to_vec(),
+        ..ActantConfig::default()
+    };
+    config.workflow.completed_retention_count = 1;
+    let orch = Orchestrator::new().with_config(config);
+
+    let failed = WorkflowId::from("wf-summary-failed");
+    let mut dag = Dag::new();
+    dag.add_node(make_node("only", "only")).unwrap();
+    orch.submit(failed.clone(), dag).await.unwrap();
+    let roots = orch.start(&failed).unwrap();
+    orch.mark_task_running(&failed, &roots[0].id).unwrap();
+    orch.fail_task(
+        &failed,
+        &TaskId::from("only"),
+        "boom".into(),
+        FailureScope::WorkflowLevel,
+    )
+    .await
+    .unwrap();
+
+    // 第二个终态结算把第一个挤淘汰。
+    let newer = WorkflowId::from("wf-summary-newer");
+    let mut dag = Dag::new();
+    dag.add_node(make_node("only", "only")).unwrap();
+    orch.submit(newer.clone(), dag).await.unwrap();
+    let roots = orch.start(&newer).unwrap();
+    orch.mark_task_running(&newer, &roots[0].id).unwrap();
+    orch.on_task_completed(&newer, &TaskId::from("only"), b"r".to_vec())
+        .await
+        .unwrap();
+
+    assert!(
+        !orch.has_workflow(&failed),
+        "超出保留数的终态工作流应被淘汰"
+    );
+    let summary = orch
+        .state_summary(&failed)
+        .expect("淘汰后终态摘要仍须可查，否则轮询抛 NotFound / 误报 completed");
+    assert_eq!(summary.state, Phase::Failed.as_str());
+    assert_eq!(summary.error.as_deref(), Some("boom"));
+}
+
+/// 淘汰顺序只统计运行期结算时，重启后从快照加载的历史终态工作流永远进不了
+/// 队列，也就永远不会被淘汰——与「最多保留 N 个终态工作流」的契约不符。
+#[tokio::test]
+async fn recover_rebuilds_terminal_retention_order() {
+    use crate::common::STORE_KEY_EXEC;
+
+    let dir = tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let mut config = ActantConfig {
+        payload_signing_key: TEST_SIGNING_KEY.to_vec(),
+        ..ActantConfig::default()
+    };
+    config.workflow.completed_retention_count = 2;
+    let orch = Orchestrator::new()
+        .with_config(config.clone())
+        .with_store(store.clone());
+
+    for i in 0..4 {
+        let wf = WorkflowId::from(format!("wf-restart-{i}"));
+        let mut dag = Dag::new();
+        dag.add_node(make_node("only", "only")).unwrap();
+        orch.submit(wf.clone(), dag).await.unwrap();
+        let roots = orch.start(&wf).unwrap();
+        orch.mark_task_running(&wf, &roots[0].id).unwrap();
+        orch.on_task_completed(&wf, &TaskId::from("only"), b"r".to_vec())
+            .await
+            .unwrap();
+    }
+    drop(orch);
+
+    let recovered = Orchestrator::recover(store.clone(), config, None)
+        .await
+        .unwrap();
+    let oldest = WorkflowId::from("wf-restart-2");
+    assert!(recovered.has_workflow(&oldest), "快照应恢复历史终态工作流");
+
+    // 重启后第一个新结算的工作流必须触发按 N 淘汰，把最旧的历史工作流清掉。
+    let wf = WorkflowId::from("wf-restart-after-recover");
+    let mut dag = Dag::new();
+    dag.add_node(make_node("only", "only")).unwrap();
+    recovered.submit(wf.clone(), dag).await.unwrap();
+    let roots = recovered.start(&wf).unwrap();
+    recovered.mark_task_running(&wf, &roots[0].id).unwrap();
+    recovered
+        .on_task_completed(&wf, &TaskId::from("only"), b"r".to_vec())
+        .await
+        .unwrap();
+
+    let persisted_terminal = store.scan_prefix(STORE_KEY_EXEC).await.unwrap().len();
+    assert!(
+        !recovered.has_workflow(&oldest),
+        "重启后重建的淘汰顺序必须让最旧的历史终态工作流被淘汰"
+    );
+    assert!(
+        persisted_terminal <= 2,
+        "重启后终态快照总数不得超过保留数，实际 {persisted_terminal}"
+    );
+}
+
+/// 墓碑与 workflow_id 绑定且永久保留：同 id 重新提交后，旧墓碑会让恢复期
+/// 跳过补建，新工作流在「快照落盘前崩溃」窗口丢失；同时旧代事件会被全量
+/// 重放，污染新代 DAG。
+#[tokio::test]
+async fn reused_workflow_id_is_not_dropped_by_stale_eviction_marker() {
+    use crate::common::{STORE_KEY_DAG, STORE_KEY_EXEC, STORE_KEY_PENDING};
+    use crate::runtime::state::event_log::MemoryEventLog;
+
+    let dir = tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let event_log = Arc::new(MemoryEventLog::default());
+    let mut config = ActantConfig {
+        payload_signing_key: TEST_SIGNING_KEY.to_vec(),
+        ..ActantConfig::default()
+    };
+    config.workflow.completed_retention_count = 0;
+    let wf = WorkflowId::from("wf-reused-id");
+
+    // 第一代：整图提交 → 完成 → 淘汰（写墓碑）。
+    let first = Orchestrator::new()
+        .with_config(config.clone())
+        .with_store(store.clone())
+        .with_event_log(event_log.clone());
+    first.submit(wf.clone(), make_linear_dag()).await.unwrap();
+    let _roots = first.start(&wf).unwrap();
+    for id in ["t1", "t2", "t3"] {
+        first.mark_task_running(&wf, &TaskId::from(id)).unwrap();
+        first
+            .on_task_completed(&wf, &TaskId::from(id), b"r".to_vec())
+            .await
+            .unwrap();
+    }
+    assert!(!first.has_workflow(&wf), "retention=0 终态后应已淘汰");
+    drop(first);
+
+    // 第二代：同 id、不同 DAG，提交后抹掉快照模拟 journal-only 崩溃。
+    let second = Orchestrator::new()
+        .with_config(config)
+        .with_store(store.clone())
+        .with_event_log(event_log.clone());
+    let mut dag = Dag::new();
+    dag.add_node(make_node("fresh", "fresh")).unwrap();
+    second.submit(wf.clone(), dag).await.unwrap();
+    for prefix in [STORE_KEY_DAG, STORE_KEY_EXEC, STORE_KEY_PENDING] {
+        for (key, _) in store.scan_prefix(prefix).await.unwrap() {
+            store.delete(&key).await.unwrap();
+        }
+    }
+    drop(second);
+
+    let recovered = Orchestrator::recover(store, recover_config(), Some(event_log))
+        .await
+        .unwrap();
+    assert!(
+        recovered.has_workflow(&wf),
+        "同 id 新代不能被旧墓碑挡住 journal-only 补建"
+    );
+    assert_eq!(
+        recovered.get_dag(&wf).map(|d| d.node_count()),
+        Some(1),
+        "只应重放新一代的事件，旧代 NodeAdded 不得污染新 DAG"
+    );
+}
+
+/// 只在 append 上注入失败的 EventLog，其余委托给内存实现。
+struct FailingAppendEventLog {
+    inner: crate::runtime::state::event_log::MemoryEventLog,
+    fail: std::sync::atomic::AtomicBool,
+}
+
+impl crate::runtime::state::event_log::EventLog for FailingAppendEventLog {
+    fn append(
+        &self,
+        topic: &str,
+        payload: &[u8],
+    ) -> Result<crate::runtime::state::event_log::EventId> {
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(ActantError::Internal("injected append failure".into()));
+        }
+        self.inner.append(topic, payload)
+    }
+    fn read_after(
+        &self,
+        topic: &str,
+        after: Option<&crate::runtime::state::event_log::EventId>,
+    ) -> Result<Vec<crate::runtime::state::event_log::LogEntry>> {
+        self.inner.read_after(topic, after)
+    }
+    fn latest(&self, topic: &str) -> Result<Option<crate::runtime::state::event_log::LogEntry>> {
+        self.inner.latest(topic)
+    }
+    fn count(&self, topic: &str) -> Result<usize> {
+        self.inner.count(topic)
+    }
+    fn list_topics(&self) -> Result<Vec<String>> {
+        self.inner.list_topics()
+    }
+    fn trim_absorbed(
+        &self,
+        topic: &str,
+        up_to: &crate::runtime::state::event_log::EventId,
+        keep: usize,
+    ) -> Result<usize> {
+        self.inner.trim_absorbed(topic, up_to, keep)
+    }
+    fn hide_topic(&self, topic: &str) -> Result<()> {
+        self.inner.hide_topic(topic)
+    }
+}
+
+/// 墓碑是「已淘汰」的唯一凭据：写入失败时若仍删除快照，重启会把已完成
+/// 任务重建为 Pending 并重新派发。
+#[tokio::test]
+async fn eviction_marker_failure_does_not_delete_snapshot() {
+    let dir = tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let log = Arc::new(FailingAppendEventLog {
+        inner: Default::default(),
+        fail: std::sync::atomic::AtomicBool::new(false),
+    });
+    let mut config = ActantConfig {
+        payload_signing_key: TEST_SIGNING_KEY.to_vec(),
+        ..ActantConfig::default()
+    };
+    config.workflow.completed_retention_count = 0;
+    let orch = Orchestrator::new()
+        .with_config(config)
+        .with_store(store.clone())
+        .with_event_log(log.clone());
+    let wf = WorkflowId::from("wf-marker-failure");
+    let mut dag = Dag::new();
+    dag.add_node(make_node("only", "only")).unwrap();
+    orch.submit(wf.clone(), dag).await.unwrap();
+
+    log.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    orch.evict_workflow(&wf).await;
+
+    assert!(
+        orch.has_workflow(&wf),
+        "墓碑写入失败时不得淘汰，否则重启会复活并重跑已完成任务"
+    );
+}
+
+// ─────────────── 遗留项：水位 / schema 1 / 淘汰 topic 扫描 ───────────────
+
+/// id 重用且新代快照已落盘、但 `event_seq_key` 尚未 flush 时，恢复期没有
+/// 水位，会从头全量重放同一 topic 里的旧代事件，把旧节点插进新 DAG。
+#[tokio::test]
+async fn reused_id_with_snapshot_but_no_watermark_replays_only_current_generation() {
+    use crate::common::{STORE_KEY_DAG, STORE_KEY_EVENT_SEQ, STORE_KEY_EXEC, STORE_KEY_PENDING};
+    use crate::runtime::state::event_log::MemoryEventLog;
+
+    let dir = tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let event_log = Arc::new(MemoryEventLog::default());
+    let mut config = ActantConfig {
+        payload_signing_key: TEST_SIGNING_KEY.to_vec(),
+        ..ActantConfig::default()
+    };
+    config.workflow.completed_retention_count = 0;
+    let wf = WorkflowId::from("wf-reused-with-snapshot");
+
+    // 第一代：整图提交 → 完成 → 淘汰。
+    let first = Orchestrator::new()
+        .with_config(config.clone())
+        .with_store(store.clone())
+        .with_event_log(event_log.clone());
+    first.submit(wf.clone(), make_linear_dag()).await.unwrap();
+    let _roots = first.start(&wf).unwrap();
+    for id in ["t1", "t2", "t3"] {
+        first.mark_task_running(&wf, &TaskId::from(id)).unwrap();
+        first
+            .on_task_completed(&wf, &TaskId::from(id), b"r".to_vec())
+            .await
+            .unwrap();
+    }
+    assert!(!first.has_workflow(&wf));
+    drop(first);
+
+    // 第二代：同 id、不同 DAG。submit 只写 dag/exec/pending 快照，不写
+    // event_seq_key，模拟后台 flush 之前的崩溃窗口。
+    let second = Orchestrator::new()
+        .with_config(config)
+        .with_store(store.clone())
+        .with_event_log(event_log.clone());
+    let mut dag = Dag::new();
+    dag.add_node(make_node("fresh", "fresh")).unwrap();
+    second.submit(wf.clone(), dag).await.unwrap();
+    for prefix in [STORE_KEY_EVENT_SEQ] {
+        for (key, _) in store.scan_prefix(prefix).await.unwrap() {
+            store.delete(&key).await.unwrap();
+        }
+    }
+    drop(second);
+    // 确认快照确实在（否则测的是 journal-only 场景而非本例）。
+    assert!(
+        !store.scan_prefix(STORE_KEY_DAG).await.unwrap().is_empty()
+            || !store.scan_prefix(STORE_KEY_EXEC).await.unwrap().is_empty()
+            || !store
+                .scan_prefix(STORE_KEY_PENDING)
+                .await
+                .unwrap()
+                .is_empty(),
+        "第二代快照应已落盘"
+    );
+
+    let recovered = Orchestrator::recover(store, recover_config(), Some(event_log))
+        .await
+        .unwrap();
+    assert_eq!(
+        recovered.get_dag(&wf).map(|d| d.node_count()),
+        Some(1),
+        "有快照但无水位时也必须只重放当前代事件"
+    );
+}
+
+/// 淘汰后 topic 不应再出现在 list_topics 中，否则恢复期要对每个历史
+/// 工作流全量读一遍事件；但历史事件本身仍须可查（审计面）。
+#[tokio::test]
+async fn evicted_topic_leaves_topic_list_but_keeps_journal_history() {
+    use crate::runtime::state::event_log::{EventLog, MemoryEventLog};
+
+    let dir = tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let event_log = Arc::new(MemoryEventLog::default());
+    let mut config = ActantConfig {
+        payload_signing_key: TEST_SIGNING_KEY.to_vec(),
+        ..ActantConfig::default()
+    };
+    config.workflow.completed_retention_count = 0;
+    let orch = Orchestrator::new()
+        .with_config(config)
+        .with_store(store.clone())
+        .with_event_log(event_log.clone());
+    let wf = WorkflowId::from("wf-hidden-topic");
+    let topic = format!("workflow:{}", wf.as_str());
+    let mut dag = Dag::new();
+    dag.add_node(make_node("only", "only")).unwrap();
+    orch.submit(wf.clone(), dag).await.unwrap();
+    let roots = orch.start(&wf).unwrap();
+    orch.mark_task_running(&wf, &roots[0].id).unwrap();
+    orch.on_task_completed(&wf, &TaskId::from("only"), b"r".to_vec())
+        .await
+        .unwrap();
+    assert!(!orch.has_workflow(&wf));
+
+    let topics = event_log.list_topics().unwrap();
+    assert!(
+        !topics.contains(&topic),
+        "已淘汰 topic 不应再被 list_topics 返回，实际 {topics:?}"
+    );
+    let entries = event_log.read_after(&topic, None).unwrap();
+    assert!(
+        entries.iter().any(|e| {
+            postcard::from_bytes::<JournalEvent>(&e.payload)
+                .is_ok_and(|ev| matches!(ev, JournalEvent::Completed { .. }))
+        }),
+        "淘汰不得删掉审计历史"
+    );
+
+    drop(orch);
+    let recovered = Orchestrator::recover(store, recover_config(), Some(event_log))
+        .await
+        .unwrap();
+    assert!(!recovered.has_workflow(&wf), "淘汰工作流不得被补建复活");
+}
+
+/// workflow_id 含 `:` 会让 event_log 的字符串前缀扫描跨工作流污染
+/// （id "a" 与 "a:b" 的 topic 前缀互为包含），提交边界统一拒绝；空 id
+/// 同理。
+#[tokio::test]
+async fn submit_rejects_invalid_workflow_id() {
+    let orch = Orchestrator::new();
+    for bad in ["wf:polluted", ""] {
+        let mut dag = Dag::new();
+        dag.add_node(make_node("only", "only")).unwrap();
+        let err = orch
+            .submit(WorkflowId::from(bad.to_string()), dag)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ActantError::Config(_)), "{bad}: {err}");
+    }
+}
+
+/// corrupt 清理与 evict 同口径：墓碑先行。快照损坏的工作流在恢复期被
+/// 移除后，journal topic 必须带 Evicted 墓碑且从 list_topics 隐藏，否则
+/// 下次恢复会补建空 slot 并重放旧事件重新派发已完成的任务。
+#[tokio::test]
+async fn corrupt_workflow_cleanup_writes_eviction_marker() {
+    use crate::common::STORE_KEY_EXEC;
+    use crate::runtime::state::event_log::{EventLog, MemoryEventLog};
+
+    let dir = tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let event_log = Arc::new(MemoryEventLog::default());
+    let wf = WorkflowId::from("wf-corrupt-tombstone");
+
+    // 直接写入损坏的 exec 快照，触发恢复期的 corrupt 清理路径。
+    store
+        .put_batch(&[(
+            format!("{STORE_KEY_EXEC}{}", wf.as_str()),
+            vec![0xDE, 0xAD, 0xBE, 0xEF],
+        )])
+        .await
+        .unwrap();
+
+    let _orch = Orchestrator::recover(store, recover_config(), Some(event_log.clone()))
+        .await
+        .unwrap();
+
+    let topic = format!("workflow:{}", wf.as_str());
+    let entries = event_log.read_after(&topic, None).unwrap();
+    assert!(
+        entries.iter().any(|e| {
+            postcard::from_bytes::<JournalEvent>(&e.payload)
+                .is_ok_and(|ev| matches!(ev, JournalEvent::Evicted { .. }))
+        }),
+        "corrupt 清理必须写 Evicted 墓碑"
+    );
+    assert!(
+        !event_log.list_topics().unwrap().contains(&topic),
+        "corrupt 清理后 topic 应从恢复期扫描中隐藏"
+    );
 }

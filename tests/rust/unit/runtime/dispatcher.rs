@@ -560,3 +560,69 @@ async fn dispatch_retries_once_when_worker_stdin_is_closed() {
     let _ = std::fs::remove_file(&state);
     let _ = std::fs::remove_file(&ready);
 }
+
+/// 替补失败必须收缩信号量：worker 被永久丢弃而许可照常归还的话，后续
+/// dispatch 会拿到「幽灵许可」（许可可领而队列无 worker），在空队列上
+/// 反复触发 crash failover。许可守卫应在 Drop 时认领赤字并 forget。
+#[cfg(unix)]
+#[tokio::test]
+async fn dispatch_after_lost_worker_without_replacement_shrinks_permits() {
+    let mut d = ProcessTaskDispatcher::new(
+        1,
+        sh_worker("exec sleep 60", BTreeMap::new()),
+        50,
+        TEST_KEY.to_vec(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(d.slots.available_permits(), 1);
+
+    // 杀死空闲队列中的唯一 worker 并放回，模拟空闲期崩溃。
+    let mut dead = d.free_workers.lock().pop_front().expect("one worker");
+    dead.child.start_kill().expect("kill idle worker");
+    dead.child.wait().await.expect("reap idle worker");
+    d.free_workers.lock().push_back(dead);
+
+    // 让替补必然失败：worker 程序指向不存在的二进制。
+    d.launch.program = "/nonexistent-actant-worker".into();
+
+    // dispatch 走「丢弃死 worker → 替补失败」路径，返回 Worker 错误；
+    // 许可守卫应认领赤字并 forget，而不是把许可归还给不存在的 worker。
+    let err = match d
+        .dispatch("t", signed(b"x"), new_cancel_flag(), Duration::from_secs(5))
+        .await
+    {
+        Ok(_) => panic!("dispatch must fail when no replacement can be spawned"),
+        Err(e) => e,
+    };
+    assert!(matches!(err, ActantError::Worker(_)), "{err}");
+    assert_eq!(
+        d.slots.available_permits(),
+        0,
+        "替补失败后许可数必须等于存活 worker 数（0）"
+    );
+    d.shutdown();
+}
+
+/// 空闲队列在等待预算内始终为空时，pop_worker 必须返回错误走 crash
+/// failover 语义，而不是 1ms 自旋永久挂起派发（且 dispatch 的超时臂
+/// 此刻尚未开始计时，挂起永远不会超时）。
+#[tokio::test]
+async fn pop_worker_bounded_wait_on_persistently_empty_queue() {
+    let d = hermetic_dispatcher(TEST_KEY);
+    let started = std::time::Instant::now();
+    let err = match d.pop_worker().await {
+        Ok(_) => panic!("pop_worker must fail on persistently empty queue"),
+        Err(e) => e,
+    };
+    let elapsed = started.elapsed();
+    assert!(matches!(err, ActantError::Worker(_)), "{err}");
+    assert!(
+        elapsed >= EMPTY_QUEUE_PATIENCE,
+        "必须等待满预算后才报错，实际 {elapsed:?}"
+    );
+    assert!(
+        elapsed < EMPTY_QUEUE_PATIENCE + Duration::from_secs(2),
+        "等待不得远超预算，实际 {elapsed:?}"
+    );
+}

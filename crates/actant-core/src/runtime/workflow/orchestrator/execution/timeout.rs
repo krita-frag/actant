@@ -3,15 +3,11 @@
 //! 与 `execution.rs` 的状态迁移逻辑分离：本模块只做周期轮询，把到期事实
 //! 转成 `Failed` / `TimerFired` 事件与取消广播，不参与 admission / readiness。
 
-use crate::common::serialization::serialize_rkyv;
 use crate::common::wire::TOPIC_CANCEL;
 use crate::common::{TaskId, WorkflowId};
 use crate::runtime::network::{NetworkEvent, NetworkMessage};
 use crate::runtime::workflow::{Phase, Terminal};
 
-use super::super::keys::exec_key;
-use super::super::persistence::append_event;
-use super::super::types::JournalEvent;
 use super::super::Orchestrator;
 
 impl Orchestrator {
@@ -25,9 +21,7 @@ impl Orchestrator {
     pub fn start_timeout_watcher(&self) -> tokio::sync::watch::Sender<bool> {
         let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
         let state = self.state.clone();
-        let store = self.store.clone();
         let network = self.network.clone();
-        let event_log = self.event_log.clone();
         // 等待点到期扫描（`poll_expired_timers`）需要一条不依赖 `&self`
         // 的调用入口——spawn 闭包有 `'static` 约束，无法借用 `self`。这里整体克隆
         // 一个 `Orchestrator` 句柄带进闭包：其字段全是 `Arc`/轻量值（`Store`、
@@ -44,10 +38,7 @@ impl Orchestrator {
                     _ = cancel_rx.changed() => break,
                     _ = interval.tick() => {
                         let expired: Vec<WorkflowId> = state.expired_workflow_ids();
-                        // 收集本轮所有超时 workflow 的 exec 快照，统一一次 put_batch 提交，
-                        // 避免在 expired 列表较长时产生 N 次独立 LMDB 事务。
-                        let mut persist_batch: Vec<(String, Vec<u8>)> = Vec::new();
-                        // 收集 (workflow_id, task_id) 对，统一在持久化后广播取消。
+                        // 收集 (workflow_id, task_id) 对，统一在终态收尾后广播取消。
                         // 先收集再 mark_workflow_failed，因为 mark 会将 Running 状态
                         // 改为 Failed，导致 running_task_ids 在后续读取时为空。
                         let mut cancels_to_broadcast: Vec<(WorkflowId, TaskId)> = Vec::new();
@@ -65,50 +56,34 @@ impl Orchestrator {
                                 }
                             }
                         }
+                        // 先在写锁内翻转状态并克隆快照；complete_terminal 内部
+                        // 会再次读取同一 slot，持锁调用会造成 DashMap 重入死锁。
+                        let mut terminal_snapshots: Vec<(
+                            WorkflowId,
+                            crate::runtime::workflow::WorkflowExecution,
+                        )> = Vec::new();
                         for wf_id in expired {
                             if let Some(mut slot) = state.slots.get_mut(&wf_id) {
                                 if !slot.execution.is_terminal() {
                                     slot.execution.mark_workflow_failed("workflow timeout exceeded".into());
                                     crate::metrics::inc_workflow_timeouts();
-                                    crate::metrics::inc_workflows_failed();
-                                    crate::metrics::dec_active_workflows();
                                     tracing::warn!("workflow {} timed out, marked as failed", wf_id.as_str());
-
-                                    match serialize_rkyv(&slot.execution) {
-                                        Ok(exec_bytes) => {
-                                            persist_batch.push((exec_key(&wf_id), exec_bytes));
-                                        }
-                                        Err(e) => {
-                                            // 序列化失败不得静默丢弃：记录 error 并重新标记脏，
-                                            // 让后台 flush 在下一轮重试落盘。
-                                            tracing::error!(
-                                                workflow = %wf_id.as_str(),
-                                                error = %e,
-                                                "failed to serialize timed-out workflow execution"
-                                            );
-                                            state.mark_dirty(&wf_id);
-                                        }
-                                    }
-
-                                    // 对齐 fail_task 路径：超时失败的工作流写入 Failed 事件，
-                                    // 供订阅者观测（事件写入失败不阻断状态推进）。
-                                    if let Some(id) = append_event(
-                                        event_log.as_ref(),
-                                        JournalEvent::Failed {
-                                            workflow_id: wf_id.clone(),
-                                            error: "workflow timeout exceeded".into(),
-                                        },
-                                    ) {
-                                        state.record_event_seq(&wf_id, id);
-                                    }
+                                    terminal_snapshots.push((wf_id.clone(), slot.execution.clone()));
                                 }
                             }
                         }
-                        if let Some(ref store) = store {
-                            if !persist_batch.is_empty() {
-                                if let Err(e) = store.put_batch(&persist_batch).await {
-                                    tracing::error!("failed to persist timed-out workflows: {}", e);
-                                }
+                        // 统一终态收尾：终态事件、指标、等待者释放、淘汰与
+                        // 落盘失败容错与其它入口共用一处实现。
+                        for (wf_id, snapshot) in terminal_snapshots {
+                            if let Err(e) = orchestrator
+                                .complete_terminal(&wf_id, None, &snapshot)
+                                .await
+                            {
+                                tracing::error!(
+                                    workflow = %wf_id.as_str(),
+                                    error = %e,
+                                    "failed to settle timed-out workflow terminal state"
+                                );
                             }
                         }
                         // 广播取消消息。即使持久化失败也要尝试取消，否则运行中的

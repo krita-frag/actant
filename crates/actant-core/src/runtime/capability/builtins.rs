@@ -129,14 +129,15 @@ pub fn builtin_capabilities() -> Vec<CapabilityMeta> {
 /// 但每个 capability 都需要 layer entry，使 `bind_actor_system` 为其
 /// spawn CapabilityActor（即使无 handler），否则 perform/emit 报
 /// "not bound to actor system"。
-pub fn register_defaults(runtime: &CapabilityRuntime) {
-    runtime.register_codec::<Store>();
-    runtime.register_codec::<TaskLifecycle>();
-    runtime.register_codec::<WorkflowLifecycle>();
+pub fn register_defaults(runtime: &CapabilityRuntime) -> Result<(), ActantError> {
+    runtime.register_codec::<Store>()?;
+    runtime.register_codec::<TaskLifecycle>()?;
+    runtime.register_codec::<WorkflowLifecycle>()?;
 
     runtime.ensure_layer::<Store>(Store::meta());
     runtime.ensure_layer::<TaskLifecycle>(TaskLifecycle::meta());
     runtime.ensure_layer::<WorkflowLifecycle>(WorkflowLifecycle::meta());
+    Ok(())
 }
 
 /// 基于真实 `Store` 的 `Store` capability handler。

@@ -21,7 +21,81 @@
 
 ## [Unreleased](https://github.com/actant/actant/compare/v0.4.0...HEAD)
 
-（暂无）
+### 变更
+
+- **journal 事件集合扩展（schema 2）**：尾部追加 `nodes_sealed` /
+  `deadline_set` / `evicted` / `started_at` 四种事件，`JOURNAL_SCHEMA_VERSION`
+  升至 2。`get_workflow_history` / `get_workflow_journal` 的 `kind` 取值集合
+  随之扩大，跨语言消费方须容忍未知 kind；`evicted` 可能出现在终态事件之后，
+  故 journal 末条不再是稳定的终态事件。前三种用于恢复期区分「已淘汰」与
+  「快照落盘前崩溃」、重建封口与 deadline；`started_at` 使工作流级硬超时
+  跨重启不重新计时。**不向后兼容**：schema 1 journal 不被恢复语义支持，
+  存在历史数据时升级前必须重建（见 `docs/architecture/recovery.md`）。
+
+- **`EventLog` trait 新增 `hide_topic`**：把 topic 从 `list_topics` 中隐藏但
+  保留事件数据，用于淘汰后阻止恢复期扫描历史工作流。自定义 `EventLog`
+  实现方需补上该方法（LMDB / 内存实现已提供）。淘汰后
+  `get_workflow_journal` 仍返回完整历史；同 id 重用时下一次追加会让 topic
+  自动重新可见。
+
+### 缺陷修复
+
+- **恢复期补齐水位与代际**：有快照但事件水位缺失时按最后一个 `Submitted`
+  钉住重放起点，避免同 id 重用时旧代事件污染新 DAG；淘汰 topic 从
+  `list_topics` 隐藏，恢复期不再全量扫描历史工作流（审计历史仍保留）。
+  同时移除零调用的 `Orchestrator::mark_workflow_failed` 兼容包装器
+  （统一走 `fail_workflow`）。
+
+- **journal 时间戳字段改为如实的 `timestamp_ns`**：`get_workflow_history` 与
+  `get_workflow_journal` 导出的时间戳取自 HLC 的 `wall_time`，而该值由
+  `SystemTime::as_nanos()` 填充，实际单位是 epoch 纳秒。原字段名
+  `timestamp_ms` 使按名理解的时间过滤错 10⁶ 倍，按毫秒构造的 `after` 游标
+  退化为「从头读」。两个出口统一改名为 `timestamp_ns`，游标形如
+  `(sequence, timestamp_ns)`；取值与排序语义不变。
+
+- **终态收尾不再被快照落盘失败打断**：磁盘写满（LMDB `MAP_FULL`）时，
+  `complete_terminal` 曾用 `?` 直接上抛持久化错误，跳过终态事件、指标扣减与
+  等待者释放——等待者 park 到超时，`active_workflows` 永久泄漏。现在落盘失败
+  只记 ERROR 并重标脏交给后台 flush 重试，内存侧结算照常完成。
+
+- **`completed_retention_count = 0` 不再让终态完成返回 `NotFound`**：收尾的
+  淘汰会移除工作流槽位，而 `on_task_completed` 随后仍要查槽位构造后继任务。
+  终态时后继清单必为空，直接跳过查询；同时把终态事件移到淘汰**之前**写入，
+  避免淘汰清理过的事件水位被重新插回并永久残留。
+
+- **迟到的失败上报不再覆盖已终态的工作流**：`mark_workflow_failed` 补上与
+  `mark_cancelled` 对称的终态守卫。工作流级取消唤醒 park 中的函数体后，驱动器
+  会按「函数体异常」再上报一次失败；此前会把 `Cancelled` 改写成 `Failed`，
+  或用驱动器拼的错误串覆盖更准确的终态原因（如 deadline 的
+  `workflow timeout exceeded`）。
+
+- **`ActorSystem::call` 增加 30s 等待上限**：绑定层在释放 GIL 后 `block_on`
+  该调用，此前 actor 卡死会让调用线程永久阻塞。超时返回 `ActantError::Timeout`，
+  actor 自身的业务失败仍封在 `Ok(ActorMessageResult { error })` 内。
+
+- **actor 退出计数覆盖 abort 路径**：在途计数从 `run()` 尾部移到
+  `Drop for RunningActor`。`kill` / `stop_timeout` 的 `JoinHandle::abort` 会
+  丢弃 future，此前 `active_actors` 只增不减。
+
+- **正常关停不再产生误导性的 scheduler close 告警**：`shutdown` 先停 actor、
+  后台 CLOSE 任务后到；此时 actor 已注销，CLOSE 的目标已达成，按 debug 记录。
+
+- **第二轮专项修复**：
+  - `TraceContext::parse` 只接受两位小写 hex，`+1` / 大写 hex 不再被误判为合法
+    traceparent；`ExponentialBackoff` 改用 `Duration` 运算，亚毫秒 `base` 不再被
+    `as_millis()` 截断成 0 而让退避静默失效。
+  - `QuotaTracker::release` 现在同时持有 `capacities` / `remaining` 两把锁，
+    与 `set_capacities` 并发时一次「归还」不再把可用配额钳回旧上限；
+    `BatchTracker::register` 先建 batch 状态再写成员索引，注册与终态并发不再
+    丢失事件，`record_terminal` 在状态缺失时保留成员以便重试。
+  - 取消终态在真实结局抢占后不再发布矛盾的 `cancelled` 事件；事件批处理的
+    渲染失败改为 WARNING 级记录；`Runtime.stop()` 等待后台 `auto_resume`
+    重放结束后再释放 Rust core。
+  - CI：Python 基准步骤启用 `pipefail`（此前基准脚本崩溃仍算绿）；框架边界
+    门禁区分 `grep` 的命中/无匹配/扫描失败三种退出码。测试台的
+    `NetemRun.wait()` 现在会暴露故障注入失败，而不是让「未注入」被当作成功。
+  - `_ActantConfig` 四个 workflow 配置项补上 Rust 默认值说明，并由
+    `test_docs_contract.py` 与 `WorkflowConfig::default()` 绑定防漂移。
 
 ## [0.4.0](https://github.com/actant/actant/compare/v0.3.5...v0.4.0) - 2026-11-12
 

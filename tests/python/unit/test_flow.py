@@ -41,51 +41,56 @@ def test_safe_emit_on_error_collect_returns(monkeypatch: pytest.MonkeyPatch) -> 
     assert result is exc
 
 
-class _FakeHandle:
-    def __init__(self, workflow_id: str, fail: bool = False) -> None:
-        self.workflow_id = workflow_id
-        self.fail = fail
-        self.cancelled = False
+class _ExplodingContext:
+    """``_cancel`` 抛错的协作上下文（模拟单个任务取消失败）。"""
 
-    def cancel(self, *, propagate: bool = False) -> None:
-        if self.fail:
-            raise RuntimeError("cancel boom")
-        self.cancelled = True
+    def _cancel(self, *, force_after: float | None = None) -> None:
+        raise RuntimeError("cancel boom")
 
 
-class _FakeRuntime:
-    def __init__(self, handles: dict[str, _FakeHandle]) -> None:
-        self._handles = handles
+class _RecordingCore:
+    def __init__(self) -> None:
+        self.cancelled: list[str] = []
+        self.broadcast: list[tuple[str, str]] = []
 
-    def _list_tasks(self) -> list[str]:
-        return list(self._handles.keys())
+    def cancel_task(self, task_id: str) -> None:
+        self.cancelled.append(task_id)
 
-    def _get_task(self, task_id: str) -> _FakeHandle | None:
-        return self._handles.get(task_id)
+    def broadcast_cancel(self, task_id: str, workflow_id: str) -> None:
+        self.broadcast.append((task_id, workflow_id))
 
 
 def test_cancel_flow_tasks_continues_on_single_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """单个任务取消失败不应阻止同 workflow 其他任务被取消。"""
-    import actant._internal.runtime
+    """单个任务取消失败不应阻止同 workflow 其他任务被取消。
 
+    用真实 ``AsyncResult`` 与未 start 的 ``Runtime``：取消协议本身不走替身，
+    替身只提供「任务表 + Rust core」这两样能力，因此这里验证的是 flow 失败
+    兜底真实走的代码路径。
+    """
+    import actant._internal.runtime
+    from actant import Runtime
+    from actant._internal.tasks.async_result import AsyncResult
+
+    rt = Runtime()
+    rt._rust_core = _RecordingCore()
     handles = {
-        "t1": _FakeHandle("wf1"),
-        "t2": _FakeHandle("wf1", fail=True),
-        "t3": _FakeHandle("wf1"),
-        "t4": _FakeHandle("wf2"),
+        "t1": AsyncResult("t1", workflow_id="wf1"),
+        "t2": AsyncResult("t2", workflow_id="wf1", context=_ExplodingContext()),  # type: ignore[arg-type]
+        "t3": AsyncResult("t3", workflow_id="wf1"),
+        "t4": AsyncResult("t4", workflow_id="wf2"),
     }
-    monkeypatch.setattr(
-        actant._internal.runtime, "get_current_runtime", lambda: _FakeRuntime(handles)
-    )
+    for task_id, handle in handles.items():
+        rt._tasks[task_id] = handle
+    monkeypatch.setattr(actant._internal.runtime, "get_current_runtime", lambda: rt)
 
     _flow_module._cancel_flow_tasks("wf1")
 
-    assert handles["t1"].cancelled is True
-    assert handles["t2"].cancelled is False  # 失败的任务未被标记
-    assert handles["t3"].cancelled is True  # 失败后仍继续
-    assert handles["t4"].cancelled is False  # 不同 workflow 不受影响
+    assert handles["t1"].state == "cancelled"
+    assert handles["t2"].state == "pending"  # 取消失败的任务未被标记
+    assert handles["t3"].state == "cancelled"  # 失败后仍继续
+    assert handles["t4"].state == "pending"  # 不同 workflow 不受影响
 
 
 def test_cancel_flow_tasks_no_runtime_returns() -> None:

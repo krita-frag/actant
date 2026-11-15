@@ -7,11 +7,13 @@
 //!
 //! 设计约束：
 //! - 除 [`JournalEvent::TaskCompleted`] 携带结果字节（重放需要恢复结果）与
-//!   [`JournalEvent::NodeAdded`] 携带节点定义（历史可重建 DAG）外，不携带
-//!   完整 DAG / Execution，避免事件体积过大。
+//!   [`JournalEvent::NodeAdded`] 携带节点定义及前驱（journal 可独立重建
+//!   DAG 边与 pending）外，不携带完整 DAG / Execution，避免事件体积过大。
 //! - `payload` / `args` / `result` 一律是上层序列化的不透明字节，Rust 不解析。
-//! - 新增变体属于 schema 变更：提升 [`JOURNAL_SCHEMA_VERSION`]；该版本号是
-//!   公开契约，非 Rust 消费者据此判断能否解析。
+//! - 尾部追加新变体是兼容变更：postcard 按变体序号编码，旧记录仍可解码，
+//!   **不**提升 [`JOURNAL_SCHEMA_VERSION`]。该常量只在不兼容的字段/语义变更
+//!   时递增，且不写入记录、不参与运行时版本协商；非 Rust 消费方需按目标
+//!   版本自行对齐，并对未知 kind 显式容错。
 
 use serde::{Deserialize, Serialize};
 
@@ -19,8 +21,13 @@ use super::model::{DagNode, TaskId, WaitCondition, WorkflowId, WorkflowInvocatio
 
 /// journal 事件 schema 版本。
 ///
-/// 只在**不兼容**的字段/语义变更时递增；新增可选字段不递增。
-pub const JOURNAL_SCHEMA_VERSION: u16 = 1;
+/// 只在**不兼容**的字段/语义变更时递增；尾部追加枚举变体不递增（判别式
+/// 不变，旧记录可解码）。当前值 2 表示事件集合已含 `NodesSealed`、
+/// `DeadlineSet`、`Evicted`、`StartedAt` 四个尾部变体。
+///
+/// 这是编译期契约标识，不写入 [`JournalRecord`]；运行时版本协商不在本版
+/// 范围内，消费方以自身构建时的常量为准。
+pub const JOURNAL_SCHEMA_VERSION: u16 = 2;
 
 /// 工作流级别事件，写入 `EventLog` 的 `workflow:{workflow_id}` topic。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,11 +38,14 @@ pub enum JournalEvent {
         workflow_id: WorkflowId,
         invocation: Option<WorkflowInvocation>,
     },
-    /// 节点进入 DAG。当前唯一变更点是 `submit`（整图提交）；增量提交
-    /// 后每个节点在写入点单独追加，携带完整 [`DagNode`] 使历史可重建 DAG。
+    /// 节点进入 DAG。
+    ///
+    /// 携带完整节点定义与前驱 `deps`，使 journal 单独即可重建 DAG 边、
+    /// execution 任务与 pending 计数。
     NodeAdded {
         workflow_id: WorkflowId,
         node: DagNode,
+        deps: Vec<TaskId>,
     },
     /// 任务由 Worker 接受本地执行（派发确认）。
     TaskDispatched {
@@ -122,6 +132,35 @@ pub enum JournalEvent {
         task_count: usize,
         corrupt: bool,
     },
+    /// 节点集封口：整图提交完成或 flow 函数体返回时写入。
+    ///
+    /// 封口状态此前只存在于快照；journal-only 恢复（快照落盘前崩溃）拿不到它，
+    /// 会让 `check_workflow_completion` 永久早退。此事件使封口成为历史事实。
+    NodesSealed {
+        workflow_id: WorkflowId,
+    },
+    /// 工作流级 deadline。deadline 晚于 `submit` 的同步落盘，若不入历史，
+    /// 后台 flush 前崩溃会让恢复后的工作流失去超时保护。
+    DeadlineSet {
+        workflow_id: WorkflowId,
+        timeout_ms: u64,
+    },
+    /// 工作流已被淘汰（`completed_retention_count` 或运维删除）。
+    ///
+    /// 淘汰只删快照，journal topic 仍存在；恢复期据此把 topic 与「快照缺失的
+    /// 崩溃窗口」区分开，避免已终态/已删除工作流被补建空 slot 后重新派发任务。
+    Evicted {
+        workflow_id: WorkflowId,
+    },
+    /// 工作流启动时刻（epoch 毫秒）。
+    ///
+    /// `Started` 本身不携带时刻，重放时用当前时间填充 `started_at_ms`，会让
+    /// 工作流级 deadline 从重启时刻重新计时，反复重启可令硬超时永不触发。
+    /// 此事件把原始启动时刻变成历史事实；旧记录缺少它时退回近似行为。
+    StartedAt {
+        workflow_id: WorkflowId,
+        started_at_ms: u64,
+    },
 }
 
 impl JournalEvent {
@@ -142,7 +181,11 @@ impl JournalEvent {
             | Self::SignalReceived { workflow_id, .. }
             | Self::TimerFired { workflow_id, .. }
             | Self::ContextValue { workflow_id, .. }
-            | Self::Recovered { workflow_id, .. } => workflow_id,
+            | Self::Recovered { workflow_id, .. }
+            | Self::NodesSealed { workflow_id }
+            | Self::DeadlineSet { workflow_id, .. }
+            | Self::Evicted { workflow_id }
+            | Self::StartedAt { workflow_id, .. } => workflow_id,
         }
     }
 
@@ -169,18 +212,23 @@ impl JournalEvent {
             Self::TimerFired { .. } => "timer_fired",
             Self::ContextValue { .. } => "context_value",
             Self::Recovered { .. } => "recovered",
+            Self::NodesSealed { .. } => "nodes_sealed",
+            Self::DeadlineSet { .. } => "deadline_set",
+            Self::Evicted { .. } => "evicted",
+            Self::StartedAt { .. } => "started_at",
         }
     }
 }
 
 /// journal 的一条记录：事件 + 其在 `EventLog` 中的位置。
 ///
-/// `seq` / `timestamp_ms` 来自 `EventId`（HLC），跨节点单调；导出 API 直接
+/// `seq` / `timestamp_ns` 来自 `EventId`（HLC），跨节点单调；导出 API 直接
 /// 返回本结构，调用方无需理解 `EventLog` 内部游标。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JournalRecord {
     pub seq: u64,
-    pub timestamp_ms: u64,
+    /// HLC 墙钟时间，**纳秒**（与 `EventId` 内部量纲一致，不做单位换算）。
+    pub timestamp_ns: u64,
     pub event: JournalEvent,
 }
 
@@ -203,7 +251,7 @@ mod tests {
     fn journal_record_roundtrips_postcard() {
         let record = JournalRecord {
             seq: 7,
-            timestamp_ms: 1_700_000_000_000,
+            timestamp_ns: 1_700_000_000_000_000_000,
             event: JournalEvent::Failed {
                 workflow_id: WorkflowId::new("wf-2".to_string()),
                 error: "boom".to_string(),

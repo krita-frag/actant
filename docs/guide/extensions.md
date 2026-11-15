@@ -85,8 +85,8 @@ for change in view.watch(interval_s=1.0):
     print("joined", change.joined, "left", change.left, "changed", change.changed)
 ```
 
-- `active_workflows` 是在途工作流 ID 元组；`available_quotas` 是剩余容量。
-- `watch()` 只报告成员与容量/标签/角色变化，不把每次心跳当作变化。
+- `ClusterView` 字段是 `Runtime.peers()` 与 `route_policy` 候选的并集：前者提供 `endpoint`、槽位、`labels`、`platform`、`last_heartbeat_ms`；`role` / `draining` / `available_quotas` 只在 `route_policy` 候选中出现，用 `peers()` 构造时保持默认值。
+- `watch()` 只报告成员与槽位/标签变化，不把纯心跳时间当作变化。
 - 轮询间隔与停止由调用方控制；这是便利层，不改变成员协议。
 
 ## 显式组件装配

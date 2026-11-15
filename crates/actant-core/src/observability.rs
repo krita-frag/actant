@@ -12,13 +12,34 @@
 use tracing_subscriber::prelude::*;
 
 /// 初始化可观测性子系统。幂等：重复调用无额外副作用。
+///
+/// 两个环境变量同时设置时，console subscriber 需要在同一个全局 dispatcher 上
+/// 与 fmt layer 组合；分开初始化会让先安装的 subscriber 独占 dispatcher，
+/// 后一个环境变量静默失效。
 pub fn init() {
+    #[cfg(feature = "tokio-console")]
+    {
+        if console_requested() {
+            init_console_subscriber();
+        } else {
+            init_tracing();
+        }
+    }
+    #[cfg(not(feature = "tokio-console"))]
     init_tracing();
-    init_console_subscriber();
+}
+
+fn tracing_requested() -> bool {
+    std::env::var_os("ACTANT_TRACING").is_some()
+}
+
+#[cfg(feature = "tokio-console")]
+fn console_requested() -> bool {
+    std::env::var_os("ACTANT_TOKIO_CONSOLE").is_some()
 }
 
 fn init_tracing() {
-    if std::env::var_os("ACTANT_TRACING").is_none() {
+    if !tracing_requested() {
         return;
     }
 
@@ -36,15 +57,13 @@ fn init_tracing() {
 
     // set_global_default 在进程生命周期内只能成功一次；后续调用返回 Err 是
     // 已被初始化的正常情况（如多 Runtime 实例依次调用 init_logger）。
-    let _ = tracing::subscriber::set_global_default(subscriber);
+    if let Err(e) = tracing::subscriber::set_global_default(subscriber) {
+        tracing::debug!(error = %e, "tracing subscriber already installed");
+    }
 }
 
 #[cfg(feature = "tokio-console")]
 fn init_console_subscriber() {
-    if std::env::var_os("ACTANT_TOKIO_CONSOLE").is_none() {
-        return;
-    }
-
     if tracing::dispatcher::has_been_set() {
         return;
     }
@@ -61,12 +80,9 @@ fn init_console_subscriber() {
 
     // set_global_default 在进程生命周期内只能成功一次；后续调用返回 Err 是
     // 已被初始化的正常情况（如多 Runtime 实例依次调用 init_logger）。
-    let _ = tracing::subscriber::set_global_default(layered);
-}
-
-#[cfg(not(feature = "tokio-console"))]
-fn init_console_subscriber() {
-    // feature 未启用时忽略环境变量；纯 tracing 已在 init_tracing 中处理。
+    if let Err(e) = tracing::subscriber::set_global_default(layered) {
+        tracing::debug!(error = %e, "tracing subscriber already installed");
+    }
 }
 
 #[cfg(test)]

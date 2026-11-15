@@ -7,7 +7,7 @@ from collections.abc import Callable
 import pytest
 
 from actant import Runtime, flow, host_flows, start_flow, task, use_runtime
-from actant.driver import BlockingDriver, FlowDriver
+from actant.driver import AsyncDriver, BlockingDriver, FlowDriver
 
 
 @task(name="driver_unit_add_one")
@@ -75,3 +75,19 @@ def test_driver_error_propagates_from_host_flows() -> None:
         start_flow("driver-unit-injected", 1, runtime=rt)
         with pytest.raises(RuntimeError, match="driver failed"):
             host_flows(runtime=rt, once=True, driver=_FailingDriver())
+
+
+def test_async_driver_propagates_error_completed_before_join() -> None:
+    """快速完成的失败不能因 done 回调先清空 in-flight 表而被 join 丢弃。"""
+    import concurrent.futures
+
+    driver = AsyncDriver()
+    try:
+        future: concurrent.futures.Future[None] = concurrent.futures.Future()
+        future.set_exception(RuntimeError("late boom"))
+        driver._on_done("wf-late", future)
+
+        with pytest.raises(RuntimeError, match="late boom"):
+            driver.join()
+    finally:
+        driver.close()

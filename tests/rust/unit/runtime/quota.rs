@@ -154,3 +154,40 @@ async fn set_capacities_wakes_waiting_task() {
         .expect("waiter task panicked");
     drop(guard);
 }
+
+/// `release` 与 `set_capacities` 并发时，一次「归还」不得让可用配额下降。
+///
+/// `release` 若在读到 capacity 快照后释放 `capacities` 锁，再去锁 `remaining`，
+/// 中间的扩容会被旧上限钳回去（2 → 扩容 10、remaining 8 → 归还后变成 2）。
+/// 多轮放大调度窗口；修复后不论交错如何结果都应是 9。
+#[test]
+fn concurrent_expansion_and_release_never_reduces_available_capacity() {
+    use std::sync::Barrier;
+    use std::thread;
+
+    for _ in 0..20000 {
+        let t = tracker(&[("gpu", 2)]);
+        let g1 = t.try_acquire(Some("gpu")).unwrap().unwrap();
+        let _g2 = t.try_acquire(Some("gpu")).unwrap().unwrap();
+        let t2 = Arc::clone(&t);
+        let barrier = Arc::new(Barrier::new(2));
+        let b2 = Arc::clone(&barrier);
+        // 扩容放在子线程：barrier 返回后主线程立刻执行 release，使扩容更
+        // 容易落在「已读 capacity 快照、尚未锁 remaining」的窗口内。
+        let expander = thread::spawn(move || {
+            b2.wait();
+            for _ in 0..4 {
+                thread::yield_now();
+            }
+            t2.set_capacities([("gpu".to_string(), 10u32)].into_iter().collect());
+        });
+        barrier.wait();
+        drop(g1);
+        expander.join().unwrap();
+        let available = *t.available_map().get("gpu").unwrap();
+        assert!(
+            available >= 8,
+            "归还后可用配额被旧容量钳回：available={available}（期望 9）"
+        );
+    }
+}

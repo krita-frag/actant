@@ -10,13 +10,8 @@ use crate::common::model::HlcTimestamp;
 ///
 /// 集中管理可避免跨模块漂移，使协议变更可在一处审计。
 pub mod constants {
-    /// 当前协议版本。协议格式发生破坏性变更时递增。
-    ///
-    /// v2：任务放置字段（`TaskDefinition.tags` / `quota` / `pinned_target`）、
-    /// 节点可用配额（`NodeHeartbeat.available_quotas`）与 DAG 节点放置字段
-    /// 进入 postcard/rkyv 布局。v1 节点解码 v2 帧会失败，滚动升级期间新旧
-    /// 节点不可混跑；本地 LMDB 中的 DAG/execution 存档同样需要重建。
-    pub const WIRE_PROTOCOL_VERSION: u8 = 2;
+    /// 当前协议版本。无生态部署，不随布局调整递增。
+    pub const WIRE_PROTOCOL_VERSION: u8 = 1;
 
     // --- Gossip 话题前缀与名称 ---
 
@@ -25,8 +20,14 @@ pub mod constants {
     pub const TOPIC_HEARTBEAT: &str = "actant:heartbeat";
     pub const TOPIC_FAILOVER: &str = "actant:failover";
     pub const TOPIC_HEADS: &str = "actant:heads";
-    pub const TOPIC_WORKFLOW_STATE_REQ: &str = "actant:wf-state-req:";
-    pub const TOPIC_WORKFLOW_STATE_RESP_PREFIX: &str = "actant:wf-state-resp:";
+    /// 工作流状态同步请求话题（全局，目标节点在载荷内）。
+    ///
+    /// 不用 `actant:wf-state-req:<node>` 形式：按对端节点在运行期新建话题时，
+    /// gossip 不会把已连接的邻居补进新话题，`broadcast` 返回成功却无接收方。
+    /// 全局话题在启动时随其它控制面话题一起订阅，邻居关系已确定。
+    pub const TOPIC_WORKFLOW_STATE_REQ: &str = "actant:wf-state-req";
+    /// 工作流状态同步响应话题（全局，目标节点在载荷内）。
+    pub const TOPIC_WORKFLOW_STATE_RESP: &str = "actant:wf-state-resp";
     /// 跨节点任务取消广播话题。
     pub const TOPIC_CANCEL: &str = "actant:cancel";
 
@@ -57,6 +58,10 @@ pub mod constants {
 
     /// 话题字符串最大长度。超过此长度的话题将被拒绝，防止畸形 gossip 消息导致内存无限增长。
     pub const MAX_TOPIC_LEN: usize = 256;
+
+    /// 超长/畸形话题的哨兵值；`Topic::classify` 对未知前缀返回
+    /// [`TopicRoute::Unknown`]，由路由器丢弃。
+    pub(super) const TOPIC_INVALID: &str = "actant:invalid-topic";
 }
 
 /// W3C Trace Context（`traceparent` header）实现。
@@ -155,8 +160,9 @@ pub mod traceparent {
         /// 从 W3C `traceparent` 字符串解析。
         ///
         /// 接受宽松格式：前后空白被忽略；版本号必须为 `00`；长度必须严格匹配。
-        /// 返回 `None` 的情况：格式错误、长度不符、trace-id 或 span-id 全零、
-        /// 含非 hex 字符。调用方应将 `None` 视为对端不支持 trace 传播，
+        /// trace-id / span-id / flags 一律要求两位小写 hex（W3C 规定）。
+        /// 返回 `None` 的情况：格式错误、长度不符、含大写或带符号等非小写 hex
+        /// 字符、trace-id 或 span-id 全零。调用方应将 `None` 视为对端不支持 trace 传播，
         /// 创建独立 root span。
         pub fn parse(header: &str) -> Option<Self> {
             let s = header.trim();
@@ -175,7 +181,13 @@ pub mod traceparent {
             }
             let trace_id = hex_decode_16(parts[1])?;
             let span_id = hex_decode_8(parts[2])?;
-            let flags = u8::from_str_radix(parts[3], 16).ok()?;
+            let flags = parts[3];
+            // W3C 只接受两位小写 hex；`from_str_radix` 会把 "+1" 解析成 1、
+            // 把 "0A" 解析成 10，必须先按字符范围收紧。
+            if flags.len() != 2 || !is_lower_hex(flags) {
+                return None;
+            }
+            let flags = u8::from_str_radix(flags, 16).ok()?;
             // W3C 规范：trace-id 与 span-id 全零为非法值。
             if trace_id == [0u8; 16] || span_id == [0u8; 8] {
                 return None;
@@ -197,9 +209,16 @@ pub mod traceparent {
         s
     }
 
-    /// 32 hex 字符 → 16 字节。失败返回 `None`（非 hex 或长度不符）。
+    /// 是否全为小写 ASCII hex 字符（`u8::from_str_radix` 另接受 `+` 与大写）。
+    fn is_lower_hex(s: &str) -> bool {
+        s.as_bytes()
+            .iter()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+    }
+
+    /// 32 hex 字符 → 16 字节。失败返回 `None`（非小写 hex 或长度不符）。
     fn hex_decode_16(s: &str) -> Option<[u8; 16]> {
-        if s.len() != 32 {
+        if s.len() != 32 || !is_lower_hex(s) {
             return None;
         }
         let mut out = [0u8; 16];
@@ -211,7 +230,7 @@ pub mod traceparent {
 
     /// 16 hex 字符 → 8 字节。失败返回 `None`。
     fn hex_decode_8(s: &str) -> Option<[u8; 8]> {
-        if s.len() != 16 {
+        if s.len() != 16 || !is_lower_hex(s) {
             return None;
         }
         let mut out = [0u8; 8];
@@ -375,7 +394,7 @@ pub use constants::{
         RESULT as STORE_KEY_RESULT, SIGNAL_BUF as STORE_KEY_SIGNAL_BUF, WAIT as STORE_KEY_WAIT,
     },
     TOPIC_CANCEL, TOPIC_DAG_STATE, TOPIC_FAILOVER, TOPIC_HEADS, TOPIC_HEARTBEAT,
-    TOPIC_WORKFLOW_STATE_REQ, TOPIC_WORKFLOW_STATE_RESP_PREFIX, WIRE_PROTOCOL_VERSION,
+    TOPIC_WORKFLOW_STATE_REQ, TOPIC_WORKFLOW_STATE_RESP, WIRE_PROTOCOL_VERSION,
 };
 
 /// Gossip 话题标识符。
@@ -412,22 +431,16 @@ impl Topic {
         Self(constants::TOPIC_HEADS.to_string())
     }
 
-    /// 构造节点作用域的工作流状态请求话题：`actant:wf-state-req:<node>`。
-    pub fn workflow_state_req(node: &NodeId) -> Self {
-        Self(format!(
-            "{}{}",
-            constants::TOPIC_WORKFLOW_STATE_REQ,
-            node.as_str()
-        ))
+    /// 构造工作流状态请求话题：`actant:wf-state-req`。
+    ///
+    /// 目标节点写在 [`WorkflowStateRequest::target_node`] 里，由接收方过滤。
+    pub fn workflow_state_req() -> Self {
+        Self(constants::TOPIC_WORKFLOW_STATE_REQ.to_string())
     }
 
-    /// 构造节点作用域的工作流状态响应话题：`actant:wf-state-resp:<node>`。
-    pub fn workflow_state_resp(node: &NodeId) -> Self {
-        Self(format!(
-            "{}{}",
-            constants::TOPIC_WORKFLOW_STATE_RESP_PREFIX,
-            node.as_str()
-        ))
+    /// 构造工作流状态响应话题：`actant:wf-state-resp`。
+    pub fn workflow_state_resp() -> Self {
+        Self(constants::TOPIC_WORKFLOW_STATE_RESP.to_string())
     }
 
     /// 判断此话题是否以给定前缀开头。
@@ -448,16 +461,14 @@ impl Topic {
         let s = self.as_str();
         if let Some(node) = s.strip_prefix(constants::TOPIC_TASK_PREFIX) {
             TopicRoute::Task(node.to_string())
-        } else if let Some(node) = s.strip_prefix(constants::TOPIC_WORKFLOW_STATE_REQ) {
-            TopicRoute::WorkflowStateReq(node.to_string())
-        } else if let Some(node) = s.strip_prefix(constants::TOPIC_WORKFLOW_STATE_RESP_PREFIX) {
-            TopicRoute::WorkflowStateResp(node.to_string())
         } else {
             match s {
                 constants::TOPIC_DAG_STATE => TopicRoute::DagState,
                 constants::TOPIC_HEARTBEAT => TopicRoute::Heartbeat,
                 constants::TOPIC_FAILOVER => TopicRoute::Failover,
                 constants::TOPIC_HEADS => TopicRoute::Heads,
+                constants::TOPIC_WORKFLOW_STATE_REQ => TopicRoute::WorkflowStateReq,
+                constants::TOPIC_WORKFLOW_STATE_RESP => TopicRoute::WorkflowStateResp,
                 constants::TOPIC_CANCEL => TopicRoute::Cancel,
                 _ => TopicRoute::Unknown,
             }
@@ -479,21 +490,19 @@ impl From<Topic> for String {
 
 impl From<&str> for Topic {
     fn from(s: &str) -> Self {
-        // 防御性边界：及早截断超长话题字符串，防止单个畸形 gossip 消息
-        // 触发下游订阅者的无限分配。使用字符边界安全截断，避免在 UTF-8
-        // 多字节字符中间切割导致 panic。
+        // 防御性边界：拒绝超长话题字符串，防止单个畸形 gossip 消息
+        // 触发下游订阅者的无限分配。
+        //
+        // 不使用截断：不同超长话题可能截断成同一前缀，`classify` 会把它们
+        // 归入错误路由。拒绝方式映射到 `TOPIC_INVALID` 哨兵，`classify`
+        // 返回 `TopicRoute::Unknown`，由路由器记录并丢弃。
         if s.len() > constants::MAX_TOPIC_LEN {
             tracing::warn!(
                 len = s.len(),
                 max = constants::MAX_TOPIC_LEN,
-                "truncating oversized topic string"
+                "rejecting oversized topic string"
             );
-            // 回退到最近的 char 边界，确保不在多字节字符中间切割
-            let mut end = constants::MAX_TOPIC_LEN;
-            while !s.is_char_boundary(end) {
-                end -= 1;
-            }
-            Self(s[..end].to_string())
+            Self(constants::TOPIC_INVALID.to_string())
         } else {
             Self(s.to_string())
         }
@@ -508,10 +517,10 @@ impl From<&str> for Topic {
 pub enum TopicRoute {
     /// 节点作用域的任务分发话题。
     Task(String),
-    /// 节点作用域的工作流状态请求话题。
-    WorkflowStateReq(String),
-    /// 节点作用域的工作流状态响应话题。
-    WorkflowStateResp(String),
+    /// 工作流状态同步请求（全局话题，目标节点在载荷内）。
+    WorkflowStateReq,
+    /// 工作流状态同步响应（全局话题，目标节点在载荷内）。
+    WorkflowStateResp,
     /// DAG 状态更新广播话题。
     DagState,
     /// 节点心跳广播话题。
@@ -744,6 +753,7 @@ fn message_origin_node(msg: &WireMessage) -> Option<&NodeId> {
     match msg {
         WireMessage::NodeHeartbeat(m) => Some(&m.node_id),
         WireMessage::OrchestratorClaim(m) => Some(&m.node_id),
+        WireMessage::SignedOrchestratorClaim(m) => Some(&m.claim.node_id),
         WireMessage::HeadsExchange(m) => Some(&m.node_id),
         WireMessage::DagStateUpdate(m) => Some(&m.origin_node),
         WireMessage::WorkflowStateRequest(m) => Some(&m.requesting_node),
@@ -780,6 +790,25 @@ fn mac_input_segments<'a>(
     ]
 }
 
+/// 计算一条 envelope（`mac: None`）的 wire MAC。
+///
+/// 序列化失败时返回错误而非降级为未签名：签名集群的接收端会丢弃无 MAC
+/// 消息，发送方必须能感知该失败。
+fn compute_wire_mac(
+    key: &[u8],
+    unsigned: &WireEnvelope,
+) -> crate::common::Result<[u8; crate::common::payload::WIRE_MAC_LEN]> {
+    let message_bytes = crate::common::encode_postcard(&unsigned.message)?;
+    let traceparent_bytes = crate::common::encode_postcard(&unsigned.traceparent)?;
+    let version_bytes = [unsigned.version];
+    let segments = mac_input_segments(&version_bytes, &message_bytes, &traceparent_bytes);
+    crate::common::payload::wire_mac_incremental(key, &segments).ok_or_else(|| {
+        crate::common::ActantError::Serialization(
+            "wire MAC requested with an empty signing key".to_string(),
+        )
+    })
+}
+
 impl WireEnvelope {
     /// 用当前协议版本封装 [`WireMessage`]，并注入跨节点 trace 上下文与 wire MAC。
     ///
@@ -797,7 +826,13 @@ impl WireEnvelope {
     /// 计算 MAC 并填入 `mac` 字段。MAC 覆盖 `version` + `message` +
     /// `traceparent` 三字段序列化字节，不含 `mac` 字段自身（见
     /// [`mac_input_segments`]）。
-    pub fn wrap(msg: WireMessage) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// 配置了签名密钥但无法序列化被签名内容时返回
+    /// [`crate::common::ActantError::Serialization`]。不降级为未签名消息：
+    /// 接收端在存在密钥时要求 MAC，静默降级只会让消息被丢弃且发送方无感知。
+    pub fn wrap(msg: WireMessage) -> crate::common::Result<Self> {
         // 生成 W3C traceparent。
         //
         // 多跳传播策略：检查当前线程的入站 trace 上下文（由 wire.recv span
@@ -827,25 +862,12 @@ impl WireEnvelope {
 
         // 计算可选 MAC：仅当按消息来源节点（或 primary 退化）找到已注册密钥时。
         // 流式分段喂 hasher，不再组装与消息等大的覆盖字节 Vec。
-        let mac = signing_key_for(&unsigned.message).and_then(|key| {
-            let message_bytes = match crate::common::encode_postcard(&unsigned.message) {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "encode_postcard for MAC computation failed; \
-                         message will be sent without integrity protection"
-                    );
-                    return None;
-                }
-            };
-            let traceparent_bytes = crate::common::encode_postcard(&unsigned.traceparent).ok()?;
-            let version_bytes = [unsigned.version];
-            let segments = mac_input_segments(&version_bytes, &message_bytes, &traceparent_bytes);
-            crate::common::payload::wire_mac_incremental(&key, &segments)
-        });
+        let mac = match signing_key_for(&unsigned.message) {
+            Some(key) => Some(compute_wire_mac(&key, &unsigned)?),
+            None => None,
+        };
 
-        Self { mac, ..unsigned }
+        Ok(Self { mac, ..unsigned })
     }
 
     /// 从原始字节解码并校验协议封装与 wire MAC。
@@ -938,10 +960,10 @@ impl WireEnvelope {
                     }
                 };
                 let version_bytes = [envelope.version];
-                let mac_input =
-                    mac_input_segments(&version_bytes, &message_bytes, &traceparent_bytes).concat();
+                let segments =
+                    mac_input_segments(&version_bytes, &message_bytes, &traceparent_bytes);
                 candidates.iter().any(|key| {
-                    crate::common::payload::verify_wire_mac(key, &mac_input, mac).is_ok()
+                    crate::common::payload::verify_wire_mac_incremental(key, &segments, mac).is_ok()
                 })
             }
         };
@@ -962,6 +984,7 @@ pub enum WireMessage {
     DagStateUpdate(WireDagStateUpdate),
     NodeHeartbeat(NodeHeartbeat),
     OrchestratorClaim(OrchestratorClaim),
+    SignedOrchestratorClaim(SignedOrchestratorClaim),
     HeadsExchange(HeadsExchange),
     WorkflowStateRequest(WorkflowStateRequest),
     WorkflowStateResponse(WorkflowStateResponse),
@@ -970,6 +993,11 @@ pub enum WireMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeHeartbeat {
     pub node_id: NodeId,
+    /// 本节点编排器当前未终态的工作流（心跳时刻快照）。
+    ///
+    /// 这是"节点失联时它还在驱动哪些工作流"的唯一新鲜来源：租约表虽然也记录
+    /// owner，但远端副本不会随 owner 的续租更新，`lease_duration` 之后就地过期
+    /// 并被清理——按它反查只能看到最近一次 claim 落在窗口内的那部分工作流。
     pub active_workflows: Vec<WorkflowId>,
     /// UNIX 纪元起的墙钟时间戳（毫秒）。用于故障检测（与 failure_timeout_ms 比较）。
     pub timestamp_ms: u64,
@@ -1016,6 +1044,16 @@ pub struct OrchestratorClaim {
     pub workflow_id: WorkflowId,
     /// UNIX 纪元起的墙钟时间戳（毫秒）。用于租约过期计算。
     pub timestamp_ms: u64,
+}
+
+/// 带签名的 orchestrator claim。
+///
+/// 签名覆盖 `(node_id, workflow_id, timestamp_ms)`，由 `node_id` 对应的
+/// endpoint 私钥签发，接收方用 `node_id` 作为公钥验证，阻止冒用他人身份。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignedOrchestratorClaim {
+    pub claim: OrchestratorClaim,
+    pub signature: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1105,11 +1143,15 @@ impl WireTaskOutcome {
 pub struct WorkflowStateRequest {
     pub workflow_id: WorkflowId,
     pub requesting_node: NodeId,
+    /// 目标节点。请求走全局话题广播，非目标节点收到后直接丢弃。
+    pub target_node: NodeId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowStateResponse {
     pub workflow_id: WorkflowId,
+    /// 目标节点（请求方）。响应走全局话题广播，非目标节点收到后直接丢弃。
+    pub target_node: NodeId,
     pub dag: Option<Vec<u8>>,
     pub execution: Option<Vec<u8>>,
     pub pending: Option<Vec<u8>>,

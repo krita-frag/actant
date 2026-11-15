@@ -4,9 +4,9 @@
 `actant worker` 启动的节点无需连接中心服务器，通过 iroh 自动发现对端节点。
 每个节点同时是编排器与执行器。
 
-CLI 保持极简：只负责 worker 启动、状态查询与指标导出，不直接执行或提交任务。
-任务提交应通过用户代码调用 `task.submit()` / `flow()` 完成；任务状态由进程内
-`Runtime` 管理，不跨进程暴露。
+CLI 保持极简：只负责 worker 启动、状态查询、节点身份管理与指标导出，不直接
+执行或提交任务。任务提交应通过用户代码调用 `task.submit()` / `flow()` 完成；
+任务状态由进程内 `Runtime` 管理，不跨进程暴露。
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ import threading
 from typing import Any
 
 import actant
-from actant.actant import metrics_text
+from actant.actant import _ensure_identity, _identity_peer_id, metrics_text
 from actant.capabilities import BUILTIN_CAPABILITIES, TaskEvent
 from actant.workflow import FLOW_REGISTRY
 
@@ -93,19 +93,26 @@ def _print_task_event(event: TaskEvent) -> None:
 
 
 def _payload_signing_key(args: argparse.Namespace) -> str:
-    """解析 payload 签名密钥（CLI 参数 > 环境变量 > 随机生成）。"""
+    """解析 payload 签名密钥（CLI 参数 > 环境变量；都未提供时为空）。
+
+    密钥是集群共享秘密：空字符串表示禁用签名，由核心在启动时记录 warn。
+    不生成随机密钥——各节点独立随机值会让对端 MAC 校验必然失败（见
+    ``payload::verify``），单节点改配置就会让整个集群的远端任务不可执行。
+    """
     if args.payload_signing_key:
         return str(args.payload_signing_key)
     env_key = os.environ.get("ACTANT_PAYLOAD_KEY", "").strip()
     if env_key:
         return env_key
-    import secrets
-
-    return secrets.token_hex(32)
+    return ""
 
 
 def _build_config(args: argparse.Namespace) -> Any:
-    """根据 CLI 参数构造 ``_ActantConfig``；无自定义参数时返回 ``None``（用默认配置）。"""
+    """根据 CLI 参数构造 ``_ActantConfig``；无自定义参数时返回 ``None``（用默认配置）。
+
+    只有 ``--payload-signing-key`` / ``ACTANT_PAYLOAD_KEY`` 也必须构造配置，
+    否则密钥会被静默忽略、签名保持关闭。
+    """
     network_keys = (
         "bootstrap_nodes",
         "listen_port",
@@ -114,7 +121,8 @@ def _build_config(args: argparse.Namespace) -> Any:
         "relay_endpoints",
         "discovery",
     )
-    has_custom = any(
+    signing_key = _payload_signing_key(args)
+    has_custom = bool(signing_key) or any(
         getattr(args, k, None) is not None
         for k in (
             *network_keys,
@@ -159,7 +167,7 @@ def _build_config(args: argparse.Namespace) -> Any:
         )
 
     return _ActantConfig(
-        payload_signing_key=_payload_signing_key(args),
+        payload_signing_key=signing_key,
         network=network,
         failover=failover,
         gossip=_GossipConfig() if network is not None else None,
@@ -383,6 +391,38 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_identity_show(args: argparse.Namespace) -> int:
+    """打印已持久化身份的 endpoint id（只读，不启动 Runtime / 网络）。"""
+    try:
+        peer_id = _identity_peer_id(args.data_dir)
+    except ValueError as e:
+        print(f"identity show failed: {e}", file=sys.stderr)
+        return 1
+    if peer_id is None:
+        print(
+            f"identity.key not found in {args.data_dir}; run "
+            f"`actant identity init --data-dir {args.data_dir}` first",
+            file=sys.stderr,
+        )
+        return 1
+    print(peer_id)
+    return 0
+
+
+def cmd_identity_init(args: argparse.Namespace) -> int:
+    """确保 data_dir 中存在节点身份并打印 endpoint id。
+
+    部署前用它生成各节点的 endpoint id，再登记到其他节点的
+    ``allowed_peer_ids``，无需先启动 Runtime。
+    """
+    try:
+        print(_ensure_identity(args.data_dir))
+    except ValueError as e:
+        print(f"identity init failed: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def cmd_version(_args: argparse.Namespace) -> int:
     print(actant.__version__)
     return 0
@@ -393,7 +433,7 @@ def _add_worker_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--name",
         default=None,
-        help="节点名称（默认自动生成）",
+        help="节点名称（默认取持久身份的 endpoint id，保证集群内唯一且重启稳定）",
     )
     p.add_argument(
         "--data-dir",
@@ -448,19 +488,25 @@ def _add_worker_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--payload-signing-key",
         default=None,
-        help="P2P payload 签名密钥（也可用 ACTANT_PAYLOAD_KEY 环境变量）",
+        help=(
+            "P2P payload 签名密钥（也可用 ACTANT_PAYLOAD_KEY 环境变量）；"
+            "集群内所有节点必须一致，未提供则禁用签名"
+        ),
     )
     p.add_argument(
         "--bootstrap-nodes",
         default=None,
-        help="逗号分隔的 bootstrap 节点地址（完整 endpoint_addr，而非仅 endpoint id）",
+        help=(
+            "逗号分隔的 bootstrap 节点地址（完整 endpoint_addr）；其中的 "
+            "endpoint id 会自动用于 gossip 引导"
+        ),
     )
     p.add_argument(
         "--gossip-bootstrap-peers",
         default=None,
         help=(
-            "逗号分隔的 gossip 引导对端 endpoint ID；discovery=none 时必填，"
-            "否则只建立直连、不会加入 gossip"
+            "逗号分隔的 gossip 引导对端 endpoint ID；仅在只有 id、没有地址时"
+            "需要，bootstrap-nodes 里的 id 会自动并入"
         ),
     )
     p.add_argument(
@@ -548,6 +594,22 @@ def main(argv: list[str] | None = None) -> int:
         help="持久化数据目录（读取 node_meta.json 获取节点信息）",
     )
     p_status.set_defaults(func=cmd_status)
+
+    p_identity = sub.add_parser(
+        "identity",
+        help="查看或初始化节点身份（endpoint id，用于 allowed_peer_ids 登记）",
+    )
+    identity_sub = p_identity.add_subparsers(dest="identity_command", required=True)
+    p_identity_show = identity_sub.add_parser(
+        "show", help="显示已持久化的 endpoint id（只读）"
+    )
+    p_identity_show.add_argument("--data-dir", required=True, help="持久化数据目录")
+    p_identity_show.set_defaults(func=cmd_identity_show)
+    p_identity_init = identity_sub.add_parser(
+        "init", help="不存在时生成身份并显示 endpoint id"
+    )
+    p_identity_init.add_argument("--data-dir", required=True, help="持久化数据目录")
+    p_identity_init.set_defaults(func=cmd_identity_init)
 
     p_version = sub.add_parser("version", help="显示版本号")
     p_version.set_defaults(func=cmd_version)

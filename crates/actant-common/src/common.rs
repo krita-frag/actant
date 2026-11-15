@@ -76,7 +76,7 @@ pub use wire::{current_trace_scope, TraceContext, TraceScopeGuard};
 // 仅供测试使用的内部类型 — 不属于稳定公共 API
 #[doc(hidden)]
 pub use wire::{
-    HeadsExchange, NodeHeartbeat, WireDagStateUpdate, WireEnvelope, WireMessage, WireTaskState,
-    WorkflowHead, WorkflowStateRequest, WorkflowStateResponse, TOPIC_DAG_STATE,
-    TOPIC_WORKFLOW_STATE_RESP_PREFIX, WIRE_PROTOCOL_VERSION,
+    HeadsExchange, NodeHeartbeat, SignedOrchestratorClaim, WireDagStateUpdate, WireEnvelope,
+    WireMessage, WireTaskState, WorkflowHead, WorkflowStateRequest, WorkflowStateResponse,
+    TOPIC_DAG_STATE, TOPIC_WORKFLOW_STATE_RESP, WIRE_PROTOCOL_VERSION,
 };

@@ -217,11 +217,29 @@ def test_kind_to_exception_map_covers_core_kinds() -> None:
     """_KIND_TO_EXCEPTION 应包含所有 Rust ActantError variant 的映射。"""
     keys = set(exc._KIND_TO_EXCEPTION.keys())
     expected = {
-        "storage", "network", "serialization", "actor", "workflow",
+        "storage", "storage_io", "heed", "postcard",
+        "network", "serialization", "actor", "workflow",
         "task", "worker", "config", "metrics", "not_found",
-        "already_exists", "timeout", "cancelled", "invalid_state", "internal",
+        "already_exists", "timeout", "cancelled", "invalid_state",
+        "replay", "internal",
     }
     assert expected.issubset(keys)
+
+
+@pytest.mark.parametrize(
+    "kind,expected",
+    [
+        ("storage_io", StorageError),
+        ("heed", StorageError),
+        ("postcard", SerializationError),
+    ],
+)
+def test_raise_for_kind_matches_pyerr_mapping(
+    kind: str, expected: type[ActantError]
+) -> None:
+    """同一 Rust 变体经 PyErr 与 kind 前缀两条通道必须得到同一异常类。"""
+    with pytest.raises(expected):
+        exc.raise_for_kind(kind, "boom")
 
 
 def test_state_to_exception_map_covers_terminal_states() -> None:

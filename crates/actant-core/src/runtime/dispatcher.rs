@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::io::IoSlice;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -44,6 +44,12 @@ const FRAME_RESULT: u8 = 0x02;
 
 /// `Cancel` 帧的完整字节（4 字节长度 + 1 字节类型 + 空正文）。
 const CANCEL_FRAME_BYTES: [u8; 5] = [1, 0, 0, 0, FRAME_CANCEL];
+
+/// `pop_worker` 空闲队列等待预算。许可数 == 存活 worker 数的不变量
+/// （由 [`Self::ensure_replacement`] 的收缩维护）保证短暂 TOCTOU 内队列
+/// 必有 worker；超过预算仍为空说明池已损坏，返回错误走 crash failover
+/// 语义，而不是 1ms 自旋永久挂起派发（且超时臂此刻尚未开始计时）。
+const EMPTY_QUEUE_PATIENCE: Duration = Duration::from_secs(2);
 
 /// 帧头长度：4 字节小端长度。
 const FRAME_HEADER_LEN: usize = 4;
@@ -270,8 +276,53 @@ pub struct ProcessTaskDispatcher {
     cancel_grace: Duration,
     /// 关闭时终止空闲 worker。
     shutting_down: AtomicBool,
+    /// worker 被永久丢弃且替补失败的次数。每次增加对应一个不再存在的
+    /// worker；dispatch 的许可守卫据此在 Drop 时 `forget()` 自己的许可，
+    /// 维持「许可数 == 存活 worker 数」不变量（详见 [`PoolPermitGuard`]）。
+    lost_without_replacement: AtomicUsize,
     /// 任务日志边带出口。`None` 时 actant_log 行仅经 tracing 转发。
     log_bus: Option<EventBus>,
+}
+
+/// dispatch 并发许可的守卫：持有期间若有 worker 被永久丢弃且替补失败
+/// （`lost_without_replacement` 赤字计数增加），Drop 时认领一笔赤字并
+/// `forget()` 自己的许可——该许可对应的 worker 已不存在，照常归还会让
+/// 后续 dispatch 拿到「幽灵许可」（许可可领而队列无 worker），只能反复
+/// 触发 crash failover。认领是原子的（CAS），多许可并发归还时每个赤字
+/// 恰好抵消一个许可；正常路径计数不变，Drop 即归还许可。
+struct PoolPermitGuard<'a> {
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    dispatcher: &'a ProcessTaskDispatcher,
+}
+
+impl PoolPermitGuard<'_> {
+    fn reconcile(&mut self) {
+        if self.permit.is_none() {
+            return;
+        }
+        let counter = &self.dispatcher.lost_without_replacement;
+        loop {
+            let current = counter.load(Ordering::Acquire);
+            if current == 0 {
+                return;
+            }
+            if counter
+                .compare_exchange_weak(current, current - 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                if let Some(permit) = self.permit.take() {
+                    permit.forget();
+                }
+                return;
+            }
+        }
+    }
+}
+
+impl Drop for PoolPermitGuard<'_> {
+    fn drop(&mut self) {
+        self.reconcile();
+    }
 }
 
 impl ProcessTaskDispatcher {
@@ -306,12 +357,28 @@ impl ProcessTaskDispatcher {
             signing_key,
             cancel_grace,
             shutting_down: AtomicBool::new(false),
+            lost_without_replacement: AtomicUsize::new(0),
             log_bus,
         };
         for _ in 0..num_workers {
-            let worker =
-                ProcessTaskDispatcher::spawn_one(&dispatcher.launch, dispatcher.log_bus.clone())?;
-            dispatcher.free_workers.lock().push_back(worker);
+            match ProcessTaskDispatcher::spawn_one(&dispatcher.launch, dispatcher.log_bus.clone()) {
+                Ok(worker) => dispatcher.free_workers.lock().push_back(worker),
+                Err(e) => {
+                    // 构造失败路径必须回收已拉起的 worker：`WorkerProc` 的
+                    // `child` 配置了 kill_on_drop，drop 时会终止进程，但这里
+                    // 显式 start_kill 让失败更可观测，并避免依赖析构时机。
+                    let spawned = std::mem::take(&mut *dispatcher.free_workers.lock());
+                    for mut worker in spawned {
+                        if let Err(kill_err) = worker.child.start_kill() {
+                            tracing::warn!(
+                                error = %kill_err,
+                                "failed to kill worker after partial pool creation"
+                            );
+                        }
+                    }
+                    return Err(e);
+                }
+            }
         }
         Ok(dispatcher)
     }
@@ -330,6 +397,7 @@ impl ProcessTaskDispatcher {
             signing_key,
             cancel_grace: Duration::from_millis(10),
             shutting_down: AtomicBool::new(false),
+            lost_without_replacement: AtomicUsize::new(0),
             log_bus: None,
         }
     }
@@ -383,6 +451,9 @@ impl ProcessTaskDispatcher {
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // 兜底回收：WorkerProc 在异常路径（构造失败、panic、未被 shutdown
+        // 覆盖的分支）被 drop 时终止子进程，避免留下常驻 worker。
+        cmd.kill_on_drop(true);
         // 独立进程组：worker 派生的子进程继承同一 pgid，取消 / 超时按组
         // 终止，避免只杀 worker 导致孙进程泄漏。
         #[cfg(unix)]
@@ -414,12 +485,17 @@ impl ProcessTaskDispatcher {
 
     /// 领用一个**存活**的空闲 worker。
     ///
-    /// 调用方须先持有 `slots` 信号量许可，保证空闲队列最终非空。队列中的
-    /// worker 可能在空闲期间自行退出（崩溃、被外部终止），因此出队后先用
-    /// `try_wait` 探测；已退出的直接丢弃并同步替补，避免把死进程交给
-    /// `send_frame` 后触发一次无意义的 crash failover。
+    /// 调用方须先持有 `slots` 信号量许可。队列中的 worker 可能在空闲期间
+    /// 自行退出（崩溃、被外部终止），因此出队后先用 `try_wait` 探测；
+    /// 已退出的直接丢弃并同步替补，避免把死进程交给 `send_frame` 后触发
+    /// 一次无意义的 crash failover。
+    ///
+    /// 空闲队列短暂为空属正常 TOCTOU（并发领用），等待即可；超过
+    /// [`EMPTY_QUEUE_PATIENCE`] 仍为空则说明池已损坏（如 spawn 持续失败），
+    /// 返回错误走 crash failover 语义，不无限自旋。
     async fn pop_worker(&self) -> Result<WorkerProc, ActantError> {
         let mut discarded = 0usize;
+        let mut empty_wait = Duration::ZERO;
         loop {
             let candidate = self.free_workers.lock().pop_front();
             if let Some(mut worker) = candidate {
@@ -432,6 +508,9 @@ impl ProcessTaskDispatcher {
                         );
                         drop(worker);
                         if discarded >= self.pool_size {
+                            // 达到丢弃上限：最后一个死 worker 未经替补即永久
+                            // 丢失，登记赤字供许可守卫收缩信号量。
+                            self.lost_without_replacement.fetch_add(1, Ordering::AcqRel);
                             return Err(ActantError::Worker(
                                 "worker pool kept returning exited processes; \
                                  check the worker program"
@@ -450,6 +529,7 @@ impl ProcessTaskDispatcher {
                         // 探测失败时进程可能仍存活；按崩溃路径终止后再丢弃。
                         Self::force_kill(&mut worker.child).await;
                         if discarded >= self.pool_size {
+                            self.lost_without_replacement.fetch_add(1, Ordering::AcqRel);
                             return Err(ActantError::Worker(format!(
                                 "worker liveness probe failed: {e}"
                             )));
@@ -463,8 +543,18 @@ impl ProcessTaskDispatcher {
             if self.shutting_down.load(Ordering::Acquire) {
                 return Err(ActantError::Internal("worker pool shut down".into()));
             }
-            // 信号量许可保证队列应有 worker；此处兜底等待以免忙轮询。
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            // 正常路径下许可数与存活 worker 数一致，空队列属并发 TOCTOU，
+            // 短暂等待 worker 归队；超过预算判定池损坏，返回错误走 crash
+            // failover。步进 25ms：TOCTOU 延迟可忽略，且避免 1ms 粒度定时器
+            // 的累计开销把预算拖长数倍。
+            if empty_wait >= EMPTY_QUEUE_PATIENCE {
+                return Err(ActantError::Worker(format!(
+                    "no free worker appeared within {EMPTY_QUEUE_PATIENCE:?}; \
+                     worker pool may have shrunk"
+                )));
+            }
+            empty_wait += Duration::from_millis(25);
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
 
@@ -577,13 +667,25 @@ impl ProcessTaskDispatcher {
     }
 
     /// 替补一个已崩溃/被杀的 worker。
+    ///
+    /// 替补失败（worker 程序损坏、fork 失败等）时登记 worker 赤字，由 dispatch
+    /// 的 [`PoolPermitGuard`] 在 Drop 时 `forget()` 自己的许可收缩信号量，恢复
+    /// 「许可数 == 存活 worker 数」不变量：worker 被永久丢弃而许可照常归还，
+    /// 后续 dispatch 会拿到「幽灵许可」——队列里并没有 worker 可领，只能反复
+    /// 触发 crash failover。
     fn ensure_replacement(&self) -> Result<(), ActantError> {
         // shutdown 后不再替补：在途任务的终止路径（超时强杀/崩溃回收）会走到这里，
         // 新 spawn 的 worker 在 shutdown 语义下无人消费也无人回收，属纯泄漏。
         if self.shutting_down.load(Ordering::Acquire) {
             return Ok(());
         }
-        let worker = ProcessTaskDispatcher::spawn_one(&self.launch, self.log_bus.clone())?;
+        let worker = match ProcessTaskDispatcher::spawn_one(&self.launch, self.log_bus.clone()) {
+            Ok(worker) => worker,
+            Err(e) => {
+                self.lost_without_replacement.fetch_add(1, Ordering::AcqRel);
+                return Err(e);
+            }
+        };
         self.release_worker(worker);
         Ok(())
     }
@@ -630,6 +732,8 @@ impl ProcessTaskDispatcher {
                         // 进行到一半），dispatch 也能从标记得知「不能复用」。
                         writing.store(true, Ordering::Release);
                         if let Some(c) = cs.as_mut() {
+                            // 取消帧是对已退出/正被 abort 的子进程尽力而为的
+                            // 通知：管道已关闭时写入必然失败，由进程组强杀兜底。
                             let _ = c.write_all(&CANCEL_FRAME_BYTES).await;
                             let _ = c.flush().await;
                         }
@@ -760,12 +864,18 @@ impl TaskDispatcher for ProcessTaskDispatcher {
         let verified = crate::common::payload::verify(&self.signing_key, &payload)
             .map_err(|e| ActantError::Internal(format!("payload verification: {e}")))?;
         // 领用并发槽位（容量 = 进程池大小），确保公平获取空闲 worker。
-        let _permit = self
-            .slots
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| ActantError::Internal("worker pool closed".into()))?;
+        // 守卫负责在 worker 永久丢失且替补失败时 forget 许可收缩信号量。
+        // `_` 前缀仅消音「未读」警告：带 Drop 的绑定仍存活到函数结束。
+        let mut _permit_guard = PoolPermitGuard {
+            permit: Some(
+                self.slots
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| ActantError::Internal("worker pool closed".into()))?,
+            ),
+            dispatcher: self,
+        };
         // 领用 worker 并写入 Dispatch 帧。写失败通常意味着该 worker 在领用后
         // 恰好退出（校验与写之间的 TOCTOU）；此时换一个 worker 重试一次，
         // 而不是把错误冒泡给调用方并消耗 crash failover 配额。
@@ -835,6 +945,9 @@ impl TaskDispatcher for ProcessTaskDispatcher {
         };
 
         let outcome = tokio::select! {
+            // 结果臂优先：完成与取消/超时同时就绪时，先消费已完成结果，
+            // 避免把已完成任务误判为 Cancelled/Timeout 并杀掉 worker。
+            biased;
             result = worker.read_result_frame() => {
                 active.store(false, Ordering::Relaxed);
                 // 先等 poller 彻底退出再决定 worker 去留：保证「poller 检查 active →

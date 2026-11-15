@@ -24,6 +24,9 @@ _HOT_PATH_FILES = (
     "crates/actant-core/src/runtime/workflow/gossip.rs",
     "crates/actant-core/src/runtime/workflow/failover.rs",
     "crates/actant-core/src/runtime/workflow/runtime/network_router.rs",
+    "crates/actant-core/src/runtime/workflow/runtime/completion.rs",
+    "crates/actant-core/src/runtime/dispatcher.rs",
+    "crates/actant-core/src/runtime/workflow/scheduler.rs",
     "crates/actant-core/src/runtime/context.rs",
 )
 

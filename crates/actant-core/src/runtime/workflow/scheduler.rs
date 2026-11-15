@@ -189,7 +189,7 @@ impl Scheduler for ActorScheduler {
         // Worker 唤醒由 InnerScheduler::enqueue 内部的 notify_one() 保证，
         // 语义与 Actor 路径的 notify_task_enqueued() 一致。
         if let Some(ref inner) = self.fast_inner {
-            return inner.enqueue(task);
+            return inner.enqueue(task).await;
         }
         // 慢路径：无共享状态（如纯单元测试构造的 ActorScheduler::new），
         // 走完整 Actor 消息协议。
@@ -207,7 +207,7 @@ impl Scheduler for ActorScheduler {
         }
         // 快路径：批量入队同样直接操作共享状态。
         if let Some(ref inner) = self.fast_inner {
-            return inner.enqueue_batch(tasks);
+            return inner.enqueue_batch(tasks).await;
         }
         let result = self
             .call(scheduler_methods::ENQUEUE_BATCH, encode(&tasks)?)
@@ -332,7 +332,18 @@ impl Scheduler for ActorScheduler {
                 .call(&actor_id, scheduler_methods::CLOSE, vec![])
                 .await
             {
-                tracing::warn!("SchedulerActor close call failed: {}", e);
+                // 停机竞态：shutdown 会先 stop actor，本任务可能在其后被调度。
+                // 此时 actor 已注销，而 CLOSE 的目标（不再接单）已由 stop 达成，
+                // 因此只在 actor 仍然存在时才视为真实失败。
+                if actor_system.list_actors().contains(&actor_id) {
+                    tracing::warn!("SchedulerActor close call failed: {}", e);
+                } else {
+                    tracing::debug!(
+                        actor = %actor_id.0,
+                        error = %e,
+                        "scheduler actor already stopped; close is a no-op"
+                    );
+                }
             }
         });
     }

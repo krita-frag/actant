@@ -65,15 +65,29 @@ def test_payload_signing_key_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert _payload_signing_key(args) == "env-secret"
 
 
-def test_payload_signing_key_generates_random() -> None:
+def test_payload_signing_key_defaults_to_disabled() -> None:
+    # 不生成随机密钥：随机值会让集群内各节点的 MAC 校验互相失败。
     args = _make_args(payload_signing_key="")
-    key = _payload_signing_key(args)
-    assert len(key) == 64  # 32 bytes hex
+    assert _payload_signing_key(args) == ""
 
 
 def test_build_config_returns_none_for_defaults() -> None:
     args = _make_args()
     assert _build_config(args) is None
+
+
+def test_build_config_with_only_payload_signing_key() -> None:
+    args = _make_args(payload_signing_key="secret")
+    config = _build_config(args)
+    assert config is not None
+    assert config.payload_signing_key == "secret"
+
+
+def test_build_config_picks_up_env_payload_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ACTANT_PAYLOAD_KEY", "env-secret")
+    config = _build_config(_make_args())
+    assert config is not None
+    assert config.payload_signing_key == "env-secret"
 
 
 def test_build_config_with_worker_params() -> None:

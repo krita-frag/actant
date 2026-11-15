@@ -76,7 +76,18 @@ def long_pipeline(items: list) -> list:
     return out
 ```
 
-`Runtime.cancel_task(task_id)` 可取消已提交任务。取消是协作式的；进程强杀始终兜底。
+`Runtime.cancel_task(task_id)` 与 `AsyncResult.cancel()` 可取消已提交任务。取消是
+协作式的；进程强杀始终兜底。两个入口走同一份取消协议（协作上下文 → 预取消标记 →
+本地 `cancel_flag` → P2P 广播 → 同 workflow 级联），因此按 id 取消 flow 任务同样
+会把取消广播到真正执行它的远端节点，而不只是置本地标记。
+
+取消是**请求**而不是结论：任务可能抢在检查点之前跑完。因此
+
+- `cancel_task()` 返回 `True` 只表示请求已提交；
+- 句柄的终态由真实结局决定——任务若最终跑完，`result()` 正常返回，句柄为
+  `completed`；只有真正以取消收尾时才抛 `TaskCancelledError`；
+- `TaskLifecycle(kind="cancelled")` 只在句柄进入取消终态时发布一次，不会出现
+  `cancelled` 之后再跟一条 `completed`。
 
 ## 提交幂等
 
@@ -106,7 +117,7 @@ rt.on_task_log(callback, task_id="t-123")  # 省略 task_id 接收全部任务�
 
 ## 生命周期事件批处理
 
-每个任务产生 `started` + `completed` 两次 `TaskLifecycle` 事件。`Runtime.start()` 会创建事件批处理器：事件先累积到 buffer，按 1ms 窗口或 100 条阈值 flush，emit 次数降为约 N/100。没有 `TaskLifecycle` 消费者时直接跳过；单条 emit 失败按 `log` 策略隔离，不阻塞同批其他事件。用户无需手动开启或关闭。
+每个任务产生 `started` + 一条终态事件（`completed` / `failed` / `cancelled`，取决于句柄最终状态）。`Runtime.start()` 会创建事件批处理器：事件先累积到 buffer，按 **25ms 窗口或 100 条阈值** flush（先到者触发）。批大小取决于事件速率——高吞吐时趋近 100 条/批，低频时一次 flush 可能只有一两条；窗口本身也是事件延迟的上界。没有 `TaskLifecycle` 消费者时直接跳过；单条 emit 失败按 `log` 策略隔离，不阻塞同批其他事件。用户无需手动开启或关闭。
 
 ## 下一步
 

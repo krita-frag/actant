@@ -231,6 +231,8 @@ def _cancel_hook_fn(marker_file: str, *, force_after: float | None = None) -> st
 
 # Task 对象
 _echo = task(_echo_fn)
+# ``silent=True`` 的任务不产生任何 TaskLifecycle 事件（高吞吐场景）。
+_silent_echo = task(_echo_fn, silent=True)
 _add = task(_add_fn)
 _increment = task(_increment_fn)
 _double = task(_double_fn)
@@ -619,10 +621,18 @@ class TestCancellation:
                 handle.result(timeout=30)
 
     def test_cancel_emits_task_lifecycle_event(self):
-        events: list[str] = []
+        """取消只发一条 ``cancelled``，且绝不出现 ``cancelled → completed``。
+
+        事件在句柄进入取消终态时发布（``Runtime._finalize_cancelled``），不在
+        ``cancel()`` 请求时发布：后者会在"取消请求赶上任务末尾"时先谎报取消、
+        再由结果回灌补一条 completed。因此这里等事件到达而不是断言请求即发。
+        """
+        events: list[tuple[str, str]] = []  # (kind, task_id)
 
         with Runtime(max_concurrent_tasks=1) as rt:
-            rt.layer("TaskLifecycle").chain(lambda e: events.append(e.kind))
+            rt.layer("TaskLifecycle").chain(
+                lambda e: events.append((e.kind, e.task_id))
+            )
             blocker = _blocker.submit()
             _wait_for_state(blocker, "running")
             handle = _echo.submit(1)
@@ -630,8 +640,93 @@ class TestCancellation:
             with pytest.raises(TaskCancelledError):
                 handle.result(timeout=30)
             blocker.result(timeout=30)
+            # 终态事件经批处理器异步派发（1ms 窗口），轮询等待而非断言立即存在。
+            deadline = time.monotonic() + 5.0
+            while not any(
+                kind == "cancelled" and tid == handle.task_id for kind, tid in events
+            ) and time.monotonic() < deadline:
+                time.sleep(0.01)
 
-        assert "cancelled" in events
+        # 只看本任务的流：blocker 的 started/completed 也在同一个 handler 里。
+        kinds = [kind for kind, tid in events if tid == handle.task_id]
+        assert kinds.count("cancelled") == 1, f"expected exactly one cancelled; got {kinds!r}"
+        assert "completed" not in kinds, f"cancelled task must not report completed; got {kinds!r}"
+
+    def test_stop_settles_remaining_handles_with_cancelled_event(self):
+        """``stop()`` 结算未完成句柄时必须同时发 ``cancelled``。
+
+        句柄进入终态就必须有对应事件——shutdown 之后不会再有结果回灌，
+        这是订阅者最后一次能观察到该任务的机会。
+        """
+        events: list[tuple[str, str]] = []
+        handle = AsyncResult("task-stuck")
+        rt = Runtime()
+        rt.start()
+        try:
+            rt.layer("TaskLifecycle").chain(
+                lambda e: events.append((e.kind, e.task_id))
+            )
+            rt._register_task(handle.task_id, handle)
+        finally:
+            rt.stop()
+
+        assert handle.state == "cancelled"
+        kinds = [kind for kind, tid in events if tid == handle.task_id]
+        assert kinds == ["cancelled"], f"expected one cancelled event; got {kinds!r}"
+
+    def test_cancel_terminal_after_real_outcome_is_ignored(self):
+        """取消终态在真实结局之后到达时不得翻案。
+
+        取消请求可能赶在任务末尾：``_finalize_cancelled`` 是取消的唯一出口，
+        必须承认已到达的成功/失败结局——不覆盖句柄、不向编排器上报相反结论、
+        不发取消事件。这是"事件与句柄终态同源"的另一半。
+        """
+        events: list[tuple[str, str]] = []
+        handle = AsyncResult("task-race")
+        handle._set_result(42)
+        with Runtime() as rt:
+            rt.layer("TaskLifecycle").chain(
+                lambda e: events.append((e.kind, e.task_id))
+            )
+            rt._finalize_cancelled(handle, handle.task_id)
+            assert handle.state == "completed", "取消不得覆盖已到达的成功结局"
+            assert handle.result() == 42
+
+        kinds = [kind for kind, tid in events if tid == handle.task_id]
+        assert kinds == [], f"superseded cancel must not emit events; got {kinds!r}"
+
+    def test_cancel_terminal_racing_real_outcome_emits_no_cancelled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """取消出口在「检查通过 → 上报」窗口被真实结局抢占时不得发 cancelled。
+
+        取消出口先做一次性标记（``_cancel_event_published``），再上报与发布；
+        若 orchestrator 上报期间另一结果帧先完成句柄，``_set_cancelled()``
+        返回 False，事件发布被跳过——句柄终态与事件流保持一致。
+        """
+        events: list[tuple[str, str]] = []
+        handle = AsyncResult("task-race-hook")
+        with Runtime() as rt:
+            rt.layer("TaskLifecycle").chain(
+                lambda e: events.append((e.kind, e.task_id))
+            )
+
+            def _report_with_racing_result(*args: object, **kwargs: object) -> bool:
+                # 模拟并发结果帧在 orchestrator 上报窗口内先落定真实结局。
+                handle._set_result(42)
+                return False
+
+            monkeypatch.setattr(
+                rt, "_report_task_result_to_orchestrator", _report_with_racing_result
+            )
+            rt._finalize_cancelled(handle, handle.task_id)
+
+        assert handle.state == "completed"
+        assert handle.result() == 42
+        kinds = [kind for kind, tid in events if tid == handle.task_id]
+        assert "cancelled" not in kinds, (
+            f"真实结局已抢占时不得再发 cancelled；got {kinds!r}"
+        )
 
     def test_dispatch_emits_started_and_completed_lifecycle_events(self):
         """回归测试：dispatch handler 在 Rust worker 线程中执行时，
@@ -655,6 +750,30 @@ class TestCancellation:
         kinds = [k for k, _ in events if _ == handle.task_id]
         assert "started" in kinds, f"missing 'started' event; got {events!r}"
         assert "completed" in kinds, f"missing 'completed' event; got {events!r}"
+
+    def test_silent_task_emits_no_lifecycle_events(self):
+        """``@task(silent=True)`` 必须真的抑制事件。
+
+        事件由父进程在结果回调中发布（worker 子进程侧的事件通道恒关闭），
+        所以该选项只有在父进程侧被读取才生效。历史实现只把它写进任务
+        envelope、worker 忽略、父进程不读——文档承诺了一个不存在的功能。
+        """
+        events: list[tuple[str, str]] = []
+
+        with Runtime() as rt:
+            rt.layer("TaskLifecycle").chain(
+                lambda e: events.append((e.kind, e.task_id))
+            )
+            handle = _silent_echo.submit(7)
+            assert handle.result(timeout=30) == 7
+            # 事件在注册表回收之前入队（add 同步、unregister 在后），
+            # 因此等句柄消失即保证本次回调的事件已进 buffer，再由 stop 刷出。
+            deadline = time.monotonic() + 5.0
+            while rt._get_task(handle.task_id) is not None and time.monotonic() < deadline:
+                time.sleep(0.01)
+
+        kinds = [kind for kind, tid in events if tid == handle.task_id]
+        assert kinds == [], f"silent task must not publish events; got {kinds!r}"
 
     def test_dispatch_emits_failed_lifecycle_event_on_exception(self):
         """任务失败时 dispatch handler 应广播 ``failed`` 事件（回归同上）。"""
@@ -794,3 +913,30 @@ class TestFlow:
     def test_flow_with_task_dependencies(self):
         with Runtime():
             assert _etl_pipeline(10) == 21  # (10 * 2) + 1
+
+    def test_duplicate_cancel_frame_is_idempotent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """两条取消路径并发到达时只发布一次 cancelled（一次性标记）。
+
+        Rust 侧会对 inflight 任务补发 Cancelled，且 COMPLETED 帧可能携带
+        TaskCancelledError：两帧在 _unregister_task 前的窗口内并发进入
+        _on_task_result 时，第二条不得重复上报 orchestrator 与发布事件。
+        """
+        events: list[tuple[str, str]] = []
+        reports: list[tuple] = []
+        handle = AsyncResult("task-dup-cancel")
+        with Runtime() as rt:
+            rt.layer("TaskLifecycle").chain(
+                lambda e: events.append((e.kind, e.task_id))
+            )
+            monkeypatch.setattr(
+                rt,
+                "_report_task_result_to_orchestrator",
+                lambda *a, **k: reports.append(a) or True,
+            )
+            rt._finalize_cancelled(handle, handle.task_id)
+            rt._finalize_cancelled(handle, handle.task_id)
+
+        assert handle.state == "cancelled"
+        assert len(reports) == 1, "第二条取消帧不得重复上报 orchestrator"
+        kinds = [kind for kind, tid in events if tid == handle.task_id]
+        assert kinds.count("cancelled") == 1, f"取消事件必须 exactly-once: {kinds!r}"

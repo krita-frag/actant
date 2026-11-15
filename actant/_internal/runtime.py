@@ -18,6 +18,8 @@
 自上而下排列：
 
 - ``Layer`` / ``_RuntimeEffectsMixin``：ERH 扩展模型的 handler 注册；
+- ``_request_cancel`` / ``_cancel_workflow_tasks``：取消请求的唯一实现（两个公开
+  取消入口与 flow 失败兜底共用），只依赖运行时的任务表与 Rust core；
 - ``_RuntimeTaskMixin``：本地任务句柄、终态回调与生命周期事件；
 - ``_RuntimeWorkflowMixin``：持久化工作流读写、上下文值，以及 flow 提交与重放驱动；
 - ``_RuntimeNetworkMixin``：节点身份、P2P 网络、指标与并发上限。
@@ -95,6 +97,10 @@ TEST_DRAIN_TIMEOUT_SECS = 5
 #: ``stop(timeout=None)`` 传向 Rust ``shutdown`` 的毫秒上限——语义是「不设上限」，
 #: 取 i64 最大毫秒数（约 2.9 亿年），避免用 0 被解释成立即强制关闭。
 _NO_SHUTDOWN_TIMEOUT_MS = 2**63 - 1
+
+#: ``stop()`` 等待后台 auto_resume 重放线程的秒数上限。重放会执行用户 flow
+#: 代码，可能长耗时；超时只记 warning 不阻断关停（该线程是 daemon）。
+_AUTO_RESUME_JOIN_TIMEOUT_SECS = 5.0
 
 
 def get_current_runtime() -> Runtime | None:
@@ -327,6 +333,118 @@ class _RuntimeEffectsMixin(_RuntimeBase):
             return list(self._layers[name])
 
 
+def _cancel_workflow_tasks(
+    runtime: _RuntimeTaskMixin,
+    workflow_id: str,
+    *,
+    exclude: str | None = None,
+) -> None:
+    """逐个取消本节点上属于 ``workflow_id`` 的任务。
+
+    两个调用方是同一件事的两种入口：``flow`` 失败兜底（没有发起方句柄）与
+    ``AsyncResult.cancel(propagate=True)``（跳过发起方自己，故有 ``exclude``）。
+    任务表遍历只此一处，避免两条路径对「哪些任务算同一 workflow」各自判断，
+    也避免 ``_request_cancel`` 的级联退化成第二次手写过滤。
+
+    单个任务取消失败不阻断其余任务：记 warning 后继续，失败本身由调用方的
+    flow 异常向上传播。
+    """
+    for task_id in runtime._list_tasks():
+        if task_id == exclude:
+            continue
+        handle = runtime._get_task(task_id)
+        if handle is None or handle.workflow_id != workflow_id:
+            continue
+        try:
+            _request_cancel(runtime, handle)
+        except Exception:
+            _logger.warning(
+                "workflow %s: failed to cancel task %s",
+                workflow_id,
+                task_id,
+                exc_info=True,
+            )
+
+
+def _request_cancel(
+    runtime: _RuntimeTaskMixin | None,
+    handle: AsyncResult,
+    *,
+    propagate: bool = False,
+    force_after: float | None = None,
+) -> bool:
+    """提交一次取消请求：``AsyncResult.cancel`` 与 ``Runtime.cancel_task`` 的唯一实现。
+
+    两个入口必须产生同一组副作用，否则同一次取消会因入口不同只覆盖一部分节点
+    或一半职责（典型漂移：句柄入口广播 P2P、按 id 的入口只置本地 cancel_flag，
+    于是 flow 任务经 ``cancel_task`` 取消时远端 Worker 收不到）。本函数按序执行
+    状态门 → 协作上下文 → 预取消标记 → Rust cancel_flag → P2P 广播 → 级联 →
+    排队期占位终态。
+
+    取消是**请求**而非结论——任务可能抢在协作检查点之前跑完。本函数不发布任何
+    事件：``TaskLifecycle(kind="cancelled")`` 由 :meth:`_finalize_cancelled` 在
+    句柄真正进入取消终态时发布一次，保证事件与句柄终态同源。
+
+    Args:
+        runtime: 提交方所属的运行时（``Runtime`` 的本地任务部分）；
+            ``None`` 表示句柄脱离运行时（手工构造或 shutdown 之后），此时
+            只能执行本地协作取消。
+        handle: 目标任务的句柄。
+        propagate: 级联取消同一 ``workflow_id`` 下的其他本地任务。
+        force_after: 取消后若未在给定秒数内协作退出，强制调用清理钩子。
+
+    Returns:
+        ``True``：请求已提交（已取消的任务幂等返回 ``True``）。
+        ``False``：任务已完成（成功/失败），请求未被接受。
+    """
+    state = handle.state
+    if state in ("completed", "failed"):
+        return False
+    if state == "cancelled":
+        return True
+
+    task_id = handle.task_id
+    workflow_id = handle.workflow_id
+    # 1. 协作式取消：任务在下一个检查点看到取消信号并自行退出。
+    handle._cancel_context(force_after)
+
+    if runtime is not None:
+        # 2. 预取消标记：dispatch handler 启动时检查，取消尚未被 Worker 取走的任务。
+        runtime._mark_task_cancelled(task_id)
+        core = runtime._rust_core
+        if core is not None:
+            # 3. 本地 cancel_flag：运行中的任务在下一个检查点退出。失败不阻断
+            #    其余步骤（尽力而为语义），但不可静默。
+            try:
+                core.cancel_task(task_id)
+            except Exception:
+                _logger.warning("cancel_task failed for %s", task_id, exc_info=True)
+            # 4. P2P 广播：远端 Worker 同样置位。按任务 id 定址，故级联时逐任务广播。
+            if workflow_id:
+                try:
+                    core.broadcast_cancel(task_id, workflow_id)
+                except Exception:
+                    _logger.warning(
+                        "task %s: broadcast_cancel failed", task_id, exc_info=True
+                    )
+        # 5. 级联：同一 workflow 的其余任务各自走一遍完整协议（含各自的广播）。
+        if propagate and workflow_id:
+            _cancel_workflow_tasks(runtime, workflow_id, exclude=task_id)
+
+    final_state = handle.state
+    if final_state in ("completed", "failed"):
+        # 竞争：任务在请求过程中跑完。回滚预取消标记——终态回收（清除该标记）
+        # 已先于本次登记执行，不回滚会让该 id 永久留在集合里。
+        if runtime is not None:
+            runtime._clear_task_cancelled(task_id)
+        return False
+    # 6. 排队期占位终态：让提交方不必等到 Worker 回应就能拿到结论。真实结局
+    #    到达时 AsyncResult._finish 会覆盖它，反向不成立。
+    if final_state == "pending":
+        handle._set_cancelled()
+    return True
+
+
 class _RuntimeTaskMixin(_RuntimeBase):
     """本地任务句柄的注册、取消、终态解析与事件发布。"""
 
@@ -368,11 +486,20 @@ class _RuntimeTaskMixin(_RuntimeBase):
         if batcher is not None:
             batcher.add(kind, task_id, workflow_id, **kwargs)
             return
-        from actant._internal.runtime import use_runtime
-        from actant._internal.tasks.helpers import _emit_task_event
+        # 未启用批处理时与后台 flush 走同一个渲染器：两者都是「把本 Runtime
+        # 绑定到当前线程再 emit」，各写一份必然漂移。
+        self._publish_task_event(kind, task_id, workflow_id, kwargs)
 
-        with use_runtime(cast("Runtime", self)):
-            _emit_task_event(kind, task_id, workflow_id, **kwargs)
+    def _emit_lifecycle(self, handle: Any, kind: str, **kwargs: Any) -> None:
+        """按句柄的 ``silent`` 选项发布一条 ``TaskLifecycle`` 事件。
+
+        所有任务生命周期事件都经这里发出：``silent`` 是提交方在 ``@task`` 上
+        声明的契约（"这个任务不进事件流"），判定必须与发射点同源，逐点各写
+        一次会漏。
+        """
+        if handle.silent:
+            return
+        self._emit_batch(kind, handle.task_id, handle.workflow_id, **kwargs)
 
     def _task_lifecycle_consumers(self) -> bool:
         """批次口径下 ``TaskLifecycle`` 是否仍有 Python 消费者。
@@ -435,17 +562,27 @@ class _RuntimeTaskMixin(_RuntimeBase):
         「任务成功」与「任务业务失败」的一侧。终态解析后上报 orchestrator；上报
         返回重试裁决时句柄保持等待（不发终态事件、不移出注册表），重试结果到达
         时经同一回调解析——与 worker 层重试的句柄语义一致。
+
+        终态事件由 :meth:`_finalize_cancelled` / :meth:`_finalize_failed` 与
+        成功路径在**写入句柄终态之后**发布，本回调只用 ``handle.state`` 做 batch
+        计账与注册表回收。事件永远与句柄终态同源：不按"到达顺序"发，也不在
+        请求期发。
         """
         task_id = completion.task_id
         with self._lock:
             handle = self._tasks.get(task_id)
         if handle is None:
+            # 无本地句柄 ≠ 与本地无关：接管/重派发场景下工作流归本节点编排，
+            # 任务却是由别的节点（或本节点）以「无提交句柄」的方式执行的。
+            # 结果仍必须回灌 orchestrator，否则接管方的工作流永远停在 Running
+            # （任务早已跑完，却等不到封口）。
+            self._report_result_without_handle(completion)
             return
         state = completion.state
         if state == TASK_STATE_RUNNING:
             # Worker 已开始执行任务，更新为 running（非终态，不从注册表移除）。
             handle._set_running()
-            self._emit_batch("started", task_id, handle.workflow_id)
+            self._emit_lifecycle(handle, "started")
             return
         batch_state: str | None = None
         if state == TASK_STATE_COMPLETED:
@@ -458,15 +595,12 @@ class _RuntimeTaskMixin(_RuntimeBase):
             # error 字段是 Rust 端生成的字符串，经 reconstruct_error 重建异常
             # 子类，保留错误类型（如 timeout → ActantTimeoutError）。
             keep = self._on_task_state_failed(handle, task_id, completion.error or "unknown error")
-            batch_state = "failed"
+            batch_state = handle.state
         elif state == TASK_STATE_CANCELLED:
             # 取消同为编排终态：上报后 orchestrator 才能收尾该节点。
-            self._report_task_result_to_orchestrator(handle, "Cancelled")
-            if not handle.workflow_id:
-                self._persist_task_failure(task_id, "Cancelled", "cancelled")
-            handle._set_cancelled()
+            self._finalize_cancelled(handle, task_id)
             keep = False
-            batch_state = "cancelled"
+            batch_state = handle.state
         else:
             return
         if not keep:
@@ -474,6 +608,71 @@ class _RuntimeTaskMixin(_RuntimeBase):
                 self._record_batch_terminal(task_id, batch_state)
             # 终态后从注册表移除（本地孤儿回收）；编排裁决为重试时保持等待。
             self._unregister_task(task_id)
+
+    def _report_result_without_handle(self, completion: Any) -> None:
+        """无本地句柄时把终态原样回灌 orchestrator。
+
+        只在接管/重派发这类「工作流归本节点编排、任务无提交句柄」的场景下
+        发生：截获结果的是执行者本人，句柄却留在提交方（可能已死亡）。
+        Rust 侧结果帧正文对编排器不透明（业务失败也编码成 COMPLETED），
+        因此成败必须在这里解码后显式上报。
+
+        上报失败只记 warning：本回调运行在事件派发线程上，抛异常会中断后续
+        结果处理，而句柄语义下也不存在「向谁传播」的问题。
+        """
+        workflow_id = getattr(completion, "workflow_id", "") or ""
+        task_id = completion.task_id
+        state = completion.state
+        if not workflow_id or state == TASK_STATE_RUNNING:
+            return
+
+        try:
+            if state == TASK_STATE_COMPLETED:
+                raw = completion.result or b""
+                import cloudpickle as _cp
+
+                from actant.exceptions import TaskCancelledError as _TCE
+
+                try:
+                    success, payload_obj = _cp.loads(raw)
+                except (pickle.UnpicklingError, ValueError, TypeError) as e:
+                    self._report_task_result(
+                        workflow_id,
+                        task_id,
+                        "Failed",
+                        error=f"undecodable result for task {task_id!r}: {e}",
+                    )
+                    return
+                if success:
+                    self._report_task_result(
+                        workflow_id, task_id, "Completed", result=raw
+                    )
+                elif isinstance(payload_obj, _TCE):
+                    self._report_task_result(workflow_id, task_id, "Cancelled")
+                else:
+                    self._report_task_result(
+                        workflow_id,
+                        task_id,
+                        "Failed",
+                        error=f"{type(payload_obj).__name__}: {payload_obj}",
+                    )
+            elif state == TASK_STATE_CANCELLED:
+                self._report_task_result(workflow_id, task_id, "Cancelled")
+            else:
+                self._report_task_result(
+                    workflow_id,
+                    task_id,
+                    "Failed",
+                    error=completion.error or "task failed (no detail reported)",
+                )
+        except Exception:
+            _logger.warning(
+                "task %s: failed to report %s for orphaned handle (workflow %s)",
+                task_id,
+                state,
+                workflow_id,
+                exc_info=True,
+            )
 
     def _on_task_state_completed(self, handle: Any, task_id: str, raw: bytes) -> bool:
         """解析 COMPLETED 结果帧，返回「编排是否裁决重试（句柄保持等待）」。
@@ -488,19 +687,15 @@ class _RuntimeTaskMixin(_RuntimeBase):
             success, payload_obj = _cp.loads(raw)
         except (pickle.UnpicklingError, ValueError, TypeError) as e:
             # 无法解码：当作失败处理（同样上报——否则编排节点会永久停留在
-            # Running，工作流无法封口收尾）。emit=False 与原有语义一致。
+            # Running，工作流无法封口收尾）。
             msg = f"undecodable result for task {task_id!r}: {e}"
-            return self._finalize_failed(handle, task_id, msg, msg, emit=False)
+            return self._finalize_failed(handle, task_id, msg, msg)
         if not success:
             # 失败：payload_obj 是异常对象，先识别取消。
             from actant.exceptions import TaskCancelledError as _TCE
 
             if isinstance(payload_obj, _TCE):
-                # 取消同为编排终态：上报后 orchestrator 才能收尾该节点。
-                self._report_task_result_to_orchestrator(handle, "Cancelled")
-                if not handle.workflow_id:
-                    self._persist_task_failure(task_id, "Cancelled", "cancelled")
-                handle._set_cancelled()
+                self._finalize_cancelled(handle, task_id)
                 return False
             error_text = f"{type(payload_obj).__name__}: {payload_obj}"
             return self._finalize_failed(handle, task_id, payload_obj, error_text)
@@ -537,7 +732,10 @@ class _RuntimeTaskMixin(_RuntimeBase):
             # 内联对象路径：直接存对象避免 dumps/loads 往返；任务返回 bytes
             # （如 echo(b"x")）也按对象存储，不会被误当作序列化结果。
             handle._set_result(payload_obj)
-        self._emit_batch("completed", task_id, handle.workflow_id)
+        # 事件与句柄终态同源：占位终态（排队期预取消）被真实结局覆盖时，
+        # 句柄已回到 completed，此时发的 completed 与句柄、Store 三方一致。
+        if handle.state == "completed":
+            self._emit_lifecycle(handle, "completed")
         return False
 
     def _on_task_state_failed(self, handle: Any, task_id: str, error_text: str) -> bool:
@@ -548,13 +746,51 @@ class _RuntimeTaskMixin(_RuntimeBase):
         """
         return self._finalize_failed(handle, task_id, reconstruct_error(error_text), error_text)
 
+    def _finalize_cancelled(self, handle: Any, task_id: str) -> None:
+        """取消终态统一出口：回灌 orchestrator、落记录、结算句柄并发布事件。
+
+        取消有两条到达路径：Rust 侧 ``CANCELLED`` 结果帧，或 ``COMPLETED`` 帧里
+        携带 ``TaskCancelledError``（预取消标记使 dispatch handler 立即返回）。
+        两者对编排器、Store、句柄、事件的效果完全相同，必须走同一出口——否则
+        事件只在其中一条路径上出现，订阅者看到的取消流取决于取消时机。
+
+        事件与句柄终态同源：句柄可能已被 ``cancel_task`` 预置为 ``cancelled``
+        （排队期占位终态，此时 ``_set_cancelled`` 是 no-op），但这仍是该任务
+        唯一一次取消事件，必须发布。反之若真实结局（成功/失败）已先到达，
+        取消就不成立——不覆盖句柄，也不再向编排器重复上报相反结论。
+        """
+        if handle.state in ("completed", "failed"):
+            _logger.info(
+                "task %s: cancel terminal arrived after %s; keeping real outcome",
+                task_id,
+                handle.state,
+            )
+            return
+        # 一次性标记：两条取消路径并发到达时只有第一条做结算与发布。
+        if getattr(handle, "_cancel_event_published", False):
+            return
+        handle._cancel_event_published = True
+        self._report_task_result_to_orchestrator(handle, "Cancelled")
+        if not handle.workflow_id:
+            self._persist_task_failure(task_id, "Cancelled", "cancelled")
+        handle._set_cancelled()
+        if handle.state in ("completed", "failed"):
+            # 上报窗口内另一结果帧抢占了句柄：_set_cancelled 是 no-op，此时
+            # 再发 cancelled 会让事件流与句柄终态互相矛盾。
+            _logger.info(
+                "task %s: real outcome %s won during cancel; skipping cancel event",
+                task_id,
+                handle.state,
+            )
+            return
+        self._emit_lifecycle(handle, "cancelled")
+
     def _finalize_failed(
         self,
         handle: Any,
         task_id: str,
         error_payload: Any,
         error_text: str,
-        emit: bool = True,
     ) -> bool:
         """失败终态统一出口：先经 orchestrator 裁决，返回「是否保持句柄等待」。
 
@@ -575,8 +811,8 @@ class _RuntimeTaskMixin(_RuntimeBase):
             # 使 get_task_result 重抛与同进程 result() 相同的异常类型。
             self._persist_task_failure(task_id, "Failed", error_text, exc=error_payload)
         handle._set_error(error_payload)
-        if emit:
-            self._emit_batch("failed", task_id, handle.workflow_id, error=error_text)
+        if handle.state == "failed":
+            self._emit_lifecycle(handle, "failed", error=error_text)
         return False
 
     def _register_task(self, task_id: str, handle: AsyncResult) -> None:
@@ -616,9 +852,7 @@ class _RuntimeTaskMixin(_RuntimeBase):
             InvalidStateError: Runtime 未启动。
             ValueError: ``state`` 不是已知终态。
         """
-        core = self._rust_core
-        if core is None:
-            raise InvalidStateError("Runtime not started")
+        core = self._require_core()
         return cast(
             "dict[str, Any]",
             core.report_task_result(workflow_id, task_id, state, result, error),
@@ -676,43 +910,21 @@ class _RuntimeTaskMixin(_RuntimeBase):
     def cancel_task(self, task_id: str) -> bool:
         """尝试取消指定任务。
 
+        取消是请求而非结论：任务可能抢在协作检查点之前跑完。返回 ``True``
+        只表示请求已提交，句柄终态随后由真实结局决定（跑完即 ``completed``，
+        ``result()`` 正常返回）。``TaskLifecycle(kind="cancelled")`` 由
+        :meth:`_finalize_cancelled` 在句柄真正进入取消终态时发布一次。
+
+        与 ``AsyncResult.cancel()`` 走同一条实现（:func:`_request_cancel`），
+        因此本入口对 flow 任务同样会广播 P2P 取消，而不只是置本地 cancel_flag。
+
         Returns:
             ``True`` 表示任务存在且取消请求已提交；``False`` 表示任务不存在或已完成。
         """
-        with self._lock:
-            handle = self._tasks.get(task_id)
+        handle = self._get_task(task_id)
         if handle is None:
             return False
-        state = handle.state
-        if state in ("completed", "failed"):
-            return False
-        if state == "cancelled":
-            return True
-        # 标记为预取消：dispatch handler 启动时会检查此集合，
-        # 若任务尚未被 Worker 拉取，handler 立即返回 TaskCancelledError。
-        self._mark_task_cancelled(task_id)
-        # 通知 Rust Worker 设置 cancel_flag，使正在运行的任务在下次检查点退出。
-        if self._rust_core is not None:
-            try:
-                self._rust_core.cancel_task(task_id)
-            except Exception:
-                # Rust 侧取消失败不阻断 Python 侧取消标记的设置（预取消标记
-                # 仍能阻止尚未被 Worker 拉取的任务执行），但必须记录告警便于排查。
-                _logger.warning(
-                    "cancel_task(%s): rust core cancel_task failed",
-                    task_id,
-                    exc_info=True,
-                )
-        cancelled = bool(handle.cancel())
-        if not cancelled:
-            self._clear_task_cancelled(task_id)
-            return False
-        # 若任务仍在 pending（排队中，尚未被 Worker 拉取），
-        # 仅更新 Python 句柄状态；保留 _cancelled_tasks 标记直到 worker
-        # 真正消费到该任务并回传终态事件，以免提前清空预取消信号。
-        if cancelled and handle.state == "pending":
-            handle._set_cancelled()
-        return cancelled
+        return _request_cancel(self, handle)
 
     def batch_progress(self, batch_id: str) -> BatchProgress | None:
         """查询 batch/array job 进度；未注册返回 ``None``。
@@ -894,9 +1106,7 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
         Raises:
             InvalidStateError: Runtime 未启动。
         """
-        core = self._rust_core
-        if core is None:
-            raise InvalidStateError("Runtime not started")
+        core = self._require_core()
         core.submit_workflow(
             workflow_id,
             failure_strategy,
@@ -932,9 +1142,7 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
             InvalidStateError: Runtime 未启动。
             FlowReplayError: 提交序列指纹不一致。
         """
-        core = self._rust_core
-        if core is None:
-            raise InvalidStateError("Runtime not started")
+        core = self._require_core()
         return cast("dict[str, Any]", core.add_workflow_node(workflow_id, node, deps))
 
     def cancel_workflow(self, workflow_id: str) -> None:
@@ -945,10 +1153,20 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
         Raises:
             InvalidStateError: Runtime 未启动。
         """
-        core = self._rust_core
-        if core is None:
-            raise InvalidStateError("Runtime not started")
+        core = self._require_core()
         core.cancel_workflow(workflow_id)
+
+    def _fail_workflow(self, workflow_id: str, error: str) -> None:
+        """以 Failed 终态结束工作流并保留错误（flow 函数体异常）。
+
+        与 ``cancel_workflow`` 的区别：业务异常是失败而不是取消；错误串
+        进入终态快照，``FlowHandle.result()`` 据此抛 ``WorkflowFailedError``。
+
+        Raises:
+            InvalidStateError: Runtime 未启动。
+        """
+        core = self._require_core()
+        core.fail_workflow(workflow_id, error)
 
     def _seal_workflow(self, workflow_id: str) -> None:
         """封口工作流节点集（flow 函数体返回信号）。
@@ -959,9 +1177,7 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
         Raises:
             InvalidStateError: Runtime 未启动。
         """
-        core = self._rust_core
-        if core is None:
-            raise InvalidStateError("Runtime not started")
+        core = self._require_core()
         core.seal_workflow(workflow_id)
 
     def _register_wait_point(
@@ -992,9 +1208,7 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
             InvalidStateError: Runtime 未启动。
             ValueError: ``kind`` 非法或 timer 缺 ``deadline_ms``。
         """
-        core = self._rust_core
-        if core is None:
-            raise InvalidStateError("Runtime not started")
+        core = self._require_core()
         core.register_wait_point(workflow_id, wait_key, kind, name, deadline_ms)
 
     def signal_wait_point(
@@ -1035,9 +1249,7 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
             NotFoundError: 工作流不存在（递交方 id 写错）。
             ValueError: ``wait_key`` 为空。
         """
-        core = self._rust_core
-        if core is None:
-            raise InvalidStateError("Runtime not started")
+        core = self._require_core()
         return cast(
             "bytes | None",
             core.signal_wait_point(workflow_id, wait_key, payload),
@@ -1064,9 +1276,7 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
         Raises:
             InvalidStateError: Runtime 未启动。
         """
-        core = self._rust_core
-        if core is None:
-            raise InvalidStateError("Runtime not started")
+        core = self._require_core()
         return int(core.resume_suspended(workflow_id))
 
     def _resolve_workflow_context_value(
@@ -1095,9 +1305,7 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
             InvalidStateError: Runtime 未启动。
             FlowReplayError: 同 ``key`` 的历史记录是另一种 ``kind``。
         """
-        core = self._rust_core
-        if core is None:
-            raise InvalidStateError("Runtime not started")
+        core = self._require_core()
         return bytes(
             core.resolve_context_value(workflow_id, key, kind, candidate)
         )
@@ -1113,9 +1321,7 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
         需要"读一个可能不存在的记录"时用它，避免为缺失键制造一条空记录。
         ``continue_as_new`` 用它读取续跑携带参数。
         """
-        core = self._rust_core
-        if core is None:
-            raise InvalidStateError("Runtime not started")
+        core = self._require_core()
         return cast("bytes | None", core.get_context_value(workflow_id, key))
 
     def _wait_wait_point(
@@ -1149,9 +1355,7 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
         Raises:
             InvalidStateError: Runtime 未启动。
         """
-        core = self._rust_core
-        if core is None:
-            raise InvalidStateError("Runtime not started")
+        core = self._require_core()
         return cast(
             "bytes | None", core.wait_wait_point(workflow_id, wait_key, timeout_ms)
         )
@@ -1181,9 +1385,7 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
         Raises:
             InvalidStateError: Runtime 未启动。
         """
-        core = self._rust_core
-        if core is None:
-            raise InvalidStateError("Runtime not started")
+        core = self._require_core()
         return cast(
             "Awaitable[bytes | None]",
             core.wait_wait_point_async(workflow_id, wait_key, timeout_ms),
@@ -1199,10 +1401,28 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
         Raises:
             InvalidStateError: Runtime 未启动。
         """
-        core = self._rust_core
-        if core is None:
-            raise InvalidStateError("Runtime not started")
+        core = self._require_core()
         return cast("dict[str, Any] | None", core.get_workflow_state(workflow_id))
+
+    def get_workflow_state_summary(self, workflow_id: str) -> dict[str, Any] | None:
+        """查询 workflow 状态摘要（**不含任务结果**）。
+
+        只返回 ``workflow_id`` / ``state`` / ``failure_strategy`` / ``error`` /
+        ``succeeded_count`` / ``total_count``；``tasks`` 与结果字节一概不搬。
+        供"轮询终态"这类高频读取使用：完整快照每次都会克隆全部任务结果，
+        M 个任务的 flow 以 50ms 轮询即 20·M 次拷贝/秒。终态确认后需要结果时
+        再调 :meth:`get_workflow_state` 一次。
+
+        Returns:
+            摘要字典；工作流不存在时返回 ``None``。
+
+        Raises:
+            InvalidStateError: Runtime 未启动。
+        """
+        core = self._require_core()
+        return cast(
+            "dict[str, Any] | None", core.get_workflow_state_summary(workflow_id)
+        )
 
     def get_task_result(self, task_id: str) -> Any:
         """读取独立任务被持久化的终态结果（按 ``task_id`` 跨重启查询）。
@@ -1228,8 +1448,7 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
         # 不把 core 绑定到局部变量：本方法可能抛异常，异常 traceback 会持有
         # 当前帧的局部引用；局部 core 会延长 LMDB env 的生命周期直到 GC
         # （同进程立即重开同一 data_dir 会撞上 "environment already open"）。
-        if self._rust_core is None:
-            raise InvalidStateError("Runtime not started")
+        self._require_core()
         store = self._terminal
         if store is None:
             raise InvalidStateError("Runtime not started")
@@ -1263,8 +1482,7 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
         if kind == "idempotency_key":
             self._idempotency.forget(key)
             return
-        if self._rust_core is None:
-            raise InvalidStateError("Runtime not started")
+        self._require_core()
         store = self._terminal
         if store is None:
             raise InvalidStateError("Runtime not started")
@@ -1300,8 +1518,7 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
             NotFoundError: 没有该 workflow 的返回值记录（未完成、失败/取消，
                 或从未在此 ``data_dir`` 运行）。
         """
-        if self._rust_core is None:
-            raise InvalidStateError("Runtime not started")
+        self._require_core()
         store = self._terminal
         if store is None:
             raise InvalidStateError("Runtime not started")
@@ -1329,9 +1546,7 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
         Raises:
             InvalidStateError: Runtime 未启动。
         """
-        core = self._rust_core
-        if core is None:
-            raise InvalidStateError("Runtime not started")
+        core = self._require_core()
         return cast("dict[str, Any] | None", core.get_dag(workflow_id))
 
     def get_workflow_journal(
@@ -1344,25 +1559,29 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
         """读取工作流的 journal（跨语言消费面）。
 
         ``raw=False``（默认）导出**稳定、自描述**的字段：
-        ``{seq, timestamp_ms, kind, workflow_id, task_id, wait_key,
+        ``{seq, timestamp_ns, kind, workflow_id, task_id, wait_key,
         error, payload, condition, invocation}``。
 
-        - ``kind`` 为小写稳定事件名（``"submitted"`` / ``"task_completed"`` …）；
+        - ``kind`` 为小写下划线稳定事件名（``"submitted"`` /
+          ``"task_completed"`` 等）。集合还含 ``nodes_sealed`` /
+          ``deadline_set`` / ``started_at`` / ``evicted`` 等编排元事件，消费方
+          须容忍未知 kind；``evicted`` 可能出现在终态事件之后；
         - ``payload`` 是该事件的不透明业务字节（节点入参、任务结果、信号载荷、
           上下文值），可 base64 后直接导出为 JSON；
         - ``condition`` 是等待点条件的字符串标签；``invocation`` 是提交描述
           dict（无则为 ``None``）。
 
         ``raw=True`` 返回底层事件历史（审计出口）：每项
-        ``{sequence, timestamp_ms, kind, task_id, error, payload}``，``kind`` 为
+        ``{sequence, timestamp_ns, kind, task_id, error, payload}``，``kind`` 为
         Rust 事件名，``payload`` 是原始编码字节。历史是**事实源**：
         ``recover`` = 快照 + 其后事件重放，等待点与信号也以事件形式进入同一历史。
 
         Args:
             workflow_id: 工作流标识。
             raw: ``True`` 读取底层事件历史；``False`` 读取规范化 journal。
-            after: 游标 ``(sequence, timestamp_ms)``（取上一项的对应字段），
-                仅 ``raw=True`` 有效；``None`` 表示从头读取。
+            after: 游标 ``(sequence, timestamp_ns)``（取上一项的对应字段，
+                ``timestamp_ns`` 是 epoch 纳秒），仅 ``raw=True`` 有效；
+                ``None`` 表示从头读取。
 
         Returns:
             按 ``seq`` 升序的 journal 记录列表；工作流不存在时为空。
@@ -1371,9 +1590,7 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
             InvalidStateError: Runtime 未启动。
             ValueError: ``raw=False`` 时传入了 ``after``。
         """
-        core = self._rust_core
-        if core is None:
-            raise InvalidStateError("Runtime not started")
+        core = self._require_core()
         if raw:
             return cast(
                 "list[dict[str, Any]]",
@@ -1394,9 +1611,7 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
         Raises:
             InvalidStateError: Runtime 未启动。
         """
-        core = self._rust_core
-        if core is None:
-            raise InvalidStateError("Runtime not started")
+        core = self._require_core()
         return cast("dict[str, Any] | None", core.get_workflow_invocation(workflow_id))
 
     def list_workflows(self, *, include_archived: bool = False) -> list[str]:
@@ -1410,9 +1625,7 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
         Raises:
             InvalidStateError: Runtime 未启动。
         """
-        core = self._rust_core
-        if core is None:
-            raise InvalidStateError("Runtime not started")
+        core = self._require_core()
         return list(core.list_workflows(include_archived))
 
     def delete_workflow(self, workflow_id: str) -> None:
@@ -1428,9 +1641,7 @@ class _RuntimeWorkflowMixin(_RuntimeBase):
         Raises:
             InvalidStateError: Runtime 未启动。
         """
-        core = self._rust_core
-        if core is None:
-            raise InvalidStateError("Runtime not started")
+        core = self._require_core()
         core.delete_workflow(workflow_id)
 
 
@@ -1462,9 +1673,8 @@ class _RuntimeNetworkMixin(_RuntimeBase):
     @property
     def node_id(self) -> str:
         """本节点的 Actant 内部 ID（可能是用户提供的 ``name``）。"""
-        if self._rust_core is None:
-            raise InvalidStateError("Runtime not started")
-        return str(self._rust_core.node_id())
+        core = self._require_core()
+        return str(core.node_id())
 
     @property
     def role(self) -> str:
@@ -1478,9 +1688,8 @@ class _RuntimeNetworkMixin(_RuntimeBase):
     @property
     def peer_id(self) -> str:
         """本节点的 iroh P2P peer ID（公钥 hex），用于 ``add_gossip_peer``。"""
-        if self._rust_core is None:
-            raise InvalidStateError("Runtime not started")
-        return str(self._rust_core.peer_id())
+        core = self._require_core()
+        return str(core.peer_id())
 
     def listen_addresses(self) -> dict[str, Any]:
         """返回本节点的监听地址信息。
@@ -1493,9 +1702,8 @@ class _RuntimeNetworkMixin(_RuntimeBase):
             - ``direct_addrs``: 直连 IP 地址列表
             - ``endpoint_addr``: 完整 NodeAddr 编码（hex postcard），传给对端 ``dial()``
         """
-        if self._rust_core is None:
-            raise InvalidStateError("Runtime not started")
-        addrs = self._rust_core.listen_addresses()
+        core = self._require_core()
+        addrs = core.listen_addresses()
         return {
             "endpoint_id": addrs.endpoint_id,
             "relay_url": addrs.relay_url,
@@ -1509,9 +1717,8 @@ class _RuntimeNetworkMixin(_RuntimeBase):
         Args:
             addr: 对端 ``listen_addresses()["endpoint_addr"]`` 返回的 hex 字符串。
         """
-        if self._rust_core is None:
-            raise InvalidStateError("Runtime not started")
-        self._rust_core.dial(addr)
+        core = self._require_core()
+        core.dial(addr)
 
     def add_gossip_peer(self, peer_id: str) -> None:
         """将远端节点加入 gossip 网络（不建立直连）。
@@ -1520,15 +1727,13 @@ class _RuntimeNetworkMixin(_RuntimeBase):
             peer_id: 对端 ``peer_id`` 返回的 iroh 公钥 hex 字符串
                 （注意不是 ``node_id``）。
         """
-        if self._rust_core is None:
-            raise InvalidStateError("Runtime not started")
-        self._rust_core.add_gossip_peer(peer_id)
+        core = self._require_core()
+        core.add_gossip_peer(peer_id)
 
     def discover_peers(self) -> list[str]:
         """返回当前已知对等节点的 peer_id 列表。"""
-        if self._rust_core is None:
-            raise InvalidStateError("Runtime not started")
-        return list(self._rust_core.discover_peers())
+        core = self._require_core()
+        return list(core.discover_peers())
 
     @property
     def capabilities(self) -> list[str]:
@@ -1566,9 +1771,7 @@ class _RuntimeNetworkMixin(_RuntimeBase):
         Raises:
             InvalidStateError: Runtime 未启动。
         """
-        core = self._rust_core
-        if core is None:
-            raise InvalidStateError("Runtime not started")
+        core = self._require_core()
         core.register_task_log_callback(callback, task_id)
 
     def on_worker_state(self, callback: Callable[[dict[str, Any]], None]) -> None:
@@ -1583,26 +1786,22 @@ class _RuntimeNetworkMixin(_RuntimeBase):
         Raises:
             InvalidStateError: Runtime 未启动。
         """
-        core = self._rust_core
-        if core is None:
-            raise InvalidStateError("Runtime not started")
+        core = self._require_core()
         core.register_worker_state_callback(callback)
 
     def peers(self) -> list[dict[str, Any]]:
         """枚举当前在线的 peer 节点（节点可见性）。
 
         每项为 ``node_id`` / ``endpoint`` / ``available_slots`` / ``max_slots`` /
-        ``active_workflows`` / ``labels`` / ``platform`` / ``last_heartbeat_ms``。
-        在线判定复用心跳新鲜度语义（超过 failure_timeout 未更新即不在线）。
+        ``labels`` / ``platform`` / ``last_heartbeat_ms``。在线判定复用心跳新鲜度
+        语义（超过 failure_timeout 未更新即不在线）。
 
         用于节点可见性与资源核算；基于此数据的路由/调度策略属第 3 层。
 
         Raises:
             InvalidStateError: Runtime 未启动。
         """
-        core = self._rust_core
-        if core is None:
-            raise InvalidStateError("Runtime not started")
+        core = self._require_core()
         return [dict(item) for item in core.peers()]
 
     def update_node_state(
@@ -1628,9 +1827,8 @@ class _RuntimeNetworkMixin(_RuntimeBase):
             InvalidStateError: Runtime 未启动。
             ConfigError: 标签超出允许的字节量。
         """
-        if self._rust_core is None:
-            raise InvalidStateError("Runtime not started")
-        self._rust_core.update_node_state(
+        core = self._require_core()
+        core.update_node_state(
             labels=dict(labels) if labels is not None else None,
             quotas=dict(quotas) if quotas is not None else None,
             draining=draining,
@@ -1645,16 +1843,14 @@ class _RuntimeNetworkMixin(_RuntimeBase):
         Args:
             new_max: 新的最大并发任务数。必须大于当前值才会生效。
         """
-        if self._rust_core is None:
-            raise InvalidStateError("Runtime not started")
-        self._rust_core.set_max_concurrent_tasks(new_max)
+        core = self._require_core()
+        core.set_max_concurrent_tasks(new_max)
 
     @property
     def max_concurrent_tasks(self) -> int:
         """Worker 当前最大并发任务数。"""
-        if self._rust_core is None:
-            raise InvalidStateError("Runtime not started")
-        return int(self._rust_core.max_concurrent_tasks())
+        core = self._require_core()
+        return int(core.max_concurrent_tasks())
 
     def storage_stats(self) -> _StoreStats:
         """返回本地存储容量与使用情况快照。
@@ -1666,9 +1862,8 @@ class _RuntimeNetworkMixin(_RuntimeBase):
         Raises:
             InvalidStateError: Runtime 未启动。
         """
-        if self._rust_core is None:
-            raise InvalidStateError("Runtime not started")
-        return cast("_StoreStats", self._rust_core.storage_stats())
+        core = self._require_core()
+        return cast("_StoreStats", core.storage_stats())
 
     def backup_to(self, path: str | os.PathLike[str]) -> int:
         """在线热备份本地存储到 ``path``，返回备份文件字节数。
@@ -1679,9 +1874,8 @@ class _RuntimeNetworkMixin(_RuntimeBase):
             InvalidStateError: Runtime 未启动。
             StorageError: 备份目录不可写或复制失败。
         """
-        if self._rust_core is None:
-            raise InvalidStateError("Runtime not started")
-        return int(self._rust_core.backup_to(os.fspath(path)))
+        core = self._require_core()
+        return int(core.backup_to(os.fspath(path)))
 
 
 class Runtime(
@@ -1696,6 +1890,11 @@ class Runtime(
     `Runtime` 提供 `ask` / `perform` / `emit` 三种执行模型。
 
     # 构造入口
+
+    ``config`` 与便捷参数（``max_concurrent_tasks`` / ``default_task_timeout_ms`` /
+    ``drain_timeout_secs`` / ``remote_fallback_delay_ms`` / ``scheduler``）互斥：
+    提供 ``config`` 时按 ``config`` 构造，便捷参数被忽略。``data_dir`` 独立于
+    该优先级——未显式传入时回退到 ``config.store.data_dir``，再回退到自动临时目录。
 
     ``Runtime()`` 以默认配置构造 ``_RuntimeCore``：``Store`` 回退到 Rust
     ``StoreHandler``，``ValueStore`` 默认走 Python→Rust blob 桥，两者开箱即用；
@@ -1895,10 +2094,13 @@ class Runtime(
           时跨节点消息会被对端拒绝，提供集群身份认证。
         - **强制心跳节点记录签名**（``require_signed_records=True``）：
           节点记录必须由其 iroh endpoint 私钥签名，未持密钥的对端无法伪造
-          身份加入集群视图。
+          身份加入集群视图；同时要求 ``node_id`` 等于 endpoint id——``name``
+          必须留空（自动采用持久身份），友好展示名请用 ``node_labels``。
         - **空 allowlist 拒启**：``network.allowed_peer_ids`` 为空时直接
           ``ValueError``——开放成员身份不属于生产语义。节点 endpoint id 可在
           启动前经 ``Runtime`` 的 ``peer_id`` 查询，逐一登记进各节点的白名单。
+          白名单元素必须是 endpoint id，写成完整 ``endpoint_addr`` 会在启动期
+          报 ``ValueError``。
         - ``data_dir`` 必填：生产部署必须显式指定持久化目录，
           避免使用临时目录导致重启后状态丢失。节点身份密钥持久化于
           ``data_dir/identity.key``，endpoint id 因此跨重启稳定，
@@ -1908,7 +2110,8 @@ class Runtime(
             payload_signing_key: 集群共享密钥，所有节点必须一致。空字符串
                 会抛 ``ValueError``。
             data_dir: 持久化数据目录，必填。
-            name: 节点名称（默认自动生成）。
+            name: 节点名称。生产模式必须留空——``node_id`` 取持久身份的
+                endpoint id，保证集群内唯一且重启稳定。
             max_concurrent_tasks: 单节点最大并发任务数（默认 ``num_cpus``）。
             default_task_timeout_ms: 任务默认超时毫秒（默认 30000）。
             drain_timeout_secs: 退出时等待在途任务的最长秒数（默认 30）。
@@ -1945,8 +2148,10 @@ class Runtime(
                 "require_signed_records=True) to restrict membership to known "
                 "peers; query each node's endpoint id via its peer_id."
             )
-        # 补齐心跳签名强制：直接置位，不逐字段重建（避免字段漂移陷阱）。
-        effective_network.require_signed_records = True
+        # 补齐心跳签名强制：取副本，不就地改写调用方传入的对象。
+        # 同一份 _NetworkConfig 可能被多个 Runtime 共用，就地置位会把它永久
+        # 改掉（后续以非生产方式启动的实例也会被带上强制签名）。
+        effective_network = effective_network.with_required_signatures()
 
         config = _ActantConfig(
             payload_signing_key=payload_signing_key,
@@ -2020,12 +2225,51 @@ class Runtime(
         # 非阻塞：worker.run() 在 tokio 后台 spawn，使任务能被调度执行。
         # serve() 内部会事件驱动等待 Worker 进入任务执行循环（基于 watch channel），
         # 因此此处无需 time.sleep(0.1) 等硬编码等待。
-        self.serve()
-        # 写入 node_meta.json 供 `actant status --data-dir` 离线读取。
-        self._write_node_meta()
+        #
+        # serve() 需要 _started 已置位才肯启动（见 serve 的守卫），所以置位在
+        # 此处；但失败必须整体回滚，否则调用方拿到 _started=True 而 worker 未
+        # 运行，且上面两个后台线程无人关闭。
+        try:
+            self.serve()
+            # 写入 node_meta.json 供 `actant status --data-dir` 离线读取。
+            self._write_node_meta()
+        except BaseException:
+            self._rollback_start()
+            raise
         if auto_resume:
             self._spawn_auto_resume()
         return self
+
+    def _rollback_start(self) -> None:
+        """回滚 ``start()`` 中 ``serve()`` 之后的失败。
+
+        只做资源释放，不向上抛错——异常由调用方继续传播，这里再抛会把
+        "启动失败"和"回滚失败"两类错误混在一起。
+
+        与 ``stop()`` 的差别：``stop()`` 对已对外承诺可用的 Runtime 做优雅
+        shutdown（可带 drain 超时）；此处启动尚未成功，直接强制关闭。
+        """
+        if self._event_batcher is not None:
+            with suppress(Exception):
+                self._event_batcher.close()
+            self._event_batcher = None
+        if self._terminal is not None:
+            with suppress(Exception):
+                self._terminal.close()
+            self._terminal = None
+        with self._lock:
+            self._started = False
+            core = self._rust_core
+            self._rust_core = None
+            self._rust_runtime = None
+        if getattr(_runtime_local, "runtime", None) is self:
+            _runtime_local.runtime = None
+        if core is not None:
+            try:
+                core.shutdown(0)
+                del core
+            except Exception:
+                _logger.warning("shutdown failed during start rollback", exc_info=True)
 
     def stop(self, timeout: float | None = None) -> None:
         """停止 Runtime，关闭 Rust tokio runtime 并清除线程上下文。
@@ -2043,6 +2287,18 @@ class Runtime(
         shutdown_timeout_ms = (
             _NO_SHUTDOWN_TIMEOUT_MS if timeout is None else max(0, int(timeout * 1000))
         )
+
+        # 后台 auto_resume 重放会执行用户 flow 并重新派发任务，须在本方法释放
+        # Rust core 之前结束；否则它会在 core 关停后继续提交任务。
+        resume_thread = self._auto_resume_thread
+        if resume_thread is not None and resume_thread.is_alive():
+            resume_thread.join(timeout=_AUTO_RESUME_JOIN_TIMEOUT_SECS)
+            if resume_thread.is_alive():
+                _logger.warning(
+                    "auto_resume thread did not exit within %ss; abandoning join",
+                    _AUTO_RESUME_JOIN_TIMEOUT_SECS,
+                )
+        self._auto_resume_thread = None
 
         # 关闭事件批处理器：停止后台 flush 线程并派发剩余缓冲事件。须在
         # rust_runtime 释放之前执行，使 flush 能经 _publish_task_event 正常 emit。
@@ -2098,19 +2354,27 @@ class Runtime(
         for handle in unsettled:
             try:
                 handle._set_cancelled()
+                # 句柄进入终态就必须有对应事件：shutdown 之后不会再有结果回灌，
+                # 这是订阅者最后一次能观察到该任务的机会。batcher 已在上方关闭，
+                # 此处走同步 emit 路径（Rust 侧已释放，只剩 Python handler）。
+                if handle.state == "cancelled":
+                    self._emit_lifecycle(handle, "cancelled")
             except Exception:  # 单个句柄结算失败不得阻断 stop
                 _logger.warning("failed to settle pending task on stop", exc_info=True)
         # 无论 shutdown 是否成功都清理线程上下文，避免后续 effect 调用
         # 持有已失效的 Runtime 引用。
         if getattr(_runtime_local, "runtime", None) is self:
             _runtime_local.runtime = None
-        if shutdown_err is not None:
-            raise shutdown_err
         # 清理由 Runtime 自动创建的临时 data_dir，避免测试/短生命周期实例留下
         # 大量空目录；用户显式传入的目录不清理，符合预期。
         # 使用 os.path.exists 前置检查：重复 stop() 时该目录可能已被第一次清理。
+        #
+        # 必须在 raise 之前：清理是 stop() 的既定职责，不能因为 shutdown 失败
+        # 就留下一份自己的临时目录（失败路径正是最需要清理的场景）。
         if self._owns_data_dir and self._data_dir and os.path.exists(self._data_dir):
             shutil.rmtree(self._data_dir, ignore_errors=True)
+        if shutdown_err is not None:
+            raise shutdown_err
 
     def __enter__(self) -> Runtime:
         return self.start()

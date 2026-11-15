@@ -112,6 +112,12 @@ harness = false
 required-features = []
 
 [[bench]]
+name = "routing"
+path = "../../benches/rust/routing.rs"
+harness = false
+required-features = []
+
+[[bench]]
 name = "mem_profile"
 path = "../../benches/rust/mem_profile.rs"
 harness = false

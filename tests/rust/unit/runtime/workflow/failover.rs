@@ -21,7 +21,12 @@ fn make_fm(node_id: &str) -> FailoverManager {
     )
 }
 
-fn hb(node_id: &str, ts_ms: u64, workflows: &[&str]) -> NodeHeartbeat {
+fn hb(node_id: &str, ts_ms: u64) -> NodeHeartbeat {
+    hb_with(node_id, ts_ms, &[])
+}
+
+/// 携带活跃 workflow 清单的心跳：接管时孤儿清单的来源。
+fn hb_with(node_id: &str, ts_ms: u64, workflows: &[&str]) -> NodeHeartbeat {
     NodeHeartbeat {
         signature: None,
         labels: BTreeMap::new(),
@@ -42,6 +47,36 @@ fn hb(node_id: &str, ts_ms: u64, workflows: &[&str]) -> NodeHeartbeat {
 }
 
 #[test]
+fn route_candidates_caches_per_version_and_tracks_peer_changes() {
+    let fm = make_fm("node-A");
+    assert!(fm.route_candidates().is_empty());
+
+    fm.handle_heartbeat(&hb("node-B", 1_000));
+    let after = fm.route_candidates();
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].node_id.as_str(), "node-B");
+    assert_eq!(after[0].available_slots, 4);
+    assert_eq!(after[0].endpoint_addr.as_deref(), Some("peer-node-B"));
+
+    // 版本未变：命中缓存，返回同一份 Arc。
+    let again = fm.route_candidates();
+    assert!(
+        Arc::ptr_eq(&after, &again),
+        "unchanged peers must reuse snapshot"
+    );
+
+    // 容量更新使缓存失效。
+    fm.update_peer_capacity(NodeId::from("node-B".to_string()), 1, 8);
+    let updated = fm.route_candidates();
+    assert_eq!(updated[0].available_slots, 1);
+    assert!(!Arc::ptr_eq(&after, &updated));
+
+    // 移除成员后重建为空。
+    fm.remove_peer(&NodeId::from("node-B".to_string()));
+    assert!(fm.route_candidates().is_empty());
+}
+
+#[test]
 fn getters_return_configured_values() {
     let fm = make_fm("node-A")
         .with_heartbeat_interval(1234)
@@ -57,7 +92,7 @@ fn getters_return_configured_values() {
 #[test]
 fn peers_returns_fresh_peers_with_metadata() {
     let fm = make_fm("node-A");
-    fm.handle_heartbeat(&hb("node-B", crate::common::epoch_millis(), &[]));
+    fm.handle_heartbeat(&hb("node-B", crate::common::epoch_millis()));
 
     let peers = fm.peers();
     assert_eq!(peers.len(), 1, "fresh peer must be visible");
@@ -77,7 +112,7 @@ fn peers_excludes_stale_and_unseen_peers() {
 
     // last_heartbeat_ms 记录的是接收方本地时钟（handle_heartbeat 忽略发送方
     // timestamp_ms），故直接把内部记录回拨到 failure_timeout 之外模拟过期。
-    fm.handle_heartbeat(&hb("node-stale", crate::common::epoch_millis(), &[]));
+    fm.handle_heartbeat(&hb("node-stale", crate::common::epoch_millis()));
     let stale = crate::common::epoch_millis().saturating_sub(10_000_000);
     fm.peers
         .get_mut(&NodeId::from("node-stale".to_string()))
@@ -86,7 +121,7 @@ fn peers_excludes_stale_and_unseen_peers() {
     assert!(fm.peers().is_empty(), "stale peer must be excluded");
 
     // 新鲜心跳恢复可见性
-    fm.handle_heartbeat(&hb("node-stale", crate::common::epoch_millis(), &[]));
+    fm.handle_heartbeat(&hb("node-stale", crate::common::epoch_millis()));
     assert_eq!(fm.peers().len(), 1);
 }
 
@@ -158,9 +193,16 @@ fn make_fm_with_identity(
     .with_identity(key, require_signed, allowlist)
 }
 
-fn signed_hb(key: &iroh::SecretKey, node: &str, ts_ms: u64) -> NodeHeartbeat {
-    let mut hb = hb(node, ts_ms, &[]);
-    hb.endpoint_addr = Some(key.public().to_string());
+fn endpoint_addr_of(key: &iroh::SecretKey) -> String {
+    let addr = iroh::EndpointAddr::new(key.public());
+    let bytes = postcard::to_allocvec(&addr).expect("encode endpoint addr");
+    data_encoding::HEXLOWER.encode(&bytes)
+}
+
+fn signed_hb(key: &iroh::SecretKey, ts_ms: u64) -> NodeHeartbeat {
+    let endpoint_addr = endpoint_addr_of(key);
+    let mut hb = hb(key.public().to_string().as_str(), ts_ms);
+    hb.endpoint_addr = Some(endpoint_addr);
     let unsigned = NodeHeartbeat {
         signature: None,
         ..hb.clone()
@@ -173,7 +215,7 @@ fn signed_hb(key: &iroh::SecretKey, node: &str, ts_ms: u64) -> NodeHeartbeat {
 #[test]
 fn unsigned_heartbeat_rejected_when_required() {
     let fm = make_fm_with_identity("node-A", None, true, Vec::new());
-    fm.handle_heartbeat(&hb("node-B", crate::common::epoch_millis(), &[]));
+    fm.handle_heartbeat(&hb("node-B", crate::common::epoch_millis()));
     assert!(
         fm.get_peer_infos().is_empty(),
         "unsigned heartbeat must be rejected under require_signed_records"
@@ -184,7 +226,7 @@ fn unsigned_heartbeat_rejected_when_required() {
 fn valid_signature_accepted() {
     let key = iroh::SecretKey::generate();
     let fm = make_fm_with_identity("node-A", None, true, Vec::new());
-    fm.handle_heartbeat(&signed_hb(&key, "node-B", crate::common::epoch_millis()));
+    fm.handle_heartbeat(&signed_hb(&key, crate::common::epoch_millis()));
     assert_eq!(
         fm.get_peer_infos().len(),
         1,
@@ -197,8 +239,8 @@ fn forged_signature_rejected() {
     // 攻击者用自己的密钥签名，却声称是 node-B 的 endpoint 身份。
     let attacker = iroh::SecretKey::generate();
     let victim = iroh::SecretKey::generate();
-    let mut hb = signed_hb(&attacker, "node-B", crate::common::epoch_millis());
-    hb.endpoint_addr = Some(victim.public().to_string());
+    let mut hb = signed_hb(&attacker, crate::common::epoch_millis());
+    hb.endpoint_addr = Some(endpoint_addr_of(&victim));
     let fm = make_fm_with_identity("node-A", None, true, Vec::new());
     fm.handle_heartbeat(&hb);
     assert!(
@@ -214,20 +256,20 @@ fn stale_signed_heartbeat_rejected_replay_defense() {
     let key = iroh::SecretKey::generate();
     let fm = make_fm_with_identity("node-A", None, true, Vec::new());
     let stale_ts = crate::common::epoch_millis().saturating_sub(10_000_000);
-    fm.handle_heartbeat(&signed_hb(&key, "node-B", stale_ts));
+    fm.handle_heartbeat(&signed_hb(&key, stale_ts));
     assert!(
         fm.get_peer_infos().is_empty(),
         "replayed stale signed heartbeat must be rejected"
     );
 
     // 新鲜时间戳的同一密钥签名照常接受。
-    fm.handle_heartbeat(&signed_hb(&key, "node-B", crate::common::epoch_millis()));
+    fm.handle_heartbeat(&signed_hb(&key, crate::common::epoch_millis()));
     assert_eq!(fm.get_peer_infos().len(), 1);
 }
 
 #[test]
 fn oversized_inbound_labels_dropped() {
-    let mut hb = hb("node-B", crate::common::epoch_millis(), &[]);
+    let mut hb = hb("node-B", crate::common::epoch_millis());
     let mut labels = BTreeMap::new();
     labels.insert("big".to_string(), "x".repeat(8192));
     hb.labels = labels;
@@ -245,25 +287,44 @@ fn oversized_inbound_labels_dropped() {
 fn unsigned_heartbeat_accepted_when_not_required() {
     // 向后兼容：require_signed_records=false（默认）时缺签心跳照常入表。
     let fm = make_fm_with_identity("node-A", None, false, Vec::new());
-    fm.handle_heartbeat(&hb("node-B", crate::common::epoch_millis(), &[]));
+    fm.handle_heartbeat(&hb("node-B", crate::common::epoch_millis()));
     assert_eq!(fm.get_peer_infos().len(), 1);
 }
 
 #[test]
 fn heartbeat_outside_allowlist_rejected() {
-    let fm = make_fm_with_identity("node-A", None, false, vec!["peer-allowed".to_string()]);
+    // allowlist 存 endpoint id（与 Runtime.production() 的登记方式一致）。
+    let member = iroh::SecretKey::generate();
+    let fm = make_fm_with_identity("node-A", None, false, vec![member.public().to_string()]);
     // 心跳无 endpoint_addr → 无法证明成员资格，拒绝。
-    fm.handle_heartbeat(&hb("node-B", crate::common::epoch_millis(), &[]));
+    fm.handle_heartbeat(&hb("node-B", crate::common::epoch_millis()));
     assert!(fm.get_peer_infos().is_empty());
-    // endpoint_addr 不在 allowlist → 拒绝。
-    fm.handle_heartbeat(&hb("node-C", crate::common::epoch_millis(), &[]));
+    // endpoint id 不在 allowlist → 拒绝。
+    let outsider = iroh::SecretKey::generate();
+    let mut foreign = hb("node-C", crate::common::epoch_millis());
+    foreign.endpoint_addr = Some(endpoint_addr_of(&outsider));
+    fm.handle_heartbeat(&foreign);
     assert!(fm.get_peer_infos().is_empty());
 
-    // 在 allowlist 内的 peer 接受。
-    let mut hb = hb("node-D", crate::common::epoch_millis(), &[]);
-    hb.endpoint_addr = Some("peer-allowed".to_string());
-    fm.handle_heartbeat(&hb);
+    // endpoint id 在 allowlist 内 → 接受；地址是完整 EndpointAddr。
+    let mut known = hb("node-D", crate::common::epoch_millis());
+    known.endpoint_addr = Some(endpoint_addr_of(&member));
+    fm.handle_heartbeat(&known);
     assert_eq!(fm.get_peer_infos().len(), 1);
+}
+
+#[test]
+fn production_identity_accepts_signed_heartbeat_with_full_endpoint_addr() {
+    // 生产组合：allowlist 存 endpoint id + require_signed_records。
+    // 心跳携带完整 EndpointAddr，验签必须从中取 endpoint id 作为公钥。
+    let key = iroh::SecretKey::generate();
+    let fm = make_fm_with_identity("node-A", None, true, vec![key.public().to_string()]);
+    fm.handle_heartbeat(&signed_hb(&key, crate::common::epoch_millis()));
+    assert_eq!(
+        fm.get_peer_infos().len(),
+        1,
+        "signed member heartbeat must be accepted in production mode"
+    );
 }
 
 #[test]
@@ -271,7 +332,7 @@ fn own_heartbeat_skips_identity_checks() {
     // 本节点回环心跳（node_id == self）不受签名/allowlist 校验影响。
     let key = iroh::SecretKey::generate();
     let fm = make_fm_with_identity("node-A", Some(key), true, vec!["peer-allowed".to_string()]);
-    fm.handle_heartbeat(&hb("node-A", crate::common::epoch_millis(), &[]));
+    fm.handle_heartbeat(&hb("node-A", crate::common::epoch_millis()));
     assert!(
         fm.get_peer_infos().is_empty(),
         "own heartbeat is ignored, not rejected-and-logged as foreign"
@@ -284,7 +345,7 @@ fn handle_heartbeat_records_peer() {
     // last_heartbeat_ms 使用接收方本地时钟记录（而非发送方 timestamp_ms），
     // 断言落在调用前后的墙钟窗口内。
     let before = crate::common::epoch_millis();
-    fm.handle_heartbeat(&hb("node-B", before, &["wf-1"]));
+    fm.handle_heartbeat(&hb("node-B", before));
     let after = crate::common::epoch_millis();
 
     let infos = fm.get_peer_infos();
@@ -298,15 +359,12 @@ fn handle_heartbeat_records_peer() {
     assert_eq!(peer.available_slots, 4);
     assert_eq!(peer.max_slots, 8);
     assert_eq!(peer.endpoint_addr.as_deref(), Some("peer-node-B"));
-    assert!(peer
-        .active_workflows
-        .contains(&WorkflowId("wf-1".to_string())));
 }
 
 #[test]
 fn handle_heartbeat_ignores_own_node() {
     let fm = make_fm("node-A");
-    fm.handle_heartbeat(&hb("node-A", crate::common::epoch_millis(), &[]));
+    fm.handle_heartbeat(&hb("node-A", crate::common::epoch_millis()));
     assert!(fm.get_peer_infos().is_empty());
 }
 
@@ -314,20 +372,19 @@ fn handle_heartbeat_ignores_own_node() {
 fn handle_heartbeat_updates_existing_peer() {
     let fm = make_fm("node-A");
     let now = crate::common::epoch_millis();
-    fm.handle_heartbeat(&hb("node-B", now, &["wf-1"]));
+    fm.handle_heartbeat(&hb("node-B", now));
     let first = fm.get_peer_infos()[&NodeId::from("node-B".to_string())].last_heartbeat_ms;
-    fm.handle_heartbeat(&hb("node-B", now + 1000, &["wf-1", "wf-2"]));
+    fm.handle_heartbeat(&hb("node-B", now + 1000));
 
     let peer = &fm.get_peer_infos()[&NodeId::from("node-B".to_string())];
     // 接收方本地时钟：第二次心跳的记录时间不早于第一次。
     assert!(peer.last_heartbeat_ms >= first);
-    assert_eq!(peer.active_workflows.len(), 2);
 }
 
 #[test]
 fn remove_peer_drops_entry() {
     let fm = make_fm("node-A");
-    fm.handle_heartbeat(&hb("node-B", crate::common::epoch_millis(), &[]));
+    fm.handle_heartbeat(&hb("node-B", crate::common::epoch_millis()));
     fm.remove_peer(&NodeId::from("node-B".to_string()));
     assert!(!fm
         .get_peer_infos()
@@ -346,7 +403,7 @@ fn expire_stale_peers_removes_only_timed_out() {
         let fm = make_fm_with_short_lease("node-A").await;
         register_and_age_peer(&fm, "node-C", &[]).await;
         // node-C 失联后刷新 node-B 心跳，保持其新鲜（超时窗口仅 5ms）。
-        fm.handle_heartbeat(&hb("node-B", crate::common::epoch_millis(), &[]));
+        fm.handle_heartbeat(&hb("node-B", crate::common::epoch_millis()));
 
         let removed = fm.expire_stale_peers();
         let removed_ids: Vec<String> = removed.iter().map(|(n, _)| n.0.clone()).collect();
@@ -361,7 +418,7 @@ fn expire_stale_peers_removes_only_timed_out() {
 fn expire_stale_peers_skips_zero_heartbeat() {
     // last_heartbeat_ms == 0 表示从未真正收到心跳，不应被判定为 stale。
     let fm = make_fm("node-A");
-    fm.handle_heartbeat(&hb("node-B", 0, &[]));
+    fm.handle_heartbeat(&hb("node-B", 0));
     let removed = fm.expire_stale_peers();
     assert!(removed.is_empty());
 }
@@ -378,7 +435,7 @@ fn update_local_capacity_reflected_in_get_peer_capacities() {
 #[test]
 fn update_peer_capacity_modifies_existing_peer() {
     let fm = make_fm("node-A");
-    fm.handle_heartbeat(&hb("node-B", crate::common::epoch_millis(), &[]));
+    fm.handle_heartbeat(&hb("node-B", crate::common::epoch_millis()));
     fm.update_peer_capacity(NodeId::from("node-B".to_string()), 2, 5);
     let caps = fm.get_peer_capacities();
     let b_cap = &caps[&NodeId::from("node-B".to_string())];
@@ -462,19 +519,22 @@ fn with_capacity_sets_atomic_counters() {
 // ───────────────────────── send_heartbeat ─────────────────────────
 
 #[tokio::test]
-async fn send_heartbeat_returns_error_without_actor_system() {
-    // 未注册 workflow actor，send_heartbeat 调用 active_workflow_ids 会失败。
-    // 验证错误被传播（而非 panic）。
+async fn send_heartbeat_does_not_require_workflow_actor() {
+    // 心跳要上报活跃 workflow 清单，但查询失败不得让心跳停摆：
+    // 没有 actor system 时降级为"清单缺失"，广播照常成功。
     let fm = make_fm("node-A").with_capacity(3, 10);
-    let result = fm.send_heartbeat().await;
-    assert!(result.is_err(), "should fail without actor system");
+    fm.send_heartbeat()
+        .await
+        .expect("heartbeat must not depend on workflow actor");
 }
 
 #[tokio::test]
-async fn send_heartbeat_with_zero_capacity_returns_error() {
+async fn send_heartbeat_with_zero_capacity_succeeds() {
+    // 零容量是合法的 drain 状态：心跳照常广播，供对端路由时排除本节点。
     let fm = make_fm("node-A").with_capacity(0, 0);
-    let result = fm.send_heartbeat().await;
-    assert!(result.is_err(), "should fail without actor system");
+    fm.send_heartbeat()
+        .await
+        .expect("zero capacity is a valid state");
 }
 
 // ───────────────────────── subscribe_topics ─────────────────────────
@@ -508,20 +568,20 @@ async fn detect_and_claim_failed_nodes_no_op_without_stale_peers() {
 async fn detect_and_claim_failed_nodes_skips_fresh_peers() {
     let fm = make_fm("node-A");
     let now = crate::common::epoch_millis();
-    // node-B 心跳新鲜且有活跃 workflow
-    fm.handle_heartbeat(&hb("node-B", now, &["wf-1"]));
+    // node-B 心跳新鲜
+    fm.handle_heartbeat(&hb("node-B", now));
     fm.detect_and_claim_failed_nodes().await;
     // 不应 claim 任何 workflow
     assert!(fm.active_leases().is_empty());
 }
 
 #[tokio::test]
-async fn detect_and_claim_failed_nodes_skips_peer_without_workflows() {
+async fn detect_and_claim_failed_nodes_skips_peer_without_leases() {
     let fm = make_fm("node-A");
     let now = crate::common::epoch_millis();
     let timeout = fm.failure_timeout_ms();
-    // node-C 心跳过期但无活跃 workflow
-    fm.handle_heartbeat(&hb("node-C", now.saturating_sub(timeout + 10000), &[]));
+    // node-C 心跳过期，但租约表中没有归属它的 workflow
+    fm.handle_heartbeat(&hb("node-C", now.saturating_sub(timeout + 10000)));
     fm.detect_and_claim_failed_nodes().await;
     assert!(fm.active_leases().is_empty());
 }
@@ -531,7 +591,7 @@ async fn detect_and_claim_failed_nodes_skips_peer_without_workflows() {
 #[test]
 fn get_peer_capacities_returns_endpoint_addr() {
     let fm = make_fm("node-A");
-    fm.handle_heartbeat(&hb("node-B", crate::common::epoch_millis(), &[]));
+    fm.handle_heartbeat(&hb("node-B", crate::common::epoch_millis()));
     let caps = fm.get_peer_capacities();
     let b_cap = &caps[&NodeId::from("node-B".to_string())];
     // endpoint_addr 应为 Some("peer-node-B")
@@ -560,9 +620,9 @@ fn set_scheduler_does_not_panic() {
 fn handle_heartbeat_records_multiple_peers() {
     let fm = make_fm("node-A");
     let now = crate::common::epoch_millis();
-    fm.handle_heartbeat(&hb("node-B", now, &["wf-1"]));
-    fm.handle_heartbeat(&hb("node-C", now, &["wf-2", "wf-3"]));
-    fm.handle_heartbeat(&hb("node-D", now, &[]));
+    fm.handle_heartbeat(&hb("node-B", now));
+    fm.handle_heartbeat(&hb("node-C", now));
+    fm.handle_heartbeat(&hb("node-D", now));
 
     let infos = fm.get_peer_infos();
     assert_eq!(infos.len(), 3);
@@ -574,7 +634,7 @@ fn handle_heartbeat_records_multiple_peers() {
 #[test]
 fn handle_heartbeat_zero_slot_values() {
     let fm = make_fm("node-A");
-    fm.handle_heartbeat(&hb("node-B", crate::common::epoch_millis(), &[]));
+    fm.handle_heartbeat(&hb("node-B", crate::common::epoch_millis()));
     let peer = &fm.get_peer_infos()[&NodeId::from("node-B".to_string())];
     // hb() 默认 available_slots=4, max_slots=8
     assert_eq!(peer.available_slots, 4);
@@ -591,16 +651,12 @@ fn expire_stale_peers_returns_expired_peer_info() {
         .unwrap();
     rt.block_on(async {
         let fm = make_fm_with_short_lease("node-A").await;
-        register_and_age_peer(&fm, "node-stale", &["wf-x"]).await;
+        register_and_age_peer(&fm, "node-stale", &[]).await;
 
         let removed = fm.expire_stale_peers();
         assert_eq!(removed.len(), 1);
-        let (node_id, info) = &removed[0];
+        let (node_id, _info) = &removed[0];
         assert_eq!(node_id.0, "node-stale");
-        // 返回的 PeerInfo 应保留原 active_workflows
-        assert!(info
-            .active_workflows
-            .contains(&WorkflowId("wf-x".to_string())));
     });
 }
 
@@ -632,7 +688,7 @@ fn update_local_capacity_max_values() {
 #[test]
 fn update_peer_capacity_zero_values() {
     let fm = make_fm("node-A");
-    fm.handle_heartbeat(&hb("node-B", crate::common::epoch_millis(), &[]));
+    fm.handle_heartbeat(&hb("node-B", crate::common::epoch_millis()));
     fm.update_peer_capacity(NodeId::from("node-B".to_string()), 0, 0);
     let caps = fm.get_peer_capacities();
     let b_cap = &caps[&NodeId::from("node-B".to_string())];
@@ -667,8 +723,8 @@ fn remove_peer_unknown_does_not_panic() {
 fn remove_peer_only_removes_specified() {
     let fm = make_fm("node-A");
     let now = crate::common::epoch_millis();
-    fm.handle_heartbeat(&hb("node-B", now, &[]));
-    fm.handle_heartbeat(&hb("node-C", now, &[]));
+    fm.handle_heartbeat(&hb("node-B", now));
+    fm.handle_heartbeat(&hb("node-C", now));
 
     fm.remove_peer(&NodeId::from("node-B".to_string()));
     let infos = fm.get_peer_infos();
@@ -716,7 +772,6 @@ async fn worker_role_never_claims_workflows() {
     fm.handle_heartbeat(&hb(
         "node-B",
         crate::common::epoch_millis().saturating_sub(timeout + 10_000),
-        &["wf-orphan"],
     ));
     fm.detect_and_claim_failed_nodes().await;
     assert!(fm.active_leases().is_empty());
@@ -784,13 +839,128 @@ async fn handle_claim_overwrites_existing_lease() {
     assert_eq!(leases[0].1, "node-C", "should be owned by node-C now");
 }
 
+#[tokio::test]
+async fn handle_claim_ignores_stale_claim() {
+    let fm = make_fm("node-A");
+    let now = crate::common::epoch_millis();
+
+    let newer = OrchestratorClaim {
+        node_id: NodeId::from("node-B".to_string()),
+        workflow_id: WorkflowId("wf-stale-claim".to_string()),
+        timestamp_ms: now + 1_000,
+    };
+    fm.handle_claim(&newer).await;
+
+    // 迟到的旧 claim 不得夺走当前 owner。
+    let stale = OrchestratorClaim {
+        node_id: NodeId::from("node-C".to_string()),
+        workflow_id: WorkflowId("wf-stale-claim".to_string()),
+        timestamp_ms: now,
+    };
+    fm.handle_claim(&stale).await;
+
+    let leases = fm.active_leases();
+    assert_eq!(leases.len(), 1);
+    assert_eq!(leases[0].1, "node-B", "stale claim must be ignored");
+
+    // 同时间戳按 node_id 全序裁决，较大的 node_id 胜出。
+    let tie = OrchestratorClaim {
+        node_id: NodeId::from("node-D".to_string()),
+        workflow_id: WorkflowId("wf-stale-claim".to_string()),
+        timestamp_ms: now + 1_000,
+    };
+    fm.handle_claim(&tie).await;
+    let leases = fm.active_leases();
+    assert_eq!(leases[0].1, "node-D", "tie-break must be deterministic");
+}
+
+#[tokio::test]
+async fn claim_from_known_worker_is_rejected() {
+    let fm = make_fm("node-A");
+    let now = crate::common::epoch_millis();
+    let mut heartbeat = hb("node-B", now);
+    heartbeat.role = crate::common::NodeRole::Worker;
+    fm.handle_heartbeat(&heartbeat);
+
+    fm.handle_claim(&OrchestratorClaim {
+        node_id: NodeId::from("node-B".to_string()),
+        workflow_id: WorkflowId("wf-worker-claim".to_string()),
+        timestamp_ms: now,
+    })
+    .await;
+
+    assert!(
+        fm.active_leases().is_empty(),
+        "worker claim must not create a lease"
+    );
+}
+
+#[tokio::test]
+async fn signed_claim_is_accepted_after_verification() {
+    let key = iroh::SecretKey::generate();
+    let fm = make_fm_with_identity("node-A", None, true, vec![key.public().to_string()]);
+    let now = crate::common::epoch_millis();
+    fm.handle_heartbeat(&signed_hb(&key, now));
+
+    let claim = OrchestratorClaim {
+        node_id: NodeId::new(key.public().to_string()),
+        workflow_id: WorkflowId("wf-signed".to_string()),
+        timestamp_ms: now,
+    };
+    let signature = key
+        .sign(&FailoverManager::claim_signing_payload(&claim))
+        .to_bytes()
+        .to_vec();
+    fm.handle_signed_claim(&SignedOrchestratorClaim { claim, signature })
+        .await;
+
+    assert!(
+        fm.active_leases()
+            .iter()
+            .any(|(w, n, _, _)| w == "wf-signed" && n == &key.public().to_string()),
+        "valid signed claim must create a lease"
+    );
+}
+
+#[tokio::test]
+async fn signed_claim_with_tampered_payload_is_rejected() {
+    let key = iroh::SecretKey::generate();
+    let fm = make_fm_with_identity("node-A", None, true, vec![key.public().to_string()]);
+    let now = crate::common::epoch_millis();
+    fm.handle_heartbeat(&signed_hb(&key, now));
+
+    let claim = OrchestratorClaim {
+        node_id: NodeId::new(key.public().to_string()),
+        workflow_id: WorkflowId("wf-tampered".to_string()),
+        timestamp_ms: now,
+    };
+    let signature = key
+        .sign(&FailoverManager::claim_signing_payload(&claim))
+        .to_bytes()
+        .to_vec();
+    let tampered = OrchestratorClaim {
+        timestamp_ms: now + 1,
+        ..claim
+    };
+    fm.handle_signed_claim(&SignedOrchestratorClaim {
+        claim: tampered,
+        signature,
+    })
+    .await;
+
+    assert!(
+        fm.active_leases().is_empty(),
+        "tampered claim must not create a lease"
+    );
+}
+
 // ───────────────────────── PeerInfo conversion ─────────────────────────
 
 #[test]
 fn peer_info_preserves_all_fields() {
     let fm = make_fm("node-A");
     let now = crate::common::epoch_millis();
-    fm.handle_heartbeat(&hb("node-B", now, &["wf-1", "wf-2"]));
+    fm.handle_heartbeat(&hb("node-B", now));
     fm.update_peer_capacity(NodeId::from("node-B".to_string()), 6, 12);
 
     let infos = fm.get_peer_infos();
@@ -799,7 +969,6 @@ fn peer_info_preserves_all_fields() {
     assert_eq!(peer.available_slots, 6);
     assert_eq!(peer.max_slots, 12);
     assert_eq!(peer.endpoint_addr.as_deref(), Some("peer-node-B"));
-    assert_eq!(peer.active_workflows.len(), 2);
 }
 
 // ───────────────────────── Stub Workflow Actor ─────────────────────────
@@ -832,7 +1001,7 @@ impl Actor for StubWorkflowActor {
                 payload: crate::runtime::workflow::messaging::encode(&Vec::<WorkflowId>::new())?,
                 error: None,
             }),
-            "reschedule_running_tasks" => {
+            "reschedule_incomplete_tasks" => {
                 let tasks = vec![TaskDefinition {
                     tags: Vec::new(),
                     quota: None,
@@ -1031,7 +1200,8 @@ async fn reschedule_workflow_tasks_enqueues_tasks_via_scheduler() {
 async fn detect_and_claim_failed_nodes_claims_orphaned_workflows() {
     let fm = make_fm_with_short_lease("node-A").await;
 
-    // node-B 心跳过期（接收方本地时钟 + 真实等待）且有一个活跃 workflow。
+    // node-B 心跳过期（接收方本地时钟 + 真实等待），且它名下仍有一条租约。
+    seed_lease(&fm, "wf-orphan", "node-B").await;
     register_and_age_peer(&fm, "node-B", &["wf-orphan"]).await;
 
     fm.detect_and_claim_failed_nodes().await;
@@ -1067,7 +1237,8 @@ async fn detect_and_claim_excludes_stale_nodes_from_election() {
     }
     let wf = target_wf.expect("should find a workflow the hash assigns to node-B");
 
-    register_and_age_peer(&fm, "node-B", &[&wf]).await;
+    seed_lease(&fm, &wf, "node-B").await;
+    register_and_age_peer(&fm, "node-B", &[wf.as_str()]).await;
 
     fm.detect_and_claim_failed_nodes().await;
 
@@ -1075,6 +1246,80 @@ async fn detect_and_claim_excludes_stale_nodes_from_election() {
     assert!(
         leases.iter().any(|(w, n, _, _)| w == &wf && n == "node-A"),
         "orphan assigned to the dead node must be claimed by the live node: {leases:?}"
+    );
+}
+
+/// 退让不是终点。
+///
+/// 触发退让的 peer 当轮就被清出视图，后续轮次没有扫描入口；若退让就此作罢，
+/// 租约到期被 `expire_leases` 删除后工作流永久无人驱动。本用例验证：
+/// 第一轮只退让（不接管、不换主），租约到期后的下一轮真正接管。
+#[tokio::test]
+async fn detect_and_claim_retries_deferred_takeover_until_lease_expires() {
+    // 租约 50ms：足够跨过 30ms 的 peer aging，使第一轮落在"租约仍有效"相位。
+    let fm = make_fm_with_lease("node-A", 50).await;
+
+    seed_lease(&fm, "wf-defer", "node-B").await;
+    register_and_age_peer(&fm, "node-B", &["wf-defer"]).await;
+
+    fm.detect_and_claim_failed_nodes().await;
+
+    let leases = fm.active_leases();
+    assert!(
+        leases
+            .iter()
+            .any(|(w, n, _, _)| w == "wf-defer" && n == "node-B"),
+        "valid lease must win the first round: {leases:?}"
+    );
+    assert_eq!(
+        fm.pending_claims_snapshot(),
+        vec![("wf-defer".to_string(), "node-B".to_string())],
+        "deferral must be queued for retry, not dropped"
+    );
+
+    // 等租约过期后重试：此时已无任何扫描入口，只有待接管表能触发接管。
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    fm.detect_and_claim_failed_nodes().await;
+
+    let leases = fm.active_leases();
+    assert!(
+        leases
+            .iter()
+            .any(|(w, n, _, _)| w == "wf-defer" && n == "node-A"),
+        "expired lease must be taken over on retry: {leases:?}"
+    );
+    assert!(
+        fm.pending_claims_snapshot().is_empty(),
+        "successful takeover must clear the pending entry"
+    );
+}
+
+/// 原 owner 复活时放弃待接管：工作流仍有人驱动，不该被抢。
+#[tokio::test]
+async fn pending_claim_dropped_when_original_owner_reappears() {
+    let fm = make_fm_with_lease("node-A", 50).await;
+
+    seed_lease(&fm, "wf-back", "node-B").await;
+    register_and_age_peer(&fm, "node-B", &["wf-back"]).await;
+    fm.detect_and_claim_failed_nodes().await;
+    assert_eq!(fm.pending_claims_snapshot().len(), 1);
+
+    // node-B 的心跳恢复（未超时），且仍在驱动该 workflow。
+    let mut heartbeat = hb("node-B", crate::common::epoch_millis());
+    heartbeat.active_workflows = vec![WorkflowId("wf-back".to_string())];
+    fm.handle_heartbeat(&heartbeat);
+    fm.detect_and_claim_failed_nodes().await;
+
+    assert!(
+        fm.pending_claims_snapshot().is_empty(),
+        "a live owner means the workflow is not an orphan"
+    );
+    let leases = fm.active_leases();
+    assert!(
+        leases
+            .iter()
+            .any(|(w, n, _, _)| w == "wf-back" && n == "node-B"),
+        "must not steal a workflow whose owner is alive: {leases:?}"
     );
 }
 
@@ -1096,6 +1341,11 @@ async fn detect_and_claim_failed_nodes_expires_stale_peers_first() {
 // ───────────────────────── expire_leases ─────────────────────────
 
 async fn make_fm_with_short_lease(node_id: &str) -> FailoverManager {
+    make_fm_with_lease(node_id, 10).await
+}
+
+/// 构造一个 `failure_timeout_ms=5`、租约时长可调的 manager。
+async fn make_fm_with_lease(node_id: &str, lease_duration_ms: u64) -> FailoverManager {
     let network: Arc<dyn crate::runtime::network::Transport> =
         Arc::new(MockTransport::new(node_id));
     let actor_system = Arc::new(ActorSystem::new());
@@ -1107,7 +1357,7 @@ async fn make_fm_with_short_lease(node_id: &str) -> FailoverManager {
     let config = FailoverConfig {
         heartbeat_interval_ms: 1,
         failure_timeout_ms: 5,
-        lease_duration_ms: 10,
+        lease_duration_ms,
         lease_expiry_check_interval_secs: 1,
     };
     FailoverManager::with_config(
@@ -1124,8 +1374,18 @@ async fn make_fm_with_short_lease(node_id: &str) -> FailoverManager {
 ///
 /// last_heartbeat_ms 由接收方本地时钟记录，无法用伪造的旧时间戳构造失联。
 async fn register_and_age_peer(fm: &FailoverManager, node: &str, workflows: &[&str]) {
-    fm.handle_heartbeat(&hb(node, crate::common::epoch_millis(), workflows));
+    fm.handle_heartbeat(&hb_with(node, crate::common::epoch_millis(), workflows));
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+}
+
+/// 制造一条归属 `node` 的租约，模拟 claim 已随 gossip 复制到本节点。
+async fn seed_lease(fm: &FailoverManager, workflow_id: &str, node: &str) {
+    let claim = OrchestratorClaim {
+        node_id: NodeId::from(node.to_string()),
+        workflow_id: WorkflowId(workflow_id.to_string()),
+        timestamp_ms: crate::common::epoch_millis(),
+    };
+    fm.handle_claim(&claim).await;
 }
 
 /// 活跃 workflow 集合可变的 WorkflowActor 桩：真实响应
@@ -1420,7 +1680,7 @@ async fn node_lost_settles_inflight_forwarded_tasks() {
     // node-B 是纯执行器：无 active workflow，旧守卫会直接跳过。
     register_and_age_peer(&fm, "node-B", &[]).await;
     // node-C 心跳新鲜：既不在失联集合内，也跳过主动探测（本轮不动它）。
-    fm.handle_heartbeat(&hb("node-C", crate::common::epoch_millis(), &[]));
+    fm.handle_heartbeat(&hb("node-C", crate::common::epoch_millis()));
 
     fm.detect_and_claim_failed_nodes().await;
 
@@ -1482,7 +1742,9 @@ async fn cleared_outbound_entry_is_not_settled() {
         &NodeId::from("node-B".to_string()),
         None,
     );
-    fm.clear_outbound("task-done");
+    // 与生产路径同口径：远端结果到达经 take_outbound_if_not_stale 原子移除
+    // 登记（clear_outbound 非原子读删已删除，勿用普通 remove 模拟结果到达）。
+    let _ = fm.take_outbound_if_not_stale("task-done", 0);
     assert_eq!(fm.outbound_len(), 0);
 
     register_and_age_peer(&fm, "node-B", &[]).await;
@@ -1693,7 +1955,7 @@ async fn heartbeat_broadcasts_remaining_quotas() {
 #[test]
 fn handle_heartbeat_updates_peer_available_quotas() {
     let fm = make_fm("node-A");
-    let mut heartbeat = hb("node-B", crate::common::epoch_millis(), &[]);
+    let mut heartbeat = hb("node-B", crate::common::epoch_millis());
     heartbeat.available_quotas.insert("gpu".to_string(), 0);
     fm.handle_heartbeat(&heartbeat);
 
@@ -1723,7 +1985,9 @@ async fn make_fm_with_store(node_id: &str, store: LmdbStore) -> FailoverManager 
         FailoverConfig {
             heartbeat_interval_ms: 1,
             failure_timeout_ms: 5,
-            lease_duration_ms: 10,
+            // 必须 > 建库到重建之间的耗时，否则"未过期租约"会在重建前自行过期；
+            // 又要 < 10s，用例靠 `timestamp_ms - 10s` 构造已过期条目。
+            lease_duration_ms: 5_000,
             lease_expiry_check_interval_secs: 1,
         },
         Some(store),
@@ -1774,5 +2038,32 @@ async fn leases_survive_manager_rebuild_from_store() {
     assert!(
         leftovers.iter().all(|(k, _)| !k.contains("wf-stale")),
         "过期租约键必须被清理，实际残留: {leftovers:?}"
+    );
+}
+
+#[test]
+fn signed_heartbeat_with_spoofed_node_id_rejected() {
+    // 攻击者用自己的合法密钥签名，却把 node_id 写成受害节点：签名有效，
+    // 但身份与 node_id 不一致，必须拒绝，否则任务/结果会落到冒名者身上。
+    let attacker = iroh::SecretKey::generate();
+    let victim = iroh::SecretKey::generate();
+    let mut spoof = hb(&victim.public().to_string(), crate::common::epoch_millis());
+    spoof.endpoint_addr = Some(endpoint_addr_of(&attacker));
+    let unsigned = NodeHeartbeat {
+        signature: None,
+        ..spoof.clone()
+    };
+    spoof.signature = Some(
+        attacker
+            .sign(&postcard::to_allocvec(&unsigned).unwrap())
+            .to_bytes()
+            .to_vec(),
+    );
+
+    let fm = make_fm_with_identity("node-A", None, true, Vec::new());
+    fm.handle_heartbeat(&spoof);
+    assert!(
+        fm.get_peer_infos().is_empty(),
+        "heartbeat whose node_id differs from endpoint identity must be rejected"
     );
 }

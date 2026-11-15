@@ -58,3 +58,35 @@ def test_api_surface_snapshot_is_current() -> None:
         check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_workflow_config_defaults_match_rust() -> None:
+    """`_ActantConfig` 属性说明里的 Rust 默认值必须与 `WorkflowConfig::default` 同源。
+
+    `configuration.md` 的 `None` 是 Python 层「不覆盖」语义；真正的默认值在 Rust
+    的 `Default` 实现里。此用例防止 .pyi 的说明与 Rust 默认值漂移。
+    """
+    import re
+
+    config = (ROOT / "crates" / "actant-common" / "src" / "common" / "config.rs").read_text()
+    block = config.split("impl Default for WorkflowConfig {", 1)[1].split("\n}", 1)[0]
+    defaults: dict[str, str] = dict(re.findall(r"(\w+):\s*(\d+),", block))
+    pyi = (ROOT / "actant" / "actant.pyi").read_text()
+
+    # .pyi 属性名 → Rust 字段名（`max_history_events` 是跨语言别名）。
+    aliases = {
+        "completed_retention_count": "completed_retention_count",
+        "max_history_events": "event_log_max_events_per_workflow",
+        "persist_flush_interval_ms": "persist_flush_interval_ms",
+        "state_poll_interval_ms": "state_poll_interval_ms",
+    }
+    for prop, rust_field in aliases.items():
+        expected = defaults.get(rust_field)
+        assert expected is not None, f"WorkflowConfig::default 缺少 {rust_field}"
+        doc = re.search(
+            rf"def {prop}\(self\)[^:]*:\s*\"\"\"([^\"]*)\"\"\"", pyi
+        )
+        assert doc is not None, f"_ActantConfig.{prop} 缺少默认值说明"
+        assert f"Rust 默认 ``{expected}``" in doc.group(1), (
+            f"{prop}: .pyi 写的是 {doc.group(1)!r}，Rust 默认是 {expected}"
+        )

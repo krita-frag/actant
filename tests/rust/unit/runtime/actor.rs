@@ -104,6 +104,82 @@ async fn spawn_duplicate_actor_returns_already_exists() {
     assert!(err.to_string().contains("already exists"));
 }
 
+/// on_start 是 await 点；同一 actor_id 的并发 spawn 只能有一个成功。
+///
+/// 旧实现先 `contains_key`、再 await on_start、最后 insert，两个并发
+/// spawn 会同时通过判重并互相覆盖 mailbox / actors 条目。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_spawn_same_id_allows_only_one() {
+    struct BlockingStartActor {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl Actor for BlockingStartActor {
+        fn actor_type(&self) -> &str {
+            "blocking-start"
+        }
+
+        async fn handle_message(&mut self, msg: ActorMessage) -> Result<ActorMessageResult> {
+            Ok(ActorMessageResult {
+                message_id: msg.id,
+                payload: vec![],
+                error: None,
+            })
+        }
+
+        async fn on_start(&mut self) -> Result<()> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(())
+        }
+    }
+
+    let system = Arc::new(ActorSystem::new());
+    let actor_id = ActorId::from("spawn-race");
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+
+    let first = {
+        let system = Arc::clone(&system);
+        let actor_id = actor_id.clone();
+        let entered = Arc::clone(&entered);
+        let release = Arc::clone(&release);
+        tokio::spawn(async move {
+            system
+                .spawn(actor_id, BlockingStartActor { entered, release })
+                .await
+        })
+    };
+
+    // 等第一个 spawn 进入 on_start（此时它持有 id 预留）。
+    entered.notified().await;
+
+    let second = system.spawn(
+        actor_id.clone(),
+        BlockingStartActor {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        },
+    );
+    let second_result = tokio::time::timeout(std::time::Duration::from_secs(1), second)
+        .await
+        .expect("second spawn must fail fast instead of entering on_start");
+    assert!(
+        second_result.is_err(),
+        "concurrent spawn with same id must be rejected"
+    );
+    assert!(second_result
+        .unwrap_err()
+        .to_string()
+        .contains("already exists"));
+
+    release.notify_waiters();
+    assert!(first.await.unwrap().is_ok());
+    assert_eq!(system.list_actors().len(), 1);
+}
+
 #[tokio::test]
 async fn send_to_unknown_actor_returns_error() {
     let system = ActorSystem::new();
@@ -143,6 +219,99 @@ async fn call_returns_error_when_actor_fails() {
         .unwrap()
         .message
         .contains("intentional failure"));
+}
+
+/// `kill` 走 `JoinHandle::abort`，`run()` 中 `await` 之后的语句不再执行。
+///
+/// 在途计数若写在 `run()` 尾部，被 abort 的 actor 会永久留在 `active_actors`
+/// 里（只增不减）。计数必须在 future 被丢弃时结算——即 `Drop`。
+///
+/// 断言用按 actor id 的结算计数（`active_actors` 是进程级全局指标，并行
+/// 测试下无法归属到具体用例）；`stop()` 走正常退出，同样必须只结算一次。
+#[tokio::test]
+async fn actor_exit_settles_exactly_once_on_kill_and_stop() {
+    struct HangingActor;
+
+    #[async_trait]
+    impl Actor for HangingActor {
+        fn actor_type(&self) -> &str {
+            "hanging"
+        }
+
+        async fn handle_message(&mut self, _msg: ActorMessage) -> Result<ActorMessageResult> {
+            std::future::pending::<Result<ActorMessageResult>>().await
+        }
+    }
+
+    use crate::runtime::actor::system::settlement_count;
+
+    let system = ActorSystem::new();
+
+    // abort 路径：kill 后 future 被丢弃 ⇒ 结算一次。
+    let killed = ActorId::from("settle-kill-1");
+    system.spawn(killed.clone(), HangingActor).await.unwrap();
+    assert_eq!(settlement_count(&killed), 0, "spawn 阶段不应结算");
+    system.kill(&killed).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while settlement_count(&killed) == 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(settlement_count(&killed), 1, "abort 路径必须结算一次");
+
+    // 正常退出路径：stop 后 run 结束、future 完成 ⇒ 同样只结算一次。
+    let stopped = ActorId::from("settle-stop-1");
+    system.spawn(stopped.clone(), HangingActor).await.unwrap();
+    system.stop(&stopped).await.unwrap();
+    assert_eq!(settlement_count(&stopped), 1, "stop 路径必须结算一次");
+}
+
+/// `call` 必须有等待上限：actor 卡死时调用线程不得永久阻塞。
+///
+/// 绑定层在释放 GIL 后 `block_on` 该调用，没有上限意味着 Python 线程永久
+/// 挂起、进程也无法退场。上限把「永不返回」降级为可诊断的超时错误。
+#[tokio::test]
+async fn call_times_out_when_actor_handler_hangs() {
+    struct HangingActor;
+
+    #[async_trait]
+    impl Actor for HangingActor {
+        fn actor_type(&self) -> &str {
+            "hanging"
+        }
+
+        async fn handle_message(&mut self, _msg: ActorMessage) -> Result<ActorMessageResult> {
+            std::future::pending::<Result<ActorMessageResult>>().await
+        }
+    }
+
+    // 默认上限必须有限，否则 opt-in 的 50ms 只是特例。
+    assert_eq!(
+        ActorSystem::new().call_timeout,
+        crate::runtime::actor::system::DEFAULT_CALL_TIMEOUT
+    );
+
+    let system = ActorSystem::new().with_call_timeout(std::time::Duration::from_millis(50));
+    let actor_id = ActorId::from("hang-1");
+    system.spawn(actor_id.clone(), HangingActor).await.unwrap();
+
+    let started = std::time::Instant::now();
+    // 外层 5s 兜底：没有上限时本用例必须以「永不返回」失败，而不是把测试挂死。
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        system.call(&actor_id, "hang", vec![]),
+    )
+    .await
+    .expect("call 必须在等待上限内返回，不得永久阻塞");
+    let err = outcome.unwrap_err();
+    assert!(
+        matches!(err, ActantError::Timeout(_)),
+        "expected timeout, got {err:?}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "50ms 上限却阻塞了 {:?}",
+        started.elapsed()
+    );
 }
 
 #[tokio::test]
@@ -351,7 +520,15 @@ async fn stop_timeout_unknown_actor_is_noop() {
 #[tokio::test]
 async fn stop_timeout_aborts_on_timeout() {
     // 使用一个长时间运行的 actor 来触发超时
-    struct SlowActor;
+    struct SlowActor {
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl Drop for SlowActor {
+        fn drop(&mut self) {
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
     #[async_trait]
     impl Actor for SlowActor {
         fn actor_type(&self) -> &str {
@@ -373,7 +550,16 @@ async fn stop_timeout_aborts_on_timeout() {
     }
     let system = ActorSystem::new();
     let actor_id = ActorId::from("slow-1");
-    system.spawn(actor_id.clone(), SlowActor).await.unwrap();
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    system
+        .spawn(
+            actor_id.clone(),
+            SlowActor {
+                dropped: Arc::clone(&dropped),
+            },
+        )
+        .await
+        .unwrap();
 
     // 给 actor 一个消息让它进入处理状态
     system
@@ -393,6 +579,10 @@ async fn stop_timeout_aborts_on_timeout() {
         .unwrap();
     // 应该在合理时间内返回（即使 actor 还在 sleep）
     assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    assert!(
+        dropped.load(std::sync::atomic::Ordering::SeqCst),
+        "stop_timeout must abort the actor task, not merely detach it"
+    );
 }
 
 // ───────────────────────── kill 测试 ─────────────────────────

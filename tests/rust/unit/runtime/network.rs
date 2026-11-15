@@ -681,6 +681,91 @@ async fn network_manager_dial_invalid_address_returns_error() {
     assert!(result.is_err(), "invalid address should fail");
 }
 
+/// 运行期新建的话题必须能送达已连接的邻居。
+///
+/// `subscribe` 只在创建话题时接收集群引导集：iroh gossip 不会把
+/// "已建连接、但当时未加入该话题"的邻居补进来。故障转移的状态同步正是
+/// 在运行期按对端节点新建话题（`wf-state-req:<node>`），若这条不变式不成立，
+/// `broadcast` 会返回 `Ok` 而消息没有任何接收方——远端永远拿不到状态副本，
+/// 表现为"接管方只有工作流空壳"。
+#[tokio::test]
+async fn late_subscribed_topic_reaches_connected_peer() {
+    let node_a = NetworkManager::new(NodeId::from("late-topic-a"), test_network_config())
+        .await
+        .expect("create manager a");
+    let node_b = NetworkManager::new(NodeId::from("late-topic-b"), test_network_config())
+        .await
+        .expect("create manager b");
+
+    let a_addr = node_a
+        .listen_addresses()
+        .expect("listen addresses")
+        .endpoint_addr;
+    let b_id = node_b
+        .listen_addresses()
+        .expect("listen addresses")
+        .endpoint_id;
+
+    // 接收端先加入话题（此时本节点一个邻居都没有）。
+    node_b
+        .subscribe("actant:late-topic")
+        .await
+        .expect("b subscribe");
+
+    // 连接由 b 发起（与跨进程场景一致：子节点 dial 父节点），
+    // a 只通过 peer id 建立邻居关系、不持有 b 的地址。
+    node_a
+        .subscribe("actant:early-topic")
+        .await
+        .expect("a subscribe early");
+    node_b.dial(&a_addr).await.expect("b dial a");
+    node_a.add_gossip_peer(&b_id).await.expect("a add peer");
+
+    // 关键：话题在连接建立之后才创建。
+    node_a
+        .subscribe("actant:late-topic")
+        .await
+        .expect("a subscribe late");
+
+    // 重复广播：区分"join 握手尚未完成的一次性时序问题"与"话题永远没有邻居"。
+    let expect = b"hello".to_vec();
+    let received = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut data = None;
+        for _ in 0..10 {
+            node_a
+                .broadcast("actant:late-topic", expect.clone())
+                .await
+                .expect("broadcast");
+            if let Ok(Some(found)) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), async {
+                    loop {
+                        match node_b.recv_event().await {
+                            Some(NetworkEvent::Message(msg))
+                                if msg.topic == "actant:late-topic" =>
+                            {
+                                break Some(msg.data);
+                            }
+                            Some(_) => continue,
+                            None => break None,
+                        }
+                    }
+                })
+                .await
+            {
+                data = Some(found);
+                break;
+            }
+        }
+        data
+    })
+    .await;
+
+    assert_eq!(
+        received.expect("晚建话题的消息未被对端收到（超时）"),
+        Some(expect)
+    );
+}
+
 #[tokio::test]
 async fn network_manager_send_direct_request_invalid_address_returns_error() {
     let manager = NetworkManager::new(NodeId::from("test-req"), test_network_config())
@@ -862,4 +947,22 @@ async fn network_manager_concurrent_subscribe_is_idempotent() {
         "exactly one subscription should be registered"
     );
     assert!(subs.contains_key("race-topic"));
+}
+
+#[test]
+fn bootstrap_nodes_endpoint_ids_join_gossip_bootstrap() {
+    let key = iroh::SecretKey::generate();
+    let addr = iroh::EndpointAddr::new(key.public());
+
+    let merged = merged_gossip_bootstrap_peers(&[], std::slice::from_ref(&addr));
+    assert_eq!(
+        merged,
+        vec![key.public()],
+        "bootstrap_nodes 的 endpoint id 必须自动并入 gossip 引导集合"
+    );
+
+    // 显式字段与自动推导重复时不产生重复项。
+    let merged =
+        merged_gossip_bootstrap_peers(&[key.public().to_string()], std::slice::from_ref(&addr));
+    assert_eq!(merged.len(), 1);
 }

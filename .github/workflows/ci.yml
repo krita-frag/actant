@@ -73,12 +73,25 @@ jobs:
       - name: cargo clippy --no-default-features（框架构建零告警）
         run: cargo clippy -p actant-core -p actant-common --no-default-features --all-targets -- -D warnings
 
+      # test-support 是「显式开启才导出测试假件」的公开 feature，默认构建覆盖不到。
+      # 单独编译该组合，防止 feature 组合漏编译（失效模式见审查卡 S16）。
+      - name: cargo check --features test-support（框架测试假件导出）
+        run: cargo check -p actant-core --features test-support
+
       # 框架一致性门禁：第 1 层（runtime/common）不得依赖绑定层（py）。
       # 当前已满足；门禁用于防止边界随时间腐蚀。
       - name: 框架边界门禁（runtime/common 零 crate::py 引用）
         run: |
-          if grep -rn "crate::py" crates --include='*.rs'; then
-            echo "::error::框架边界腐蚀：src/runtime 或 src/common 出现 crate::py 引用（第 1 层不得依赖绑定层）"
+          # grep 的 0=命中、1=无匹配、>=2=扫描失败；if 语句会把 1 和 2 一起
+          # 当成「无匹配」，门禁因此假绿，这里显式区分三种退出码。
+          matches=$(grep -rn "crate::py" crates --include='*.rs') && status=0 || status=$?
+          if [ "$status" -eq 0 ]; then
+            echo "::error::框架边界腐蚀：crates/ 出现 crate::py 引用（第 1 层不得依赖绑定层）"
+            echo "$matches"
+            exit 1
+          fi
+          if [ "$status" -ne 1 ]; then
+            echo "::error::框架边界门禁扫描失败(grep exit=${status})"
             exit 1
           fi
           echo "OK: runtime/common 无 crate::py 引用"

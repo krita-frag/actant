@@ -587,6 +587,53 @@ fn nodes_iterator_visits_all_nodes() {
 
 // --- 终态守卫（can_transition_task）测试 ---
 
+/// 取消后迟到的失败上报不得把 Cancelled 改写为 Failed。
+///
+/// flow 函数体在工作流级取消后被唤醒并抛 `WorkflowCancelledError`，驱动器会
+/// 按「函数体异常」再上报一次失败；两条路径竞态时取消必须胜出，否则调用方
+/// 看到的是「失败」并丢失「被取消」这一事实。
+#[test]
+fn late_failure_after_cancel_does_not_override_terminal() {
+    let mut wf = WorkflowExecution::new(
+        WorkflowId::from("wf-1".to_string()),
+        vec![TaskId::from("a".to_string())],
+    );
+    wf.mark_running();
+    wf.mark_task_running(&TaskId::from("a".to_string()));
+    wf.mark_cancelled();
+    assert_eq!(wf.state, Phase::Cancelled);
+
+    wf.mark_workflow_failed("WorkflowCancelledError: aborted".to_string());
+    assert_eq!(wf.state, Phase::Cancelled, "取消不得被迟到的失败改写");
+    assert!(
+        wf.error.is_none(),
+        "取消的终态原因不得被失败错误串覆盖: {:?}",
+        wf.error
+    );
+    let task = wf.tasks.get(&TaskId::from("a".to_string())).unwrap();
+    assert_eq!(task.state, Phase::Cancelled, "task must stay Cancelled");
+}
+
+/// 已 Failed 的工作流：迟到的失败上报不得覆盖更准确的终态原因。
+#[test]
+fn late_failure_keeps_first_terminal_reason() {
+    let mut wf = WorkflowExecution::new(
+        WorkflowId::from("wf-2".to_string()),
+        vec![TaskId::from("a".to_string())],
+    );
+    wf.mark_running();
+    wf.mark_task_running(&TaskId::from("a".to_string()));
+    wf.mark_workflow_failed("workflow timeout exceeded".to_string());
+
+    wf.mark_workflow_failed("ActantTimeoutError: enriched message".to_string());
+    assert_eq!(wf.state, Phase::Failed);
+    assert_eq!(
+        wf.error.as_deref(),
+        Some("workflow timeout exceeded"),
+        "首个终态原因必须保留"
+    );
+}
+
 /// 取消后迟到的完成结果不得把 Cancelled 任务改写为 Completed，
 /// 也不得把 Cancelled 工作流"复活"为 Completed。
 #[test]

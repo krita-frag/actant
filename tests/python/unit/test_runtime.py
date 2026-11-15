@@ -9,9 +9,21 @@ import pytest
 import actant
 from actant import Runtime
 from actant._internal.runtime import get_current_runtime, use_runtime
+from actant._internal.tasks.async_result import AsyncResult
 from actant.actant import _NetworkConfig
 from actant.capabilities import TaskEvent
 from actant.effects import ask
+from actant.exceptions import ConfigError
+
+
+def _endpoint_id() -> str:
+    """生成一个语法合法的 iroh endpoint id（用自动临时目录的独立节点）。"""
+    rt = Runtime()
+    rt.start()
+    try:
+        return rt.peer_id
+    finally:
+        rt.stop()
 
 
 class TestRuntimeLifecycle:
@@ -24,6 +36,23 @@ class TestRuntimeLifecycle:
         rt.stop()
         assert not rt._started
         assert get_current_runtime() is None
+
+    def test_default_node_id_is_endpoint_id(self):
+        """未显式命名时 node_id 取持久身份 endpoint id，避免集群内重名。"""
+        rt = Runtime()
+        rt.start()
+        try:
+            assert rt.node_id == rt.peer_id
+        finally:
+            rt.stop()
+
+    def test_explicit_name_is_kept(self):
+        rt = Runtime(name="node-a")
+        rt.start()
+        try:
+            assert rt.node_id == "node-a"
+        finally:
+            rt.stop()
 
     def test_runtime_context_manager(self):
         with Runtime() as rt:
@@ -194,6 +223,57 @@ class TestRuntimeCleanup:
         finally:
             shutil.rmtree(data_dir, ignore_errors=True)
 
+    def test_temp_data_dir_cleaned_even_when_shutdown_fails(self):
+        """shutdown 失败不得留下 Runtime 自建的临时 data_dir。
+
+        清理是 stop() 的既定职责；失败路径正是最需要清理的场景（否则每次
+        异常退出都在临时目录里留一份 LMDB）。
+        """
+        rt = Runtime()
+        data_dir = rt._data_dir
+        rt.start()
+
+        class _Boom:
+            def shutdown(self, _timeout_ms: int) -> None:
+                raise RuntimeError("shutdown boom")
+
+        rt._rust_core = _Boom()
+        with pytest.raises(RuntimeError, match="shutdown boom"):
+            rt.stop()
+
+        assert not rt._started
+        assert not os.path.exists(data_dir)
+
+
+class TestRuntimeStartRollback:
+    """start() 在 serve() 之后失败时必须整体回滚。"""
+
+    def test_failed_serve_does_not_leave_started_state(self, monkeypatch):
+        rt = Runtime()
+        data_dir = rt._data_dir
+
+        def boom(_self):
+            raise RuntimeError("serve boom")
+
+        monkeypatch.setattr(Runtime, "serve", boom)
+        with pytest.raises(RuntimeError, match="serve boom"):
+            rt.start()
+
+        assert not rt._started, "启动失败不能留下 _started=True"
+        assert rt._rust_core is None
+        assert rt._event_batcher is None
+        assert rt._terminal is None
+        assert get_current_runtime() is None
+
+        # 回滚后重新启动必须干净成功（后台线程不得残留）。
+        monkeypatch.undo()
+        rt.start()
+        try:
+            assert rt._started
+        finally:
+            rt.stop()
+        assert not os.path.exists(data_dir)
+
 
 class TestRuntimeProduction:
     """生产级 Runtime 工厂的契约测试。"""
@@ -221,7 +301,7 @@ class TestRuntimeProduction:
             rt = Runtime.production(
                 payload_signing_key="cluster-shared-secret",
                 data_dir=data_dir,
-                network=_NetworkConfig(allowed_peer_ids=["peer-a"]),
+                network=_NetworkConfig(allowed_peer_ids=[_endpoint_id()]),
             )
             assert rt._config is not None
             assert rt._config.require_payload_signing is True
@@ -236,11 +316,63 @@ class TestRuntimeProduction:
             rt = Runtime.production(
                 payload_signing_key="cluster-shared-secret",
                 data_dir=data_dir,
-                network=_NetworkConfig(allowed_peer_ids=["peer-a"]),
+                network=_NetworkConfig(allowed_peer_ids=[_endpoint_id()]),
             )
             assert rt._config is not None
             assert rt._config.network.require_signed_records is True
         finally:
+            shutil.rmtree(data_dir, ignore_errors=True)
+
+    def test_production_does_not_mutate_caller_network_config(self):
+        """强制签名必须作用在副本上。
+
+        同一份 ``_NetworkConfig`` 可能被多个 Runtime 共用；就地置位会把它永久
+        改掉，后续以非生产方式启动的实例也会被带上强制签名。
+        """
+        data_dir = tempfile.mkdtemp()
+        network = _NetworkConfig(allowed_peer_ids=[_endpoint_id()])
+        assert network.require_signed_records is False
+        try:
+            rt = Runtime.production(
+                payload_signing_key="cluster-shared-secret",
+                data_dir=data_dir,
+                network=network,
+            )
+        finally:
+            shutil.rmtree(data_dir, ignore_errors=True)
+
+        assert network.require_signed_records is False, "调用方传入的配置被就地改写"
+        assert rt._config.network.require_signed_records is True
+
+    def test_production_rejects_full_endpoint_addr_in_allowlist(self):
+        """白名单必须是 endpoint id；写成完整地址会永远匹配不上，启动即失败。"""
+        data_dir = tempfile.mkdtemp()
+        rt = Runtime.production(
+            payload_signing_key="cluster-shared-secret",
+            data_dir=data_dir,
+            network=_NetworkConfig(allowed_peer_ids=["deadbeef"]),
+        )
+        try:
+            with pytest.raises(ConfigError, match="allowed_peer_ids"):
+                rt.start()
+        finally:
+            rt.stop()
+            shutil.rmtree(data_dir, ignore_errors=True)
+
+    def test_production_rejects_custom_name(self):
+        """生产模式要求 node_id == endpoint id：显式 name 启动即失败。"""
+        data_dir = tempfile.mkdtemp()
+        rt = Runtime.production(
+            payload_signing_key="cluster-shared-secret",
+            data_dir=data_dir,
+            name="node-a",
+            network=_NetworkConfig(allowed_peer_ids=[_endpoint_id()]),
+        )
+        try:
+            with pytest.raises(ConfigError, match="require_signed_records"):
+                rt.start()
+        finally:
+            rt.stop()
             shutil.rmtree(data_dir, ignore_errors=True)
 
     def test_production_persists_identity_key(self):
@@ -250,7 +382,7 @@ class TestRuntimeProduction:
             with Runtime.production(
                 payload_signing_key="cluster-shared-secret",
                 data_dir=data_dir,
-                network=_NetworkConfig(allowed_peer_ids=["peer-a"]),
+                network=_NetworkConfig(allowed_peer_ids=[_endpoint_id()]),
             ) as rt:
                 assert rt._started
                 identity_path = os.path.join(data_dir, "identity.key")
@@ -259,7 +391,7 @@ class TestRuntimeProduction:
             with Runtime.production(
                 payload_signing_key="cluster-shared-secret",
                 data_dir=data_dir,
-                network=_NetworkConfig(allowed_peer_ids=["peer-a"]),
+                network=_NetworkConfig(allowed_peer_ids=[_endpoint_id()]),
             ) as rt2:
                 # 同一 data_dir 重启 → 同一 endpoint id（白名单因此可维护）
                 assert rt2.peer_id == peer_id_first
@@ -273,7 +405,7 @@ class TestRuntimeProduction:
             with Runtime.production(
                 payload_signing_key="cluster-shared-secret",
                 data_dir=data_dir,
-                network=_NetworkConfig(allowed_peer_ids=["peer-a"]),
+                network=_NetworkConfig(allowed_peer_ids=[_endpoint_id()]),
             ) as rt:
                 assert rt._started
                 assert get_current_runtime() is rt
@@ -307,8 +439,8 @@ class TestNetworkPresetSelection:
         assert rt._config.network.preset == "local"
 
 
-class TestCancelTaskErrorLogging:
-    """cancel_task 关键路径的 Rust 侧取消失败必须记录告警而非静默吞掉。"""
+class TestCancelTask:
+    """``Runtime.cancel_task`` 与 ``AsyncResult.cancel`` 共用同一份取消协议。"""
 
     def test_cancel_task_logs_warning_when_rust_cancel_fails(self, caplog):
         import logging
@@ -317,25 +449,71 @@ class TestCancelTaskErrorLogging:
             def cancel_task(self, task_id: str) -> None:
                 raise RuntimeError("rust cancel exploded")
 
-        class _FakeHandle:
-            def __init__(self) -> None:
-                self._state = "pending"
-
-            @property
-            def state(self) -> str:
-                return self._state
-
-            def cancel(self) -> bool:
-                return True
-
-            def _set_cancelled(self) -> None:
-                self._state = "cancelled"
-
         rt = Runtime()
         rt._rust_core = _BoomCore()
-        rt._tasks["t-1"] = _FakeHandle()  # type: ignore[assignment]
+        handle = AsyncResult("t-1")
+        rt._tasks["t-1"] = handle
         with caplog.at_level(logging.WARNING, logger="actant.runtime"):
             assert rt.cancel_task("t-1") is True
         assert any(
-            "rust core cancel_task failed" in rec.message for rec in caplog.records
+            "cancel_task failed for" in rec.message for rec in caplog.records
         )
+        # 取消失败不阻断其余步骤：预取消标记与占位终态照常生效。
+        assert rt._is_cancelled("t-1")
+        assert handle.state == "cancelled"
+
+    def test_cancel_task_on_flow_task_broadcasts_over_p2p(self):
+        """按 id 取消 flow 任务必须广播 P2P，否则远端 Worker 会继续执行。"""
+
+        class _RecordingCore:
+            def __init__(self) -> None:
+                self.cancelled: list[str] = []
+                self.broadcast: list[tuple[str, str]] = []
+
+            def cancel_task(self, task_id: str) -> None:
+                self.cancelled.append(task_id)
+
+            def broadcast_cancel(self, task_id: str, workflow_id: str) -> None:
+                self.broadcast.append((task_id, workflow_id))
+
+        rt = Runtime()
+        core = _RecordingCore()
+        rt._rust_core = core
+        rt._tasks["t-1"] = AsyncResult("t-1", workflow_id="wf-1")
+        assert rt.cancel_task("t-1") is True
+        assert core.cancelled == ["t-1"]
+        assert core.broadcast == [("t-1", "wf-1")]
+
+    def test_cancel_task_unknown_id_returns_false(self):
+        """不存在的任务不触碰 Rust：没有句柄就没有取消语义。"""
+        rt = Runtime()
+        assert rt.cancel_task("missing") is False
+        assert not rt._is_cancelled("missing")
+
+
+def test_stop_waits_for_auto_resume_thread(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``stop()`` 必须等后台 auto_resume 重放结束再释放 Rust core。
+
+    重放会执行用户 flow 代码并重新派发任务；若 stop() 不 join，线程仍持有
+    Runtime 引用，可能在 core 关停后继续提交任务。
+    """
+    import time
+
+    rt = Runtime()
+
+    def _slow_host_flows(*args: object, **kwargs: object) -> list[object]:
+        time.sleep(0.4)
+        return []
+
+    monkeypatch.setattr(rt, "host_flows", _slow_host_flows)
+    rt.start(auto_resume=True)
+    thread = rt._auto_resume_thread
+    assert thread is not None
+    # 确认线程已进入重放（避免 stop 抢在线程启动前返回造成的假绿）。
+    deadline = time.monotonic() + 2.0
+    while not thread.is_alive() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    rt.stop()
+    assert not thread.is_alive(), (
+        "stop() 返回后 auto_resume 线程仍在跑，可能访问已释放的 Rust core"
+    )

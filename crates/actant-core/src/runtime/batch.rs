@@ -91,6 +91,9 @@ impl BatchTracker {
         I: IntoIterator<Item = TaskId>,
     {
         let mut added = 0u32;
+        // 先建立 batch 状态，再写成员索引：终态结算由 members 查到 batch_id
+        // 后必须能找到对应状态，否则注册与终态并发时事件会丢失且不可重试。
+        drop(self.batches.entry(batch_id.to_string()).or_default());
         for task_id in task_ids {
             match self.members.entry(task_id) {
                 Entry::Vacant(slot) => {
@@ -123,9 +126,14 @@ impl BatchTracker {
         task_id: &TaskId,
         state: BatchItemState,
     ) -> Option<BatchProgress> {
-        let batch_id = self.members.remove(task_id)?.1;
+        let (_, batch_id) = self.members.remove(task_id)?;
 
-        let mut batch = self.batches.get_mut(&batch_id)?;
+        let Some(mut batch) = self.batches.get_mut(&batch_id) else {
+            // batch 状态不存在（注册尚未建好，或已被清理）：把成员映射放回，
+            // 让这次终态可以在状态补齐后重试，而不是静默丢失。
+            self.members.insert(task_id.clone(), batch_id);
+            return None;
+        };
         match state {
             BatchItemState::Completed => batch.completed = batch.completed.saturating_add(1),
             BatchItemState::Failed => batch.failed = batch.failed.saturating_add(1),

@@ -283,6 +283,12 @@ impl WorkflowExecution {
         self.started_at_ms
     }
 
+    /// 用 journal 里记录的原始启动时刻覆盖 `mark_running` 在恢复期填入的
+    /// 当前时间，保证工作流级 deadline 跨重启仍按原始起点计时。
+    pub(crate) fn set_started_at_ms(&mut self, started_at_ms: u64) {
+        self.started_at_ms = Some(started_at_ms);
+    }
+
     pub(crate) fn set_deadline_ms(&mut self, deadline: u64) {
         self.deadline_ms = Some(deadline);
     }
@@ -426,10 +432,10 @@ impl WorkflowExecution {
     /// 与 [`Self::can_transition_task`] 互补：fencing 校验派发代际，
     /// 终态守卫校验状态机合法性。任务不存在时放行（NotFound 由上层处理）。
     ///
-    /// `pub(crate)`：orchestrator 的 `complete_task` 在推进状态与发事件**之前**
-    /// 需要先判定 fencing（被拒结果不得触发 TaskCompleted 事件或后继调度），
-    /// 因此单独暴露给同 crate 使用；`mark_task_completed` / `fail_task` 内部
-    /// 亦会再次调用，保证任何直接写入路径都经过 fencing。
+    /// `pub(crate)`：`WorkflowActor::on_task_result` 在回灌前用它做唯一的
+    /// 代数裁决；DAG 写入方法内部保留同一次校验作为绕行写入的防线。
+    /// 当前 wire 结果通路未携带派发代数，生产写入路径传 `None`（放行），
+    /// 因此生效的是 actor 入口的前置裁决。
     pub(crate) fn attempt_fencing_passes(
         &self,
         task_id: &TaskId,
@@ -579,8 +585,13 @@ impl WorkflowExecution {
         const MAX_FAILED_SUMMARY_ENTRIES: usize = 10;
         const MAX_FAILED_ERROR_LEN: usize = 200;
 
+        // HashMap 迭代顺序未定义；按 task_id 排序，保证失败摘要（会进入
+        // Failed 事件与终态快照）在同一失败场景下是确定的字节。
+        let mut failed_tasks: Vec<(&TaskId, &TaskState)> = self.tasks.iter().collect();
+        failed_tasks.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+
         let mut failed: Vec<String> = Vec::new();
-        for (id, t) in &self.tasks {
+        for (id, t) in failed_tasks {
             if t.state == Phase::Failed {
                 let e = t.error.as_deref().unwrap_or("");
                 let truncated = if e.len() > MAX_FAILED_ERROR_LEN {
@@ -672,6 +683,14 @@ impl WorkflowExecution {
     }
 
     pub fn mark_workflow_failed(&mut self, error: String) {
+        // 终态守卫（与 `mark_cancelled` 对称）：已终态的工作流不可被迟到的
+        // 失败上报改写。flow 函数体在工作流级取消后会被唤醒并抛
+        // `WorkflowCancelledError`，驱动器随后按「函数体异常」上报失败——
+        // 若不拦截，取消会被记成 Failed；同样的竞态也会用驱动器拼的错误串
+        // 覆盖更准确的终态原因（如 deadline 的 `workflow timeout exceeded`）。
+        if self.state.is_terminal() {
+            return;
+        }
         for task in self.tasks.values_mut() {
             if task.state == Phase::Running {
                 task.state = Phase::Failed;
@@ -785,6 +804,12 @@ impl Dag {
 
     pub fn add_node(&mut self, node: DagNode) -> Result<()> {
         let id = node.task_id.clone();
+        if self.nodes.contains_key(&id) {
+            return Err(crate::common::ActantError::Workflow(format!(
+                "node {} already exists",
+                id.as_str()
+            )));
+        }
         self.nodes.insert(id.clone(), node);
         self.predecessors.entry(id.clone()).or_default();
         self.successors.entry(id).or_default();

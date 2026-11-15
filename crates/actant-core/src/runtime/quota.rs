@@ -132,8 +132,11 @@ impl QuotaTracker {
     /// 归还一个配额单元（由 [`QuotaGuard`] 调用）。
     fn release(&self, key: &str) {
         {
-            // 与 set_capacities 保持同一锁顺序：先 capacities，后 remaining。
-            let capacity = self.capacities.lock().get(key).copied().unwrap_or(u32::MAX);
+            // 与 set_capacities 保持同一锁顺序，且**同时持有**两把锁：capacity
+            // 快照与 remaining 更新必须原子，否则中途扩容会被旧容量上限钳回去，
+            // 一次「归还」反而减少可用配额。
+            let caps = self.capacities.lock();
+            let capacity = caps.get(key).copied().unwrap_or(u32::MAX);
             let mut remaining = self.remaining.lock();
             if let Some(slot) = remaining.get_mut(key) {
                 *slot = slot.saturating_add(1).min(capacity);

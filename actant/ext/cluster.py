@@ -79,7 +79,6 @@ def _change_key(node: NodeView) -> tuple[Any, ...]:
     return (
         node.available_slots,
         node.max_slots,
-        node.active_workflows,
         node.labels,
         node.available_quotas,
         node.role,

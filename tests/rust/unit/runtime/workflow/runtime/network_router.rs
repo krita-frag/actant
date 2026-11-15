@@ -262,7 +262,8 @@ async fn handle_task_topic_enqueues_task() {
     let router = make_router(transport.clone(), scheduler, None);
 
     let task = make_task("t1");
-    let envelope = WireEnvelope::wrap(WireMessage::TaskDispatch(task.clone()));
+    let envelope =
+        WireEnvelope::wrap(WireMessage::TaskDispatch(task.clone())).expect("wire envelope wrap");
     let payload = postcard::to_allocvec(&envelope).unwrap();
 
     router
@@ -450,15 +451,15 @@ async fn handle_workflow_state_request_routes_to_dag_gossip_actor() {
     let req = crate::common::wire::WorkflowStateRequest {
         workflow_id: WorkflowId::from("wf-1".to_string()),
         requesting_node: NodeId::from("node-B".to_string()),
+        target_node: NodeId::from("node-A".to_string()),
     };
-    let envelope = WireEnvelope::wrap(WireMessage::WorkflowStateRequest(req));
+    let envelope =
+        WireEnvelope::wrap(WireMessage::WorkflowStateRequest(req)).expect("wire envelope wrap");
     let payload = postcard::to_allocvec(&envelope).unwrap();
 
     router
         .handle(NetworkEvent::Message(NetworkMessage {
-            topic: Topic::workflow_state_req(&NodeId::from("node-A".to_string()))
-                .as_str()
-                .to_string(),
+            topic: Topic::workflow_state_req().as_str().to_string(),
             data: payload,
         }))
         .await;
@@ -587,7 +588,8 @@ async fn handle_dag_state_topic_dispatches_to_dag_gossip_actor() {
         hlc_timestamp: crate::runtime::state::HlcTimestamp::from_parts(1, 2),
         origin_node: NodeId::from("node-B".to_string()),
     };
-    let envelope = WireEnvelope::wrap(WireMessage::DagStateUpdate(update));
+    let envelope =
+        WireEnvelope::wrap(WireMessage::DagStateUpdate(update)).expect("wire envelope wrap");
     let payload = postcard::to_allocvec(&envelope).unwrap();
 
     router
@@ -638,7 +640,7 @@ async fn handle_heartbeat_topic_dispatches_to_failover_manager() {
         platform: None,
         available_quotas: std::collections::BTreeMap::new(),
         node_id: NodeId::from("node-B".to_string()),
-        active_workflows: vec![WorkflowId::from("wf-1".to_string())],
+        active_workflows: vec![],
         timestamp_ms: crate::common::epoch_millis(),
         available_slots: 4,
         max_slots: 8,
@@ -646,7 +648,7 @@ async fn handle_heartbeat_topic_dispatches_to_failover_manager() {
         role: crate::common::NodeRole::Both,
         draining: false,
     };
-    let envelope = WireEnvelope::wrap(WireMessage::NodeHeartbeat(hb));
+    let envelope = WireEnvelope::wrap(WireMessage::NodeHeartbeat(hb)).expect("wire envelope wrap");
     let payload = postcard::to_allocvec(&envelope).unwrap();
 
     router
@@ -695,7 +697,8 @@ async fn handle_failover_topic_dispatches_claim_to_failover_manager() {
         workflow_id: WorkflowId::from("wf-1".to_string()),
         timestamp_ms: crate::common::epoch_millis(),
     };
-    let envelope = WireEnvelope::wrap(WireMessage::OrchestratorClaim(claim));
+    let envelope =
+        WireEnvelope::wrap(WireMessage::OrchestratorClaim(claim)).expect("wire envelope wrap");
     let payload = postcard::to_allocvec(&envelope).unwrap();
 
     router
@@ -772,7 +775,8 @@ async fn handle_heads_topic_dispatches_exchange_to_dag_gossip_actor() {
         node_id: NodeId::from("node-B".to_string()),
         heads: vec![],
     };
-    let envelope = WireEnvelope::wrap(WireMessage::HeadsExchange(exchange));
+    let envelope =
+        WireEnvelope::wrap(WireMessage::HeadsExchange(exchange)).expect("wire envelope wrap");
     let payload = postcard::to_allocvec(&envelope).unwrap();
 
     router

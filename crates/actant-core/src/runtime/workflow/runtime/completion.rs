@@ -13,7 +13,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::result_delivery::{try_enqueue_pending_result, PendingResult};
+use super::result_delivery::{enqueue_pending_result, PendingResult};
 use crate::common::{
     format_error_kind, ActantError, NodeId, TaskCompletion, TaskDefinition, WorkflowId,
 };
@@ -198,6 +198,128 @@ pub(super) async fn publish_drained_task_cancellation(
     .await;
 }
 
+/// 延迟重入队的共享依赖与终态回退上下文。
+///
+/// detached 重入队任务不在 drain 的排队/inflight 视野内，需要自带
+/// worker 状态与结果投递依赖，才能在 drain 或重试耗尽时补发终态。
+pub(super) struct ReenqueueCtx {
+    pub(super) node_id: NodeId,
+    pub(super) network: Arc<dyn crate::runtime::network::Transport>,
+    pub(super) event_bus: EventBus,
+    pub(super) pending_results: tokio::sync::mpsc::Sender<PendingResult>,
+    pub(super) pending_capacity: usize,
+    pub(super) state: tokio::sync::watch::Receiver<super::WorkerState>,
+}
+
+/// 重入队尝试次数与退避基数。
+const REENQUEUE_MAX_ATTEMPTS: usize = 3;
+const REENQUEUE_RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
+
+/// 延迟后把任务重新入队。
+pub(super) async fn reenqueue_after_delay(
+    scheduler: Arc<dyn crate::runtime::workflow::Scheduler>,
+    task: TaskDefinition,
+    delay: Duration,
+    ctx: ReenqueueCtx,
+    reason: &'static str,
+) {
+    tokio::time::sleep(delay).await;
+    reenqueue_with_retry(scheduler, task, &ctx, reason).await;
+}
+
+/// 重新入队并按需补发终态。
+///
+/// 延迟/配额等待后的重入队是 detached 的：若调度器已关闭或持续拒绝，
+/// 任务既不会执行也不会被取消，origin 可能永久等待。这里在 drain 时发
+/// Cancelled、重试耗尽时发 Failed，保证任务不会静默丢失。
+pub(super) async fn reenqueue_with_retry(
+    scheduler: Arc<dyn crate::runtime::workflow::Scheduler>,
+    task: TaskDefinition,
+    ctx: &ReenqueueCtx,
+    reason: &'static str,
+) {
+    let mut backoff = REENQUEUE_RETRY_BASE_DELAY;
+    for attempt in 1..=REENQUEUE_MAX_ATTEMPTS {
+        let draining = *ctx.state.borrow() == super::WorkerState::Draining;
+        if draining {
+            tracing::info!(
+                task_id = %task.id.as_str(),
+                reason,
+                "worker draining; cancelling pending re-enqueue"
+            );
+            let completion = TaskCompletion::Cancelled {
+                workflow_id: task
+                    .workflow_id
+                    .clone()
+                    .unwrap_or_else(|| WorkflowId::from(String::new())),
+                task_id: task.id.clone(),
+                task_name: task.name.clone(),
+                target_node: task.target_node.clone(),
+            };
+            publish_reenqueue_terminal(&task, ctx, completion).await;
+            return;
+        }
+        match scheduler.enqueue(task.clone()).await {
+            Ok(()) => return,
+            Err(e) if attempt < REENQUEUE_MAX_ATTEMPTS => {
+                tracing::warn!(
+                    task_id = %task.id.as_str(),
+                    attempt,
+                    error = %e,
+                    reason,
+                    "re-enqueue failed; retrying"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = backoff.saturating_mul(2);
+            }
+            Err(e) => {
+                tracing::error!(
+                    task_id = %task.id.as_str(),
+                    attempt,
+                    error = %e,
+                    reason,
+                    "re-enqueue failed after retries; publishing failure"
+                );
+                let completion = TaskCompletion::Failed {
+                    workflow_id: task
+                        .workflow_id
+                        .clone()
+                        .unwrap_or_else(|| WorkflowId::from(String::new())),
+                    task_id: task.id.clone(),
+                    task_name: task.name.clone(),
+                    error: format_error_kind(
+                        "scheduler",
+                        &format!(
+                            "{reason} re-enqueue failed after {REENQUEUE_MAX_ATTEMPTS} attempts: {e}"
+                        ),
+                    ),
+                    target_node: task.target_node.clone(),
+                };
+                publish_reenqueue_terminal(&task, ctx, completion).await;
+                return;
+            }
+        }
+    }
+}
+
+async fn publish_reenqueue_terminal(
+    task: &TaskDefinition,
+    ctx: &ReenqueueCtx,
+    completion: TaskCompletion,
+) {
+    settle_local_completion(
+        completion,
+        task,
+        &ctx.node_id,
+        ctx.network.as_ref(),
+        &ctx.event_bus,
+        &ctx.pending_results,
+        ctx.pending_capacity,
+        None,
+    )
+    .await;
+}
+
 /// 本地任务终态结算。
 ///
 /// 本地任务的结算**只做事件发布**：[`publish_task_completion`] 把终态投递给
@@ -233,25 +355,18 @@ pub(super) async fn settle_local_completion(
     // COMPLETE_TASK 通道取 ready_successors 入队；Failed 经 ON_TASK_RESULT
     // 做重试裁决（bridge.ingest 内部处理）。
     if let Some(bridge) = orchestrator_bridge {
-        match bridge.ingest(&completion, task).await {
-            Ok(ready_successors) if !ready_successors.is_empty() => {
-                let scheduler = bridge.scheduler.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = scheduler.enqueue_batch(ready_successors).await {
-                        tracing::error!(
-                            error = %e,
-                            "failed to enqueue ready successor tasks (local result report)"
-                        );
-                    }
-                });
-            }
-            Ok(_) => {}
+        match bridge.apply(&completion, task).await {
+            Ok(()) => {}
             Err(e) => {
                 tracing::warn!(
                     task_id = %task.id.as_str(),
                     error = %e,
-                    "local orchestration ingest failed; falling back to event-only settlement"
+                    "local orchestration ingest failed; retrying in background"
                 );
+                let bridge = bridge.clone();
+                let completion = completion.clone();
+                let task = task.clone();
+                tokio::spawn(retry_local_orchestration_ingest(bridge, completion, task));
             }
         }
     }
@@ -268,34 +383,173 @@ pub(super) async fn settle_local_completion(
     .await;
 }
 
+/// 本地编排回灌失败后的后台重试次数与退避基数。
+const ORCHESTRATION_INGEST_MAX_ATTEMPTS: usize = 3;
+const ORCHESTRATION_RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
+/// 本地入队（后继 / 重试任务）的重试次数与退避基数。
+const LOCAL_ENQUEUE_MAX_ATTEMPTS: usize = 3;
+const LOCAL_ENQUEUE_RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
+
+/// 编排回灌失败后按指数退避重试。
+///
+/// actor 短暂不可用或消息丢失不应让 workflow 永久停摆；重试耗尽后记录
+/// error（workflow 视图由恢复/失联接管兜底）。
+async fn retry_local_orchestration_ingest(
+    bridge: OrchestratorBridge,
+    completion: TaskCompletion,
+    task: TaskDefinition,
+) {
+    let mut backoff = ORCHESTRATION_RETRY_BASE_DELAY;
+    for attempt in 1..=ORCHESTRATION_INGEST_MAX_ATTEMPTS {
+        tokio::time::sleep(backoff).await;
+        match bridge.apply(&completion, &task).await {
+            Ok(()) => {
+                tracing::info!(
+                    task_id = %task.id.as_str(),
+                    attempt,
+                    "local orchestration ingest retry succeeded"
+                );
+                return;
+            }
+            Err(e) if attempt < ORCHESTRATION_INGEST_MAX_ATTEMPTS => {
+                tracing::warn!(
+                    task_id = %task.id.as_str(),
+                    attempt,
+                    error = %e,
+                    "local orchestration ingest retry failed"
+                );
+                backoff = backoff.saturating_mul(2);
+            }
+            Err(e) => {
+                tracing::error!(
+                    task_id = %task.id.as_str(),
+                    attempt,
+                    error = %e,
+                    "local orchestration ingest failed after retries; workflow may stall"
+                );
+                return;
+            }
+        }
+    }
+}
+
+/// 入队就绪后继或编排重试任务；失败按指数退避重试。
+///
+/// `initial_delay` 用于尊重编排器给出的重试延迟。重试耗尽后记录 error：
+/// 任务保持未入队状态，由工作流恢复/失联接管重新评估。
+async fn enqueue_with_retry(
+    scheduler: Arc<dyn crate::runtime::workflow::Scheduler>,
+    tasks: Vec<TaskDefinition>,
+    initial_delay: Duration,
+    description: &'static str,
+) {
+    if !initial_delay.is_zero() {
+        tokio::time::sleep(initial_delay).await;
+    }
+    let mut backoff = LOCAL_ENQUEUE_RETRY_BASE_DELAY;
+    for attempt in 1..=LOCAL_ENQUEUE_MAX_ATTEMPTS {
+        let result = match tasks.as_slice() {
+            [single] => scheduler.enqueue(single.clone()).await,
+            _ => scheduler.enqueue_batch(tasks.clone()).await,
+        };
+        match result {
+            Ok(()) => return,
+            Err(e) if attempt < LOCAL_ENQUEUE_MAX_ATTEMPTS => {
+                tracing::warn!(
+                    attempt,
+                    error = %e,
+                    description,
+                    "failed to enqueue tasks; retrying"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = backoff.saturating_mul(2);
+            }
+            Err(e) => {
+                tracing::error!(
+                    attempt,
+                    error = %e,
+                    description,
+                    "failed to enqueue tasks after retries; workflow may stall"
+                );
+                return;
+            }
+        }
+    }
+}
+
 /// 本地结果 → orchestrator 的回灌桥。
 ///
 /// 持有 ON_TASK_RESULT 通道两端（actor_system + workflow_actor_id）与调度器
-/// 引用；`ingest` 返回 `Some(OrchestratorRetry)` 表示 orchestrator 裁决重试。
+/// 引用；`ingest` 返回 [`IngestAction`] 描述需要入队的后继/重试任务。
 /// `None` 变体由 `settle_local_completion` 的调用方在 spawn 时按 Worker 内部
 /// 状态构造（未绑定 workflow actor 时为 `None`，降级为纯事件结算）。
+#[derive(Clone)]
 pub(super) struct OrchestratorBridge {
     pub(super) actor_system: Arc<crate::runtime::actor::ActorSystem>,
     pub(super) workflow_actor_id: crate::common::ActorId,
     pub(super) scheduler: Arc<dyn crate::runtime::workflow::Scheduler>,
 }
 
+/// 编排回灌的结果：需要由调用方入队的任务。
+enum IngestAction {
+    /// 无需入队（终局或非工作流任务）。
+    None,
+    /// 依赖推进产出的就绪后继任务。
+    Successors(Vec<TaskDefinition>),
+    /// 编排器裁决的重试任务及其延迟。
+    Retry {
+        task: Box<TaskDefinition>,
+        delay_ms: u64,
+    },
+}
+
 impl OrchestratorBridge {
-    /// 结果单入口回灌。成功返回就绪后继任务（可为空）；`Err` = 回灌失败
-    /// （调用方降级为事件结算并告警）。重试裁决在 Failed 分支内部处理。
+    /// 回灌结果并将就绪后继/重试任务入队。入队失败在内部重试；
+    /// `Err` 仅表示回灌本身失败。
+    async fn apply(
+        &self,
+        completion: &TaskCompletion,
+        task: &TaskDefinition,
+    ) -> crate::common::Result<()> {
+        match self.ingest(completion, task).await? {
+            IngestAction::None => {}
+            IngestAction::Successors(tasks) => {
+                enqueue_with_retry(
+                    self.scheduler.clone(),
+                    tasks,
+                    Duration::ZERO,
+                    "ready successor tasks",
+                )
+                .await;
+            }
+            IngestAction::Retry {
+                task: retry_task,
+                delay_ms,
+            } => {
+                enqueue_with_retry(
+                    self.scheduler.clone(),
+                    vec![*retry_task],
+                    Duration::from_millis(delay_ms),
+                    "orchestrator-driven retry task",
+                )
+                .await;
+            }
+        }
+        Ok(())
+    }
+
+    /// 结果单入口回灌。`Err` = 回灌失败（调用方退避重试）。
     async fn ingest(
         &self,
         completion: &TaskCompletion,
         task: &TaskDefinition,
-    ) -> crate::common::Result<Vec<TaskDefinition>> {
-        // 返回「就绪后继任务」（依赖推进产出），由调用方入队调度器。
-        // 重试裁决走同通道：Failed 时 ON_TASK_RESULT 响应携带 retry verdict，
-        // 由 Worker::report_task_result 的既有路径延迟入队（此处不重复）。
+    ) -> crate::common::Result<IngestAction> {
+        // 返回需要入队的任务（就绪后继 / 重试裁决），由调用方统一入队。
         let Some(ref workflow_id) = task.workflow_id else {
-            return Ok(Vec::new());
+            return Ok(IngestAction::None);
         };
         if workflow_id.as_str().is_empty() {
-            return Ok(Vec::new());
+            return Ok(IngestAction::None);
         }
         match completion {
             TaskCompletion::Completed { result, .. } => {
@@ -315,35 +569,30 @@ impl OrchestratorBridge {
                     return Err(ActantError::from(error));
                 }
                 let parsed: TaskCompletionResponse = if response.payload.is_empty() {
-                    return Ok(Vec::new());
+                    tracing::warn!(
+                        "empty COMPLETE_TASK response payload; treating as no ready successors"
+                    );
+                    return Ok(IngestAction::None);
                 } else {
                     decode(&response.payload)?
                 };
-                Ok(parsed.ready_successors)
+                Ok(IngestAction::Successors(parsed.ready_successors))
             }
             TaskCompletion::Failed { error, .. } => {
                 let outcome = TaskResultOutcome::Failed(error.clone());
                 let retry = self
                     .ingest_for_retry(workflow_id, &task.id, outcome)
                     .await?;
-                if let Some((retry_task, delay_ms)) = retry {
-                    let scheduler = self.scheduler.clone();
-                    tokio::spawn(async move {
-                        if delay_ms > 0 {
-                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                        }
-                        if let Err(e) = scheduler.enqueue(retry_task).await {
-                            tracing::error!(
-                                error = %e,
-                                "failed to enqueue orchestrator-driven retry task (local result report)"
-                            );
-                        }
-                    });
-                }
-                Ok(Vec::new())
+                Ok(match retry {
+                    Some((task, delay_ms)) => IngestAction::Retry {
+                        task: Box::new(task),
+                        delay_ms,
+                    },
+                    None => IngestAction::None,
+                })
             }
             // Cancelled：编排侧由 cancel 路径收敛，事件结算即可。
-            TaskCompletion::Cancelled { .. } => Ok(Vec::new()),
+            TaskCompletion::Cancelled { .. } => Ok(IngestAction::None),
         }
     }
 
@@ -375,6 +624,9 @@ impl OrchestratorBridge {
         // 响应载荷是 `Option<(TaskDefinition, u64)>`：`None` = 终局。
         // postcard 的 `None` 占一个判别字节，必须按 `Option` 解码。
         let verdict: Option<(TaskDefinition, u64)> = if result.payload.is_empty() {
+            // 生产 handler 总是 encode（None 也有判别字节）；空载荷意味着
+            // 协议被破坏，显性化「可能丢失的重试裁决」而不是静默当终局。
+            tracing::warn!("empty ON_TASK_RESULT response payload; treating verdict as terminal");
             None
         } else {
             decode(&result.payload)?
@@ -394,7 +646,7 @@ pub(super) async fn publish_task_completion(
     network: &dyn crate::runtime::network::Transport,
     event_bus: &EventBus,
     pending_results: &tokio::sync::mpsc::Sender<PendingResult>,
-    pending_capacity: usize,
+    _pending_capacity: usize,
 ) {
     let is_remote_task = task.origin_node.as_ref().is_some_and(|o| o != node_id);
 
@@ -435,30 +687,15 @@ pub(super) async fn publish_task_completion(
                         "orchestrator {} rejected task result, enqueuing for retry",
                         origin_addr
                     );
-                    if !try_enqueue_pending_result(
-                        pending_results,
-                        origin_addr.to_string(),
-                        request,
-                        0,
-                        pending_capacity,
-                    )
-                    .await
+                    // 队列满时等待（背压）而不是在本地发 TaskFailed——origin
+                    // 在远端，本地事件无法终止它的等待。
+                    if !enqueue_pending_result(pending_results, origin_addr.to_string(), request, 0)
+                        .await
                     {
-                        // 通道满：降级为 TaskFailed 事件，避免结果静默丢失。
-                        let failed = TaskCompletion::Failed {
-                            workflow_id: workflow_id.clone(),
-                            task_id: task.id.clone(),
-                            task_name: task.name.clone(),
-                            error: format_error_kind(
-                                "network",
-                                &format!(
-                                    "result delivery to orchestrator {} rejected and retry queue full",
-                                    origin_addr
-                                ),
-                            ),
-                            target_node: task.target_node.clone(),
-                        };
-                        event_bus.publish(BusEvent::TaskFailed(failed));
+                        tracing::warn!(
+                            origin = %origin_addr,
+                            "result retry queue closed during shutdown; origin will re-dispatch"
+                        );
                     }
                 }
                 Ok(_) => {
@@ -466,29 +703,13 @@ pub(super) async fn publish_task_completion(
                         "unexpected response from {}, enqueuing result for retry",
                         origin_addr
                     );
-                    if !try_enqueue_pending_result(
-                        pending_results,
-                        origin_addr.to_string(),
-                        request,
-                        0,
-                        pending_capacity,
-                    )
-                    .await
+                    if !enqueue_pending_result(pending_results, origin_addr.to_string(), request, 0)
+                        .await
                     {
-                        let failed = TaskCompletion::Failed {
-                            workflow_id: workflow_id.clone(),
-                            task_id: task.id.clone(),
-                            task_name: task.name.clone(),
-                            error: format_error_kind(
-                                "network",
-                                &format!(
-                                    "unexpected response from {} and retry queue full",
-                                    origin_addr
-                                ),
-                            ),
-                            target_node: task.target_node.clone(),
-                        };
-                        event_bus.publish(BusEvent::TaskFailed(failed));
+                        tracing::warn!(
+                            origin = %origin_addr,
+                            "result retry queue closed during shutdown; origin will re-dispatch"
+                        );
                     }
                 }
                 Err(e) => {
@@ -497,29 +718,13 @@ pub(super) async fn publish_task_completion(
                         origin_addr,
                         e
                     );
-                    if !try_enqueue_pending_result(
-                        pending_results,
-                        origin_addr.to_string(),
-                        request,
-                        0,
-                        pending_capacity,
-                    )
-                    .await
+                    if !enqueue_pending_result(pending_results, origin_addr.to_string(), request, 0)
+                        .await
                     {
-                        let failed = TaskCompletion::Failed {
-                            workflow_id: workflow_id.clone(),
-                            task_id: task.id.clone(),
-                            task_name: task.name.clone(),
-                            error: format_error_kind(
-                                "network",
-                                &format!(
-                                    "delivery to {} failed: {} and retry queue full",
-                                    origin_addr, e
-                                ),
-                            ),
-                            target_node: task.target_node.clone(),
-                        };
-                        event_bus.publish(BusEvent::TaskFailed(failed));
+                        tracing::warn!(
+                            origin = %origin_addr,
+                            "result retry queue closed during shutdown; origin will re-dispatch"
+                        );
                     }
                 }
             }

@@ -6,7 +6,7 @@ use dashmap::DashMap;
 use crate::common::{
     ActorId, GossipConfig, HeadsExchange, NodeId, TaskCompletion, TaskId, WireDagStateUpdate,
     WireEnvelope, WireMessage, WireTaskState, WorkflowHead, WorkflowId, WorkflowStateRequest,
-    WorkflowStateResponse, TOPIC_DAG_STATE, TOPIC_HEADS, TOPIC_WORKFLOW_STATE_REQ,
+    WorkflowStateResponse, TOPIC_DAG_STATE, TOPIC_HEADS,
 };
 use crate::runtime::actor::ActorSystem;
 use crate::runtime::network::Transport;
@@ -23,6 +23,16 @@ struct SeenEntry {
     hlc_timestamp: crate::runtime::state::HlcTimestamp,
     state_priority: u8,
 }
+
+/// 未完成的全量状态请求：用于重试与过期清理。
+struct StateRequestState {
+    target: NodeId,
+    sent_at: std::time::Instant,
+    attempts: u32,
+}
+
+const STATE_REQUEST_RETRY_AFTER: Duration = Duration::from_secs(3);
+const STATE_REQUEST_MAX_ATTEMPTS: u32 = 5;
 
 impl SeenEntry {
     /// 如果传入的更新应该覆盖当前条目，则返回 true。
@@ -80,6 +90,7 @@ pub struct DagGossip {
     retry_attempts: usize,
     retry_base_delay: Duration,
     heads_broadcast_interval: Duration,
+    state_requests: Arc<DashMap<WorkflowId, StateRequestState>>,
 }
 
 impl Drop for DagGossip {
@@ -112,6 +123,7 @@ impl DagGossip {
             retry_attempts: config.retry_attempts,
             retry_base_delay: Duration::from_millis(config.retry_base_delay_ms),
             heads_broadcast_interval: Duration::from_millis(config.heads_broadcast_interval_ms),
+            state_requests: Arc::new(DashMap::new()),
         }
     }
 
@@ -258,7 +270,7 @@ impl DagGossip {
         self.evict_seen();
 
         let msg = WireMessage::DagStateUpdate(update);
-        let data = postcard::to_allocvec(&WireEnvelope::wrap(msg))
+        let data = postcard::to_allocvec(&WireEnvelope::wrap(msg)?)
             .map_err(|e| crate::common::ActantError::Serialization(e.to_string()))?;
 
         crate::metrics::inc_gossip_updates_sent();
@@ -453,7 +465,7 @@ impl DagGossip {
             heads,
         };
         let msg = WireMessage::HeadsExchange(exchange);
-        let data = postcard::to_allocvec(&WireEnvelope::wrap(msg))
+        let data = postcard::to_allocvec(&WireEnvelope::wrap(msg)?)
             .map_err(|e| crate::common::ActantError::Serialization(e.to_string()))?;
 
         self.network.broadcast(TOPIC_HEADS, data).await
@@ -486,16 +498,26 @@ impl DagGossip {
                         &remote_head.workflow_id,
                     )
                     .await?;
-                    self.request_workflow_state(&remote_head.workflow_id, &exchange.node_id)
+                    self.ensure_state_request(&remote_head.workflow_id, &exchange.node_id)
                         .await?;
                 }
                 Some(local) => {
-                    if remote_head.succeeded_count > local.succeeded_count() {
+                    // 落后判据必须同时看节点数：flow 增量提交的新节点在它**成功**
+                    // 之前不会改变 succeeded_count，只看成功数会让"仍在 Running
+                    // 的任务"永远复制不到对端——编排节点失联后接管方手里没有可
+                    // 重调度的任务，工作流停摆。
+                    if remote_head.total_count > local.total_count()
+                        || remote_head.succeeded_count > local.succeeded_count()
+                    {
                         tracing::info!(
-                            "workflow {} behind: local succeeded {} < remote succeeded {}, requesting state",
-                            remote_head.workflow_id.as_str(), local.succeeded_count(), remote_head.succeeded_count
+                            "workflow {} behind: local {}/{} < remote {}/{}, requesting state",
+                            remote_head.workflow_id.as_str(),
+                            local.succeeded_count(),
+                            local.total_count(),
+                            remote_head.succeeded_count,
+                            remote_head.total_count
                         );
-                        self.request_workflow_state(&remote_head.workflow_id, &exchange.node_id)
+                        self.ensure_state_request(&remote_head.workflow_id, &exchange.node_id)
                             .await?;
                     }
                 }
@@ -506,6 +528,10 @@ impl DagGossip {
     }
 
     /// 请求从远程节点获取完整的 DAG 状态（DAG +执行）。
+    ///
+    /// 请求走全局话题广播，目标节点由载荷里的 [`WorkflowStateRequest::target_node`]
+    /// 指定。刻意不用「每节点一个话题」：运行期新建的话题拿不到已连接的邻居，
+    /// `broadcast` 会返回成功却无人接收（接管方永远等不到状态副本）。
     pub async fn request_workflow_state(
         &self,
         workflow_id: &WorkflowId,
@@ -514,19 +540,126 @@ impl DagGossip {
         let request = WorkflowStateRequest {
             workflow_id: workflow_id.clone(),
             requesting_node: self.node_id.clone(),
+            target_node: target_node.clone(),
         };
         let msg = WireMessage::WorkflowStateRequest(request);
-        let data = postcard::to_allocvec(&WireEnvelope::wrap(msg))
+        let data = postcard::to_allocvec(&WireEnvelope::wrap(msg)?)
             .map_err(|e| crate::common::ActantError::Serialization(e.to_string()))?;
-        let topic = format!("{}{}", TOPIC_WORKFLOW_STATE_REQ, target_node.as_str());
-        self.network.broadcast(&topic, data).await
+        let topic = crate::common::Topic::workflow_state_req();
+        let sent = self.network.broadcast(topic.as_str(), data).await;
+        let attempts = self
+            .state_requests
+            .get(workflow_id)
+            .map(|entry| entry.attempts.saturating_add(1))
+            .unwrap_or(1);
+        self.state_requests.insert(
+            workflow_id.clone(),
+            StateRequestState {
+                target: target_node.clone(),
+                sent_at: std::time::Instant::now(),
+                attempts,
+            },
+        );
+        // 控制面稀有事件（仅在发现未知/落后的工作流时触发），info 级即可观测，
+        // 否则跨节点同步一旦静默失败，唯一线索是"本地副本永远不更新"。
+        tracing::info!(
+            workflow = %workflow_id.as_str(),
+            target = %target_node.as_str(),
+            ok = sent.is_ok(),
+            "sent workflow state request"
+        );
+        sent
     }
 
+    /// 有界地请求全量状态：同一目标在重试间隔内不重复发送；超过次数后
+    /// 清理仍为空的占位符，避免 workflow 永久停在 Loading。
+    async fn ensure_state_request(
+        &self,
+        workflow_id: &WorkflowId,
+        target_node: &NodeId,
+    ) -> crate::common::Result<()> {
+        let now = std::time::Instant::now();
+        let should_retry = match self.state_requests.get(workflow_id) {
+            Some(entry)
+                if entry.target == *target_node
+                    && now.duration_since(entry.sent_at) < STATE_REQUEST_RETRY_AFTER =>
+            {
+                None
+            }
+            Some(entry) if entry.attempts >= STATE_REQUEST_MAX_ATTEMPTS => Some(false),
+            _ => Some(true),
+        };
+        match should_retry {
+            None => Ok(()),
+            Some(true) => self.request_workflow_state(workflow_id, target_node).await,
+            Some(false) => {
+                self.state_requests.remove(workflow_id);
+                self.clear_empty_placeholder(workflow_id).await;
+                Ok(())
+            }
+        }
+    }
+
+    /// 若 workflow 仍无状态（仅占位符），删除它以便后续重新发现。
+    async fn clear_empty_placeholder(&self, workflow_id: &WorkflowId) {
+        let empty = match self
+            .call_workflow(workflow_methods::GET_STATE, workflow_id)
+            .await
+        {
+            Ok(result) => matches!(
+                crate::runtime::workflow::messaging::decode::<
+                    Option<crate::runtime::workflow::WorkflowExecution>,
+                >(&result.payload),
+                Ok(None)
+            ),
+            Err(_) => false,
+        };
+        if empty {
+            if let Err(e) = self
+                .call_workflow_void(workflow_methods::DELETE_WORKFLOW, workflow_id)
+                .await
+            {
+                tracing::warn!(
+                    workflow = %workflow_id.as_str(),
+                    error = %e,
+                    "failed to clear exhausted state-request placeholder"
+                );
+            }
+        }
+    }
+
+    /// 周期性重试已超时但未耗尽次数的全量状态请求。
+    pub async fn retry_pending_state_requests(&self) {
+        let now = std::time::Instant::now();
+        let due: Vec<(WorkflowId, NodeId)> = self
+            .state_requests
+            .iter()
+            .filter(|entry| {
+                entry.attempts < STATE_REQUEST_MAX_ATTEMPTS
+                    && now.duration_since(entry.sent_at) >= STATE_REQUEST_RETRY_AFTER
+            })
+            .map(|entry| (entry.key().clone(), entry.target.clone()))
+            .collect();
+        for (workflow_id, target) in due {
+            if let Err(e) = self.request_workflow_state(&workflow_id, &target).await {
+                tracing::warn!(
+                    workflow = %workflow_id.as_str(),
+                    error = %e,
+                    "failed to retry workflow state request"
+                );
+            }
+        }
+    }
     /// 处理从远程节点收到的 DAG 状态请求。
+    ///
+    /// 全局话题上的请求只有目标节点需要响应，其余节点直接丢弃。
     pub async fn handle_workflow_state_request(
         &self,
         request: &WorkflowStateRequest,
     ) -> crate::common::Result<()> {
+        if request.target_node != self.node_id {
+            return Ok(());
+        }
         let (dag_bytes, exec_bytes, pending_bytes) = {
             let result = self
                 .call_workflow(
@@ -541,16 +674,24 @@ impl DagGossip {
         };
 
         if dag_bytes.is_empty() && exec_bytes.is_empty() {
-            tracing::debug!(
-                "no state available for workflow {} requested by {}",
-                request.workflow_id.as_str(),
-                request.requesting_node.as_str()
+            tracing::warn!(
+                workflow = %request.workflow_id.as_str(),
+                requester = %request.requesting_node.as_str(),
+                "no state available for requested workflow; replying nothing"
             );
             return Ok(());
         }
+        tracing::info!(
+            workflow = %request.workflow_id.as_str(),
+            requester = %request.requesting_node.as_str(),
+            dag_bytes = dag_bytes.len(),
+            exec_bytes = exec_bytes.len(),
+            "replying with workflow state snapshot"
+        );
 
         let response = WorkflowStateResponse {
             workflow_id: request.workflow_id.clone(),
+            target_node: request.requesting_node.clone(),
             dag: if dag_bytes.is_empty() {
                 None
             } else {
@@ -568,17 +709,30 @@ impl DagGossip {
             },
         };
         let msg = WireMessage::WorkflowStateResponse(response);
-        let data = postcard::to_allocvec(&WireEnvelope::wrap(msg))
+        let data = postcard::to_allocvec(&WireEnvelope::wrap(msg)?)
             .map_err(|e| crate::common::ActantError::Serialization(e.to_string()))?;
-        let topic = crate::common::Topic::workflow_state_resp(&request.requesting_node);
-        self.network.broadcast(topic.as_str(), data).await
+        let topic = crate::common::Topic::workflow_state_resp();
+        let sent = self.network.broadcast(topic.as_str(), data).await;
+        tracing::info!(
+            workflow = %request.workflow_id.as_str(),
+            target = %request.requesting_node.as_str(),
+            ok = sent.is_ok(),
+            "sent workflow state response"
+        );
+        sent
     }
 
     /// 处理从远程节点收到的 DAG 状态响应。
+    ///
+    /// 全局话题上的响应只有目标节点需要应用，其余节点直接丢弃
+    /// （响应可能携带完整的 DAG/执行快照，不应落到无关节点上）。
     pub async fn handle_workflow_state_response(
         &self,
         response: &WorkflowStateResponse,
     ) -> crate::common::Result<()> {
+        if response.target_node != self.node_id {
+            return Ok(());
+        }
         if response.dag.is_none() && response.execution.is_none() {
             tracing::warn!(
                 "incomplete state response for workflow {}, cannot restore",
@@ -597,6 +751,7 @@ impl DagGossip {
             ),
         )
         .await?;
+        self.state_requests.remove(&response.workflow_id);
 
         tracing::info!(
             "restored workflow {} from remote state response",

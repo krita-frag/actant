@@ -238,20 +238,18 @@ async def _wait_terminal_and_emit_async(
     """异步版 :func:`actant._internal.flow._wait_terminal_and_emit`。
 
     终态分类复用 :func:`actant._internal.flow._terminal_kind`；轮询间隔内 ``await``
-    让出 loop，使其他 parked flow 继续推进。
+    让出 loop，使其他 parked flow 继续推进。轮询读摘要（不搬任务结果字节），
+    终态确认后再取一次完整快照。
     """
     while True:
-        state = cast(
+        summary = cast(
             "dict[str, Any] | None",
-            runtime.get_workflow_state(workflow_id),
+            runtime.get_workflow_state_summary(workflow_id),
         )
-        if _emit_terminal(
-            workflow_id,
-            state,
-            _terminal_kind(state),
-            on_completed=on_completed,
-        ):
-            return state
+        kind = _terminal_kind(summary)
+        if kind != "pending":
+            _emit_terminal(workflow_id, summary, kind, on_completed=on_completed)
+            return summary
         await asyncio.sleep(_FLOW_TERMINAL_POLL_INTERVAL_S)
 
 

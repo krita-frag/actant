@@ -18,12 +18,12 @@ fn init_tracing_with_actant_tracing_env() {
 }
 
 #[test]
-fn init_console_subscriber_without_feature_is_noop() {
+fn init_with_console_env_without_feature_is_noop() {
     // 未启用 tokio-console feature 时，无论环境变量如何都应为空操作。
     unsafe {
         std::env::set_var("ACTANT_TOKIO_CONSOLE", "1");
     }
-    init_console_subscriber();
+    init();
     unsafe {
         std::env::remove_var("ACTANT_TOKIO_CONSOLE");
     }

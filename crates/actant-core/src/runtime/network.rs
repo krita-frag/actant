@@ -3,7 +3,7 @@
 //! 作为 Runtime 的 Network 盒。
 //!
 //! 公开内容：
-//! - `Discovery` trait 与内置发现策略（local / mdns / none / 预留 dns / relay）。
+//! - `Discovery` trait 与内置发现策略（none / local / dns）。
 //! - `Transport` trait：网络传输抽象，便于测试与替换实现。
 //! - `NetworkManager`：基于 iroh 的 `Transport` 实现，提供 gossip、直连请求-响应、
 //!   peer 发现等能力。
@@ -441,6 +441,13 @@ pub struct NetworkManager {
     topic_subscriptions: Arc<RwLock<HashMap<String, (TopicId, GossipSender)>>>,
     peer_neighbor_count: Arc<RwLock<HashMap<String, usize>>>,
     gossip_bootstrap_peers: Arc<Vec<EndpointId>>,
+    /// 已知的 gossip 邻居（由 `dial` / `add_gossip_peer` 登记）。
+    ///
+    /// 新话题必须把它们一并 join：iroh gossip 的 `subscribe` 只在创建时接收
+    /// 引导集，**不会**把"已建连接但当时未加入该话题"的邻居自动补进来。
+    /// 缺了这一步，运行期新建的话题（如按对端节点命名的 `wf-state-req:<node>`）
+    /// 在本节点看来订阅成功、`broadcast` 也返回 `Ok`，但一个接收方都没有。
+    known_gossip_peers: Arc<RwLock<Vec<EndpointId>>>,
     max_message_size: usize,
     allowed_peer_ids: Arc<HashSet<String>>,
     direct_request_timeout: Duration,
@@ -611,31 +618,27 @@ impl NetworkManager {
             tracing::info!("iroh endpoint online: endpoint_id={}", endpoint_id_str);
         }
 
-        for node_addr in &config.bootstrap_nodes {
-            match parse_endpoint_addr(node_addr) {
-                Ok(addr) => {
-                    tracing::info!("connecting to bootstrap node: {:?}", addr);
-                    if let Err(e) = endpoint.connect(addr, ACTANT_DIRECT_ALPN).await {
-                        tracing::warn!("failed to connect to bootstrap node: {}", e);
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("invalid bootstrap node address '{}': {}", node_addr, e);
-                }
+        // bootstrap_nodes 只解析一次：同一份地址同时用于 gossip 引导与直连。
+        let mut bootstrap_addrs: Vec<EndpointAddr> = Vec::new();
+        for raw in &config.bootstrap_nodes {
+            match parse_endpoint_addr(raw) {
+                Ok(addr) => bootstrap_addrs.push(addr),
+                Err(e) => tracing::warn!("invalid bootstrap node address '{}': {}", raw, e),
             }
         }
 
-        let gossip_bootstrap_peers: Vec<EndpointId> = config
-            .gossip_bootstrap_peers
-            .iter()
-            .filter_map(|s| match s.parse::<EndpointId>() {
-                Ok(id) => Some(id),
-                Err(e) => {
-                    tracing::warn!("invalid gossip_bootstrap_peer '{}': {}", s, e);
-                    None
-                }
-            })
-            .collect();
+        // gossip 引导集合：显式字段用于"只有 endpoint id、没有地址"的场景；
+        // bootstrap_nodes 解析出的 endpoint id 自动并入，避免同一 seed 需要
+        // 在两处配置（漏配时直连成功但 gossip 永不收敛，且只留 WARN）。
+        let gossip_bootstrap_peers =
+            merged_gossip_bootstrap_peers(&config.gossip_bootstrap_peers, &bootstrap_addrs);
+
+        for addr in bootstrap_addrs {
+            tracing::info!("connecting to bootstrap node: {:?}", addr);
+            if let Err(e) = endpoint.connect(addr, ACTANT_DIRECT_ALPN).await {
+                tracing::warn!("failed to connect to bootstrap node: {}", e);
+            }
+        }
 
         let (event_tx, event_rx) = mpsc::channel(config.event_channel_capacity);
 
@@ -653,6 +656,7 @@ impl NetworkManager {
             topic_subscriptions: Arc::new(RwLock::new(HashMap::new())),
             peer_neighbor_count: Arc::new(RwLock::new(HashMap::new())),
             gossip_bootstrap_peers: Arc::new(gossip_bootstrap_peers),
+            known_gossip_peers: Arc::new(RwLock::new(Vec::new())),
             max_message_size,
             allowed_peer_ids,
             direct_request_timeout,
@@ -690,6 +694,9 @@ impl NetworkManager {
     /// 并发订阅同一 topic 时严格只执行一次 gossip.subscribe，不会产生
     /// 被覆盖插入后泄漏的 sender/receiver。
     ///
+    /// 新话题的初始成员 = 静态引导集 ∪ [`Self::known_gossip_peers`]，
+    /// 因此运行期才建立的话题同样有邻居；否则订阅成功也没有接收方。
+    ///
     /// # Errors
     ///
     /// 如果 iroh gossip 订阅失败，返回错误。
@@ -703,7 +710,17 @@ impl NetworkManager {
 
         let topic_id = topic_id_from_str(topic);
 
-        let bootstrap: Vec<EndpointId> = self.gossip_bootstrap_peers.to_vec();
+        // 引导集 = 静态配置 ∪ 已登记邻居。后者是运行期新建话题唯一能拿到
+        // 邻居的来源（动态 dial 的 peer 不在静态配置里）。
+        let mut bootstrap: Vec<EndpointId> = self.gossip_bootstrap_peers.to_vec();
+        {
+            let known = self.known_gossip_peers.read().await;
+            for peer in known.iter() {
+                if !bootstrap.contains(peer) {
+                    bootstrap.push(*peer);
+                }
+            }
+        }
         let (sender, mut receiver) = self
             .gossip
             .subscribe(topic_id, bootstrap)
@@ -728,12 +745,15 @@ impl NetworkManager {
                     max_gossip_msg_size,
                 ) {
                     GossipEventOutcome::Message(event) => {
-                        if let Err(mpsc::error::TrySendError::Full(_)) = event_tx.try_send(event) {
-                            tracing::warn!(
-                                "network event channel full, dropping gossip message on '{}'",
+                        // gossip 承载心跳、claim、DAG 状态等控制面消息：
+                        // 内部事件通道满时应用背压而不是丢弃。接收端关闭
+                        // （Runtime 收尾）时退出接收循环。
+                        if event_tx.send(event).await.is_err() {
+                            tracing::debug!(
+                                "network event channel closed; stopping gossip receiver for '{}'",
                                 topic_name
                             );
-                            crate::metrics::inc_gossip_updates_dropped();
+                            return;
                         }
                     }
                     GossipEventOutcome::PeerConnected(peer_str) => {
@@ -819,7 +839,9 @@ impl NetworkManager {
         Ok(())
     }
 
-    /// 手动把 peer id 加入所有已订阅 gossip topic。
+    /// 手动把 peer id 加入所有已订阅 gossip topic，并登记为已知邻居。
+    ///
+    /// 登记之后新建的话题也会自动把它 join 进来（见 [`Self::subscribe`]）。
     ///
     /// # Errors
     ///
@@ -833,6 +855,13 @@ impl NetworkManager {
     }
 
     async fn join_gossip_peer(&self, peer_id: EndpointId) {
+        // 先登记邻居（不持话题锁），保证之后新建的话题能把它 join 进来。
+        {
+            let mut known = self.known_gossip_peers.write().await;
+            if !known.contains(&peer_id) {
+                known.push(peer_id);
+            }
+        }
         let subs = self.topic_subscriptions.read().await;
         if subs.is_empty() {
             return;
@@ -933,7 +962,18 @@ impl NetworkManager {
         let addr = parse_endpoint_addr(node.as_str()).map_err(|e| {
             ActantError::Network(format!("invalid blob source node '{}': {e}", node.as_str()))
         })?;
-        BlobFetch::start(&self.endpoint, addr, hash).await
+        // 连接 + fsm 握手必须有界：不可达或故意不响应的 provider 否则会让
+        // 取值线程永久阻塞（Python `_blob_fetch` 直接 await 此调用）。
+        let timeout = self.direct_request_timeout;
+        tokio::time::timeout(timeout, BlobFetch::start(&self.endpoint, addr, hash))
+            .await
+            .map_err(|_| {
+                ActantError::Timeout(format!(
+                    "blob fetch handshake to '{}' timed out after {:?}",
+                    node.as_str(),
+                    timeout
+                ))
+            })?
     }
 
     /// 发送一次直连请求并等待响应。
@@ -1272,6 +1312,9 @@ fn handle_gossip_event<E: std::fmt::Display>(
         }
         Ok(Event::Lagged) => {
             tracing::warn!("gossip lagged on topic '{}'", topic_name);
+            // Lagged 意味着 iroh 内部缓冲已丢事件；计入 dropped 让丢失可观测
+            // （周期性心跳 / heads 广播负责最终收敛）。
+            crate::metrics::inc_gossip_updates_dropped();
             GossipEventOutcome::None
         }
         Err(e) => {
@@ -1317,17 +1360,19 @@ impl DirectProtocolHandler {
         }
 
         loop {
+            // 先等待对端打开双向流，再领取并发许可。若反过来，允许的 peer
+            // 可以只建连接不发流，长期占用许可并耗尽直连并发额度。
+            let (send, mut recv) = conn
+                .accept_bi()
+                .await
+                .map_err(|e| ActantError::Network(format!("accept_bi failed: {e}")))?;
+
             let permit = self
                 .semaphore
                 .clone()
                 .acquire_owned()
                 .await
                 .map_err(|e| ActantError::Internal(format!("semaphore closed: {e}")))?;
-
-            let (send, mut recv) = conn
-                .accept_bi()
-                .await
-                .map_err(|e| ActantError::Network(format!("accept_bi failed: {e}")))?;
 
             let request_bytes = match read_length_prefixed(&mut recv, self.max_message_size).await {
                 Ok(bytes) => bytes,
@@ -1400,7 +1445,7 @@ fn topic_id_from_str(topic: &str) -> TopicId {
     TopicId::from(*hash.as_bytes())
 }
 
-fn parse_endpoint_addr(s: &str) -> crate::common::Result<EndpointAddr> {
+pub(crate) fn parse_endpoint_addr(s: &str) -> crate::common::Result<EndpointAddr> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
         return Err(ActantError::Config("empty endpoint address".into()));
@@ -1429,6 +1474,34 @@ fn parse_endpoint_addr(s: &str) -> crate::common::Result<EndpointAddr> {
         "invalid endpoint address '{}': expected hex-encoded postcard or node_id@ip:port",
         s
     )))
+}
+
+/// 合并 gossip 引导集合：显式 endpoint id + 已解析的 `bootstrap_nodes`。
+///
+/// `bootstrap_nodes` 若只用于直连，gossip 成员关系不会建立（表现为直连成功
+/// 但永远看不到 peers），因此把地址里的 endpoint id 自动并入。显式字段保留
+/// 给"只有 id、没有地址"的场景；重复项去重。
+fn merged_gossip_bootstrap_peers(
+    explicit: &[String],
+    bootstrap_nodes: &[EndpointAddr],
+) -> Vec<EndpointId> {
+    let mut peers: Vec<EndpointId> = Vec::new();
+    for raw in explicit {
+        match raw.parse::<EndpointId>() {
+            Ok(id) => {
+                if !peers.contains(&id) {
+                    peers.push(id);
+                }
+            }
+            Err(e) => tracing::warn!("invalid gossip_bootstrap_peer '{}': {}", raw, e),
+        }
+    }
+    for addr in bootstrap_nodes {
+        if !peers.contains(&addr.id) {
+            peers.push(addr.id);
+        }
+    }
+    peers
 }
 
 async fn write_length_prefixed(send: &mut SendStream, data: &[u8]) -> crate::common::Result<()> {

@@ -41,7 +41,6 @@ class NodeView:
     labels: Mapping[str, str] = field(default_factory=dict)
     available_slots: int = 0
     max_slots: int = 0
-    active_workflows: tuple[str, ...] = ()
     platform: str = ""
     last_heartbeat_ms: int = 0
     endpoint: str | None = None
@@ -57,7 +56,6 @@ class NodeView:
             labels=_freeze_str_map(peer.get("labels")),
             available_slots=int(peer.get("available_slots", 0)),
             max_slots=int(peer.get("max_slots", 0)),
-            active_workflows=_active_workflows(peer.get("active_workflows")),
             platform=str(peer.get("platform", "")),
             last_heartbeat_ms=int(peer.get("last_heartbeat_ms", 0)),
             endpoint=_optional_str(peer.get("endpoint")),
@@ -166,12 +164,3 @@ def _optional_str(value: Any) -> str | None:
         return None
     text = str(value)
     return text or None
-
-
-def _active_workflows(value: Any) -> tuple[str, ...]:
-    """归一化 ``active_workflows``：源字段可能是列表或单值。"""
-    if value is None:
-        return ()
-    if isinstance(value, (list, tuple, set, frozenset)):
-        return tuple(str(item) for item in value)
-    return (str(value),)

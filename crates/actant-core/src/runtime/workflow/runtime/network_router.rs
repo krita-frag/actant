@@ -220,21 +220,32 @@ impl NetworkEventRouter {
                 }
             }
             crate::common::TopicRoute::Failover => {
-                if let Some((WireMessage::OrchestratorClaim(claim), _)) = decoded {
-                    match &self.failover {
-                        Some(failover) => {
-                            // 控制面直连：更新本地租约表，非本节点 claim 时移除
-                            // 本地 active 状态，构成双主防护。
-                            failover.handle_claim(&claim).await;
+                match decoded {
+                    Some((WireMessage::SignedOrchestratorClaim(signed), _)) => {
+                        match &self.failover {
+                            Some(failover) => failover.handle_signed_claim(&signed).await,
+                            None => tracing::warn!(
+                                claim_node = %signed.claim.node_id.0,
+                                workflow_id = %signed.claim.workflow_id.as_str(),
+                                "no failover manager configured; dropping inbound claim"
+                            ),
                         }
-                        None => {
-                            tracing::warn!(
+                    }
+                    Some((WireMessage::OrchestratorClaim(claim), _)) => {
+                        match &self.failover {
+                            Some(failover) => {
+                                // 控制面直连：更新本地租约表，非本节点 claim 时移除
+                                // 本地 active 状态，构成双主防护。
+                                failover.handle_claim(&claim).await;
+                            }
+                            None => tracing::warn!(
                                 claim_node = %claim.node_id.0,
                                 workflow_id = %claim.workflow_id.as_str(),
                                 "no failover manager configured; dropping inbound claim"
-                            );
+                            ),
                         }
                     }
+                    _ => tracing::warn!("failover topic but failed to unwrap claim envelope"),
                 }
             }
             crate::common::TopicRoute::Heads => {
@@ -247,7 +258,7 @@ impl NetworkEventRouter {
                     .await;
                 }
             }
-            crate::common::TopicRoute::WorkflowStateReq(_) => {
+            crate::common::TopicRoute::WorkflowStateReq => {
                 if let Some((WireMessage::WorkflowStateRequest(request), _)) = decoded {
                     self.handle_workflow_state_event(
                         crate::runtime::workflow::gossip_methods::HANDLE_WORKFLOW_STATE_REQUEST,
@@ -256,7 +267,7 @@ impl NetworkEventRouter {
                     .await;
                 }
             }
-            crate::common::TopicRoute::WorkflowStateResp(_) => {
+            crate::common::TopicRoute::WorkflowStateResp => {
                 if let Some((WireMessage::WorkflowStateResponse(response), _)) = decoded {
                     self.handle_workflow_state_event(
                         crate::runtime::workflow::gossip_methods::HANDLE_WORKFLOW_STATE_RESPONSE,
@@ -280,15 +291,16 @@ impl NetworkEventRouter {
                     }
                     {
                         let mut cancelled_tasks = self.cancelled_tasks.lock();
-                        // 仅在新插入时增加 pending 计数；已存在的条目为重复取消，不重复计数。
+                        // 仅在新插入时增加计数；已存在的条目为重复取消，不重复计数。
+                        // 口径与本地 cancel_task 一致：确认的取消（此处 = 新登记）。
                         if cancelled_tasks
                             .insert(msg.task_id.to_string(), Instant::now())
                             .is_none()
                         {
                             crate::metrics::inc_cancelled_tasks_pending();
+                            crate::metrics::inc_tasks_cancelled();
                         }
                     }
-                    crate::metrics::inc_tasks_cancelled();
                     let tid = msg.task_id.clone();
                     self.event_bus
                         .publish(BusEvent::TaskCancelled(TaskCompletion::Cancelled {
@@ -452,7 +464,9 @@ impl NetworkEventRouter {
                         worker = %worker_node.as_str(),
                         "rejecting stale standalone task result"
                     );
-                    return false;
+                    // 旧 attempt 已作废：确认收到以停止 executor 重试，
+                    // 同时保留当前 attempt 的在途登记（不在此清除）。
+                    return true;
                 }
             }
             self.publish_remote_completion(
@@ -466,10 +480,20 @@ impl NetworkEventRouter {
             return true;
         }
 
-        // 远端已回报该任务的结果，本地对它的命运已有定论 → 清出"在途
-        // 转发"登记，避免该节点后续失联时对同一任务重复发布失败事件。
+        // 远端结果按 attempt fencing：早于当前在途登记的旧结果直接确认丢弃
+        // （返回 true 以停止 executor 重试），且不得清除当前 attempt 的登记。
         if let Some(failover) = self.failover.as_ref() {
-            failover.clear_outbound(task_id.as_str());
+            if failover
+                .outbound_attempt(task_id.as_str())
+                .is_some_and(|current| current > attempt)
+            {
+                tracing::warn!(
+                    task_id = %task_id.as_str(),
+                    attempt,
+                    "dropping stale workflow task result (newer attempt in flight)"
+                );
+                return true;
+            }
         }
 
         let Some(ref actor_system) = self.actor_system else {
@@ -498,7 +522,6 @@ impl NetworkEventRouter {
         };
 
         let outcome_wire = outcome.clone();
-        // wire 协议尚未携带派发代数，attempt 传 `None`（入口 fencing 放行）。
         let outcome = match outcome {
             WireTaskOutcome::Completed(result_payload) => {
                 TaskResultOutcome::Completed(result_payload)
@@ -510,7 +533,7 @@ impl NetworkEventRouter {
             workflow_id.clone(),
             task_id.clone(),
             outcome,
-            None::<u32>,
+            Some(attempt),
             ResultSource::Remote,
         )) {
             Ok(p) => p,
@@ -538,11 +561,21 @@ impl NetworkEventRouter {
                     );
                     return false;
                 }
+                // 结果已被编排入口接受：现在才清除在途登记。若 actor 调用
+                // 失败（下方 Err 分支），登记保留，执行节点失联时仍可结算。
+                if let Some(failover) = self.failover.as_ref() {
+                    failover.take_outbound_if_not_stale(task_id.as_str(), attempt);
+                }
                 // 重试裁决：orchestrator 判定重试时随响应返回重派发任务，
                 // 由本节点调度器延迟入队（远端执行的 flow 任务其编排者在本
                 // 节点）；终局结果发布到 event_bus，使提交方 `AsyncResult`
                 // 解析（远端执行路径若无事件，flow 句柄无法跨节点解析）。
                 let retry: Option<(TaskDefinition, u64)> = if result.payload.is_empty() {
+                    tracing::warn!(
+                        workflow_id = %workflow_id.as_str(),
+                        task_id = %task_id.as_str(),
+                        "empty ON_TASK_RESULT response payload; treating verdict as terminal"
+                    );
                     None
                 } else {
                     decode(&result.payload).unwrap_or_else(|e| {
@@ -563,11 +596,29 @@ impl NetworkEventRouter {
                                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms))
                                     .await;
                             }
-                            if let Err(e) = scheduler.enqueue(task).await {
-                                tracing::error!(
-                                    error = %e,
-                                    "failed to enqueue orchestrator-driven retry task"
-                                );
+                            const MAX_ENQUEUE_ATTEMPTS: usize = 3;
+                            let mut backoff = std::time::Duration::from_millis(100);
+                            for attempt in 1..=MAX_ENQUEUE_ATTEMPTS {
+                                match scheduler.enqueue(task.clone()).await {
+                                    Ok(()) => return,
+                                    Err(e) if attempt < MAX_ENQUEUE_ATTEMPTS => {
+                                        tracing::warn!(
+                                            attempt,
+                                            error = %e,
+                                            "failed to enqueue orchestrator-driven retry task; retrying"
+                                        );
+                                        tokio::time::sleep(backoff).await;
+                                        backoff = backoff.saturating_mul(2);
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            attempt,
+                                            error = %e,
+                                            "failed to enqueue orchestrator-driven retry task after retries; workflow may stall"
+                                        );
+                                        return;
+                                    }
+                                }
                             }
                         });
                     }

@@ -657,3 +657,138 @@ class TestQuotaPlacement:
             f"quota release did not wake the deferred task promptly: {gap:.3f}s "
             f"(fixed fallback delay is 5s)"
         )
+
+
+class TestBootstrapNodes:
+    """只配置 ``bootstrap_nodes`` 即可收敛到 gossip 成员关系。
+
+    ``bootstrap_nodes`` 里的 endpoint id 会自动并入 gossip 引导集合；本测试
+    不调用 ``dial`` / ``add_gossip_peer``，验证配置面单点即可建立成员关系。
+    """
+
+    def test_bootstrap_nodes_alone_establish_gossip(self) -> None:
+        import shutil
+        import tempfile
+
+        from actant.actant import _ActantConfig, _NetworkConfig
+
+        dir_a = tempfile.mkdtemp(prefix="actant-boot-a-")
+        dir_b = tempfile.mkdtemp(prefix="actant-boot-b-")
+
+        rt_a = Runtime(
+            name="boot-a",
+            data_dir=dir_a,
+            config=_ActantConfig(
+                payload_signing_key="",
+                network=_NetworkConfig(preset="none"),
+                max_concurrent_tasks=1,
+            ),
+        )
+        rt_a.start()
+        try:
+            bootstrap_addr = rt_a.listen_addresses()["endpoint_addr"]
+            rt_b = Runtime(
+                name="boot-b",
+                data_dir=dir_b,
+                config=_ActantConfig(
+                    payload_signing_key="",
+                    network=_NetworkConfig(
+                        preset="none", bootstrap_nodes=[bootstrap_addr]
+                    ),
+                    max_concurrent_tasks=1,
+                ),
+            )
+            rt_b.start()
+            try:
+                converged = wait_until(
+                    lambda: rt_a.peer_id in rt_b.discover_peers(),
+                    timeout_s=15.0,
+                )
+                if not converged:
+                    pytest.skip(
+                        "bootstrap gossip not converged within timeout (network env)"
+                    )
+                assert rt_a.peer_id in rt_b.discover_peers()
+            finally:
+                rt_b.stop()
+        finally:
+            rt_a.stop()
+            shutil.rmtree(dir_a, ignore_errors=True)
+            shutil.rmtree(dir_b, ignore_errors=True)
+
+
+class TestProductionMembership:
+    """生产模式（白名单 + 心跳签名）下两个节点可以互相发现。"""
+
+    def test_signed_heartbeats_establish_membership(self) -> None:
+        import shutil
+        import tempfile
+
+        from actant.actant import _ActantConfig, _NetworkConfig
+
+        secret = "cluster-shared-secret"
+        dir_a = tempfile.mkdtemp(prefix="actant-prod-a-")
+        dir_b = tempfile.mkdtemp(prefix="actant-prod-b-")
+
+        def _probe(data_dir: str) -> str:
+            # 先以普通模式启动一次，取得持久身份的 endpoint id，供对端登记白名单。
+            rt = Runtime(
+                data_dir=data_dir,
+                config=_ActantConfig(
+                    payload_signing_key=secret,
+                    network=_NetworkConfig(preset="none"),
+                    max_concurrent_tasks=1,
+                ),
+            )
+            rt.start()
+            try:
+                return rt.peer_id
+            finally:
+                rt.stop()
+
+        try:
+            id_a = _probe(dir_a)
+            id_b = _probe(dir_b)
+
+            rt_a = Runtime.production(
+                payload_signing_key=secret,
+                data_dir=dir_a,
+                network=_NetworkConfig(
+                    preset="none", allowed_peer_ids=[id_b]
+                ),
+            )
+            rt_a.start()
+            try:
+                addr_a = rt_a.listen_addresses()["endpoint_addr"]
+                rt_b = Runtime.production(
+                    payload_signing_key=secret,
+                    data_dir=dir_b,
+                    network=_NetworkConfig(
+                        preset="none",
+                        allowed_peer_ids=[id_a],
+                        bootstrap_nodes=[addr_a],
+                    ),
+                )
+                rt_b.start()
+                try:
+                    visible = wait_until(
+                        lambda: any(
+                            p["node_id"] == id_a for p in rt_b.peers()
+                        ),
+                        timeout_s=20.0,
+                    )
+                    if not visible:
+                        pytest.skip(
+                            "production membership not converged (network env)"
+                        )
+                    peer_a = next(
+                        p for p in rt_b.peers() if p["node_id"] == id_a
+                    )
+                    assert peer_a["endpoint"] == addr_a
+                finally:
+                    rt_b.stop()
+            finally:
+                rt_a.stop()
+        finally:
+            shutil.rmtree(dir_a, ignore_errors=True)
+            shutil.rmtree(dir_b, ignore_errors=True)

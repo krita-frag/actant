@@ -51,3 +51,11 @@ fn accessors_return_configured_values() {
 fn remote_call_max_retry_delay_is_30s() {
     assert_eq!(REMOTE_CALL_MAX_RETRY_DELAY, Duration::from_secs(30));
 }
+
+/// 亚毫秒 base 不得被 `as_millis()` 截断成 0：截断会让整个退避静默失效。
+#[test]
+fn sub_millisecond_base_keeps_its_precision() {
+    let bo = ExponentialBackoff::new(Duration::from_micros(500), Duration::from_secs(1));
+    assert_eq!(bo.delay_for(0), Duration::from_micros(500));
+    assert_eq!(bo.delay_for(1), Duration::from_millis(1));
+}

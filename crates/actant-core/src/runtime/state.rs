@@ -141,8 +141,10 @@ fn prefix_upper_bound(prefix: &str) -> Option<String> {
 
 /// 校验（或首次创建时写入）store 格式版本 meta 条目。
 ///
-/// - 无 meta 条目 → 视为首次创建，写入当前版本（存量库无此 meta 条目）。
-///   条目，按首次创建对待并补写；0.x 里程碑本身不承诺向后兼容）；
+/// - 无 meta 条目且 store 为空 → 首次创建，写入当前版本；
+/// - 无 meta 条目但 store 已有数据 → 存量库（版本化之前写入），显式告警后
+///   标记为当前版本。0.x 不承诺向后兼容，不做迁移；若旧布局与当前 rkyv
+///   布局不兼容，会在恢复期以 “corrupt workflow 被清理” 的形式暴露；
 /// - 条目与当前版本匹配 → 放行；
 /// - 条目存在但不匹配 → 返回语义化 [`ActantError::Storage`]，拒绝启动——
 ///   旧格式数据在新代码上读取会静默损坏（rkyv 字节校验失败表现为 workflow
@@ -155,6 +157,21 @@ fn ensure_fmt_version(db: &Database<Str, Bytes>, env: &Env) -> Result<()> {
     };
     match current {
         None => {
+            let existing_entries = {
+                let rtxn = env.read_txn()?;
+                db.stat(&rtxn)
+                    .map_err(|e| map_storage_error(e, env.info().map_size))?
+                    .entries
+            };
+            if existing_entries > 0 {
+                tracing::warn!(
+                    entries = existing_entries,
+                    format_version = STORE_FMT_VERSION,
+                    "store has data but no format version meta (pre-versioning store); \
+                     marking it as current format — incompatible legacy layouts will \
+                     surface as corrupt workflow cleanup during recovery"
+                );
+            }
             let mut wtxn = env.write_txn()?;
             db.put(&mut wtxn, STORE_FMT_VERSION_KEY, &expected)?;
             wtxn.commit()?;
@@ -656,6 +673,13 @@ impl WriteBatcher {
 
     /// 后台合并提交主循环：通道收满阈值立即 flush，超时间隔定时 flush，
     /// 发送端关闭后完成最终 flush 并退出。
+    ///
+    /// # 失败背压
+    ///
+    /// flush 失败后进入 degraded 状态：不再从通道取新条目，只周期性重试
+    /// 当前缓冲。通道是有界的，填满后 `try_send` 返回 `Full`，写入方退化
+    /// 为同步 `put` 并看到真实存储错误；缓冲最多为「阈值 + 通道容量」，
+    /// 不会随持续失败无限增长。
     fn run_flusher(
         store: LmdbStore,
         rx: std::sync::mpsc::Receiver<BatchEntry>,
@@ -663,7 +687,25 @@ impl WriteBatcher {
         committed: Arc<FlushCounter>,
     ) {
         let mut buf: Vec<BatchEntry> = Vec::with_capacity(BATCH_FLUSH_THRESHOLD);
+        let mut degraded = false;
         loop {
+            if degraded {
+                match Self::flush_batch(&store, &mut buf, &committed) {
+                    Ok(()) => {
+                        degraded = false;
+                        tracing::info!("WriteBatcher recovered from a failed flush");
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            count = buf.len(),
+                            "WriteBatcher flush still failing; pausing ingestion until it succeeds"
+                        );
+                        std::thread::sleep(flush_interval);
+                        continue;
+                    }
+                }
+            }
             match rx.recv_timeout(flush_interval) {
                 Ok(entry) => {
                     buf.push(entry);
@@ -678,6 +720,7 @@ impl WriteBatcher {
                                 count = buf.len(),
                                 "WriteBatcher threshold flush failed"
                             );
+                            degraded = true;
                         }
                     }
                 }
@@ -688,6 +731,7 @@ impl WriteBatcher {
                             count = buf.len(),
                             "WriteBatcher periodic flush failed"
                         );
+                        degraded = true;
                     }
                 }
                 // 发送端已关闭：缓冲中不会有新条目（Disconnected 仅在

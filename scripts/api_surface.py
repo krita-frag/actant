@@ -4,7 +4,8 @@
 
 - ``actant/__init__.py`` 的 ``__all__``
 - ``actant/actant.pyi`` 中每个类的公开方法/属性
-- ``src/py/*.rs`` 中 ``#[pymethods]`` 暴露给 Python 的成员
+- ``src/py/*.rs`` 中 ``#[pymethods]`` 暴露给 Python 的成员，以及
+  ``#[pyclass]`` 结构体上 ``#[pyo3(get)]`` 的字段
 
 此外校验 ``__all__`` 不超过 :data:`PYTHON_ALL_BUDGET`，防止顶层命名空间膨胀。
 
@@ -33,6 +34,14 @@ _PYO3_NAME = re.compile(r'pyo3\s*\(\s*name\s*=\s*"([^"]+)"')
 _FN = re.compile(r"^\s*fn\s+([A-Za-z_][A-Za-z0-9_]*)")
 _IMPL = re.compile(r"^impl<(?:[^>]*)>\s+([A-Za-z_][A-Za-z0-9_]*)")
 _IMPL_PLAIN = re.compile(r"^impl\s+([A-Za-z_][A-Za-z0-9_]*)")
+_PYCLASS_ATTR = re.compile(r"^\s*#\[pyclass\b")
+_STRUCT_DECL = re.compile(
+    r"^\s*pub(?:\([^)]*\))?\s+struct\s+([A-Za-z_][A-Za-z0-9_]*)"
+)
+_PYO3_FIELD_ATTR = re.compile(r"^\s*#\[pyo3\(([^)]*)\)\]")
+_FIELD_DECL = re.compile(
+    r"^\s*(?:pub(?:\([^)]*\))?\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*:"
+)
 
 #: 顶层 ``__all__`` 的硬上限。新增名字必须显式上调这里，迫使变更被评审，
 #: 避免 0.x 期间顶层命名空间再次膨胀。
@@ -179,7 +188,54 @@ def _pyo3_surface() -> dict[str, list[str]]:
                 pending_attrs = []
             elif stripped:
                 pending_attrs = []
+    _merge_pyo3_field_surface(surface)
     return {name: sorted(members) for name, members in surface.items()}
+
+
+def _merge_pyo3_field_surface(surface: dict[str, list[str]]) -> None:
+    """把 ``#[pyclass]`` 结构体上 ``#[pyo3(get)]`` 的字段计入公开面。
+
+    字段是 PyO3 最常见的公开属性形态（``#[pyo3(get)] pub x: T``），不属于
+    ``#[pymethods]``；只看 pymethods 会让新增的 Python 可见字段逃过快照比对。
+    """
+    for path in sorted(PYO3_DIR.glob("*.rs")):
+        struct_name: str | None = None
+        pending_pyclass = False
+        pending_get = False
+        for line in path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if struct_name is None:
+                if _PYCLASS_ATTR.match(line):
+                    pending_pyclass = True
+                    continue
+                if pending_pyclass:
+                    match = _STRUCT_DECL.match(line)
+                    if match:
+                        struct_name = match.group(1)
+                        surface.setdefault(struct_name, [])
+                        pending_get = False
+                        continue
+                    if stripped and not stripped.startswith(("#[", "//", "]", "name", ")")):
+                        # `#[pyclass]` 后跟 enum 或其它项，结束本次等待。
+                        pending_pyclass = False
+                continue
+
+            if line.startswith("}"):
+                struct_name = None
+                pending_get = False
+                continue
+            attr = _PYO3_FIELD_ATTR.match(line)
+            if attr is not None:
+                tokens = {token.strip() for token in attr.group(1).split(",")}
+                pending_get = "get" in tokens
+                continue
+            if stripped.startswith(("#[", "//")):
+                continue
+            field = _FIELD_DECL.match(line)
+            if field is not None:
+                if pending_get:
+                    surface[struct_name].append(field.group(1))
+                pending_get = False
 
 
 def build_snapshot() -> dict[str, object]:

@@ -62,6 +62,8 @@ class Task:
         silent: ``True`` 时跳过 TaskLifecycle 事件发布（started/completed/
             failed/retried/cancelled 均不 emit）。用于高吞吐批量提交场景，
             避免每个 task 产生两次事件造成 event_bus 噪声。默认 ``False``。
+            抑制发生在提交方（事件唯一的生产方）：任务仍正常执行与回灌结果，
+            只是不出现在事件流里。
     """
 
     # 注意：不使用 __slots__。functools.wraps 会设置 __name__/__doc__/__wrapped__ 等
@@ -404,8 +406,10 @@ class Task:
         task_ctx = TaskContext(task_id, workflow_id=workflow_id)
 
         # 创建 AsyncResult 句柄（由 Runtime._on_task_result 回调解析）。
+        # silent 一并带，父进程侧据此抑制 started/终态事件——worker 子进程内的
+        # 事件通道恒定关闭，不看这个选项。
         handle = AsyncResult(
-            task_id, context=task_ctx, workflow_id=workflow_id,
+            task_id, context=task_ctx, workflow_id=workflow_id, silent=self._silent,
         )
         # 注册到 Runtime 任务表，供 list_tasks/get_task/cancel_task 查询。
         runtime._register_task(task_id, handle)

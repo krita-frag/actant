@@ -206,6 +206,73 @@ async fn slow_path_scheduler_rejects_enqueue_after_close() {
         .is_err());
 }
 
+/// 外部调度器的 async 方法必须在 Actor 任务内直接 await。
+///
+/// 在 current_thread runtime 上，旧实现的 `futures::executor::block_on`
+/// 会阻塞唯一线程，使 tokio timer 无法推进而永久挂起；本测试同时覆盖
+/// enqueue / enqueue_batch / try_dequeue / dequeue_batch / drain_unrouted /
+/// len / is_empty 的 External 分支。
+#[tokio::test(flavor = "current_thread")]
+async fn external_scheduler_awaits_without_blocking_runtime() {
+    struct TimerScheduler;
+
+    #[async_trait]
+    impl Scheduler for TimerScheduler {
+        async fn enqueue(&self, _task: TaskDefinition) -> Result<(), crate::common::ActantError> {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            Ok(())
+        }
+
+        async fn enqueue_batch(
+            &self,
+            _tasks: Vec<TaskDefinition>,
+        ) -> Result<(), crate::common::ActantError> {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            Ok(())
+        }
+
+        async fn dequeue(&self) -> Option<TaskDefinition> {
+            None
+        }
+
+        async fn try_dequeue(&self) -> Option<TaskDefinition> {
+            None
+        }
+
+        async fn dequeue_batch(&self, _limit: usize) -> Vec<TaskDefinition> {
+            vec![]
+        }
+
+        async fn drain_unrouted(&self) -> Vec<TaskDefinition> {
+            vec![]
+        }
+
+        async fn is_empty(&self) -> bool {
+            true
+        }
+
+        async fn len(&self) -> usize {
+            0
+        }
+    }
+
+    let actor_system = Arc::new(ActorSystem::new());
+    let actor_id = ActorId::new("scheduler-external-timer".to_string());
+    let actor = SchedulerActor::fifo()
+        .with_scheduler(Arc::new(TimerScheduler))
+        .unwrap();
+    actor_system.spawn(actor_id.clone(), actor).await.unwrap();
+    let client = ActorScheduler::new(actor_id, actor_system);
+
+    client.enqueue(make_task("x", 0)).await.unwrap();
+    client.enqueue_batch(vec![make_task("y", 0)]).await.unwrap();
+    assert!(client.try_dequeue().await.is_none());
+    assert!(client.dequeue_batch(10).await.is_empty());
+    assert!(client.drain_unrouted().await.is_empty());
+    assert!(client.is_empty().await);
+    assert_eq!(client.len().await, 0);
+}
+
 // --- Scheduler 契约测试（供第三方实现复用） ---
 
 #[tokio::test]

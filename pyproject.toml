@@ -128,7 +128,8 @@ source = [
 
 [tool.coverage.report]
 # 整体门禁：所有模块平均。当前基线 82.74%，卡 82 防回退；目标 85。
-# 分模块阈值（公共 API / 关键路径）需要独立脚本才能表达，暂不引入。
+# 分模块阈值（公共 API / 关键路径）需要独立脚本才能表达，当前**未接入 CI**，
+# 因此只有下面的整体 fail_under 生效。
 fail_under = 82
 show_missing = true
 skip_covered = false
@@ -143,8 +144,9 @@ exclude_lines = [
     "\\.\\.\\.$",  # Protocol / stub body
 ]
 
-# 分模块门禁：精确控制关键路径覆盖率
-# 通过 `coverage report --include=<glob> --fail-under=N` 在 CI 中分阶段执行
+# 分模块门禁（未接入）：若后续需要，用
+# `coverage report --include=<glob> --fail-under=N` 在 CI 中分阶段执行；
+# 当前 CI 只跑整体 fail_under，不执行分模块命令。
 [tool.mypy]
 python_version = "3.10"
 strict = true

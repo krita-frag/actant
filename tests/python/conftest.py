@@ -152,7 +152,8 @@ def _force_offline_discovery():
     （loopback bind，无 DNS Pkarr，无 relay）。否则默认 local preset 在
     sandbox/CI 环境会阻塞 15s ready timeout。
 
-    需要 real networking 的测试可用 ``@pytest.mark.online`` opt-out。
+    跨节点 e2e 用例通过显式 ``connect_peers`` 建立连接，不依赖发现；本
+    fixture 对整个 session 无条件生效，没有 opt-out 标记。
     """
     prev = os.environ.get("ACTANT_DISCOVERY")
     os.environ["ACTANT_DISCOVERY"] = "none"

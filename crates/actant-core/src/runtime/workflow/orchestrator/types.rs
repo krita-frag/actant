@@ -3,7 +3,9 @@
 //! 这些类型是 `Orchestrator` 操作的数据结构，与 `Orchestrator` 的 impl 解耦，
 //! 便于独立阅读与测试。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
+
+use super::queries::WorkflowStateSummary;
 
 use dashmap::{DashMap, DashSet};
 use serde::{Deserialize, Serialize};
@@ -179,6 +181,22 @@ impl DirtyTracker {
 /// - `pending_signals`：workflow → 等待点注册前抵达的信号缓冲
 /// - `dirty_tracker`：脏 workflow 跟踪器
 /// - `event_seqs`：workflow → 最近一次追加事件的 `EventId`（事件水位）
+///
+/// 另外两张表服务于淘汰后的可观测性：`completed_order` 记录终态结算顺序，
+/// `terminal_summaries` 保留被淘汰工作流的终态摘要，使轮询路径仍能判定终态。
+///
+/// 淘汰后保留的终态摘要条数上限。摘要只有几个标量，不落盘：跨重启的旧工作流
+/// 本就超出保留上限，不承诺可查；这里只覆盖「终态刚被异步淘汰、轮询尚未读到」
+/// 的窗口。
+pub(crate) const TERMINAL_SUMMARY_KEEP: usize = 1024;
+
+/// 终态结算顺序：`queue` 保持最旧在前，`seen` 让去重为 O(1)。
+#[derive(Default)]
+struct CompletedOrder {
+    queue: VecDeque<WorkflowId>,
+    seen: HashSet<WorkflowId>,
+}
+
 pub struct OrchestratorState {
     pub(crate) slots: DashMap<WorkflowId, WorkflowSlot>,
     pub(crate) wait_waiters: WaiterRegistry,
@@ -196,6 +214,13 @@ pub struct OrchestratorState {
     pub(crate) context_values: DashMap<WorkflowId, DashMap<String, ContextEntry>>,
     pub(crate) dirty_tracker: DirtyTracker,
     pub(crate) event_seqs: DashMap<WorkflowId, crate::runtime::state::event_log::EventId>,
+    /// 终态工作流的淘汰顺序（最旧在前）。运行期由 `complete_terminal` 追加，
+    /// 重启时由 `recover` 从已加载的终态快照重建（见 `seed_completed_order`）。
+    completed_order: parking_lot::Mutex<CompletedOrder>,
+    /// 已淘汰工作流的终态摘要，供 `state_summary` 在 slot 缺失时回退查询。
+    terminal_summaries: DashMap<WorkflowId, WorkflowStateSummary>,
+    /// `terminal_summaries` 的淘汰顺序（最旧在前）。
+    terminal_summary_order: parking_lot::Mutex<VecDeque<WorkflowId>>,
 }
 
 impl Default for OrchestratorState {
@@ -214,6 +239,9 @@ impl OrchestratorState {
             context_values: DashMap::new(),
             dirty_tracker: DirtyTracker::new(),
             event_seqs: DashMap::new(),
+            completed_order: parking_lot::Mutex::new(CompletedOrder::default()),
+            terminal_summaries: DashMap::new(),
+            terminal_summary_order: parking_lot::Mutex::new(VecDeque::new()),
         }
     }
 
@@ -272,6 +300,13 @@ impl OrchestratorState {
         self.context_values.remove(workflow_id);
         self.event_seqs.remove(workflow_id);
         self.wait_waiters.remove_workflow(workflow_id);
+        {
+            let mut order = self.completed_order.lock();
+            order.queue.retain(|id| id != workflow_id);
+            order.seen.remove(workflow_id);
+        }
+        // 不清理 terminal_summaries：淘汰时先写入摘要再移除 slot，
+        // 轮询路径仍需据此判定终态。摘要由自身上限淘汰。
     }
 
     /// 记录工作流最近一次成功追加的事件 ID（事件水位）。
@@ -389,6 +424,85 @@ impl OrchestratorState {
     /// Drain all dirty workflow IDs, returning them for batch persistence.
     pub(crate) fn drain_dirty(&self) -> Vec<WorkflowId> {
         self.dirty_tracker.drain()
+    }
+
+    /// 登记一次终态结算，返回因超出保留数而需要淘汰的工作流 ID。
+    ///
+    /// `retention == 0` 由调用方走立即淘汰分支，本方法只在 `retention > 0`
+    /// 时调用；同一工作流重复结算不重复入队。
+    pub(crate) fn record_completed(
+        &self,
+        workflow_id: WorkflowId,
+        retention: usize,
+    ) -> Vec<WorkflowId> {
+        let mut order = self.completed_order.lock();
+        if !order.seen.insert(workflow_id.clone()) {
+            return Vec::new();
+        }
+        order.queue.push_back(workflow_id);
+        let mut evict = Vec::new();
+        while order.queue.len() > retention {
+            if let Some(old) = order.queue.pop_front() {
+                order.seen.remove(&old);
+                evict.push(old);
+            }
+        }
+        evict
+    }
+
+    /// 重启后用从快照加载的终态工作流重建淘汰顺序，返回立即超出保留数的 ID。
+    ///
+    /// 快照扫描顺序不确定，按 `workflow_id` 排序保证淘汰次序可复现；这是
+    /// 「结算先后」在重启后不可精确重建时的确定性近似。
+    pub(crate) fn seed_completed_order(
+        &self,
+        mut ids: Vec<WorkflowId>,
+        retention: usize,
+    ) -> Vec<WorkflowId> {
+        ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        ids.dedup_by(|a, b| a.as_str() == b.as_str());
+        let mut order = self.completed_order.lock();
+        order.queue.clear();
+        order.seen.clear();
+        for id in ids {
+            order.seen.insert(id.clone());
+            order.queue.push_back(id);
+        }
+        if retention == 0 {
+            return Vec::new();
+        }
+        let mut evict = Vec::new();
+        while order.queue.len() > retention {
+            if let Some(old) = order.queue.pop_front() {
+                order.seen.remove(&old);
+                evict.push(old);
+            }
+        }
+        evict
+    }
+
+    /// 淘汰前留存终态摘要，使 `state_summary` 在 slot 消失后仍能返回终态。
+    pub(crate) fn record_evicted_summary(
+        &self,
+        workflow_id: WorkflowId,
+        summary: WorkflowStateSummary,
+    ) {
+        let mut order = self.terminal_summary_order.lock();
+        if !self.terminal_summaries.contains_key(&workflow_id) {
+            order.push_back(workflow_id.clone());
+        }
+        self.terminal_summaries.insert(workflow_id, summary);
+        while order.len() > TERMINAL_SUMMARY_KEEP {
+            if let Some(old) = order.pop_front() {
+                self.terminal_summaries.remove(&old);
+            }
+        }
+    }
+
+    pub(crate) fn evicted_summary(&self, workflow_id: &WorkflowId) -> Option<WorkflowStateSummary> {
+        self.terminal_summaries
+            .get(workflow_id)
+            .map(|entry| entry.clone())
     }
 
     pub(crate) fn active_workflow_ids(&self) -> Vec<WorkflowId> {

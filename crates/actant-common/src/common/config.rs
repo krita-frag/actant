@@ -134,14 +134,11 @@ impl std::fmt::Display for DiscoveryMode {
 /// - `local`：n0 预设（DNS + Pkarr 发布 + relay 兜底），适合互联网节点。
 /// - `dns`：仅 DNS endpoint 发现（`DnsAddressLookup` + `PkarrPublisher`），无 relay。
 ///   适合 K8s Headless Service / 自建 DNS 场景：通过 `dns_origin_domain` 指定起源域。
-/// - `relay`：强制启用 iroh relay（`RelayMode::Default` + DNS），适合 NAT 穿透场景。
 pub mod discovery_mode {
     /// 无自动发现。须通过 `bootstrap_nodes` 或 `dial()` 显式拨号。用于测试和 CI。
     pub const NONE: &str = "none";
     /// n0 预设：DNS Pkarr + relay 兜底。互联网节点的默认模式。
     pub const LOCAL: &str = "local";
-    /// 仅局域网：n0 预设但禁用 relay。
-    pub const MDNS: &str = "mdns";
     /// 仅 DNS endpoint 发现（无 relay）。配合 `dns_origin_domain` 使用。
     pub const DNS: &str = "dns";
 }
@@ -423,6 +420,8 @@ pub struct NetworkConfig {
     pub max_pending_direct_requests: usize,
     /// 订阅后加入 gossip 话题的对端 endpoint ID 列表。
     /// 建立 gossip 订阅时通过 `GossipSender::join_peers` 自动添加这些对端。
+    /// `bootstrap_nodes` 解析出的 endpoint id 会自动并入本集合，本字段只用于
+    /// 仅有 endpoint id、不掌握地址的场景。
     #[serde(default)]
     pub gossip_bootstrap_peers: Vec<String>,
     /// 单个直连请求消息帧的最大字节数。超过此值将被拒绝，防止畸形或恶意对端导致 OOM。默认 16 MiB。
@@ -434,9 +433,9 @@ pub struct NetworkConfig {
     /// 非空 = 仅接受 EndpointId 在此列表中的对端的直连请求；其余连接在 ALPN
     /// `accept` 阶段即被关闭，不读取其请求体。
     ///
-    /// EndpointId 由 iroh 在 QUIC/TLS 握手层基于对端密钥对认证，不可伪造，
-    /// 因此本字段构成对**入站直连请求**的认证白名单。gossip 广播不在本白名单
-    /// 管辖范围（gossip 话题成员由 iroh-gossip 管理，不由此字段控制）。
+    /// 元素必须是 iroh endpoint id（z32，如 `Runtime.peer_id`）；启动期校验，
+    /// 写成完整 `endpoint_addr` 会返回 `Config` 错误而不是静默失联。
+    /// 同一集合还用于 gossip 直连邻居过滤与入站心跳的成员校验。
     #[serde(default)]
     pub allowed_peer_ids: Vec<String>,
     /// 单次直连请求-响应调用的超时（毫秒）。覆盖 connect + open_bi + 读写全过程。
@@ -452,8 +451,9 @@ pub struct NetworkConfig {
     /// 网络事件有界通道容量。
     ///
     /// `NetworkManager` 内部使用此容量的 `mpsc::channel` 缓冲 `NetworkEvent`。
-    /// 当事件生产速率超过消费速率时，新事件被丢弃（仅记录日志）以避免无界队列导致 OOM。
-    /// 高吞吐场景下应适当增大此值。默认 1024。
+    /// 控制面 gossip 消息（心跳 / claim / DAG 状态）在通道满时**背压等待**，
+    /// 不丢弃；连接类事件（`PeerConnected` / `PeerDisconnected`）是观测性
+    /// 通知，满时丢弃并仅记录日志。高吞吐场景下应适当增大此值。默认 1024。
     #[serde(default = "default_event_channel_capacity")]
     pub event_channel_capacity: usize,
     /// 自定义 DNS 起源域名，仅当 `discovery_mode = "dns"` 时生效。
@@ -676,8 +676,9 @@ impl Default for EventBusConfig {
 ///   新节点无法安全接管工作流，可能导致双主。
 ///
 /// - **`lease_duration_ms`**：工作流租约时长。持有者必须在此时间内续约，否则租约过期，
-///   其他节点可竞争接管。默认 = `failure_timeout_ms * 2`，确保故障检测（约
-///   `failure_timeout_ms`）完成后仍有充足时间让原持有者的租约自然过期。
+///   其他节点可竞争接管。默认 16000ms（固定值，不随 `failure_timeout_ms` 推导），
+///   须保持严格大于 `failure_timeout_ms`；调大 `failure_timeout_ms` 时须同步调大本值，
+///   否则启动校验会拒绝。
 ///
 /// - **`lease_expiry_check_interval_secs`**：租约过期扫描周期。此值决定了从租约实际
 ///   过期到被检测到的延迟。建议 `lease_expiry_check_interval_secs * 1000 <=
@@ -692,12 +693,18 @@ impl Default for EventBusConfig {
 /// t=0s    节点 A 持有工作流 W 的租约（有效期至 t=16s）
 /// t=2s    A 发送心跳
 /// t=4s    A 发送心跳
-/// t=6s    A 发送心跳
+/// t=6s    A 发送心跳（最后一次）
 /// t=8s    A 崩溃，停止心跳
-/// t=10s   其他节点发现 A 已超过 failure_timeout (8s) 未心跳 → 标记 A 失联
-/// t=16s   W 的租约过期
-/// t≤46s   下次 lease_expiry_check 扫描发现 W 租约过期 → 触发接管选举
+/// t>14s   B 发现 `now - last_heartbeat > failure_timeout`（8s）→ 标记 A 失联
+///         （判据是"最后一次心跳之后超过 timeout"，故最早也要等 t=6s+8s）
+/// t≈14s   B 的故障检测轮次（周期 failure_timeout/2 = 4s）按一致性哈希选举：
+///         若 W 的租约仍有效则**退让**，W 进入待接管表，逐轮重试
+/// t=16s   W 的租约到期，此后 claim 不再退让
+/// t≈18s   B 在下一轮故障检测中接管成功 → 重调度 W 的在途任务
 /// ```
+///
+/// 注意 `lease_expiry_check_interval_secs` 只驱动 `expire_leases`（续租与本节点
+/// 名下过期条目的清理），**不触发接管选举**；选举在故障检测循环里进行。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FailoverConfig {
     /// 心跳发送间隔（毫秒）。建议 `failure_timeout_ms / 3` 以上。
@@ -708,9 +715,9 @@ pub struct FailoverConfig {
     /// 租约过期扫描周期（**秒**）。注意与其他参数的单位差异。
     /// 建议此值（换算为毫秒）不超过 `lease_duration_ms / 2`。
     pub lease_expiry_check_interval_secs: u64,
-    /// 工作流租约时长（毫秒）。默认 = `failure_timeout_ms * 2`。
-    /// 必须严格大于 `failure_timeout_ms`，否则故障检测完成前租约未过期，
-    /// 可能导致双主。
+    /// 工作流租约时长（毫秒）。默认 16000ms（固定值，不随
+    /// `failure_timeout_ms` 推导）。必须严格大于 `failure_timeout_ms`，
+    /// 否则故障检测完成前租约未过期，可能导致双主。
     #[serde(default = "default_lease_duration_ms")]
     pub lease_duration_ms: u64,
 }

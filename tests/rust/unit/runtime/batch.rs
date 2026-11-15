@@ -149,3 +149,29 @@ fn remove_clears_batch_and_members() {
         .record_terminal(&tid("t-1"), BatchItemState::Completed)
         .is_none());
 }
+
+/// `register` 的「写 members → 建 batches」窗口内，终态不得被永久丢弃。
+#[test]
+fn terminal_during_registration_window_is_recoverable() {
+    let tracker = BatchTracker::new();
+    let task = tid("t-race");
+    // 模拟并发窗口：members 已有该任务，但 batch 状态尚未建立。
+    tracker.members.insert(task.clone(), "b-race".to_string());
+    assert!(tracker.batches.get("b-race").is_none());
+    assert!(
+        tracker
+            .record_terminal(&task, BatchItemState::Completed)
+            .is_none(),
+        "batch 状态缺失时本次结算可以不产出进度，但必须保留成员以便重试"
+    );
+    assert!(
+        tracker.members.contains_key(&task),
+        "终态结算未产出进度时，成员映射不得被删除（否则事件永久丢失）"
+    );
+    // 注册补齐 batch 状态后，迟到的终态仍能收敛到 finished。
+    tracker.register("b-race", [task.clone()]);
+    let progress = tracker
+        .record_terminal(&task, BatchItemState::Completed)
+        .expect("成员映射保留后，重试必须能结算");
+    assert!(progress.finished(), "batch 进度必须能收敛：{progress:?}");
+}

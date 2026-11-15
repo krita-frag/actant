@@ -110,6 +110,34 @@ class TestFlowOrchestration:
         kinds = [i["kind"] for i in events.items]
         assert kinds == ["submitted", "started", "failed"], kinds
 
+    def test_state_summary_omits_task_results(self) -> None:
+        """摘要查询不搬任务结果，标量字段与完整快照一致。"""
+
+        @flow(name="wf-summary")
+        def pipeline(src: int) -> int:
+            return _fetch.submit(src).result()
+
+        events = _Events()
+        with Runtime() as rt:
+            rt.layer("WorkflowLifecycle", "emit").chain(events)
+            assert pipeline(7) == 7
+            wf_id = events.items[-1]["workflow_id"]
+            full = rt.get_workflow_state(wf_id)
+            summary = rt.get_workflow_state_summary(wf_id)
+            assert full is not None and summary is not None
+            # 轮询面刻意不含 tasks：这是"不搬结果字节"的实现约束，不是遗漏。
+            assert "tasks" not in summary, summary
+            for key in (
+                "workflow_id",
+                "state",
+                "failure_strategy",
+                "error",
+                "succeeded_count",
+                "total_count",
+            ):
+                assert summary[key] == full[key], key
+            assert rt.get_workflow_state_summary("missing-wf") is None
+
     def test_query_state_by_id_after_terminal(self) -> None:
         """终态后可按 ID 查询：状态/计数/tasks 明细可读。"""
 
@@ -288,30 +316,70 @@ class TestFlowOrchestration:
             assert pipeline(5) == "stored[5]"
             history = rt.get_workflow_journal(seen[0], raw=True)
 
-        kinds = [e["kind"] for e in history]
-        # 提交 → 节点 → 启动 → 完成 → 工作流终态。
-        assert "Submitted" in kinds, kinds
-        assert kinds.count("NodeAdded") == 2, kinds
-        assert "Started" in kinds, kinds
-        assert "Completed" in kinds, kinds
-        assert kinds.count("TaskCompleted") == 2, kinds
+            kinds = [e["kind"] for e in history]
+            assert "Submitted" in kinds, kinds
+            assert kinds.count("NodeAdded") == 2, kinds
+            assert "Started" in kinds, kinds
+            assert "Completed" in kinds, kinds
+            assert kinds.count("TaskCompleted") == 2, kinds
 
-        # 筛选字段：任务事件带 task_id；payload 是不透明字节。
-        completed = [e for e in history if e["kind"] == "TaskCompleted"]
-        assert all(e["task_id"] for e in completed), completed
-        assert all(isinstance(e["payload"], bytes) for e in history)
-        # 序列递增，可作为游标。
-        seqs = [e["sequence"] for e in history]
-        assert seqs == sorted(seqs), seqs
+            # 筛选字段：任务事件带 task_id；payload 是不透明字节。
+            completed = [e for e in history if e["kind"] == "TaskCompleted"]
+            assert all(e["task_id"] for e in completed), completed
+            assert all(isinstance(e["payload"], bytes) for e in history)
+            # 序列递增，可作为游标。
+            seqs = [e["sequence"] for e in history]
+            assert seqs == sorted(seqs), seqs
 
-        # 游标：从中间读取应更短，且不与头部重叠。
-        cursor = (history[2]["sequence"], history[2]["timestamp_ms"])
-        with Runtime():
-            pass
-        tail_history: list[dict] = []
-        with Runtime() as rt2:
-            tail_history = rt2.get_workflow_journal(seen[0], raw=True, after=cursor)
-        assert len(tail_history) < len(history)
+            # 游标：从中间读取应恰好是剩余部分（必须同一实例，历史才可见）。
+            cursor = (history[2]["sequence"], history[2]["timestamp_ns"])
+            tail = rt.get_workflow_journal(seen[0], raw=True, after=cursor)
+        assert [e["sequence"] for e in tail] == [
+            e["sequence"] for e in history[3:]
+        ]
+
+    def test_journal_timestamp_is_epoch_nanoseconds(self) -> None:
+        """``timestamp_ns`` 必须是真实 epoch **纳秒**，且能精确续读。
+
+        历史事件 ID 由 HLC 生成，`wall_time` 取自 `SystemTime::as_nanos()`。
+        导出字段必须如实反映这一量纲：若名字写成毫秒而值是纳秒，按字段名
+        构造的时间过滤会错 10⁶ 倍；按毫秒构造的 ``after`` 游标会退化成
+        “从头读”。
+        """
+        seen: list[str] = []
+
+        @flow(name="wf-ts-unit")
+        def pipeline(src: int) -> int:
+            seen.append(current_workflow_id() or "")
+            return _fetch.submit(src).result()
+
+        with Runtime() as rt:
+            start_ns = time.time_ns()
+            assert pipeline(7) == 7
+            history = rt.get_workflow_journal(seen[0], raw=True)
+            journal = rt.get_workflow_journal(seen[0])
+            end_ns = time.time_ns()
+
+            assert history, "journal 不得为空"
+            for entry in history:
+                ts = entry["timestamp_ns"]
+                # 毫秒量纲的 epoch 值在 1e12 量级，纳秒在 1e18 量级。
+                assert ts > 10**15, f"timestamp_ns={ts} 是毫秒量纲"
+                assert start_ns <= ts <= end_ns, (
+                    f"timestamp_ns={ts} 不在 [{start_ns}, {end_ns}] 内，"
+                    "说明导出的是毫秒或其它量纲"
+                )
+            # 规范化视图使用同一量纲，否则两个出口无法互相引用。
+            assert [e["timestamp_ns"] for e in journal] == [
+                e["timestamp_ns"] for e in history
+            ]
+
+            # 游标取上一项的 (sequence, timestamp_ns)，续读必须恰好是剩余部分。
+            cursor = (history[2]["sequence"], history[2]["timestamp_ns"])
+            tail = rt.get_workflow_journal(seen[0], raw=True, after=cursor)
+        assert [e["sequence"] for e in tail] == [
+            e["sequence"] for e in history[3:]
+        ], "游标续读必须无重叠、无遗漏"
 
     def test_get_workflow_journal_raw_returns_empty_for_unknown_workflow(self) -> None:
         """未知工作流 → 空列表（历史是**可选**观测面，缺失不构成错误）。"""

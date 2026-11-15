@@ -110,6 +110,14 @@ _NetworkConfig(preset: str | None = None, bootstrap_nodes: list[str] | None = No
 | `relay_endpoints` | `list[str]` | 自定义 relay 集群 URL 列表；非空时覆盖 preset 自带的 relay 配置。 |
 | `require_signed_records` | `bool` | 强制校验心跳节点记录签名。 |
 
+**方法**
+
+```python
+def with_required_signatures(self) -> _NetworkConfig
+```
+
+返回 ``require_signed_records=True`` 的副本，不改动原对象。
+
 ### `_FailoverConfig`
 
 **构造**
@@ -212,10 +220,10 @@ _ActantConfig(payload_signing_key: str, network: _NetworkConfig | None = None, f
 | `prefetch_max` | `int` |  |
 | `worker_cancel_grace_ms` | `int` |  |
 | `pending_result_channel_capacity` | `int` |  |
-| `completed_retention_count` | `int` |  |
-| `max_history_events` | `int` |  |
-| `persist_flush_interval_ms` | `int` |  |
-| `state_poll_interval_ms` | `int` |  |
+| `completed_retention_count` | `int` | 终态工作流保留条数上限，``0`` 表示终态即淘汰；``None`` 构造时不覆盖 Rust 默认 ``1000``。 |
+| `max_history_events` | `int` | 每个工作流保留的已被快照吸收事件上限，``0`` 表示不裁剪；``None`` 构造时不覆盖 Rust 默认 ``0``。 |
+| `persist_flush_interval_ms` | `int` | 脏工作流状态批量落盘间隔；``None`` 构造时不覆盖 Rust 默认 ``200``。 |
+| `state_poll_interval_ms` | `int` | 工作流状态轮询间隔；``None`` 构造时不覆盖 Rust 默认 ``500``。 |
 
 ### `PyAsyncAwaitable`
 
@@ -527,6 +535,12 @@ def cancel_workflow(self, workflow_id: str) -> None
 ```
 
 ```python
+def fail_workflow(self, workflow_id: str, error: str) -> None
+```
+
+以 Failed 终态结束工作流并保留错误（flow 函数体异常收尾）。
+
+```python
 def seal_workflow(self, workflow_id: str) -> None
 ```
 
@@ -620,6 +634,17 @@ def get_workflow_state(self, workflow_id: str) -> dict[str, Any] | None
 ```
 
 ```python
+def get_workflow_state_summary(self, workflow_id: str) -> dict[str, Any] | None
+```
+
+查询工作流状态**摘要**（不含任务结果）。
+
+返回 ``workflow_id`` / ``state`` / ``failure_strategy`` / ``error`` /
+``succeeded_count`` / ``total_count``，或 ``None``（工作流不存在）。
+与 `get_workflow_state` 的分工：本方法供轮询终态使用，不构造 ``tasks``
+子字典、不克隆结果字节；确认终态后需要结果时再取完整快照。
+
+```python
 def get_dag(self, workflow_id: str) -> dict[str, Any] | None
 ```
 
@@ -636,9 +661,10 @@ def get_workflow_history(self, workflow_id: str, *, after: tuple[int, int] | Non
 
 读取工作流事件历史（审计出口）。
 
-每项 ``{sequence, timestamp_ms, kind, task_id, error, payload}``；``kind``
+每项 ``{sequence, timestamp_ns, kind, task_id, error, payload}``；``kind``
 / ``task_id`` / ``error`` 供筛选，``payload`` 为不透明字节。`after` 是
-``(sequence, timestamp_ms)`` 游标，``None`` 从头读取。
+``(sequence, timestamp_ns)`` 游标（``timestamp_ns`` 为 epoch 纳秒），
+``None`` 从头读取。
 
 ```python
 def get_workflow_journal(self, workflow_id: str) -> list[dict[str, Any]]
@@ -646,7 +672,7 @@ def get_workflow_journal(self, workflow_id: str) -> list[dict[str, Any]]
 
 读取工作流的稳定 journal（跨语言消费面）。
 
-每项固定含 ``seq`` / ``timestamp_ms`` / ``kind`` / ``workflow_id`` /
+每项固定含 ``seq`` / ``timestamp_ns`` / ``kind`` / ``workflow_id`` /
 ``task_id`` / ``wait_key`` / ``error`` / ``payload``，并按事件类型附带
 ``condition``（等待点标签）与 ``invocation``（提交描述 dict / ``None``）。
 ``kind`` 为小写稳定事件名；``payload`` 是该事件的业务字节。

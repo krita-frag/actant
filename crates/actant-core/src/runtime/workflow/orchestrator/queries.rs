@@ -46,12 +46,56 @@ pub struct DagEdgeSnapshot {
     pub to: String,
 }
 
+/// 工作流状态摘要（高频轮询的轻量面）。
+///
+/// 与 [`Orchestrator::get_state`] 的区别是**不搬任务结果字节**：等待终态的轮询
+/// 只需要 `state` / `error` / 计数，而 `tasks[*].result` 可能是 MB 级，
+/// 每个轮询周期克隆全部结果会让等待期间的 CPU 与分配随任务数线性增长。
+/// 终态判定后需要结果时再调一次完整 `get_workflow_state`。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowStateSummary {
+    pub workflow_id: String,
+    pub state: String,
+    pub failure_strategy: String,
+    pub error: Option<String>,
+    pub succeeded_count: usize,
+    pub total_count: usize,
+}
+
+impl WorkflowStateSummary {
+    pub(crate) fn from_execution(workflow_id: &WorkflowId, exec: &WorkflowExecution) -> Self {
+        Self {
+            workflow_id: workflow_id.as_str().to_string(),
+            state: exec.state.as_str().to_string(),
+            failure_strategy: exec.failure_strategy.as_str().to_string(),
+            error: exec.error.clone(),
+            succeeded_count: exec.succeeded_count(),
+            total_count: exec.total_count(),
+        }
+    }
+}
+
 impl Orchestrator {
     pub fn get_state(&self, workflow_id: &WorkflowId) -> Option<WorkflowExecution> {
         self.state
             .slots
             .get(workflow_id)
             .map(|s| s.execution.clone())
+    }
+
+    /// 摘要读取：只克隆标量与计数，不碰 `tasks`。
+    ///
+    /// 工作流被淘汰后 slot 消失，回退到淘汰时留存的终态摘要：轮询方据此
+    /// 仍能看到 Completed / Failed / Cancelled 与错误，而不是把「已淘汰」
+    /// 误判成「不存在」而把失败上报为完成。
+    pub fn state_summary(&self, workflow_id: &WorkflowId) -> Option<WorkflowStateSummary> {
+        if let Some(slot) = self.state.slots.get(workflow_id) {
+            return Some(WorkflowStateSummary::from_execution(
+                workflow_id,
+                &slot.execution,
+            ));
+        }
+        self.state.evicted_summary(workflow_id)
     }
 
     pub fn get_dag(&self, workflow_id: &WorkflowId) -> Option<Dag> {
@@ -165,6 +209,12 @@ impl Orchestrator {
         self.state.contains_workflow(workflow_id)
     }
 
+    /// 工作流是否在淘汰保留的终态摘要表中（slot 已消失）。
+    /// 供 actor 的迟到结果守卫区分「已终结的淘汰历史」与「从未存在」。
+    pub fn has_evicted_summary(&self, workflow_id: &WorkflowId) -> bool {
+        self.state.evicted_summary(workflow_id).is_some()
+    }
+
     /// Serialize the current workflow state (dag, execution, pending) as rkyv bytes.
     /// Returns (dag_bytes, exec_bytes, pending_bytes) or None if workflow not found.
     pub async fn get_workflow_state_bytes(
@@ -258,7 +308,7 @@ impl Orchestrator {
     /// 返回指定工作流中处于 `Running` 状态的任务 ID 列表。
     ///
     /// 工作流不存在时返回空列表。用于崩溃故障转移时枚举需要重新调度
-    /// 的在途任务（见 `reschedule_running_tasks`）。
+    /// 的在途任务（见 `reschedule_incomplete_tasks`）。
     pub fn get_running_task_ids(&self, workflow_id: &WorkflowId) -> Vec<TaskId> {
         if let Some(slot) = self.state.slots.get(workflow_id) {
             slot.execution
@@ -318,7 +368,16 @@ impl Orchestrator {
         let raw = self.get_result(workflow_id).await?;
         match unpack_payload(&raw) {
             Ok(items) => Some(items),
-            Err(_) => Some(vec![raw]),
+            Err(e) => {
+                // 未打包的裸 payload（single 标签或历史直写）是合法兼容输入，
+                // 按单结果返回；记录解码原因以便区分兼容路径与损坏数据。
+                tracing::debug!(
+                    workflow_id = %workflow_id.0,
+                    error = %e,
+                    "result payload is not a group encoding; treating as a single result"
+                );
+                Some(vec![raw])
+            }
         }
     }
 }

@@ -44,18 +44,15 @@ fn make_task_dispatch() -> WireMessage {
     })
 }
 
-/// 构造一个含 10 个活跃 workflow 的 NodeHeartbeat（典型规模）。
+/// 构造一个 NodeHeartbeat（规模由容量字段决定）。
 fn make_node_heartbeat() -> WireMessage {
-    let active_workflows = (0..10)
-        .map(|i| WorkflowId::from(format!("wf-bench-{i:04}").as_str()))
-        .collect();
     WireMessage::NodeHeartbeat(NodeHeartbeat {
         signature: None,
         labels: std::collections::BTreeMap::new(),
         platform: None,
         available_quotas: std::collections::BTreeMap::new(),
         node_id: NodeId::from("node-bench-self"),
-        active_workflows,
+        active_workflows: Vec::new(),
         timestamp_ms: 1_700_000_000_000,
         available_slots: 8,
         max_slots: 16,
@@ -76,7 +73,7 @@ fn bench_wrap(c: &mut Criterion) {
         &dispatch,
         |b, msg| {
             b.iter(|| {
-                let env = WireEnvelope::wrap(black_box(msg.clone()));
+                let env = WireEnvelope::wrap(black_box(msg.clone())).expect("wire envelope wrap");
                 black_box(env);
             });
         },
@@ -86,7 +83,7 @@ fn bench_wrap(c: &mut Criterion) {
         &heartbeat,
         |b, msg| {
             b.iter(|| {
-                let env = WireEnvelope::wrap(black_box(msg.clone()));
+                let env = WireEnvelope::wrap(black_box(msg.clone())).expect("wire envelope wrap");
                 black_box(env);
             });
         },
@@ -100,8 +97,10 @@ fn bench_wrap(c: &mut Criterion) {
 fn bench_decode(c: &mut Criterion) {
     let dispatch = make_task_dispatch();
     let heartbeat = make_node_heartbeat();
-    let dispatch_bytes = postcard::to_allocvec(&WireEnvelope::wrap(dispatch)).unwrap();
-    let heartbeat_bytes = postcard::to_allocvec(&WireEnvelope::wrap(heartbeat)).unwrap();
+    let dispatch_bytes =
+        postcard::to_allocvec(&WireEnvelope::wrap(dispatch).expect("wire envelope wrap")).unwrap();
+    let heartbeat_bytes =
+        postcard::to_allocvec(&WireEnvelope::wrap(heartbeat).expect("wire envelope wrap")).unwrap();
 
     let mut group = c.benchmark_group("network/decode");
     group.bench_with_input(
@@ -138,7 +137,7 @@ fn bench_round_trip(c: &mut Criterion) {
         &dispatch,
         |b, msg| {
             b.iter(|| {
-                let env = WireEnvelope::wrap(black_box(msg.clone()));
+                let env = WireEnvelope::wrap(black_box(msg.clone())).expect("wire envelope wrap");
                 let bytes = postcard::to_allocvec(&env).unwrap();
                 let decoded = WireEnvelope::decode(black_box(&bytes));
                 black_box(decoded);

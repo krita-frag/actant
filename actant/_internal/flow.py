@@ -39,6 +39,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import random
 import struct
@@ -344,26 +345,18 @@ def _current_flow_state() -> _FlowState | None:
 
 
 def _cancel_flow_tasks(workflow_id: str) -> None:
-    """取消指定 workflow 下的所有本地任务（flow 失败/超时时调用）。"""
-    from actant._internal.runtime import get_current_runtime
+    """取消指定 workflow 下的所有本地任务（flow 失败/超时时调用）。
+
+    圈定任务集的判定与 ``AsyncResult.cancel(propagate=True)`` 共用
+    ``Runtime._cancel_workflow_tasks``：两者都是「按 workflow 取本地任务并逐个
+    提交取消请求」，差别只在失败路径没有发起方句柄可跳过。
+    """
+    from actant._internal.runtime import _cancel_workflow_tasks, get_current_runtime
 
     runtime = get_current_runtime()
     if runtime is None:
         return
-    for tid in list(runtime._list_tasks()):
-        handle = runtime._get_task(tid)
-        if handle is not None and handle.workflow_id == workflow_id:
-            try:
-                handle.cancel(propagate=False)
-            except Exception:
-                # 批量取消：单个任务取消失败不应阻止后续任务被取消，
-                # 记录 warning 后继续（最终由 flow 失败异常向上传播）。
-                _logger.warning(
-                    "flow %s: failed to cancel task %s",
-                    workflow_id,
-                    tid,
-                    exc_info=True,
-                )
+    _cancel_workflow_tasks(runtime, workflow_id)
 
 
 class _FlowContext:
@@ -1303,6 +1296,12 @@ def flow(
                 f"{_VALID_FAILURE_STRATEGIES} or None, got {failure_strategy!r}"
             )
         flow_name = name or f.__qualname__
+        # workflow_id = f"{flow_name}-{uuid}"，最终进入 journal topic 拼接与
+        # event_log 的前缀扫描：':' 会让前缀互相包含（Rust 侧
+        # validate_workflow_id 拒绝）。装饰期提前报错并指向 flow 名根因，
+        # 而不是提交时以拼好的 workflow_id 报 ConfigError。
+        if ":" in flow_name:
+            raise ValueError(f"flow: name must not contain ':', got {flow_name!r}")
         # 导入时登记定义：host loop 只凭 journal 中的 flow 名即可找回函数体。
         # 调用参数不在登记里——它们随 invocation 持久化，与进程无关。
         FLOW_REGISTRY.register(
@@ -1414,27 +1413,37 @@ def _run_body(
 def _settle_flow_failure(runtime: Any, state: _FlowState, exc: BaseException) -> None:
     """flow 函数体失败/超时的收尾：工作流终态化 + 级联取消 + 失败事件。
 
-    - ``cancel_workflow`` 把仍在运行/排队的工作流置为 Cancelled 终态
-      （已终态或未创建时幂等/忽略）——防止编排节点在失败后继续执行；
+    - 业务异常经 ``_fail_workflow`` 置为 **Failed** 并保留真实错误；只有
+      协程取消（``asyncio.CancelledError``）才走 ``cancel_workflow`` 置为
+      Cancelled。把两者混为一谈会让 ``FlowHandle.result()`` 把业务失败报成
+      「工作流被取消」并丢失错误串。
     - 本地句柄级联取消（best-effort，与既有语义一致）；
-    - 广播 ``failed`` 事件。错误源是函数体异常本身（任务失败经
-      ``AsyncResult.result()`` 重抛的同源异常）。
+    - 广播 ``failed`` / ``cancelled`` 事件。错误源是函数体异常本身（任务失败
+      经 ``AsyncResult.result()`` 重抛的同源异常）。
     """
     workflow_id = state.workflow_id
+    is_cancelled = isinstance(exc, asyncio.CancelledError)
     try:
         if state.workflow_created or state.existing:
-            runtime.cancel_workflow(workflow_id)
-    except Exception as cancel_exc:
-        # 工作流可能已终态（fail-fast 已触发）：取消是兜底动作，失败不应掩盖
-        # 原始异常，且日志应记录真正的**取消失败**原因（cancel_exc），而不是误记
-        # 函数体原始异常（exc）。
+            if is_cancelled:
+                runtime.cancel_workflow(workflow_id)
+            else:
+                runtime._fail_workflow(workflow_id, f"{type(exc).__name__}: {exc}")
+    except Exception as settle_exc:
+        # 工作流可能已终态（fail-fast 已触发）：终态化是兜底动作，失败不应掩盖
+        # 原始异常，且日志应记录真正的**终态化失败**原因（settle_exc）。
         _logger.debug(
-            "flow %s: cancel_workflow skipped (%s)",
+            "flow %s: %s skipped (%s)",
             workflow_id,
-            type(cancel_exc).__name__,
+            "cancel_workflow" if is_cancelled else "fail_workflow",
+            type(settle_exc).__name__,
         )
     _cancel_flow_tasks(workflow_id)
-    _safe_emit(workflow_id, "failed", error=f"{type(exc).__name__}: {exc}")
+    _safe_emit(
+        workflow_id,
+        "cancelled" if is_cancelled else "failed",
+        error=f"{type(exc).__name__}: {exc}",
+    )
 
 
 def _wait_terminal(
@@ -1454,16 +1463,18 @@ def _wait_terminal(
     """
     deadline = 0.0 if timeout_ms <= 0 else time.monotonic() + timeout_ms / 1000.0
     while True:
-        state = cast("dict[str, Any] | None", runtime.get_workflow_state(workflow_id))
-        if state is None:
+        # 全程读摘要：终态裁决只需要 ``state`` / ``error``，而完整快照每次都会
+        # 把全部任务结果字节搬进 Python dict。返回的也是摘要（不含 ``tasks``）——
+        # 本函数的消费方只看 state/error，任务明细请自行查 get_workflow_state。
+        summary = cast(
+            "dict[str, Any] | None", runtime.get_workflow_state_summary(workflow_id)
+        )
+        if summary is None:
             raise NotFoundError(f"flow {workflow_id!r} not found")
-        state_name = state.get("state")
-        if state_name in (
-            WORKFLOW_STATE_COMPLETED,
-            WORKFLOW_STATE_FAILED,
-            WORKFLOW_STATE_CANCELLED,
-        ):
-            return state
+        # 终态判定只认 ``_terminal_kind``：本函数与 ``_wait_terminal_and_emit``
+        # 若各自维护一份状态集合，新增/重命名终态时必然漏改一处。
+        if _terminal_kind(summary) != "pending":
+            return summary
         if deadline and time.monotonic() >= deadline:
             raise ActantTimeoutError(
                 f"flow {workflow_id!r} did not reach a terminal state within {timeout_ms}ms"
@@ -1511,9 +1522,11 @@ def _emit_terminal(
         _safe_emit(workflow_id, "failed", error=(state or {}).get("error") or "")
         return True
     if kind == "cancelled":
+        # 取消终态发布 cancelled（WorkflowEvent 支持）：与 _settle_flow_failure
+        # 的本地取消路径一致，订阅者可据事件种类区分失败与取消。
         _safe_emit(
             workflow_id,
-            "failed",
+            "cancelled",
             error=(state or {}).get("error") or "workflow cancelled",
         )
         return True
@@ -1528,7 +1541,8 @@ def _wait_terminal_and_emit(
 ) -> dict[str, Any] | None:
     """等待工作流到达终态，广播生命周期事件，并返回该终态快照。
 
-    轮询 ``get_workflow_state``（终态由最后一个任务完成触发）。
+    轮询 ``get_workflow_state_summary``（终态由最后一个任务完成触发）。返回的是
+    摘要快照（不含 ``tasks``）：调用方只用 ``state``/``error`` 做终局裁决。
     工作流不存在（空 flow 未创建 / 已被淘汰）时直接广播 ``completed`` 并返回
     ``None``（空 flow 无编排数据，语义上立即完成）。
 
@@ -1536,7 +1550,7 @@ def _wait_terminal_and_emit(
     ``completed`` 时应能立即查询到 workflow 返回值，否则事件与可查询状态
     之间存在确定性窗口。
 
-    返回终态快照供调用方做终局裁决（``failed`` 且 error 为 deadline 到期
+    返回终态摘要供调用方做终局裁决（``failed`` 且 error 为 deadline 到期
     时，调用方须抛 ``ActantTimeoutError`` 而非返回结果）。
 
     Python 侧不设等待上界：工作流带
@@ -1544,14 +1558,13 @@ def _wait_terminal_and_emit(
     因此必然退出；不带 deadline 的工作流本就允许任意时长运行。
     """
     while True:
-        state = cast("dict[str, Any] | None", runtime.get_workflow_state(workflow_id))
-        if _emit_terminal(
-            workflow_id,
-            state,
-            _terminal_kind(state),
-            on_completed=on_completed,
-        ):
-            return state
+        summary = cast(
+            "dict[str, Any] | None", runtime.get_workflow_state_summary(workflow_id)
+        )
+        kind = _terminal_kind(summary)
+        if kind != "pending":
+            _emit_terminal(workflow_id, summary, kind, on_completed=on_completed)
+            return summary
         time.sleep(_FLOW_TERMINAL_POLL_INTERVAL_S)
 
 

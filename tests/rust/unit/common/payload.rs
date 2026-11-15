@@ -59,6 +59,24 @@ fn empty_key_disables_signing() {
 // --- Wire MAC ---
 
 #[test]
+fn unpack_group_rejects_impossible_count_before_allocating() {
+    // 5 字节载荷声明 u32::MAX 个结果；必须在 Vec::with_capacity 前拒绝，
+    // 否则会触发数 GB 的内存分配尝试。
+    let payload = [TAG_GROUP, 0xFF, 0xFF, 0xFF, 0xFF];
+    assert!(unpack_payload(&payload).is_err());
+}
+
+#[test]
+fn unpack_group_rejects_count_beyond_available_bytes() {
+    // 声明 2 个结果，但正文只够 1 个（4 字节长度 + 1 字节数据）。
+    let mut payload = vec![TAG_GROUP];
+    payload.extend_from_slice(&2u32.to_le_bytes());
+    payload.extend_from_slice(&1u32.to_le_bytes());
+    payload.push(0xAA);
+    assert!(unpack_payload(&payload).is_err());
+}
+
+#[test]
 fn wire_mac_roundtrip() {
     let key = b"cluster-secret";
     let bytes = b"some wire message bytes";
@@ -98,6 +116,22 @@ fn wire_mac_empty_key_disables() {
 fn wire_mac_wrong_length_fails() {
     let short = [0u8; 16];
     assert!(verify_wire_mac(b"key", b"bytes", &short).is_err());
+}
+
+#[test]
+fn wire_mac_incremental_matches_single_buffer() {
+    let key = b"cluster-secret";
+    let segments: [&[u8]; 3] = [b"version", b"message-body", b"traceparent"];
+    let expected = wire_mac_incremental(key, &segments).expect("non-empty key");
+    // 单缓冲校验必须与分段校验一致（同字节序）。
+    let joined: Vec<u8> = segments.concat();
+    assert_eq!(Some(expected), wire_mac(key, &joined));
+    verify_wire_mac_incremental(key, &segments, &expected).expect("valid MAC should verify");
+
+    let mut tampered = expected;
+    tampered[0] ^= 0xFF;
+    assert!(verify_wire_mac_incremental(key, &segments, &tampered).is_err());
+    assert!(verify_wire_mac_incremental(key, &segments, &[0u8; 16]).is_err());
 }
 
 /// 回归测试：所有字节位错的 MAC 都应被拒绝，且不依赖前缀提前返回。

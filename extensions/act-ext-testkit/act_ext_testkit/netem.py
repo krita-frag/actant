@@ -292,6 +292,14 @@ class NetemRun:
     def wait(self, *, timeout_s: float | None = None) -> None:
         try:
             self._run.wait(timeout_s=timeout_s)
+            # FaultRun 默认 strict=False：注入失败只进 errors 而不抛错。等待方
+            # 必须感知，否则「未注入」会被当成一次成功的弱网实验。
+            errors = self.errors
+            if errors:
+                fault, error = errors[0]
+                raise NetemError(
+                    f"netem fault {fault.to_dict()} failed: {error}"
+                ) from error
         finally:
             self.restore()
 

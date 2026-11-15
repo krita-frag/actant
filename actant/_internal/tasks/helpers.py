@@ -36,6 +36,13 @@ _logger = logging.getLogger("actant.tasks")
 # 暴露为模块常量便于测试覆盖超时分支（避免每次测试等待 5s）。
 _EVENT_BATCHER_CLOSE_JOIN_TIMEOUT: float = 5.0
 
+# 事件批处理的默认时间窗口（毫秒）。
+#
+# 1ms 窗口在高频事件下每批只有一两条，拿不到批处理收益，却固定付出约
+# 1000 次/秒的线程唤醒与 buffer 锁竞争；25ms 仍远低于人眼可感知的延迟上界，
+# 同时让「100 条阈值」只在真正的高吞吐场景才触发。
+_DEFAULT_EVENT_FLUSH_INTERVAL_MS = 25
+
 # Dispatch 载荷版本字节（与 `actant/_internal/tasks/worker.py` 保持一致）。
 # v2：控制元数据内联为紧凑二进制头部，载荷仅序列化 (func, args, kwargs)。
 _PAYLOAD_VERSION = 0x02
@@ -52,15 +59,16 @@ class _EventBatcher:
     触发 flush；调用方也可显式调用 ``flush()`` 强制立即派发。
 
     派发策略：每次 flush 将 buffer 中所有事件顺序 emit 到 ``TaskLifecycle``
-    capability。emit 失败按 ``on_error="log"`` 处理（单事件失败不阻塞其他）。
+    capability。单条渲染失败记 WARNING 后继续下一条，且不回灌该事件——回灌会
+    让后台线程对每个持续失败的渲染器无限重试。
     """
 
     def __init__(
         self,
         *,
-        flush_interval_ms: int = 1,
+        render: Callable[[str, str, str, dict[str, Any]], None],
+        flush_interval_ms: int = _DEFAULT_EVENT_FLUSH_INTERVAL_MS,
         flush_threshold: int = 100,
-        render: Callable[[str, str, str, dict[str, Any]], None] | None = None,
     ) -> None:
         if flush_interval_ms < 0:
             raise ValueError(f"flush_interval_ms must be >= 0, got {flush_interval_ms}")
@@ -68,9 +76,10 @@ class _EventBatcher:
             raise ValueError(f"flush_threshold must be >= 1, got {flush_threshold}")
         self._flush_interval = flush_interval_ms / 1000.0
         self._flush_threshold = flush_threshold
-        # 事件渲染器：``(kind, task_id, workflow_id, kwargs)``。用于 flush 发生在
-        # 后台线程时，调用方依赖的能力——如把 ``TaskLifecycle`` 事件绑定到某个
-        # Runtime 上下文中再 emit。``None`` 时使用默认 ``_emit_task_event``。
+        # 事件渲染器：``(kind, task_id, workflow_id, kwargs)``。flush 发生在后台
+        # 线程，渲染器负责把事件绑定到正确的运行时上下文后 emit。必填：唯一生产
+        # 调用方 ``Runtime.start`` 总是传 ``_publish_task_event``，默认值只服务于
+        # 测试，反而让「未传 = 走另一条 emit 路径」成为隐式分支。
         self._render = render
         # (kind, task_id, workflow_id, kwargs) 四元组列表。
         self._buffer: list[tuple[str, str, str, dict[str, Any]]] = []
@@ -136,23 +145,14 @@ class _EventBatcher:
             events = list(self._buffer)
             self._buffer.clear()
         # 在锁外派发，避免 emit 失败导致 buffer 锁死。
-        # 当提供了 render（如 Runtime 绑定的生命周期事件渲染器）时，改由 render
-        # 负责在正确的运行时上下文中 emit；未提供时走默认 _emit_task_event。
+        # 渲染器负责在正确的运行时上下文中 emit（本方法可能在后台线程执行，
+        # 线程局部没有 Runtime）。
         for kind, task_id, workflow_id, kwargs in events:
             try:
-                if self._render is not None:
-                    self._render(kind, task_id, workflow_id, kwargs)
-                else:
-                    _emit_task_event(
-                        kind,
-                        task_id,
-                        workflow_id,
-                        on_error="log",
-                        **kwargs,
-                    )
+                self._render(kind, task_id, workflow_id, kwargs)
             except Exception:
-                _logger.debug(
-                    "EventBatcher: emit event kind=%s task=%s raised",
+                _logger.warning(
+                    "EventBatcher: emit event kind=%s task=%s failed; event dropped",
                     kind,
                     task_id,
                     exc_info=True,
@@ -693,6 +693,9 @@ def _emit_task_event(
         silent: ``True`` 时跳过事件发布。用于 ``@task(silent=True)`` 等场景，
             避免每个 task 产生 started/completed 事件造成 event_bus 噪声。
             批量提交/低优先级任务可启用此选项以提升吞吐。
+            注意作用范围：worker 子进程内恒传 ``True``（子进程独立于父 runtime，
+            不能依赖其事件通道）；``@task(silent=True)`` 的抑制由提交方在结果
+            回调中执行（``Runtime._emit_lifecycle``）。
 
     Returns:
         捕获到的异常（仅当 ``on_error="collect"`` 时）。

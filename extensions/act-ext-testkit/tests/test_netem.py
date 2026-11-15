@@ -70,3 +70,34 @@ def test_shaping_reports_platform_capability() -> None:
 def test_empty_nodes_rejected() -> None:
     with pytest.raises(ValueError):
         build_schedule(NetworkProfile(), [], duration_s=1.0)
+
+
+def test_netem_wait_surfaces_failed_fault_injection() -> None:
+    """等待弱网注入结束时必须暴露注入失败，不能把它只记进 errors 当成功。
+
+    ``FaultScript.run`` 默认 ``strict=False``：应用故障抛异常时只记录并继续，
+    ``FaultRun.wait()`` 也不抛错。若 ``NetemRun.wait()`` 不检查 errors，调用方
+    会以为故障真的注入过，而集群一直保持健康。
+    """
+    from act_ext_testkit import CustomFault, FaultScript, NetemError
+    from act_ext_testkit.netem import NetemRun
+
+    class _FailingCluster:
+        def __init__(self) -> None:
+            self.restored: list[tuple[str, int]] = []
+
+        def pause_heartbeat(self, node: str, ms: int) -> None:
+            self.restored.append((node, ms))
+
+    def _boom(cluster: object) -> None:
+        raise RuntimeError("injection failed")
+
+    cluster = _FailingCluster()
+    script = FaultScript()
+    script.add(CustomFault(label="boom", action=_boom))
+    run = script.run(cluster, background=True)
+    handle = NetemRun(run, cluster, ["a"])
+
+    with pytest.raises(NetemError, match="injection failed"):
+        handle.wait(timeout_s=2.0)
+    assert cluster.restored, "注入失败后仍必须恢复心跳"

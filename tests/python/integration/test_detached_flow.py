@@ -52,10 +52,12 @@ class TestDetachedFlow:
             for i, workflow_id in enumerate(workflow_ids):
                 journal = submitter.get_workflow_journal(workflow_id)
                 assert journal[0]["kind"] == "submitted", journal
-                # 函数体未执行：只有提交与定义元数据，没有节点/任务事件。
+                # 函数体未执行：只有提交与定义元数据（含工作流级 deadline），
+                # 没有节点/任务事件。
                 assert {e["kind"] for e in journal} <= {
                     "submitted",
                     "context_value",
+                    "deadline_set",
                 }, journal
                 invocation = submitter.get_workflow_invocation(workflow_id)
                 assert invocation is not None

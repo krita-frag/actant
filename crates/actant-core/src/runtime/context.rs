@@ -79,8 +79,10 @@ impl Runtime {
         Ok(())
     }
 
+    /// 仅供 [`RuntimeBuilder`](crate::runtime::builder::RuntimeBuilder) 装配：
+    /// 公开装配路径只有 `RuntimeBuilder::build`。
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         node_id: NodeId,
         config: ActantConfig,
         network: Arc<dyn Transport>,
@@ -146,7 +148,7 @@ impl Runtime {
         self.worker.as_ref()
     }
 
-    pub fn set_worker(&mut self, worker: Arc<Worker>) {
+    pub(crate) fn set_worker(&mut self, worker: Arc<Worker>) {
         self.worker = Some(worker);
     }
 
@@ -162,7 +164,7 @@ impl Runtime {
         self.orchestrator.as_ref()
     }
 
-    pub fn set_orchestrator(&mut self, orchestrator: Orchestrator) {
+    pub(crate) fn set_orchestrator(&mut self, orchestrator: Orchestrator) {
         self.orchestrator = Some(orchestrator);
     }
 

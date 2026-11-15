@@ -280,6 +280,23 @@ class _RuntimeBase:
         if self._rust_runtime is None:
             raise InvalidStateError("Runtime not started")
 
+    def _require_core(self) -> Any:
+        """返回 Rust 核心句柄；未启动时抛 ``InvalidStateError``。
+
+        core 与 runtime 视图在 ``start()`` 中一起创建、在 ``stop()`` /
+        ``_rollback_start()`` 中一起置空，故二者是同一条启动状态的两种视图；
+        core 是网络、存储与 workflow 查询的实际抓手，需要调用 core 方法的地方
+        一律经此取用，不再各自重复 "取句柄 + 判空 + 抛错" 三行。
+
+        不需要 core 本身、只做启动检查的调用方可直接写 ``self._require_core()``
+        不绑定返回值——见 :meth:`Runtime.get_task_result` 对 traceback 持有
+        局部引用的顾虑。
+        """
+        core = self._rust_core
+        if core is None:
+            raise InvalidStateError("Runtime not started")
+        return core
+
     def _store_get(self, key: str) -> bytes | None:
         """读取持久化 Store 中的原始字节；未启动时返回 ``None``。
 

@@ -7,14 +7,15 @@
 ## `actant`
 
 ```text
-usage: actant [-h] {worker,status,version,metrics} ...
+usage: actant [-h] {worker,status,identity,version,metrics} ...
 
 Actant CLI — P2P 分布式任务编排引擎
 
 positional arguments:
-  {worker,status,version,metrics}
+  {worker,status,identity,version,metrics}
     worker              启动一个 Worker 节点（后台常驻，P2P 自动发现对端）
     status              查询本地 Runtime 状态（版本、capability、持久化节点信息）
+    identity            查看或初始化节点身份（endpoint id，用于 allowed_peer_ids 登记）
     version             显示版本号
     metrics             启动独立的 Prometheus HTTP exporter（/metrics 端点）
 
@@ -43,7 +44,7 @@ usage: actant worker [-h] [--name NAME] [--data-dir DATA_DIR]
 
 options:
   -h, --help            show this help message and exit
-  --name NAME           节点名称（默认自动生成）
+  --name NAME           节点名称（默认取持久身份的 endpoint id，保证集群内唯一且重启稳定）
   --data-dir DATA_DIR   持久化数据目录（默认使用系统临时目录）
   --log-level {debug,info,warning,error}
                         Python 侧日志级别（默认 info；Rust 侧用 RUST_LOG 环境变量）
@@ -61,11 +62,11 @@ options:
                         节点拓扑角色（默认 both）。orchestrator 只编排不执行本地任务；worker 只执行任务、不 claim workflow、不驱动
                         flow host
   --payload-signing-key PAYLOAD_SIGNING_KEY
-                        P2P payload 签名密钥（也可用 ACTANT_PAYLOAD_KEY 环境变量）
+                        P2P payload 签名密钥（也可用 ACTANT_PAYLOAD_KEY 环境变量）；集群内所有节点必须一致，未提供则禁用签名
   --bootstrap-nodes BOOTSTRAP_NODES
-                        逗号分隔的 bootstrap 节点地址（完整 endpoint_addr，而非仅 endpoint id）
+                        逗号分隔的 bootstrap 节点地址（完整 endpoint_addr）；其中的 endpoint id 会自动用于 gossip 引导
   --gossip-bootstrap-peers GOSSIP_BOOTSTRAP_PEERS
-                        逗号分隔的 gossip 引导对端 endpoint ID；discovery=none 时必填，否则只建立直连、不会加入 gossip
+                        逗号分隔的 gossip 引导对端 endpoint ID；仅在只有 id、没有地址时需要，bootstrap-nodes 里的 id 会自动并入
   --discovery {none,local,dns}
                         节点发现 preset（默认 local）。纯内网/离线用 none；也可用 ACTANT_DISCOVERY 环境变量覆盖
   --listen-ip LISTEN_IP

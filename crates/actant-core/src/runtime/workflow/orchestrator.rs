@@ -1,11 +1,14 @@
 //! 工作流 Orchestrator 的聚合入口。
 //!
-//! 原 `orchestrator.rs` 已按职责拆分为：
+//! `orchestrator` 按职责拆分为：
 //! - `state`: 结构体定义与依赖注入
+//! - `types`: slot、等待者注册表与事件契约重导出
+//! - `keys`: Store key 生成
 //! - `persistence`: 恢复（快照 + 事件重放）、落盘、清理、迁移
-//! - `execution`: 提交、启动、任务完成、取消、重试、调度
+//! - `execution`: 提交、启动、任务完成、取消、重试、调度（含 `timeout` 子模块）
 //! - `queries`: 状态查询与结果读取
 //! - `waitpoint`: 持久化等待点原语
+//! - `context`: 确定性上下文值
 //!
 //! 本文件仅保留子模块声明与公共 re-export，保持外部 API 不变。
 
@@ -21,9 +24,8 @@ pub mod queries;
 mod state;
 mod waitpoint;
 
-/// Python 暴露面的序列化形态（`queries` 模块私有，仅 PyO3 边界层需要构造它）。
-///
-pub use queries::DagSnapshot;
+/// Python 暴露面的序列化形态，由 PyO3 边界层构造。
+pub use queries::{DagSnapshot, WorkflowStateSummary};
 pub use state::Orchestrator;
 
 #[cfg(test)]

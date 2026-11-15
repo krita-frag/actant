@@ -466,7 +466,8 @@ async fn failed_build_after_key_registration_does_not_leak_wire_key() {
             role: crate::common::NodeRole::Both,
             draining: false,
         },
-    ));
+    ))
+    .expect("wire envelope wrap");
     let mac = envelope.mac;
     let unsigned = crate::common::WireEnvelope {
         mac: None,
@@ -1031,6 +1032,20 @@ impl crate::runtime::state::event_log::EventLog for RecordingEventLog {
         self.inner.count(topic)
     }
 
+    fn append_batch(
+        &self,
+        topic: &str,
+        payloads: &[Vec<u8>],
+    ) -> crate::common::Result<Vec<crate::runtime::state::event_log::EventId>> {
+        self.appends
+            .fetch_add(payloads.len(), std::sync::atomic::Ordering::Relaxed);
+        self.inner.append_batch(topic, payloads)
+    }
+
+    fn list_topics(&self) -> crate::common::Result<Vec<String>> {
+        self.inner.list_topics()
+    }
+
     fn trim_absorbed(
         &self,
         topic: &str,
@@ -1038,6 +1053,10 @@ impl crate::runtime::state::event_log::EventLog for RecordingEventLog {
         keep: usize,
     ) -> crate::common::Result<usize> {
         self.inner.trim_absorbed(topic, up_to, keep)
+    }
+
+    fn hide_topic(&self, topic: &str) -> crate::common::Result<()> {
+        self.inner.hide_topic(topic)
     }
 }
 
@@ -1082,4 +1101,59 @@ async fn build_without_store_redispatches_nothing() {
         recovered.is_empty(),
         "empty orchestrator has no ready tasks"
     );
+}
+
+#[test]
+fn resolve_node_id_derives_stable_endpoint_id_from_identity() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().to_string_lossy().to_string();
+
+    let first = resolve_node_id(&path).expect("resolve node id");
+    let second = resolve_node_id(&path).expect("resolve node id again");
+    assert_eq!(first, second, "node id must be stable across calls");
+    // 与 iroh endpoint id 同构，才能满足 require_signed_records 的身份绑定。
+    assert!(first.as_str().parse::<iroh::EndpointId>().is_ok());
+}
+
+#[test]
+fn normalize_allowed_peer_ids_accepts_ids_and_rejects_addresses() {
+    let key = iroh::SecretKey::generate();
+    let id = key.public().to_string();
+
+    let normalized = normalize_allowed_peer_ids(&[format!("  {id}  "), id.clone()])
+        .expect("valid endpoint ids must be accepted");
+    assert_eq!(normalized, vec![id]);
+
+    let err = normalize_allowed_peer_ids(&["deadbeef".to_string()])
+        .expect_err("full address or typo must be rejected at startup");
+    assert!(matches!(err, ActantError::Config(_)));
+    assert!(err.to_string().contains("allowed_peer_ids"));
+
+    let err = normalize_allowed_peer_ids(&["".to_string()])
+        .expect_err("empty entry must be rejected instead of silently dropped");
+    assert!(err.to_string().contains("empty entries"));
+}
+
+#[test]
+fn read_node_id_is_none_until_identity_is_created() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().to_string_lossy().to_string();
+
+    assert_eq!(read_node_id(&path).expect("read missing identity"), None);
+
+    let created = resolve_node_id(&path).expect("create identity");
+    assert_eq!(
+        read_node_id(&path).expect("read existing identity"),
+        Some(created)
+    );
+}
+
+#[test]
+fn read_node_id_rejects_corrupt_identity_file() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().to_string_lossy().to_string();
+    std::fs::write(dir.path().join("identity.key"), b"short").expect("write corrupt key");
+
+    let err = read_node_id(&path).expect_err("corrupt identity must fail");
+    assert!(err.to_string().contains("identity.key corrupt"));
 }

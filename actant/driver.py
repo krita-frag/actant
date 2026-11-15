@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
-import contextlib
 import inspect
 import logging
 import threading
@@ -296,9 +295,17 @@ class AsyncDriver:
         with self._lock:
             if self._active.get(workflow_id) is future:
                 self._active.pop(workflow_id, None)
-        # 取出异常避免被静默丢弃；真正的传播发生在 join()。
-        with contextlib.suppress(concurrent.futures.CancelledError):
-            future.exception()
+        # 完成回调可能先于 join() 把条目移出 in-flight 表；失败必须在此登记，
+        # 否则 join() 只看到“空表”，异常被静默丢弃。
+        try:
+            exc = future.exception()
+        except concurrent.futures.CancelledError:
+            return
+        if exc is not None and not isinstance(exc, ActantTimeoutError):
+            with self._lock:
+                if self._error is None:
+                    self._error = exc
+            _logger.error("workflow %s replay failed", workflow_id, exc_info=exc)
 
     def _ensure_loop(self) -> asyncio.AbstractEventLoop:
         with self._lock:

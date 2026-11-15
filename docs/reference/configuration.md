@@ -112,8 +112,12 @@ Gossip 同步配置。所有字段的默认值取自 Rust ``GossipConfig::defaul
 | 变量 | 读取位置 | 作用 |
 | --- | --- | --- |
 | `ACTANT_DISCOVERY` | `src/py/config.rs` | 覆盖 `network.preset`；CI 用 `ACTANT_DISCOVERY=none` 强制离线 |
-| `ACTANT_PAYLOAD_KEY` | `actant/cli.py` | `actant worker` 的 payload 签名密钥 |
-| `ACTANT_TRACING` | `crates/actant-core/src/observability.rs` | 设为 `1` 启用 Rust `tracing` 结构化日志 |
-| `ACTANT_TOKIO_CONSOLE` | `crates/actant-core/src/observability.rs` | 设为 `1` 启用 tokio-console（需 `tokio-console` feature） |
+| `ACTANT_PAYLOAD_KEY` | `actant/cli.py` | `actant worker` 的 payload 签名密钥；未设置时禁用签名（集群内必须一致） |
+| `ACTANT_TRACING` | `crates/actant-core/src/observability.rs` | 设置后启用 Rust `tracing` 结构化日志（过滤级别由 `RUST_LOG` 控制） |
+| `ACTANT_TOKIO_CONSOLE` | `crates/actant-core/src/observability.rs` | 设置后启用 tokio-console（需 `tokio-console` feature；与 `ACTANT_TRACING` 同时设置时合并为一个 subscriber） |
+| `RUST_LOG` | `crates/actant-core/src/observability.rs` | `tracing` 过滤表达式（如 `actant=debug`）；未设置时默认 `info` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `crates/actant-core/src/metrics.rs` | 非空时挂载 OTLP gRPC metric exporter（如 `http://localhost:4317`） |
+| `OTEL_EXPORTER_OTLP_HEADERS` | `crates/actant-core/src/metrics.rs` | OTLP 认证头，`key=value,key=value` 格式 |
+| `OTEL_METRIC_EXPORT_INTERVAL` | `opentelemetry_sdk（PeriodicReader）` | OTLP 周期导出间隔（毫秒，默认 60000） |
 
 测试专用：`ACTANT_SKIP_BUILD_CHECK=1` 跳过原生扩展新鲜度检查，见 [测试](../contributing/testing.md)。

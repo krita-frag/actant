@@ -1,7 +1,32 @@
 {
   "pyo3_classes": {
     "PyActantConfig": [
-      "new"
+      "completed_retention_count",
+      "crash_failover_max_attempts",
+      "default_task_timeout_ms",
+      "drain_timeout_secs",
+      "failover",
+      "gossip",
+      "max_concurrent_tasks",
+      "max_history_events",
+      "network",
+      "new",
+      "node_labels",
+      "node_quotas",
+      "num_worker_processes",
+      "payload_signing_key",
+      "pending_result_channel_capacity",
+      "persist_flush_interval_ms",
+      "prefetch_max",
+      "prefetch_min",
+      "remote_fallback_delay_ms",
+      "require_payload_signing",
+      "role",
+      "scheduler",
+      "starvation_timeout_ms",
+      "state_poll_interval_ms",
+      "store",
+      "worker_cancel_grace_ms"
     ],
     "PyAsyncAwaitable": [
       "__await__",
@@ -20,19 +45,62 @@
       "registered_capabilities"
     ],
     "PyFailoverConfig": [
+      "failure_timeout_ms",
+      "heartbeat_interval_ms",
+      "lease_duration_ms",
+      "lease_expiry_check_interval_secs",
       "new"
     ],
     "PyGossipConfig": [
-      "new"
+      "dedup_ttl_secs",
+      "dedup_window_size",
+      "heads_broadcast_interval_ms",
+      "new",
+      "retry_attempts",
+      "retry_base_delay_ms"
+    ],
+    "PyListenAddresses": [
+      "direct_addrs",
+      "endpoint_addr",
+      "endpoint_id",
+      "relay_url"
     ],
     "PyNetworkConfig": [
-      "new"
+      "allowed_peer_ids",
+      "bootstrap_nodes",
+      "direct_request_timeout_ms",
+      "dns_origin_domain",
+      "event_channel_capacity",
+      "gossip_bootstrap_peers",
+      "hlc_max_drift_ms",
+      "listen_ip",
+      "listen_port",
+      "max_message_size",
+      "max_pending_direct_requests",
+      "new",
+      "preset",
+      "relay_endpoints",
+      "require_signed_records",
+      "with_required_signatures"
     ],
     "PyNode": [
       "__repr__",
-      "new"
+      "metadata",
+      "name",
+      "new",
+      "payload",
+      "priority",
+      "quota",
+      "retry",
+      "tags",
+      "task_id",
+      "timeout_ms"
     ],
     "PyRetryPolicy": [
+      "backoff_multiplier",
+      "delay_ms",
+      "max_delay_ms",
+      "max_retries",
       "new",
       "to_bytes"
     ],
@@ -54,12 +122,14 @@
       "delete_workflow",
       "dial",
       "discover_peers",
+      "fail_workflow",
       "get_context_value",
       "get_dag",
       "get_workflow_history",
       "get_workflow_invocation",
       "get_workflow_journal",
       "get_workflow_state",
+      "get_workflow_state_summary",
       "list_workflows",
       "listen_addresses",
       "max_concurrent_tasks",
@@ -95,15 +165,46 @@
     ],
     "PyStoreConfig": [
       "__repr__",
-      "new"
+      "data_dir",
+      "flush_interval_ms",
+      "map_size",
+      "max_dbs",
+      "new",
+      "sync_mode"
     ],
     "PyStoreStats": [
       "__repr__",
+      "entries",
+      "file_bytes",
+      "map_size",
+      "max_readers",
+      "readers",
+      "used_bytes",
       "utilization_ratio"
     ],
     "PyTask": [
       "__repr__",
-      "new"
+      "name",
+      "new",
+      "payload",
+      "pinned_target",
+      "priority",
+      "quota",
+      "tags",
+      "target_endpoint_addr",
+      "target_node",
+      "task_id",
+      "timeout_ms",
+      "workflow_id"
+    ],
+    "PyTaskCompletion": [
+      "error",
+      "result",
+      "state",
+      "target_node",
+      "task_id",
+      "task_name",
+      "workflow_id"
     ],
     "PyWorkflowState": [
       "__repr__"
@@ -345,7 +446,8 @@
       "preset",
       "relay_endpoints",
       "require_signed_records",
-      "require_signed_records"
+      "require_signed_records",
+      "with_required_signatures"
     ],
     "_RetryPolicy": [
       "backoff_multiplier",
@@ -366,12 +468,14 @@
       "delete_workflow",
       "dial",
       "discover_peers",
+      "fail_workflow",
       "get_context_value",
       "get_dag",
       "get_workflow_history",
       "get_workflow_invocation",
       "get_workflow_journal",
       "get_workflow_state",
+      "get_workflow_state_summary",
       "list_workflows",
       "listen_addresses",
       "max_concurrent_tasks",

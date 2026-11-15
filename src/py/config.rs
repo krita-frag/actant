@@ -238,6 +238,19 @@ impl PyNetworkConfig {
             require_signed_records,
         }
     }
+
+    /// 返回一份把 `require_signed_records` 强制置为 `true` 的副本。
+    ///
+    /// 供 `Runtime.production()` 使用：生产语义要求强制心跳签名，但不能就地
+    /// 改写调用方传入的配置对象——同一份 `_NetworkConfig` 可能被多个 Runtime
+    /// 共用，就地置位会把它永久改掉。副本在 Rust 侧用结构体更新语法构造，
+    /// 新增字段由编译器兜住，不会像 Python 侧逐字段重建那样漏掉。
+    fn with_required_signatures(&self) -> Self {
+        Self {
+            require_signed_records: true,
+            ..self.clone()
+        }
+    }
 }
 
 impl Default for PyNetworkConfig {
@@ -562,7 +575,8 @@ pub struct PyActantConfig {
     /// 远端结果投递重试队列容量。默认 256。
     #[pyo3(get)]
     pub pending_result_channel_capacity: usize,
-    /// 已完成工作流的自动淘汰保留数（0 = 不淘汰）。默认 1000。
+    /// 已完成工作流的保留数。`0` = 终态后立即淘汰；`N > 0` = 最多保留
+    /// N 个终态工作流，超出时淘汰最旧的。默认 1000。
     #[pyo3(get)]
     pub completed_retention_count: usize,
     /// 每个工作流保留的事件历史上限（0 = 不裁剪）。默认 0。

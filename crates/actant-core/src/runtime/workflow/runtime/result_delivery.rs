@@ -11,10 +11,11 @@
 //! 不会阻塞队列中其他结果（消除队头阻塞）；并发上限防止目标节点长时间
 //! 不可达时重试任务无限堆积。
 //!
-//! ## 超限补偿
+//! ## 超限行为
 //!
-//! 重试次数达到上限后，结果不再重试，而是发布 `BusEvent::TaskFailed`
-//! 补偿事件——否则远端提交方会永久等待一个永远不会到达的结果。
+//! 重试次数达到上限后不做本地补偿（origin 在远端节点，收不到本地事件）：
+//! 结果继续按封顶退避重试，直到投递成功或节点停机；停机后由 origin 的
+//! 失联接管/租约重投兜底。
 //!
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,12 +31,39 @@ pub(super) struct PendingResult {
     pub(super) attempts: usize,
 }
 
-/// 尝试将待重试结果入队。
+/// 有界队列上的阻塞入队：队列满时等待，而不是丢弃结果。
 ///
-/// 使用 `try_send`（非阻塞）：通道满时立即返回 `false`，让调用方决定降级策略
-/// （如发布 TaskFailed 事件）。避免在高负载下无限阻塞任务执行循环。
-///
-/// 返回 `true` 表示成功入队，`false` 表示通道满或已关闭。
+/// 远端结果一旦丢弃，origin 可能永久等待；这里用 `send().await` 形成背压。
+/// 返回 `false` 只表示重试循环已关闭（节点正在停机），此时由 origin 的
+/// 失联接管/租约重投兜底。
+pub(super) async fn enqueue_pending_result(
+    tx: &tokio::sync::mpsc::Sender<PendingResult>,
+    target: String,
+    request: crate::runtime::network::DirectRequest,
+    attempts: usize,
+) -> bool {
+    let target_for_log = target.clone();
+    match tx
+        .send(PendingResult {
+            target,
+            request,
+            attempts,
+        })
+        .await
+    {
+        Ok(()) => true,
+        Err(_) => {
+            tracing::warn!(
+                target = %target_for_log,
+                "pending_results channel closed during shutdown; origin will re-dispatch"
+            );
+            false
+        }
+    }
+}
+
+/// 尝试将待重试结果入队（非阻塞，仅测试使用）。
+#[cfg(test)]
 pub(super) async fn try_enqueue_pending_result(
     tx: &tokio::sync::mpsc::Sender<PendingResult>,
     target: String,
@@ -65,64 +93,10 @@ pub(super) async fn try_enqueue_pending_result(
     }
 }
 
-/// 从 `DirectRequest::TaskResult` 提取 (workflow_id, task_id, task_name, outcome)。
+/// 超过重试上限后继续重试：远端结果不能因为本地放弃而永久丢失。
 ///
-/// 重试队列中的结果均来自任务完成路径；其他 `DirectRequest` 变体不会入队，
-/// 但仍需处理以防万一（返回 `None` 时跳过补偿事件）。
-fn extract_task_result(
-    request: &crate::runtime::network::DirectRequest,
-) -> Option<(
-    crate::common::WorkflowId,
-    crate::common::TaskId,
-    String,
-    crate::common::WireTaskOutcome,
-)> {
-    match request {
-        crate::runtime::network::DirectRequest::TaskResult {
-            workflow_id,
-            task_id,
-            task_name,
-            outcome,
-            ..
-        } => Some((
-            workflow_id.clone(),
-            task_id.clone(),
-            task_name.clone(),
-            outcome.clone(),
-        )),
-        _ => None,
-    }
-}
-
-/// 超过重试上限后发布 TaskFailed 补偿事件。
-///
-/// 结果本身可能是 Completed（任务在 worker 上成功了，只是结果送不回去），
-/// 但对提交方而言它永远等不到结果——以 Failed 终止比永久挂起更好。
-fn publish_delivery_failure_compensation(
-    event_bus: &crate::runtime::event_bus::EventBus,
-    request: &crate::runtime::network::DirectRequest,
-    target: &str,
-    max_attempts: usize,
-) {
-    let Some((workflow_id, task_id, task_name, _outcome)) = extract_task_result(request) else {
-        return;
-    };
-    let completion = crate::common::TaskCompletion::Failed {
-        workflow_id: workflow_id.clone(),
-        task_id,
-        task_name,
-        error: crate::common::format_error_kind(
-            "network",
-            &format!(
-                "task result could not be delivered to orchestrator {target} \
-                 after {max_attempts} retry attempts"
-            ),
-        ),
-        target_node: None,
-    };
-    event_bus.publish(crate::runtime::event_bus::BusEvent::TaskFailed(completion));
-}
-
+/// 队列有界 + 并发上限提供背压；origin 不可达期间结果保留，恢复后补投。
+/// 只有节点停机（channel 关闭）才停止，由 origin 的失联接管兜底。
 pub(super) fn start_pending_result_loop(
     network: std::sync::Arc<dyn crate::runtime::network::Transport>,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
@@ -142,6 +116,9 @@ pub(super) fn start_pending_result_loop(
     let retry_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_RETRIES));
 
     tokio::spawn(async move {
+        // 保持 EventBus 存活：测试/订阅者依赖它判断重试循环是否仍在运行；
+        // 结果不再在本地发 TaskFailed，但 EventBus 不能提前 drop。
+        let _keepalive = event_bus;
         loop {
             tokio::select! {
                 _ = retry_cancel.changed() => {
@@ -150,70 +127,47 @@ pub(super) fn start_pending_result_loop(
                 }
                 Some(pending) = pending_rx.recv() => {
                     if pending.attempts >= max_attempts {
-                        // 超限：发布 TaskFailed 补偿事件而非静默丢弃，
-                        // 让提交方（远端 orchestrator / 本地订阅者）感知终态。
-                        tracing::error!(
-                            "dropping result for {} after {} failed attempts; publishing compensation event",
-                            pending.target, max_attempts
+                        // 不做本地补偿（origin 在远端，收不到本地事件）；
+                        // 继续按封顶退避重试，直到投递成功或节点停机。
+                        tracing::warn!(
+                            target = %pending.target,
+                            attempts = pending.attempts,
+                            "result still undeliverable after max attempts; keeping for retry"
                         );
-                        publish_delivery_failure_compensation(
-                            &event_bus,
-                            &pending.request,
-                            &pending.target,
-                            max_attempts,
-                        );
-                        continue;
                     }
                     let delay = backoff.delay_for(pending.attempts as u32);
                     // 并发上限背压：在途重试任务达到上限时阻塞接收循环，
-                    // 使 retry queue 逐渐填满并最终触发调用方的降级路径。
+                    // 使 retry queue 逐渐填满并最终触发调用方的背压路径。
                     let Ok(permit) = retry_semaphore.clone().acquire_owned().await else {
-                        // 信号量关闭只发生在 loop 退出后，实际不可达。
                         break;
                     };
                     let network = network.clone();
                     let retry_tx = retry_tx.clone();
-                    let retry_event_bus = event_bus.clone();
                     let mut retry_cancel = retry_cancel.clone();
                     tokio::spawn(async move {
                         let _permit = permit;
                         tokio::select! {
                             _ = retry_cancel.changed() => {
-                                // shutdown：放弃本次重试（节点在停机，不发补偿）。
+                                // shutdown：放弃本次重试（节点在停机，origin 会重投）。
                             }
                             _ = tokio::time::sleep(delay) => {
-                                // 重投失败（retry channel 满或已关闭）：该结果将
-                                // 永远无法再进入重试队列——接收循环见不到它，
-                                // "attempts 超限发补偿"的兜底不会触发。必须在
-                                // 此处直接发布补偿事件，否则结果静默丢失。
-                                async fn reenqueue_or_compensate(
+                                // 重投失败（retry channel 满或已关闭）：队列满时
+                                // `enqueue_pending_result` 会等待而不是丢弃；只有
+                                // 停机关闭通道才返回 false。
+                                async fn reenqueue_or_log(
                                     retry_tx: &tokio::sync::mpsc::Sender<PendingResult>,
-                                    event_bus: &crate::runtime::event_bus::EventBus,
                                     pending: PendingResult,
-                                    capacity: usize,
                                 ) {
                                     let attempts = pending.attempts + 1;
-                                    let enqueued = try_enqueue_pending_result(
+                                    // 返回值只表示本次是否入队成功；停机关闭通道
+                                    // 时无人可收，重投自然终止，无需上报。
+                                    let _ = enqueue_pending_result(
                                         retry_tx,
                                         pending.target.clone(),
                                         pending.request.clone(),
                                         attempts,
-                                        capacity,
                                     )
                                     .await;
-                                    if !enqueued {
-                                        tracing::error!(
-                                            target = %pending.target,
-                                            attempts,
-                                            "retry re-enqueue failed; publishing compensation event for undeliverable result"
-                                        );
-                                        publish_delivery_failure_compensation(
-                                            event_bus,
-                                            &pending.request,
-                                            &pending.target,
-                                            attempts,
-                                        );
-                                    }
                                 }
                                 match network.send_direct_request(&pending.target, pending.request.clone()).await {
                                     Ok(crate::runtime::network::DirectResponse::TaskResultAck { accepted: true }) => {
@@ -221,21 +175,11 @@ pub(super) fn start_pending_result_loop(
                                     }
                                     Ok(crate::runtime::network::DirectResponse::TaskResultAck { accepted: false }) => {
                                         tracing::warn!("pending result rejected by {}, will retry", pending.target);
-                                        reenqueue_or_compensate(
-                                            &retry_tx,
-                                            &retry_event_bus,
-                                            pending,
-                                            pending_result_channel_capacity,
-                                        ).await;
+                                        reenqueue_or_log(&retry_tx, pending).await;
                                     }
                                     Ok(_) | Err(_) => {
                                         tracing::debug!("pending result delivery to {} failed, will retry (attempt {})", pending.target, pending.attempts + 1);
-                                        reenqueue_or_compensate(
-                                            &retry_tx,
-                                            &retry_event_bus,
-                                            pending,
-                                            pending_result_channel_capacity,
-                                        ).await;
+                                        reenqueue_or_log(&retry_tx, pending).await;
                                     }
                                 }
                             }

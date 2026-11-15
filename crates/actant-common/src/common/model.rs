@@ -728,6 +728,27 @@ impl HybridLogicalClock {
         }
     }
 
+    /// 从持久化的最大事件时间戳恢复本地时钟下界。
+    ///
+    /// 重启后物理时钟可能回拨（NTP 调整、VM 恢复）；恢复下界后，下一次
+    /// [`tick`](Self::tick) 一定严格大于 `last`，保证新事件不会排在已有
+    /// 事件（及其重放水位）之前。
+    ///
+    /// 与 [`merge`](Self::merge) 的区别：merge 会对超前于物理时钟的远端值
+    /// 施加 drift 上限，而恢复本地持久化时间戳不能截断，否则回拨场景下
+    /// 仍会落后于既有事件。
+    pub fn restore(&self, last: HlcTimestamp) {
+        let mut inner = self.inner.lock();
+        let physical = self.physical_now_with_drift();
+        let wall = physical.max(last.wall_time());
+        inner.logical = if wall == last.wall_time() {
+            last.logical()
+        } else {
+            0
+        };
+        inner.last_time = wall;
+    }
+
     /// 注入物理时钟偏移（毫秒，可正可负）。传 0 恢复正常时钟。
     ///
     /// 仅影响本时钟后续 `tick`/`merge` 使用的物理时间，用于测试台模拟
@@ -1002,6 +1023,21 @@ mod hlc_merge_tests {
             assert_advances(&mut last, t);
             let t = clock.tick();
             assert_advances(&mut last, t);
+        }
+    }
+
+    #[test]
+    fn restore_keeps_clock_above_persisted_timestamp() {
+        // 模拟重启后物理时钟落后于持久化事件：restore 后每次 tick 都必须
+        // 严格推进，不能被物理时钟拉回到 last 之前。
+        let clock = HybridLogicalClock::new();
+        let mut last =
+            HlcTimestamp::from_parts(HybridLogicalClock::physical_now() + 60_000_000_000, 7);
+        clock.restore(last);
+        for _ in 0..10 {
+            let next = clock.tick();
+            assert_advances(&mut Some(last), next);
+            last = next;
         }
     }
 }

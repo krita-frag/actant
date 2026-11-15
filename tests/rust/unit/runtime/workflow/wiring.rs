@@ -125,7 +125,8 @@ async fn inbound_heartbeat_creates_peer_with_capacity() {
         draining: false,
     };
     let envelope =
-        crate::common::WireEnvelope::wrap(crate::common::WireMessage::NodeHeartbeat(hb.clone()));
+        crate::common::WireEnvelope::wrap(crate::common::WireMessage::NodeHeartbeat(hb.clone()))
+            .expect("wire envelope wrap");
     let payload = crate::runtime::workflow::messaging::encode(&envelope).expect("encode envelope");
     wiring
         .router
@@ -158,7 +159,7 @@ async fn inbound_dag_update_registers_gossip_seen() {
         hlc_timestamp: crate::runtime::state::HlcTimestamp::from_parts(10, 0),
         origin_node: NodeId::from("node-wire-D".to_string()),
     });
-    let envelope = crate::common::WireEnvelope::wrap(update);
+    let envelope = crate::common::WireEnvelope::wrap(update).expect("wire envelope wrap");
     let payload = crate::runtime::workflow::messaging::encode(&envelope).expect("encode");
     wiring
         .router
@@ -183,7 +184,7 @@ async fn inbound_claim_records_lease() {
         workflow_id: WorkflowId::from("wf-wire-2"),
         timestamp_ms: crate::common::epoch_millis(),
     });
-    let envelope = crate::common::WireEnvelope::wrap(claim);
+    let envelope = crate::common::WireEnvelope::wrap(claim).expect("wire envelope wrap");
     let payload = crate::runtime::workflow::messaging::encode(&envelope).expect("encode");
     wiring
         .router

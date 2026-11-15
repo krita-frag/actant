@@ -16,7 +16,7 @@ use crate::runtime::workflow::{
     Dag, FailureScope, Phase, Terminal, WaitCondition, WaitPoint, WaitPointState, WorkflowExecution,
 };
 
-use super::{keys::*, types::*, Orchestrator};
+use super::{keys::*, types::*, Orchestrator, WorkflowStateSummary};
 
 /// 裁剪已被快照吸收的事件历史（留存策略）。
 ///
@@ -81,9 +81,6 @@ pub(crate) fn append_event(
             None
         }
     }
-    // 规则评估在 Python 编排循环中实现：远端订阅者通过
-    // WireEnvelope::TaskDispatch / TaskResult 接收事件，业务规则在
-    // Python 侧订阅 EventBus 自行处理。
 }
 
 /// 序列化单个持久化槽位；失败时记录日志并返回 `None`。
@@ -244,6 +241,59 @@ impl Orchestrator {
         let workflow_id = payload.workflow_id().clone();
         if let Some(id) = append_event(self.event_log.as_ref(), payload) {
             self.state.record_event_seq(&workflow_id, id);
+        } else if self.event_log.is_some() {
+            // 封口 / deadline 等「只存在于内存」的状态也经本路径入历史。
+            // 写入失败时把工作流标脏，让同步快照至少承载该状态，否则崩溃后
+            // 恢复既拿不到快照、也重放不出事件，会永久丢失封口或超时保护。
+            // 未配置 event_log 时不标脏：那不是写入失败，无需额外 flush。
+            self.state.mark_dirty(&workflow_id);
+        }
+    }
+
+    /// 原子记录同一工作流的一批事件。
+    ///
+    /// journal-first 提交使用：`Submitted` 与全部 `NodeAdded` 必须在同一批
+    /// 可见，恢复期才不会重放出半个 DAG。任一条序列化失败则整批不写。
+    pub(crate) fn log_events(&self, payloads: &[JournalEvent]) {
+        let Some(first) = payloads.first() else {
+            return;
+        };
+        let workflow_id = first.workflow_id().clone();
+        let topic = first.topic();
+        let Some(log) = self.event_log.as_ref() else {
+            return;
+        };
+        let mut encoded = Vec::with_capacity(payloads.len());
+        for payload in payloads {
+            match postcard::to_allocvec(payload) {
+                Ok(bytes) => encoded.push(bytes),
+                Err(e) => {
+                    tracing::warn!(
+                        workflow = %workflow_id.as_str(),
+                        error = %e,
+                        "failed to serialize workflow event batch; batch skipped"
+                    );
+                    self.state.mark_dirty(&workflow_id);
+                    return;
+                }
+            }
+        }
+        match log.append_batch(&topic, &encoded) {
+            Ok(ids) => {
+                if let Some(last) = ids.last() {
+                    self.state.record_event_seq(&workflow_id, *last);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    workflow = %workflow_id.as_str(),
+                    error = %e,
+                    "failed to append workflow event batch"
+                );
+                // journal-first 提交：整批没写进历史时，同步快照是崩溃后唯一的
+                // 恢复凭据，标脏确保 flush 不会把它漏掉。
+                self.state.mark_dirty(&workflow_id);
+            }
         }
     }
 
@@ -310,7 +360,16 @@ impl Orchestrator {
                     if !execution.is_terminal() {
                         let task_ids: Vec<TaskId> = execution.tasks.keys().cloned().collect();
                         for tid in &task_ids {
-                            execution.reset_task(tid, false, true);
+                            // 只重置崩溃时仍在 Running 的任务。Failed 是已裁决的
+                            // 终态（Continue 策略下工作流可能仍未终态），重置为
+                            // Pending 会让失败任务在重启后绕过重试预算重跑。
+                            if execution
+                                .tasks
+                                .get(tid)
+                                .is_some_and(|task| task.state == Phase::Running)
+                            {
+                                execution.reset_task(tid, false, true);
+                            }
                         }
                     }
                     if let Some(mut slot) = state.slots.get_mut(&wf_id) {
@@ -417,6 +476,77 @@ impl Orchestrator {
             }
         }
 
+        // journal-first 提交可能在快照落盘前崩溃：journal 已有
+        // Submitted/NodeAdded，但 DAG/exec/pending 三键缺失。仅扫描快照
+        // 发现不了这类工作流，需从 event_log 的 topic 列表补建空 slot，
+        // 再由下面的重放从事件重建 DAG、任务与 pending。
+        // 补建出的工作流只重放**当前代**的事件：同一 workflow_id 被重用后，
+        // topic 里仍有上一代的事件，从头重放会把旧节点插入新 DAG。
+        let mut generation_starts: HashMap<WorkflowId, EventId> = HashMap::new();
+        if let Some(log) = event_log.as_deref() {
+            match log.list_topics() {
+                Ok(topics) => {
+                    for topic in topics {
+                        let Some(wf_id_str) = topic.strip_prefix("workflow:") else {
+                            continue;
+                        };
+                        if wf_id_str.is_empty() {
+                            continue;
+                        }
+                        let wf_id = WorkflowId::from(wf_id_str.to_string());
+                        if state.slots.contains_key(&wf_id) || corrupt.contains(&wf_id) {
+                            continue;
+                        }
+                        // 一次扫描同时定位最后一个 Submitted（新一代起点）与
+                        // 最后一个 Evicted（淘汰墓碑）的事件序号。
+                        let (last_submitted, last_evicted) = match log.read_after(&topic, None) {
+                            Ok(entries) => entries.iter().fold(
+                                (None, None),
+                                |(sub, ev): (Option<EventId>, Option<EventId>), entry| {
+                                    match postcard::from_bytes::<JournalEvent>(&entry.payload) {
+                                        Ok(JournalEvent::Submitted { .. }) => (Some(entry.id), ev),
+                                        Ok(JournalEvent::Evicted { .. }) => (sub, Some(entry.id)),
+                                        _ => (sub, ev),
+                                    }
+                                },
+                            ),
+                            Err(e) => {
+                                tracing::warn!(
+                                    workflow = %wf_id_str,
+                                    error = %e,
+                                    "recover: failed to read journal topic for generation markers"
+                                );
+                                (None, None)
+                            }
+                        };
+                        // 墓碑只代表写下它之前的那一代。若其后又出现新的
+                        // Submitted，说明 id 已被重用，必须允许补建。
+                        let current_generation_evicted = match (last_evicted, last_submitted) {
+                            (Some(ev), Some(sub)) => ev > sub,
+                            (Some(_), None) => true,
+                            _ => false,
+                        };
+                        if current_generation_evicted {
+                            continue;
+                        }
+                        if let Some(start) = last_submitted {
+                            generation_starts.insert(wf_id.clone(), start);
+                        }
+                        let execution = WorkflowExecution::new(wf_id.clone(), Vec::new());
+                        state.insert_workflow(wf_id, Dag::new(), execution, HashMap::new());
+                        tracing::info!(
+                            workflow = %wf_id_str,
+                            "recover: workflow discovered from journal (snapshot missing)"
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "recover: failed to list event topics; journal-only workflows will not be recovered"
+                ),
+            }
+        }
+
         let mut watermarks: HashMap<WorkflowId, EventId> = HashMap::new();
         let seq_entries = store.scan_prefix(STORE_KEY_EVENT_SEQ).await?;
         for (key, data) in seq_entries {
@@ -436,14 +566,58 @@ impl Orchestrator {
             }
         }
 
-        // 任何条目损坏的 workflow：移除内存 slot，并删除 store 中的所有三类条目，
-        // 避免"exec 数据悬空而 dag 缺失"等不一致状态在后续操作中触发 workflow not found。
+        // 有快照但事件水位缺失（旧数据，或 submit 后尚未 flush 就崩溃）：
+        // 同一 topic 可能混有上一代事件，重放必须从当前代的 Submitted 起，
+        // 否则旧代 NodeAdded 会插进新 DAG、旧代结果会提前终结新工作流。
+        if let Some(log) = event_log.as_deref() {
+            for entry in state.slots.iter() {
+                let wf_id = entry.key();
+                if watermarks.contains_key(wf_id) || generation_starts.contains_key(wf_id) {
+                    continue;
+                }
+                let topic = format!("workflow:{}", wf_id.as_str());
+                let Ok(entries) = log.read_after(&topic, None) else {
+                    continue;
+                };
+                if let Some(last) = entries.iter().rev().find(|entry| {
+                    postcard::from_bytes::<JournalEvent>(&entry.payload)
+                        .is_ok_and(|ev| matches!(ev, JournalEvent::Submitted { .. }))
+                }) {
+                    generation_starts.insert(wf_id.clone(), last.id);
+                }
+            }
+        }
+
+        // 任何条目损坏的 workflow：移除内存 slot，并删除 store 中的所有快照
+        // 条目，避免"exec 数据悬空而 dag 缺失"等不一致状态在后续操作中触发
+        // workflow not found。
         for wf_id in &corrupt {
+            // 与 evict_workflow 同口径：墓碑先行——它是该 topic 已淘汰的
+            // 唯一凭据，必须先于任何状态删除落盘成功。先删后写的话，两步
+            // 之间崩溃会留下「快照已删、topic 可见、无墓碑」，下次恢复补建
+            // 空 slot 并重放旧事件重新派发已完成的任务。墓碑写失败则放弃
+            // 清理，保留损坏现场。
+            if event_log.is_some()
+                && append_event(
+                    event_log.as_ref(),
+                    JournalEvent::Evicted {
+                        workflow_id: wf_id.clone(),
+                    },
+                )
+                .is_none()
+            {
+                tracing::error!(
+                    workflow = %wf_id.as_str(),
+                    "failed to persist eviction marker for corrupt workflow; keeping state intact"
+                );
+                continue;
+            }
             state.remove_workflow(wf_id);
             for key in [
                 dag_key(wf_id),
                 exec_key(wf_id),
                 pending_key(wf_id),
+                result_key(wf_id),
                 wait_key(wf_id),
                 signal_buf_key(wf_id),
                 context_key(wf_id),
@@ -459,8 +633,20 @@ impl Orchestrator {
                 "workflow removed due to corrupt data; total corrupt={}",
                 corrupt.len(),
             );
-            // 记录损坏恢复事件（corrupt=true）供外部观测。
+            // 记录损坏恢复事件（corrupt=true）供外部观测。必须在 hide_topic
+            // 之前写：append 的「再次追加即恢复可见」语义会把刚隐藏的 topic
+            // 重新暴露给恢复期扫描。
             Self::log_recovered_event(event_log.as_deref(), wf_id, 0, true);
+            if let Some(log) = event_log.as_deref() {
+                let topic = format!("workflow:{}", wf_id.as_str());
+                if let Err(e) = log.hide_topic(&topic) {
+                    tracing::warn!(
+                        workflow = %wf_id.as_str(),
+                        error = %e,
+                        "failed to hide corrupt workflow topic from recovery scan"
+                    );
+                }
+            }
         }
 
         // 为成功恢复的非损坏 workflow 记录恢复事件（corrupt=false）。
@@ -488,8 +674,28 @@ impl Orchestrator {
 
         // 快照加载完成后重放其后的事件，恢复语义唯一化（快照 + 事件重放）。
         orchestrator
-            .replay_events_after_watermarks(event_log.as_deref(), &watermarks)
+            .replay_events_after_watermarks(event_log.as_deref(), &watermarks, &generation_starts)
             .await;
+
+        // 重启后重建淘汰顺序：若队列只由运行期的 complete_terminal 填充，
+        // 从快照加载的历史终态工作流永远进不了队列，按 N 淘汰的契约在重启后
+        // 失效，状态会随每次重启无限累积。
+        let retention = config.workflow.completed_retention_count;
+        if retention > 0 {
+            let terminal_ids: Vec<WorkflowId> = orchestrator
+                .state
+                .slots
+                .iter()
+                .filter(|entry| entry.execution.is_terminal())
+                .map(|entry| entry.key().clone())
+                .collect();
+            let excess = orchestrator
+                .state
+                .seed_completed_order(terminal_ids, retention);
+            for old_id in excess {
+                orchestrator.evict_workflow(&old_id).await;
+            }
+        }
 
         Ok(orchestrator)
     }
@@ -511,6 +717,7 @@ impl Orchestrator {
         &self,
         event_log: Option<&dyn EventLog>,
         watermarks: &HashMap<WorkflowId, EventId>,
+        generation_starts: &HashMap<WorkflowId, EventId>,
     ) {
         let Some(log) = event_log else {
             return;
@@ -527,7 +734,16 @@ impl Orchestrator {
             .map(|entry| {
                 let wf = entry.key().clone();
                 let wm = watermarks.get(&wf).copied();
-                (wf, wm)
+                // 补建出的工作流没有快照，重放必须从当前代的 Submitted 开始；
+                // 若同时存在旧水位，取两者中较新的那个作为起点。
+                let start = generation_starts.get(&wf).copied();
+                let effective = match (wm, start) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                };
+                (wf, effective)
             })
             .collect();
         for (wf_id, watermark) in targets {
@@ -645,17 +861,55 @@ impl Orchestrator {
                     self.persist_terminal_after_replay(&workflow_id).await;
                 }
             }
-            JournalEvent::NodeAdded { workflow_id, node } => {
+            JournalEvent::NodeAdded {
+                workflow_id,
+                node,
+                deps,
+            } => {
                 let mut slot = match self.state.slots.get_mut(&workflow_id) {
                     Some(slot) if slot.state == SlotState::Ready => slot,
                     _ => return,
                 };
-                if slot.dag.get_node(&node.task_id).is_none() {
-                    let task_id = node.task_id.clone();
-                    if slot.dag.add_node(node).is_ok() {
-                        slot.pending.entry(task_id).or_insert(0);
-                        self.state.mark_dirty(&workflow_id);
+                let task_id = node.task_id.clone();
+                if slot.dag.get_node(&task_id).is_none() {
+                    if let Err(e) = slot.dag.add_node(node) {
+                        tracing::warn!(
+                            workflow = %workflow_id.as_str(),
+                            task = %task_id.as_str(),
+                            error = %e,
+                            "replay: failed to rebuild node from journal"
+                        );
+                        return;
                     }
+                    let mut pending = 0usize;
+                    for dep in deps {
+                        if dep == task_id || slot.dag.get_node(&dep).is_none() {
+                            continue;
+                        }
+                        if let Err(e) = slot.dag.add_edge(dep.clone(), task_id.clone()) {
+                            tracing::warn!(
+                                workflow = %workflow_id.as_str(),
+                                task = %task_id.as_str(),
+                                error = %e,
+                                "replay: failed to rebuild edge from journal"
+                            );
+                            continue;
+                        }
+                        let unfinished = slot
+                            .execution
+                            .tasks
+                            .get(&dep)
+                            .map(|task| !task.state.is_terminal())
+                            .unwrap_or(true);
+                        if unfinished {
+                            pending += 1;
+                        }
+                    }
+                    if !slot.execution.tasks.contains_key(&task_id) {
+                        slot.execution.register_task(task_id.clone());
+                    }
+                    slot.pending.insert(task_id, pending);
+                    self.state.mark_dirty(&workflow_id);
                 }
             }
             JournalEvent::Started { workflow_id } => {
@@ -667,6 +921,19 @@ impl Orchestrator {
                     slot.execution.mark_running();
                     self.state.mark_dirty(&workflow_id);
                 }
+            }
+            JournalEvent::StartedAt {
+                workflow_id,
+                started_at_ms,
+            } => {
+                // 覆盖 mark_running 在恢复期填入的当前时间，使工作流级
+                // deadline 仍从原始启动时刻计时。
+                let mut slot = match self.state.slots.get_mut(&workflow_id) {
+                    Some(slot) if slot.state == SlotState::Ready => slot,
+                    _ => return,
+                };
+                slot.execution.set_started_at_ms(started_at_ms);
+                self.state.mark_dirty(&workflow_id);
             }
             JournalEvent::WaitPointRegistered {
                 workflow_id,
@@ -771,16 +1038,44 @@ impl Orchestrator {
                     .entry(key)
                     .or_insert(ContextEntry { kind, value });
             }
+            JournalEvent::NodesSealed { workflow_id } => {
+                let mut slot = match self.state.slots.get_mut(&workflow_id) {
+                    Some(slot) if slot.state == SlotState::Ready => slot,
+                    _ => return,
+                };
+                slot.execution.seal_nodes();
+                self.state.mark_dirty(&workflow_id);
+                if slot.execution.is_terminal() {
+                    drop(slot);
+                    self.persist_terminal_after_replay(&workflow_id).await;
+                }
+            }
+            JournalEvent::DeadlineSet {
+                workflow_id,
+                timeout_ms,
+            } => {
+                if let Some(mut slot) = self.state.slots.get_mut(&workflow_id) {
+                    if slot.state == SlotState::Ready {
+                        slot.execution.set_deadline_ms(timeout_ms);
+                        // 与其它有状态变更的重放分支一致：标脏让后台 flush
+                        // 把 deadline 并入快照并推进水位，避免每次重启都从头
+                        // 全量重放同一段历史。
+                        self.state.mark_dirty(&workflow_id);
+                    }
+                }
+            }
             // 派发/运行事件对状态机无增量语义（Running 会在快照加载时被重置
             // 为 Pending 以便重派发）；Submitted/Completed/Cancelled/Failed/
-            // Recovered 的状态已由快照吸收。
+            // Recovered 的状态已由快照吸收。Evicted 已在补建阶段拦截，这里
+            // 保留为 no-op 以防其它重放路径直接喂入该事件。
             JournalEvent::TaskDispatched { .. }
             | JournalEvent::TaskRunning { .. }
             | JournalEvent::Submitted { .. }
             | JournalEvent::Completed { .. }
             | JournalEvent::Cancelled { .. }
             | JournalEvent::Failed { .. }
-            | JournalEvent::Recovered { .. } => {}
+            | JournalEvent::Recovered { .. }
+            | JournalEvent::Evicted { .. } => {}
         }
     }
 
@@ -951,11 +1246,6 @@ impl Orchestrator {
             if let Ok(Some(data)) = store.get(&dag_key).await {
                 if let Ok(dag) = rkyv::from_bytes::<Dag, rkyv::rancor::Error>(&data) {
                     let task_ids: Vec<TaskId> = dag.nodes().map(|n| n.task_id.clone()).collect();
-                    let mut pending: HashMap<TaskId, usize> = HashMap::new();
-                    for node in dag.nodes() {
-                        let pred_count = dag.predecessor_count(&node.task_id);
-                        pending.insert(node.task_id.clone(), pred_count);
-                    }
 
                     let exec_key = exec_key(workflow_id);
                     let execution = if let Ok(Some(exec_data)) = store.get(&exec_key).await {
@@ -965,7 +1255,15 @@ impl Orchestrator {
                                 let task_ids: Vec<TaskId> =
                                     execution.tasks.keys().cloned().collect();
                                 for tid in &task_ids {
-                                    execution.reset_task(tid, false, true);
+                                    // 只重置崩溃时仍在 Running 的任务；Failed 是已裁决
+                                    // 终态（Continue 策略下工作流可能仍未终态），不能复活。
+                                    if execution
+                                        .tasks
+                                        .get(tid)
+                                        .is_some_and(|task| task.state == Phase::Running)
+                                    {
+                                        execution.reset_task(tid, false, true);
+                                    }
                                 }
                                 execution
                             }
@@ -981,6 +1279,34 @@ impl Orchestrator {
                     } else {
                         WorkflowExecution::new(workflow_id.clone(), task_ids)
                     };
+
+                    // 优先使用持久化的 pending 计数；缺失时按“未完成前驱数”
+                    // 重建，避免用总前驱数把已完成前驱仍然算作阻塞。
+                    let pending = match store.get(&pending_key(workflow_id)).await {
+                        Ok(Some(bytes)) => crate::common::serialization::deserialize_rkyv_value::<
+                            HashMap<TaskId, usize>,
+                        >(&bytes)
+                        .ok(),
+                        _ => None,
+                    }
+                    .unwrap_or_else(|| {
+                        let mut p = HashMap::new();
+                        for node in dag.nodes() {
+                            let unfinished = dag
+                                .predecessors_of(&node.task_id)
+                                .into_iter()
+                                .filter(|pred| {
+                                    execution
+                                        .tasks
+                                        .get(&pred.task_id)
+                                        .map(|task| !task.state.is_terminal())
+                                        .unwrap_or(true)
+                                })
+                                .count();
+                            p.insert(node.task_id.clone(), unfinished);
+                        }
+                        p
+                    });
 
                     self.state
                         .insert_workflow(workflow_id.clone(), dag, execution, pending);
@@ -1016,12 +1342,32 @@ impl Orchestrator {
             (Some(dag), Some(mut exec)) => {
                 let task_ids: Vec<TaskId> = exec.tasks.keys().cloned().collect();
                 for tid in &task_ids {
-                    exec.reset_task(tid, false, true);
+                    // 与本地恢复同语义：只重置接管时仍在 Running 的任务，
+                    // Failed 保持终态，避免接管方复活已失败节点。
+                    if exec
+                        .tasks
+                        .get(tid)
+                        .is_some_and(|task| task.state == Phase::Running)
+                    {
+                        exec.reset_task(tid, false, true);
+                    }
                 }
                 let pending = pending.unwrap_or_else(|| {
                     let mut p = HashMap::new();
                     for node in dag.nodes() {
-                        p.insert(node.task_id.clone(), dag.predecessor_count(&node.task_id));
+                        // 缺失 pending 快照时，按「未完成前驱数」重建；已终态
+                        // 前驱（Completed/Failed/Cancelled）不应继续挡住后继。
+                        let unfinished = dag
+                            .predecessors_of(&node.task_id)
+                            .into_iter()
+                            .filter(|pred| {
+                                exec.tasks
+                                    .get(&pred.task_id)
+                                    .map(|task| !task.state.is_terminal())
+                                    .unwrap_or(true)
+                            })
+                            .count();
+                        p.insert(node.task_id.clone(), unfinished);
                     }
                     p
                 });
@@ -1050,14 +1396,78 @@ impl Orchestrator {
 
     /// Restore a workflow from remote state (DAG + execution + pending).
     /// Called by the gossip layer when a WorkflowStateResponse is received.
-    /// Overwrites any existing placeholder entry for this workflow.
+    ///
+    /// 合并语义：本地终态不被回退；双方都非终态时保留本地（避免旧快照把
+    /// Running 打回 Pending）；远端终态可以推进本地非终态。合并后按实际
+    /// 任务状态重算 pending，不信任可能过期的远端 pending。
     pub async fn restore_workflow(
         &self,
         workflow_id: &WorkflowId,
         dag: Dag,
-        execution: WorkflowExecution,
+        mut execution: WorkflowExecution,
         pending: HashMap<TaskId, usize>,
     ) {
+        let (dag, execution, pending) = match self.state.slots.get(workflow_id) {
+            Some(existing) if existing.state == SlotState::Ready => {
+                if existing.execution.is_terminal() {
+                    tracing::debug!(
+                        workflow = %workflow_id.as_str(),
+                        "ignoring full-state response for terminal workflow"
+                    );
+                    return;
+                }
+                if execution.total_count() < existing.execution.total_count()
+                    || execution.succeeded_count() < existing.execution.succeeded_count()
+                {
+                    tracing::warn!(
+                        workflow = %workflow_id.as_str(),
+                        local = %format!(
+                            "{}/{}",
+                            existing.execution.succeeded_count(),
+                            existing.execution.total_count()
+                        ),
+                        incoming = %format!(
+                            "{}/{}",
+                            execution.succeeded_count(),
+                            execution.total_count()
+                        ),
+                        "ignoring stale full-state response"
+                    );
+                    return;
+                }
+                let local_tasks = existing.execution.tasks.clone();
+                for (tid, local) in local_tasks {
+                    match execution.tasks.get_mut(&tid) {
+                        Some(incoming) => {
+                            if local.state.is_terminal() || !incoming.state.is_terminal() {
+                                *incoming = local;
+                            }
+                        }
+                        None => {
+                            execution.tasks.insert(tid, local);
+                        }
+                    }
+                }
+                let mut merged_pending = HashMap::new();
+                for node in dag.nodes() {
+                    let unfinished = dag
+                        .predecessors_of(&node.task_id)
+                        .into_iter()
+                        .filter(|pred| {
+                            execution
+                                .tasks
+                                .get(&pred.task_id)
+                                .map(|task| !task.state.is_terminal())
+                                .unwrap_or(true)
+                        })
+                        .count();
+                    merged_pending.insert(node.task_id.clone(), unfinished);
+                }
+                (dag, execution, merged_pending)
+            }
+            _ => (dag, execution, pending),
+        };
+
         // 若可用，批量持久化到本地 store（单次事务，减少 fsync）
         if let Some(ref store) = self.store {
             let mut batch = Vec::new();
@@ -1086,6 +1496,32 @@ impl Orchestrator {
     }
 
     pub async fn evict_workflow(&self, old_id: &WorkflowId) {
+        // 墓碑是「已淘汰」的唯一凭据，必须在删除任何状态之前写成功。
+        // 写入失败时放弃淘汰：否则快照已删而 topic 无墓碑，恢复期会补建空
+        // slot，把已完成的任务重建为 Pending 并重新派发（重复副作用）。
+        if self.event_log.is_some()
+            && append_event(
+                self.event_log.as_ref(),
+                JournalEvent::Evicted {
+                    workflow_id: old_id.clone(),
+                },
+            )
+            .is_none()
+        {
+            tracing::error!(
+                workflow = %old_id.as_str(),
+                "failed to persist eviction marker; keeping workflow state intact"
+            );
+            return;
+        }
+
+        // 淘汰前留存终态摘要：轮询方在 slot 消失后仍需判定终态与错误。
+        if let Some(slot) = self.state.slots.get(old_id) {
+            let summary = WorkflowStateSummary::from_execution(old_id, &slot.execution);
+            drop(slot);
+            self.state.record_evicted_summary(old_id.clone(), summary);
+        }
+
         self.state.remove_workflow(old_id);
         if let Some(ref s) = self.store {
             for key in [
@@ -1105,6 +1541,25 @@ impl Orchestrator {
                         e
                     );
                 }
+            }
+        }
+        // 墓碑在函数开头已先行写入（成功才会走到这里）。此处不复用
+        // log_event：它会 record_event_seq，在 remove_workflow 清理水位后又把
+        // 水位插回，形成永久残留；且失败时无法回滚已删除的快照。
+        //
+        // 不裁剪该 topic 的历史事件：`get_workflow_journal` 是跨语言消费面，
+        // 淘汰工作流后其历史仍应可查。只把 topic 从 `list_topics` 隐藏，
+        // 使恢复期不再逐个扫描历史工作流；事件数据保持原样。
+        if let Some(log) = self.event_log.as_deref() {
+            let topic = format!("workflow:{}", old_id.as_str());
+            if let Err(e) = log.hide_topic(&topic) {
+                // 隐藏失败时 topic 仍会被扫描，但墓碑已写入，补建阶段的
+                // 代际判定仍会跳过它，语义不丢。
+                tracing::warn!(
+                    workflow = %old_id.as_str(),
+                    error = %e,
+                    "failed to hide evicted workflow topic from recovery scan"
+                );
             }
         }
     }

@@ -48,18 +48,17 @@ impl ExponentialBackoff {
     /// 返回第 `attempt` 次重试应等待的延迟。
     ///
     /// `attempt = 0` 返回 `base`；后续按 `2^attempt` 指数增长，被 `max_delay` 钳制。
-    /// `attempt` 过大导致 `2^attempt` 溢出时，通过 `saturating_mul` 钳制到 `max_delay`。
+    /// `attempt` 过大导致 `2^attempt` 溢出时，通过 `saturating_pow` 钳制到 u32 上限，
+    /// 再经 `Duration::saturating_mul` 饱和到 `Duration::MAX`，最终由 `max_delay` 封顶。
+    /// 全程用 `Duration` 运算而非毫秒整数，避免亚毫秒 `base` 被 `as_millis()` 截断
+    /// 成 0 而让退避静默失效。
     pub fn delay_for(&self, attempt: u32) -> Duration {
         if self.base.is_zero() {
             return Duration::ZERO;
         }
-        // 2^attempt 计算为 u32（attempt 上限 32），再提升到 u64 与 base 毫秒数相乘。
-        // saturating_pow(32) = u32::MAX，不会 panic。
+        // 2^attempt 计算为 u32（attempt 上限 32），saturating_pow(32) = u32::MAX。
         let multiplier = 2u32.saturating_pow(attempt);
-        let base_ms = self.base.as_millis() as u64;
-        let delay_ms = base_ms.saturating_mul(multiplier as u64);
-        let capped_ms = delay_ms.min(self.max_delay.as_millis() as u64);
-        Duration::from_millis(capped_ms)
+        self.base.saturating_mul(multiplier).min(self.max_delay)
     }
 
     /// 返回基础延迟（用于调用方日志或断言）。

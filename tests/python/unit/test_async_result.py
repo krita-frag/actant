@@ -8,7 +8,7 @@ import pytest
 
 from actant._internal.tasks.async_result import AsyncResult
 from actant._internal.tasks.context import TaskContext
-from actant.exceptions import ActantError, ActantTimeoutError
+from actant.exceptions import ActantError, ActantTimeoutError, TaskCancelledError
 
 _async_result_module = importlib.import_module("actant._internal.tasks.async_result")
 
@@ -30,6 +30,12 @@ class _FakeRustCore:
 
 
 class _FakeRuntime:
+    """Runtime 的能力替身：取消协议本身的实现不接受替身（见 `_request_cancel`）。
+
+    协议只依赖下列 Runtime 面：预取消标记、Rust core、本地任务表。替身只提供
+    这些能力，协议逻辑仍由真实代码执行。
+    """
+
     def __init__(self, *, broadcast_cancel_fails: bool = False) -> None:
         self._rust_core = _FakeRustCore(broadcast_cancel_fails=broadcast_cancel_fails)
         self._tasks: dict[str, AsyncResult] = {}
@@ -38,16 +44,14 @@ class _FakeRuntime:
     def _mark_task_cancelled(self, task_id: str) -> None:
         self._cancelled.add(task_id)
 
+    def _clear_task_cancelled(self, task_id: str) -> None:
+        self._cancelled.discard(task_id)
+
     def _list_tasks(self) -> list[str]:
         return list(self._tasks.keys())
 
     def _get_task(self, task_id: str) -> AsyncResult | None:
         return self._tasks.get(task_id)
-
-    def cancel_task(self, task_id: str) -> None:
-        handle = self._tasks.get(task_id)
-        if handle is not None:
-            handle.cancel(propagate=False)
 
     def register(self, handle: AsyncResult) -> None:
         self._tasks[handle.task_id] = handle
@@ -144,10 +148,65 @@ def test_cancel_rust_core_failure_logged_but_continues(
     )
 
 
+def test_cancel_pre_places_terminal_state_for_queued_task() -> None:
+    """排队期取消立即给出占位终态：提交方不必等 Worker 回应。
+
+    这是 ``Runtime.cancel_task`` 一直有的语义；收敛为单一协议后
+    ``AsyncResult.cancel()`` 同样具备，两个入口不再有行为差异。
+    """
+    h = AsyncResult("t1")
+    assert h.cancel() is True
+    assert h.state == "cancelled"
+    assert h.wait(timeout=0) is True
+    with pytest.raises(TaskCancelledError):
+        h.result(timeout=0)
+
+
 def test_cancel_completed_returns_false() -> None:
     h = AsyncResult("t1")
     h._set_result(42)
     assert h.cancel() is False
+
+
+def test_finish_reports_whether_it_wrote() -> None:
+    """``_finish`` 的返回值是"是否真正写入终态"，重复终态一并不生效。"""
+    h = AsyncResult("t1")
+    assert h._set_result(1) is True
+    assert h._set_result(2) is False
+    assert h.result() == 1
+
+
+def test_real_outcome_supersedes_pre_cancel_placeholder() -> None:
+    """排队期预取消是占位终态，真实结局必须能覆盖它。
+
+    ``Runtime.cancel_task`` 对排队中的任务立即置 ``cancelled``，让提交方不必
+    等 worker 回应；但该任务可能已被 worker 取走并跑完。若不允许覆盖，句柄停在
+    cancelled 而 Store 里是 Completed——同一任务两个互相矛盾的真相。
+    """
+    h = AsyncResult("t1")
+    assert h._set_cancelled() is True
+    assert h.state == "cancelled"
+    assert h._set_result(42) is True
+    assert h.state == "completed"
+    assert h.result() == 42
+
+
+def test_failed_outcome_supersedes_pre_cancel_placeholder() -> None:
+    h = AsyncResult("t1")
+    h._set_cancelled()
+    assert h._set_error("boom") is True
+    assert h.state == "failed"
+    with pytest.raises(ActantError):
+        h.result()
+
+
+def test_cancel_does_not_overwrite_real_outcome() -> None:
+    """反向不成立：真实取消不得覆盖已到达的成功结局。"""
+    h = AsyncResult("t1")
+    assert h._set_result(42) is True
+    assert h._set_cancelled() is False
+    assert h.state == "completed"
+    assert h.result() == 42
 
 
 def test_cancel_broadcast_failure_continues_cascade(

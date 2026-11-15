@@ -86,7 +86,7 @@ impl GilThread {
             // 通道已被 drop 方关闭（Runtime 正在收尾）：就地执行，保证结果
             // 不会因为「没人接收」而丢失。
             tracing::warn!("gil_thread channel closed; running task inline");
-            Python::attach(task);
+            Self::run_inline(task, "channel closed");
             return;
         };
         match sender.try_send(task) {
@@ -96,12 +96,29 @@ impl GilThread {
                     "gil_thread queue full (cap={}); falling back to synchronous Python::attach",
                     GIL_QUEUE_CAPACITY
                 );
-                Python::attach(boxed);
+                Self::run_inline(boxed, "queue full");
             }
             Err(channel::TrySendError::Disconnected(boxed)) => {
                 tracing::warn!("gil_thread worker disconnected; running task inline");
-                Python::attach(boxed);
+                Self::run_inline(boxed, "worker disconnected");
             }
+        }
+    }
+
+    /// 降级路径：在调用线程执行任务。
+    ///
+    /// 使用 `try_attach` 而非 `attach`：解释器已进入收尾时 `attach` 会
+    /// abort 整个进程，`try_attach` 返回 `None`。此时回调已无法安全执行，
+    /// 记录 error 后放弃（进程正在退出，Future 会被 GC 回收）。
+    ///
+    /// 解释器正常运行时仍会等待 GIL；调用点都是 tokio 线程（不持 GIL），
+    /// 等待由 Python 的 GIL 切换周期界定，不会自锁。
+    fn run_inline(task: Task, reason: &str) {
+        if Python::try_attach(task).is_none() {
+            tracing::error!(
+                reason,
+                "gil_thread: interpreter unavailable; deferred callback dropped"
+            );
         }
     }
 }

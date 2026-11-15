@@ -177,11 +177,12 @@ async fn pending_result_loop_delivers_and_stops_on_cancel() {
 }
 
 #[tokio::test]
-async fn pending_result_loop_retries_on_rejected_and_drops_after_max_attempts() {
+async fn pending_result_loop_keeps_retrying_until_accepted() {
     let transport = Arc::new(RecordingTransport::new());
-    // 两次 rejected 后无更多响应，第二次重试后 attempts 达到 max_attempts 被丢弃。
+    // 两次 rejected 后接受：超过 max_attempts 也不能丢弃远端结果。
     transport.push_response(DirectResponse::TaskResultAck { accepted: false });
     transport.push_response(DirectResponse::TaskResultAck { accepted: false });
+    transport.push_response(DirectResponse::TaskResultAck { accepted: true });
 
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
     let pending_tx = start_pending_result_loop(
@@ -202,18 +203,24 @@ async fn pending_result_loop_retries_on_rejected_and_drops_after_max_attempts() 
         .await
         .unwrap();
 
-    // 等待重试完成：第一次 1ms，第二次 2ms，再加上执行开销。
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // 等待重试完成：1ms + 2ms + 执行开销。
+    tokio::time::sleep(Duration::from_millis(150)).await;
 
-    // 第一次尝试 + 一次重试 = 2 次请求，达到 max_attempts 后不再重试。
-    assert_eq!(transport.request_count(), 2);
+    assert_eq!(transport.request_count(), 3);
+    assert_eq!(
+        transport.responses.lock().unwrap().len(),
+        0,
+        "all responses must be consumed"
+    );
 
     let _ = cancel_tx.send(true);
 }
 
 #[tokio::test]
-async fn pending_result_loop_drops_immediately_when_max_attempts_reached() {
+async fn pending_result_loop_retries_even_when_attempts_exceed_max() {
     let transport = Arc::new(RecordingTransport::new());
+    transport.push_response(DirectResponse::TaskResultAck { accepted: true });
+
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
     let pending_tx = start_pending_result_loop(
         transport.clone(),
@@ -235,7 +242,11 @@ async fn pending_result_loop_drops_immediately_when_max_attempts_reached() {
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    assert_eq!(transport.request_count(), 0);
+    assert_eq!(
+        transport.request_count(),
+        1,
+        "result beyond max attempts must still be delivered"
+    );
 
     let _ = cancel_tx.send(true);
 }

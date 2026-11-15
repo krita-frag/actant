@@ -66,6 +66,25 @@ impl Orchestrator {
         self.submit_with_invocation(workflow_id, dag, None).await
     }
 
+    /// workflow_id 进入 journal topic（`workflow:{id}`）与 event_log 键拼接，
+    /// `:` 会让字符串前缀扫描跨工作流污染（id `"a"` 与 `"a:b"` 的 topic
+    /// 前缀互为包含，重放会读进别人的事件、trim 甚至误删）；空 id 产生空
+    /// topic。提交与增量加节点是仅有的两个 id 进入点，在此统一校验。
+    fn validate_workflow_id(workflow_id: &WorkflowId) -> Result<()> {
+        let id = workflow_id.as_str();
+        if id.is_empty() {
+            return Err(crate::common::ActantError::Config(
+                "workflow id must not be empty".into(),
+            ));
+        }
+        if id.contains(':') {
+            return Err(crate::common::ActantError::Config(format!(
+                "workflow id must not contain ':': {id}"
+            )));
+        }
+        Ok(())
+    }
+
     /// 与 [`Self::submit`] 相同，但把调用描述写入 `Submitted` 事件。
     ///
     /// `invocation` 是 journal 的一部分：恢复后的任意节点都能据此重建
@@ -77,6 +96,7 @@ impl Orchestrator {
         dag: Dag,
         invocation: Option<WorkflowInvocation>,
     ) -> Result<()> {
+        Self::validate_workflow_id(&workflow_id)?;
         // 已就绪的工作流不允许重复提交；占位符允许覆盖（adopt 后本地重新提交）。
         if self.state.is_ready(&workflow_id) {
             if dag.node_count() == 0 {
@@ -89,6 +109,8 @@ impl Orchestrator {
             )));
         }
         let task_ids: Vec<TaskId> = dag.nodes().map(|n| n.task_id.clone()).collect();
+        // 整图提交立即封口；flow 的空 DAG 外壳保持未封口，由 seal_workflow 收口。
+        let sealed_on_submit = dag.node_count() > 0;
 
         let mut pending: HashMap<TaskId, usize> = HashMap::new();
         for node in dag.nodes() {
@@ -100,12 +122,67 @@ impl Orchestrator {
             .with_failure_strategy(dag.failure_strategy);
         // 整图提交：全部节点已知，立即封口。空 DAG 是 flow 增量提交
         // 的外壳（节点随后经 add_node 加入），保持未封口。
-        if dag.node_count() > 0 {
+        if sealed_on_submit {
             execution.seal_nodes();
         }
 
+        // 节点事件（含前驱）按拓扑序预生成：journal 单独即可重建 DAG 边、
+        // execution 任务与 pending 计数（schema v2）。必须在把 dag 移入
+        // 内存状态之前算好。
+        let node_events: Vec<JournalEvent> = {
+            let ordered = dag.topological_sort()?;
+            ordered
+                .into_iter()
+                .map(|node| {
+                    let deps = dag
+                        .predecessors_of(&node.task_id)
+                        .into_iter()
+                        .map(|pred| pred.task_id.clone())
+                        .collect();
+                    JournalEvent::NodeAdded {
+                        workflow_id: workflow_id.clone(),
+                        node: node.clone(),
+                        deps,
+                    }
+                })
+                .collect()
+        };
+
+        self.state
+            .insert_workflow(workflow_id.clone(), dag, execution.clone(), pending.clone());
+
+        // 阶段 2：journal-first。Submitted 与全部 NodeAdded 作为一个原子批次
+        // 追加，随后才写快照；若快照写入前崩溃，恢复期可从 journal topic
+        // 发现该工作流并重放出完整 DAG（见 `Orchestrator::recover`）。
+        {
+            let mut batch = Vec::with_capacity(node_events.len() + 1);
+            batch.push(JournalEvent::Submitted {
+                workflow_id: workflow_id.clone(),
+                invocation,
+            });
+            batch.extend(node_events);
+            // 封口与结构登记同属一个原子批次：崩溃窗口若只重放出 DAG 而没有
+            // 封口，恢复后的工作流永远不进入终态判定。
+            if sealed_on_submit {
+                batch.push(JournalEvent::NodesSealed {
+                    workflow_id: workflow_id.clone(),
+                });
+            }
+            self.log_events(&batch);
+        }
+
+        // 阶段 3：同步落盘。写失败返回错误，但内存状态与 journal 已就绪：
+        // 后台 flush 会重试，崩溃后恢复也能从 journal 重建。
         if let Some(ref store) = self.store {
-            let dag_bytes = serialize_rkyv(&dag)?;
+            let dag_bytes = {
+                let slot = self.state.slots.get(&workflow_id).ok_or_else(|| {
+                    crate::common::ActantError::NotFound(format!(
+                        "workflow {} not found after submit",
+                        workflow_id.as_str()
+                    ))
+                })?;
+                serialize_rkyv(&slot.dag)?
+            };
             let exec_bytes = serialize_rkyv(&execution)?;
             let pending_bytes = serialize_rkyv(&pending)?;
             store
@@ -115,27 +192,6 @@ impl Orchestrator {
                     (pending_key(&workflow_id), pending_bytes),
                 ])
                 .await?;
-        }
-
-        self.state
-            .insert_workflow(workflow_id.clone(), dag, execution, pending);
-
-        self.log_event(JournalEvent::Submitted {
-            workflow_id: workflow_id.clone(),
-            invocation,
-        });
-        // 节点新增事件。当前节点唯一变更点是整图提交；增量提交后
-        // 每个节点在其写入点单独追加。携带完整节点定义使历史可重建 DAG。
-        {
-            let slot = self.state.slots.get(&workflow_id);
-            if let Some(slot) = slot {
-                for node in slot.dag.nodes() {
-                    self.log_event(JournalEvent::NodeAdded {
-                        workflow_id: workflow_id.clone(),
-                        node: node.clone(),
-                    });
-                }
-            }
         }
 
         crate::metrics::inc_workflows_submitted();
@@ -163,12 +219,26 @@ impl Orchestrator {
     ) -> Result<()> {
         self.submit_with_invocation(workflow_id.clone(), dag, invocation)
             .await?;
-        if let Some(mut slot) = self.state.slots.get_mut(&workflow_id) {
-            slot.execution.set_deadline_ms(timeout_ms);
+        // 0 表示无工作流级 deadline（与 Python 层 `timeout_ms=0` 语义一致）。
+        // 写入 Some(0) 会让 is_expired 在下一毫秒即判定超时。
+        if timeout_ms > 0 {
+            {
+                let mut slot = self.state.slots.get_mut(&workflow_id).ok_or_else(|| {
+                    crate::common::ActantError::NotFound(format!(
+                        "workflow {} not found after submit",
+                        workflow_id.as_str()
+                    ))
+                })?;
+                slot.execution.set_deadline_ms(timeout_ms);
+            }
+            // deadline 晚于 submit 的同步落盘：除标脏让后台 flush 写快照外，
+            // 还要写入 journal，否则 flush 前崩溃会让恢复后的工作流失去超时保护。
+            self.log_event(JournalEvent::DeadlineSet {
+                workflow_id: workflow_id.clone(),
+                timeout_ms,
+            });
+            self.state.mark_dirty(&workflow_id);
         }
-        // deadline 设置晚于 submit 的同步落盘，必须标记脏，否则在后台 flush
-        // 触发前崩溃会丢失 deadline，重启后工作流失去超时保护。
-        self.state.mark_dirty(&workflow_id);
         Ok(())
     }
 
@@ -196,10 +266,13 @@ impl Orchestrator {
         node: DagNode,
         deps: Vec<TaskId>,
     ) -> Result<AddNodeOutcome> {
+        Self::validate_workflow_id(workflow_id)?;
         let task_id = node.task_id.clone();
 
-        // 阶段 1：重放检测 + 结构登记（slot 写锁内完成）。
-        let (auto_started, pending_count) = {
+        // 阶段 1：重放检测 + 结构登记 + 事件载荷构造（同一次 slot 写锁内完成）。
+        // 结构与 journal 事件必须来自同一视图：拆成「先登记、再重取表写事件」
+        // 会在两次取表之间留下并发淘汰窗口，报错时阶段 1 的状态变更无法回滚。
+        let (auto_started, pending_count, node_event, started_at_ms) = {
             let mut slot = self.state.slots.get_mut(workflow_id).ok_or_else(|| {
                 crate::common::ActantError::NotFound(format!(
                     "workflow {} not found",
@@ -259,14 +332,54 @@ impl Orchestrator {
             }
             slot.execution.register_task(task_id.clone());
             slot.pending.insert(task_id.clone(), pending_count);
-            if auto_started {
+            let started_at_ms = if auto_started {
                 slot.execution.mark_running();
-            }
-            (auto_started, pending_count)
+                slot.execution.started_at_ms()
+            } else {
+                None
+            };
+            // 节点定义与实际前驱边取自刚登记完的同一个 slot；快照写入前
+            // 崩溃时，重放可据此独立重建节点、边与 execution 任务。
+            let event_node = slot.dag.get_node(&task_id).cloned().ok_or_else(|| {
+                crate::common::ActantError::Internal(format!(
+                    "node {} missing immediately after registration",
+                    task_id.as_str()
+                ))
+            })?;
+            let deps: Vec<TaskId> = slot
+                .dag
+                .predecessors_of(&task_id)
+                .into_iter()
+                .map(|pred| pred.task_id.clone())
+                .collect();
+            (
+                auto_started,
+                pending_count,
+                JournalEvent::NodeAdded {
+                    workflow_id: workflow_id.clone(),
+                    node: event_node,
+                    deps,
+                },
+                started_at_ms,
+            )
         };
 
-        // 阶段 2：同步落盘（先持久化再派发）。节点定义必须在派发前可恢复，
-        // 否则节点死亡后工作流历史缺失该节点，重放无法重建提交序列。
+        // 阶段 2：历史事件（journal-first），在写锁释放后追加。
+        self.log_event(node_event);
+        if auto_started {
+            self.log_event(JournalEvent::Started {
+                workflow_id: workflow_id.clone(),
+            });
+            if let Some(started_at_ms) = started_at_ms {
+                self.log_event(JournalEvent::StartedAt {
+                    workflow_id: workflow_id.clone(),
+                    started_at_ms,
+                });
+            }
+        }
+
+        // 阶段 3：同步落盘（journal 之后）。节点定义在派发前可恢复；
+        // 事件已先写，崩溃后的重放能补齐快照尚未包含的节点。
         if let Some(ref store) = self.store {
             let (dag_bytes, exec_bytes, pending_bytes) = {
                 let slot = self.state.slots.get(workflow_id).ok_or_else(|| {
@@ -290,26 +403,6 @@ impl Orchestrator {
                 .await?;
         }
 
-        // 阶段 3：历史事件。NodeAdded 携带完整节点定义使历史可重建 DAG。
-        {
-            let node = self
-                .state
-                .slots
-                .get(workflow_id)
-                .and_then(|slot| slot.dag.get_node(&task_id).cloned());
-            if let Some(node) = node {
-                self.log_event(JournalEvent::NodeAdded {
-                    workflow_id: workflow_id.clone(),
-                    node,
-                });
-            }
-        }
-        if auto_started {
-            self.log_event(JournalEvent::Started {
-                workflow_id: workflow_id.clone(),
-            });
-        }
-
         // 阶段 4：派发裁决。依赖已满足 → 构造 TaskDefinition 交调用方入队。
         let ready = if pending_count == 0 {
             self.build_task_for_id(workflow_id, &task_id)?
@@ -328,7 +421,7 @@ impl Orchestrator {
     /// 已终态（fire-and-forget flow），立即执行终态收尾（持久化、事件、
     /// 指标、唤醒等待者）；封口前已终态（重放命中已完结工作流）为幂等 no-op。
     pub async fn seal_workflow(&self, workflow_id: &WorkflowId) -> Result<()> {
-        let terminal_snapshot = {
+        let (terminal_snapshot, seal_event_needed) = {
             let mut slot = self.state.slots.get_mut(workflow_id).ok_or_else(|| {
                 crate::common::ActantError::NotFound(format!(
                     "workflow {} not found",
@@ -341,14 +434,21 @@ impl Orchestrator {
                     workflow_id.as_str()
                 )));
             }
+            let was_sealed = slot.execution.nodes_sealed();
             let was_terminal = slot.execution.is_terminal();
             slot.execution.seal_nodes();
-            if !was_terminal && slot.execution.is_terminal() {
-                Some(slot.execution.clone())
-            } else {
-                None
-            }
+            let snapshot =
+                (!was_terminal && slot.execution.is_terminal()).then(|| slot.execution.clone());
+            (snapshot, !was_sealed)
         };
+
+        // 封口是终态判定的前置条件，必须进入历史：journal-only 恢复时靠它
+        // 重建封口状态，否则工作流永远收敛不到终态。
+        if seal_event_needed {
+            self.log_event(JournalEvent::NodesSealed {
+                workflow_id: workflow_id.clone(),
+            });
+        }
 
         match terminal_snapshot {
             Some(exec_snapshot) => {
@@ -445,8 +545,10 @@ impl Orchestrator {
                 })?;
                 let reset = slot.execution.begin_orchestrated_retry(task_id);
                 if reset {
-                    let pred_count = slot.dag.predecessor_count(task_id);
-                    slot.pending.insert(task_id.clone(), pred_count);
+                    // 任务能进入 Running 说明其前驱已全部完成；重试立即可派发。
+                    // 若沿用 predecessor_count，故障转移后 pending != 0，重试任务
+                    // 永远不会被 recover_ready_tasks / reschedule_incomplete_tasks 选中。
+                    slot.pending.insert(task_id.clone(), 0);
                 }
                 reset
             };
@@ -522,7 +624,7 @@ impl Orchestrator {
 
     /// Starts a workflow by marking it Running and returning root tasks.
     pub fn start(&self, workflow_id: &WorkflowId) -> Result<Vec<TaskDefinition>> {
-        let roots = {
+        let (roots, started_at_ms) = {
             let mut slot = self.state.slots.get_mut(workflow_id).ok_or_else(|| {
                 crate::common::ActantError::NotFound(format!(
                     "workflow {} not found",
@@ -536,6 +638,7 @@ impl Orchestrator {
                 )));
             }
             slot.execution.mark_running();
+            let started_at_ms = slot.execution.started_at_ms();
 
             // 根任务与后继任务走同一构造入口：payload 必须在派发前签名，
             // 否则 `require_payload_signing` 节点会以“unsigned payload”拒绝
@@ -546,7 +649,10 @@ impl Orchestrator {
                 .into_iter()
                 .map(|node| node.task_id.clone())
                 .collect();
-            self.build_ready_tasks_from_slot(&slot, workflow_id, &root_ids)?
+            (
+                self.build_ready_tasks_from_slot(&slot, workflow_id, &root_ids)?,
+                started_at_ms,
+            )
         };
 
         // Non-terminal: defer persistence to background flush
@@ -555,6 +661,12 @@ impl Orchestrator {
         self.log_event(JournalEvent::Started {
             workflow_id: workflow_id.clone(),
         });
+        if let Some(started_at_ms) = started_at_ms {
+            self.log_event(JournalEvent::StartedAt {
+                workflow_id: workflow_id.clone(),
+                started_at_ms,
+            });
+        }
 
         Ok(roots)
     }
@@ -596,8 +708,13 @@ impl Orchestrator {
             .complete_task(workflow_id, task_id, result, None)
             .await?;
 
-        // 将 ready_successors 转换为 TaskDefinition。
-        let ready = self.build_ready_tasks_for(workflow_id, &info.ready_successors)?;
+        // 出现终态时后继清单必然为空；且 `completed_retention_count == 0`
+        // 的收尾会把工作流直接淘汰，此时查 slot 只会得到 NotFound。
+        let ready = if info.workflow_terminal {
+            Vec::new()
+        } else {
+            self.build_ready_tasks_for(workflow_id, &info.ready_successors)?
+        };
 
         Ok((ready, info.workflow_terminal))
     }
@@ -821,7 +938,6 @@ impl Orchestrator {
         }
 
         if is_terminal {
-            // Terminal: persist immediately for crash safety
             let exec_snapshot = {
                 let slot = self.state.slots.get(workflow_id).ok_or_else(|| {
                     crate::common::ActantError::NotFound(format!(
@@ -831,23 +947,15 @@ impl Orchestrator {
                 })?;
                 slot.execution.clone()
             };
-            if let Some(ref store) = self.store {
-                let exec_bytes = serialize_rkyv(&exec_snapshot)?;
-                store
-                    .put_batch(&[(exec_key(workflow_id), exec_bytes)])
-                    .await?;
-            }
-            self.log_event(JournalEvent::Failed {
-                workflow_id: workflow_id.clone(),
-                error: format!("workflow failed at task {}", task_id.as_str()),
-            });
-            crate::metrics::inc_workflows_failed();
-            crate::metrics::dec_active_workflows();
-            self.notify_terminal(workflow_id);
-        } else {
-            // Non-terminal: defer to background flush
-            self.state.mark_dirty(workflow_id);
+            // 与其它终态入口共用收尾：终态事件、指标、等待者释放、淘汰和
+            // 落盘失败容错只有一处实现，落盘失败不得跳过内存侧结算。
+            return self
+                .complete_terminal(workflow_id, Some(task_id), &exec_snapshot)
+                .await
+                .map(|_| ());
         }
+        // Non-terminal: defer to background flush
+        self.state.mark_dirty(workflow_id);
         Ok(())
     }
 
@@ -945,27 +1053,24 @@ impl Orchestrator {
         completed_task_id: Option<&TaskId>,
         exec_snapshot: &crate::runtime::workflow::dag::WorkflowExecution,
     ) -> Result<CompletionInfo> {
+        if !exec_snapshot.state.is_terminal() {
+            // 所有调用方都应在翻转到终态后再进入本方法。若这里收到非终态
+            // 快照，下面的 `_` 分支会把它记成 Failed 并污染指标，故显式
+            // 暴露而非静默吞掉；仍继续结算以保持内存侧一致性。
+            tracing::error!(
+                workflow = %workflow_id.as_str(),
+                state = %exec_snapshot.state.as_str(),
+                "complete_terminal called with a non-terminal execution snapshot"
+            );
+        }
         if let Some(started_at_ms) = exec_snapshot.started_at_ms() {
             let now_ms = crate::common::epoch_millis();
             crate::metrics::observe_workflow_duration_ms(now_ms.saturating_sub(started_at_ms));
         }
 
-        if self.config.workflow.completed_retention_count == 0 {
-            self.evict_workflow(workflow_id).await;
-        } else if let Some(ref store) = self.store {
-            let exec_bytes = serialize_rkyv(exec_snapshot)?;
-            let mut batch = vec![(exec_key(workflow_id), exec_bytes)];
-
-            if matches!(exec_snapshot.state, Phase::Completed) {
-                let results: Vec<Vec<u8>> = exec_snapshot.collected_results();
-                if !results.is_empty() {
-                    let result_bytes = crate::common::pack_group(&results)?;
-                    batch.push((result_key(workflow_id), result_bytes));
-                }
-            }
-            store.put_batch(&batch).await?;
-        }
-
+        // 终态事件与指标先结算：事件日志是恢复的事实源，且终态事件必须在
+        // 淘汰（`completed_retention_count == 0`）**之前**写入——淘汰会清理
+        // 事件水位，之后再写会让 `record_event_seq` 把水位重新插回并永久残留。
         match exec_snapshot.state {
             Phase::Completed => {
                 self.log_event(JournalEvent::Completed {
@@ -998,6 +1103,33 @@ impl Orchestrator {
                 crate::metrics::inc_workflows_failed();
             }
         }
+
+        let retention = self.config.workflow.completed_retention_count;
+        if retention == 0 {
+            // 0 = 终态后立即淘汰。
+            self.evict_workflow(workflow_id).await;
+        } else {
+            if let Some(ref store) = self.store {
+                if let Err(err) = Self::persist_terminal(store, workflow_id, exec_snapshot).await {
+                    // 终态在内存中已是事实，journal（同为恢复事实源）也已记录终态
+                    // 事件；快照落盘只是恢复加速。此处上抛会跳过下面的指标扣减与
+                    // 等待者释放——等待者 park 到超时、`active_workflows` 永久泄漏。
+                    // 因此只记录并重标脏，交给后台 flush 在容量恢复后重试。
+                    tracing::error!(
+                        workflow = %workflow_id.as_str(),
+                        error = %err,
+                        "failed to persist terminal workflow snapshot; settling in memory"
+                    );
+                    self.state.mark_dirty(workflow_id);
+                }
+            }
+            // 非 0 时按「最多保留 N 个终态工作流」淘汰最旧的那些，
+            // 避免内存与存储随已完成工作流无限增长。
+            for old_id in self.state.record_completed(workflow_id.clone(), retention) {
+                self.evict_workflow(&old_id).await;
+            }
+        }
+
         crate::metrics::dec_active_workflows();
 
         self.notify_terminal(workflow_id);
@@ -1007,20 +1139,37 @@ impl Orchestrator {
         })
     }
 
-    /// Notify waiters that a workflow has reached a terminal state.
-    /// Fires the per-workflow oneshot channel for instant wake-up.
+    /// 持久化终态快照：执行快照必写，`Completed` 时附带聚合结果。
     ///
-    /// 只触发当前 workflow 的 oneshot：其他已终态工作流的等待者在注册时
-    /// 已由 `register_terminal_waiter` 的"注册后检查"立即解决，无需在此
-    /// 全量扫描兜底。
+    /// 与收尾的其余步骤（终态事件、指标、等待者释放）分开，使调用方能在
+    /// 落盘失败时仍完成内存侧结算。
+    async fn persist_terminal(
+        store: &crate::runtime::state::Store,
+        workflow_id: &WorkflowId,
+        exec_snapshot: &crate::runtime::workflow::dag::WorkflowExecution,
+    ) -> Result<()> {
+        let exec_bytes = serialize_rkyv(exec_snapshot)?;
+        let mut batch = vec![(exec_key(workflow_id), exec_bytes)];
+
+        if matches!(exec_snapshot.state, Phase::Completed) {
+            let results: Vec<Vec<u8>> = exec_snapshot.collected_results();
+            if !results.is_empty() {
+                let result_bytes = crate::common::pack_group(&results)?;
+                batch.push((result_key(workflow_id), result_bytes));
+            }
+        }
+        store.put_batch(&batch).await
+    }
+
+    /// 释放工作流进入终态后仍 park 在等待点上的等待者。
     ///
-    /// 同时释放该工作流**等待点 park 的等待者**。`AsyncResult` 的等待由
-    /// `BusEvent::TaskCancelled` 结算，而等待点 park 是另一条阻塞原语，
-    /// 仅靠运行时关停的 `release_all_wait_point_waiters` 释放不够：缺了这一步，
-    /// cancel / fail / deadline 都到不了 park 中的 flow 体——工作流已终态而函数体
-    /// 永久挂起（实测：8s 观察窗内纹丝不动）。
-    /// 三个终态入口（`fail_task` / `complete_terminal` / `mark_workflow_failed`）
-    /// 共用本方法，故在此单点释放即可。
+    /// `AsyncResult` 的等待由 `BusEvent::TaskCancelled` 结算，而等待点 park
+    /// 是另一条阻塞原语，仅靠运行时关停的 `release_all_wait_point_waiters`
+    /// 释放不够：缺了这一步，cancel / fail / deadline 都到不了 park 中的
+    /// flow 体——工作流已终态而函数体永久挂起。
+    /// 丢弃 sender 使 receiver 立即收到 `Err`，park 方据此查工作流终态判定
+    /// 真实原因；此处不投递 oneshot payload。
+    /// 所有终态入口共用 `complete_terminal`，故在此单点释放即可。
     fn notify_terminal(&self, workflow_id: &WorkflowId) {
         self.state.release_wait_waiters(workflow_id);
     }
@@ -1058,36 +1207,28 @@ impl Orchestrator {
         Ok(ready_ids)
     }
 
-    pub async fn mark_workflow_failed(
-        &self,
-        workflow_id: &WorkflowId,
-        error: String,
-    ) -> Result<()> {
-        let store_writes = {
+    /// 将工作流标记为 Failed 并保留真实错误（flow 函数体异常收尾）。
+    ///
+    /// 与 [`Self::cancel`] 的区别：取消表示外部主动终止（Cancelled），
+    /// 本方法表示执行失败（Failed），错误串进入终态快照与 `Failed` 事件，
+    /// 使 `FlowHandle.result()` 能区分失败与取消。
+    pub async fn fail_workflow(&self, workflow_id: &WorkflowId, error: String) -> Result<()> {
+        let terminal_snapshot = {
             let mut slot = self.state.slots.get_mut(workflow_id).ok_or_else(|| {
                 crate::common::ActantError::NotFound(format!(
                     "workflow {} not found",
                     workflow_id.as_str()
                 ))
             })?;
+            let was_terminal = slot.execution.is_terminal();
             slot.execution.mark_workflow_failed(error);
-            if self.store.is_some() {
-                Some(slot.execution.clone())
-            } else {
-                None
-            }
+            (!was_terminal && slot.execution.is_terminal()).then(|| slot.execution.clone())
         };
 
-        if let Some(exec_snapshot) = store_writes {
-            if let Some(ref store) = self.store {
-                let exec_bytes = serialize_rkyv(&exec_snapshot)?;
-                store
-                    .put_batch(&[(exec_key(workflow_id), exec_bytes)])
-                    .await?;
-            }
+        if let Some(exec_snapshot) = terminal_snapshot {
+            self.complete_terminal(workflow_id, None, &exec_snapshot)
+                .await?;
         }
-
-        self.notify_terminal(workflow_id);
         Ok(())
     }
 
@@ -1174,22 +1315,55 @@ impl Orchestrator {
         all_ready
     }
 
-    pub fn reschedule_running_tasks(
+    /// 接管后重新派发单个工作流中「未终结且已就绪」的任务。
+    ///
+    /// 判定与 [`Self::recover_ready_tasks`] 同构（`pending` 计数为 0 且状态
+    /// 为 [`Phase::Pending`]），因为接管方要做的正是"从别人留下的快照继续跑"：
+    /// `restore_workflow_from_bytes` 已把非终态任务重置为 Pending 并推进
+    /// attempt，若只认 Running，接管方就一个可派发任务都没有——工作流停在
+    /// Running 却永不推进（表现为任务永久 Pending）。
+    ///
+    /// 仍为 Running 的任务先重置为 Pending（attempt 递增，用于按代数栅栏掉
+    /// 旧代在途结果）：这类任务来自本地已有的副本而非远端快照。
+    pub fn reschedule_incomplete_tasks(
         &self,
         workflow_id: &WorkflowId,
     ) -> Result<Vec<TaskDefinition>> {
         let running_task_ids = self.get_running_task_ids(workflow_id);
-        let mut tasks_to_reschedule = Vec::with_capacity(running_task_ids.len());
-
         for task_id in &running_task_ids {
             self.mark_task_pending(workflow_id, task_id)?;
-
-            if let Some(task_def) = self.build_task_for_id(workflow_id, task_id)? {
-                crate::metrics::inc_retry_scheduled();
-                tasks_to_reschedule.push(task_def);
-            }
         }
 
-        Ok(tasks_to_reschedule)
+        let slot = match self.state.slots.get(workflow_id) {
+            Some(slot) => slot,
+            None => return Ok(Vec::new()),
+        };
+        if slot.execution.is_terminal() {
+            return Ok(Vec::new());
+        }
+
+        let ready_ids: Vec<TaskId> = slot
+            .pending
+            .iter()
+            .filter(|(tid, &count)| {
+                count == 0
+                    && slot
+                        .execution
+                        .tasks
+                        .get(tid)
+                        .is_some_and(|t| t.state == Phase::Pending)
+            })
+            .map(|(tid, _)| tid.clone())
+            .collect();
+
+        if ready_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let tasks = self.build_ready_tasks_from_slot(&slot, workflow_id, &ready_ids)?;
+        for _ in &tasks {
+            crate::metrics::inc_retry_scheduled();
+        }
+        Ok(tasks)
     }
 }

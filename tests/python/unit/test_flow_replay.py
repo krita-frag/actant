@@ -13,7 +13,11 @@ from typing import Any
 import pytest
 
 from actant import Runtime, flow, host_flows
-from actant._internal.flow import _replay_node_outcome
+from actant._internal.flow import (
+    _FlowState,
+    _replay_node_outcome,
+    _settle_flow_failure,
+)
 from actant.exceptions import InvalidStateError
 from actant.workflow import FLOW_REGISTRY
 
@@ -39,6 +43,48 @@ class _FakeHandle:
 
     def _set_error(self, message: str) -> None:
         self.error = message
+
+
+class _SettleRuntime:
+    """记录终态化选择的假 Runtime。"""
+
+    def __init__(self) -> None:
+        self.failed: list[tuple[str, str]] = []
+        self.cancelled: list[str] = []
+
+    def _fail_workflow(self, workflow_id: str, error: str) -> None:
+        self.failed.append((workflow_id, error))
+
+    def cancel_workflow(self, workflow_id: str) -> None:
+        self.cancelled.append(workflow_id)
+
+
+class TestSettleFlowFailure:
+    """业务异常 → Failed；协程取消 → Cancelled，不能混为一谈。"""
+
+    def test_business_exception_marks_failed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(_FLOW_MODULE, "get_current_runtime", lambda: None)
+        rt = _SettleRuntime()
+        state = _FlowState("wf-fail")
+        state.workflow_created = True
+
+        _settle_flow_failure(rt, state, ValueError("boom"))
+
+        assert rt.failed == [("wf-fail", "ValueError: boom")]
+        assert rt.cancelled == []
+
+    def test_cancelled_error_marks_cancelled(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import asyncio
+
+        monkeypatch.setattr(_FLOW_MODULE, "get_current_runtime", lambda: None)
+        rt = _SettleRuntime()
+        state = _FlowState("wf-cancel")
+        state.workflow_created = True
+
+        _settle_flow_failure(rt, state, asyncio.CancelledError())
+
+        assert rt.cancelled == ["wf-cancel"]
+        assert rt.failed == []
 
 
 class TestFlowRegistry:
@@ -133,3 +179,27 @@ def test_replay_node_outcome_accepts_simplenamespace_shape() -> None:
     # dict 形态（生产路径）与 Mapping 形态都应被接受。
     _replay_node_outcome(rt, handle, {"state": outcome.state, "result": outcome.result})
     assert rt.results[0].result == b"x"
+
+def test_flow_name_with_colon_rejected_at_decoration() -> None:
+    """flow 名含 ':' 会在装饰期被拒绝（Rust 侧 validate_workflow_id 的根因前移）。"""
+    import pytest as _pytest
+
+    from actant._internal.flow import flow
+
+    with _pytest.raises(ValueError, match="must not contain ':'"):
+
+        @flow(name="a:b")
+        def _some_flow() -> None:  # pragma: no cover - 装饰即抛
+            pass
+
+
+def test_emit_terminal_cancelled_publishes_cancelled_kind(monkeypatch) -> None:
+    """取消终态发布 cancelled 事件（而非 failed），与本地取消路径一致。"""
+    import actant._internal.flow as flow_mod
+
+    events = []
+    monkeypatch.setattr(flow_mod, "emit", lambda _cap, ev: events.append(ev))
+
+    assert flow_mod._emit_terminal("wf-cancel-kind", {"error": "boom"}, "cancelled")
+    assert [e.kind for e in events] == ["cancelled"]
+    assert events[0].error == "boom"

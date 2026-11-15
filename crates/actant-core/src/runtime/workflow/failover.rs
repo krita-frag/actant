@@ -14,14 +14,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::common::{
     should_claim_workflow, ActorId, FailoverConfig, NodeHeartbeat, NodeId, OrchestratorClaim,
-    PlatformInfo, Result, TaskCompletion, TaskDefinition, TaskId, WireEnvelope, WireMessage,
-    WorkflowId, STORE_KEY_LEASE, TOPIC_FAILOVER, TOPIC_HEADS, TOPIC_HEARTBEAT,
+    PlatformInfo, Result, SignedOrchestratorClaim, TaskCompletion, TaskDefinition, TaskId,
+    WireEnvelope, WireMessage, WorkflowId, STORE_KEY_LEASE, TOPIC_FAILOVER, TOPIC_HEADS,
+    TOPIC_HEARTBEAT,
 };
 use crate::runtime::actor::ActorSystem;
 use crate::runtime::event_bus::{BusEvent, EventBus};
 use crate::runtime::state::{HybridLogicalClock, LmdbStore};
 use crate::runtime::workflow::actor::workflow_methods;
 use crate::runtime::workflow::messaging;
+use crate::runtime::workflow::route::RouteCandidate;
 
 /// 在途目标主动存活探测的单次超时上界。
 ///
@@ -41,6 +43,10 @@ struct PersistedLease {
 struct PeerState {
     node_id: NodeId,
     last_heartbeat_ms: u64,
+    /// 对端编排器最近一次心跳声明的活跃工作流。
+    ///
+    /// 失联判定发生在此字段最后一次被刷新的时刻之后，因此它等价于"对端失联
+    /// 时仍在驱动的工作流"，是接管的对象清单。
     active_workflows: HashSet<WorkflowId>,
     available_slots: u32,
     max_slots: u32,
@@ -82,6 +88,8 @@ pub struct OutboundTask {
 pub struct PeerInfo {
     pub node_id: NodeId,
     pub last_heartbeat_ms: u64,
+    /// 对端最近一次心跳声明的活跃工作流（接管时的孤儿清单）。
+    #[serde(default)]
     pub active_workflows: HashSet<WorkflowId>,
     pub available_slots: u32,
     pub max_slots: u32,
@@ -117,6 +125,23 @@ impl From<&PeerState> for PeerInfo {
             draining: state.draining,
         }
     }
+}
+
+/// `claim_workflow` 的裁决结果。
+///
+/// 调用方必须区分「已接管」与「退让」：两者都不是错误，但只有前者允许重调度
+/// 该工作流的在途任务。合并成 `Ok(())` 会让退让方也去重调度，而它并不持有
+/// 该工作流。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimOutcome {
+    /// 本节点新建租约并广播 claim，已接管。
+    Adopted,
+    /// 本节点原本就持有有效租约，无需重复 claim。
+    AlreadyOwned,
+    /// 租约仍被其它节点有效持有，本节点退让。
+    Deferred,
+    /// 本节点角色不具备编排能力，未参与 claim。
+    NotOrchestrator,
 }
 
 struct LeaseEntry {
@@ -232,6 +257,28 @@ pub struct FailoverManager {
     /// 本节点命名配额计数器（用于心跳广播剩余容量）。由 builder 在 Worker
     /// 创建后注入；`None` 时广播空表（等价"不提供任何配额"）。
     local_quota_tracker: Arc<parking_lot::Mutex<Option<Arc<crate::runtime::quota::QuotaTracker>>>>,
+    /// 路由候选快照版本：成员或容量变更时递增，驱动缓存重建。
+    peers_version: AtomicU64,
+    /// 路由候选缓存：`(版本, 候选列表)`。
+    ///
+    /// 构建在锁外完成，写锁只替换指针；读取命中时仅做 `Arc::clone`。
+    /// 缓存放这里是因为候选完全由 `peers` 派生，与成员状态同生命周期，
+    /// 避免跨层失效通知。
+    route_snapshot: parking_lot::RwLock<Option<(u64, Arc<Vec<RouteCandidate>>)>>,
+    /// 最近一次成功查询到的活跃 workflow 清单。
+    ///
+    /// 心跳查询失败时沿用该清单，避免发送空清单让 peers 误以为本节点没有
+    /// 孤儿 workflow（随后失联将无人接管）。
+    last_active_workflows: Arc<parking_lot::RwLock<Vec<WorkflowId>>>,
+    /// 重调度入队失败的任务，按 task_id 保留以便逐轮重试。
+    pending_reschedules: Arc<DashMap<TaskId, crate::common::TaskDefinition>>,
+    /// 待接管工作流：本轮被选举接管、但因租约仍被原 owner 有效持有而退让。
+    ///
+    /// 退让不能是终点。触发退让的 peer 当轮已被 `expire_stale_peers` 移出视图，
+    /// 后续轮次不再扫描它；而租约到期后 `expire_leases` 会把条目删掉。若退让即
+    /// 作罢，工作流此后永久无人驱动。键是工作流，值是原 owner（用于判断它是否
+    /// 复活）。条目在接管成功或原 owner 复活时移除，因此不会无限累积。
+    pending_claims: DashMap<WorkflowId, NodeId>,
 }
 
 impl Drop for FailoverManager {
@@ -295,6 +342,11 @@ impl FailoverManager {
             blocked_peers: Arc::new(DashMap::new()),
             heartbeat_paused_until_ms: Arc::new(AtomicU64::new(0)),
             local_quota_tracker: Arc::new(parking_lot::Mutex::new(None)),
+            peers_version: AtomicU64::new(0),
+            route_snapshot: parking_lot::RwLock::new(None),
+            last_active_workflows: Arc::new(parking_lot::RwLock::new(Vec::new())),
+            pending_reschedules: Arc::new(DashMap::new()),
+            pending_claims: DashMap::new(),
         };
         fm.recover_leases_from_store();
         fm
@@ -304,8 +356,9 @@ impl FailoverManager {
     ///
     /// - `signing_key`：本节点 endpoint 私钥，`Some` 时出站心跳签名；
     /// - `require_signed_records`：拒绝缺签/坏签的入站心跳；
-    /// - `allowed_peer_ids`：非空时入站心跳的 `endpoint_addr` 必须在列表内
-    ///   （gossip 侧成员校验；直连侧另有 ALPN 白名单）。
+    /// - `allowed_peer_ids`：非空时入站心跳的 endpoint id（取自完整
+    ///   `endpoint_addr`）必须在列表内（gossip 侧成员校验；直连侧另有
+    ///   ALPN 白名单）。
     pub fn with_identity(
         mut self,
         signing_key: Option<iroh::SecretKey>,
@@ -325,6 +378,21 @@ impl FailoverManager {
             ..hb.clone()
         };
         postcard::to_allocvec(&unsigned).unwrap_or_default()
+    }
+
+    /// claim 签名域：带长度前缀的 `(node_id, workflow_id, timestamp_ms)`。
+    ///
+    /// 使用长度前缀避免 `a|b` 与 `ab|` 之类拼接歧义；域标签隔离心跳签名。
+    fn claim_signing_payload(claim: &OrchestratorClaim) -> Vec<u8> {
+        let mut payload = b"actant/orchestrator-claim/v1".to_vec();
+        let node = claim.node_id.as_str().as_bytes();
+        payload.extend_from_slice(&(node.len() as u32).to_le_bytes());
+        payload.extend_from_slice(node);
+        let workflow = claim.workflow_id.as_str().as_bytes();
+        payload.extend_from_slice(&(workflow.len() as u32).to_le_bytes());
+        payload.extend_from_slice(workflow);
+        payload.extend_from_slice(&claim.timestamp_ms.to_le_bytes());
+        payload
     }
 
     /// 设置本节点拓扑角色。
@@ -402,7 +470,7 @@ impl FailoverManager {
         }
     }
 
-    /// 获取活跃 workflow ID 列表。
+    /// 获取本地编排器当前的活跃 workflow ID 列表（用于租约续期）。
     async fn active_workflow_ids(&self) -> crate::common::Result<Vec<WorkflowId>> {
         let result = self
             .call_workflow(workflow_methods::ACTIVE_WORKFLOW_IDS, ())
@@ -489,11 +557,9 @@ impl FailoverManager {
         );
     }
 
-    /// 清除一条在途登记（该任务的命运已在本地确定）。
-    ///
-    /// 由 Worker 网络事件路由在收到该任务的远端结果时调用。
-    pub fn clear_outbound(&self, task_id: &str) {
-        self.outbound.remove(task_id);
+    /// 当前在途登记的任务 attempt（无登记返回 `None`）。
+    pub(crate) fn outbound_attempt(&self, task_id: &str) -> Option<u32> {
+        self.outbound.get(task_id).map(|entry| entry.task.attempt)
     }
 
     /// 取出并移除所有租约已失效的直提任务登记。
@@ -577,28 +643,37 @@ impl FailoverManager {
     ///
     /// 探测成功即认为对端仍在服务：**不**终结其任务（避免误杀健康任务）；
     /// 探测失败/超时才终结。仅对"不在新鲜心跳窗口内"的目标探测，正常拓扑下
-    /// 每次扫描通常零探测。
-    async fn probe_outbound_targets(&self) {
+    /// 每次扫描通常零探测。`skip` 是本轮已被第 2 腿判死并处置过的节点：
+    /// fail-fast 重插的直提条目目标仍是死节点，再探测无信息增量且白白消耗
+    /// 一次 2s 超时。
+    async fn probe_outbound_targets(&self, skip: &HashSet<NodeId>) {
         // 去重：同一目标可能承载多个在途任务，只探测一次。
         let mut targets: HashMap<NodeId, Option<String>> = HashMap::new();
         for entry in self.outbound.iter() {
             let target = entry.value().target_node.clone();
-            if self.is_peer_fresh(&target) {
+            if skip.contains(&target) || self.is_peer_fresh(&target) {
                 continue;
             }
             targets
                 .entry(target)
                 .or_insert_with(|| entry.value().target_endpoint_addr.clone());
         }
-        for (target, addr) in targets {
+        // 并发探测：串行时 K 个不可达目标会让检测轮线性膨胀到 K×2s，且
+        // 推迟同循环内的接管重试与重调度腿。结果统一在并发全部返回后处置。
+        let probes = targets.into_iter().map(|(target, addr)| {
             let addr = addr.unwrap_or_else(|| target.as_str().to_string());
-            let probe = self
-                .network
-                .send_direct_request(&addr, crate::runtime::network::DirectRequest::Ping);
-            let alive = matches!(
-                tokio::time::timeout(OUTBOUND_PROBE_TIMEOUT, probe).await,
-                Ok(Ok(crate::runtime::network::DirectResponse::Pong))
-            );
+            async move {
+                let probe = self
+                    .network
+                    .send_direct_request(&addr, crate::runtime::network::DirectRequest::Ping);
+                let alive = matches!(
+                    tokio::time::timeout(OUTBOUND_PROBE_TIMEOUT, probe).await,
+                    Ok(Ok(crate::runtime::network::DirectResponse::Pong))
+                );
+                (target, addr, alive)
+            }
+        });
+        for (target, addr, alive) in futures::future::join_all(probes).await {
             if alive {
                 tracing::debug!(
                     node = %target.as_str(),
@@ -701,6 +776,15 @@ impl FailoverManager {
         self.network
             .subscribe(crate::common::TOPIC_DAG_STATE)
             .await?;
+        // 工作流状态同步：请求与响应都走全局话题（目标节点在载荷内）。
+        // 用固定话题而非 `wf-state-req:<node>`：运行期新建的话题拿不到已连接
+        // 的邻居，`broadcast` 返回成功却无人接收，跨节点状态复制会静默失效。
+        self.network
+            .subscribe(crate::common::Topic::workflow_state_req().as_str())
+            .await?;
+        self.network
+            .subscribe(crate::common::Topic::workflow_state_resp().as_str())
+            .await?;
         Ok(())
     }
 
@@ -717,7 +801,23 @@ impl FailoverManager {
             );
             return Ok(());
         }
-        let active_workflows = self.active_workflow_ids().await?;
+        // 活跃清单要随心跳上报（对端据此判定失联节点留下了哪些孤儿），但心跳
+        // 本身不能因为这次查询失败而停摆：查询失败只降级为"清单缺失"，对端
+        // 就看不到本节点名下的工作流，日志里可查。
+        let active_workflows = match self.active_workflow_ids().await {
+            Ok(ids) => {
+                *self.last_active_workflows.write() = ids.clone();
+                ids
+            }
+            Err(e) => {
+                tracing::warn!(
+                    node = %self.node_id.0,
+                    error = %e,
+                    "failed to list active workflows for heartbeat; reusing last known inventory"
+                );
+                self.last_active_workflows.read().clone()
+            }
+        };
         let now_ms = crate::common::epoch_millis();
         let endpoint_addr = self
             .network
@@ -750,7 +850,7 @@ impl FailoverManager {
             hb.signature = Some(key.sign(&Self::signing_payload(&hb)).to_bytes().to_vec());
         }
         let msg = WireMessage::NodeHeartbeat(hb);
-        let data = postcard::to_allocvec(&WireEnvelope::wrap(msg))
+        let data = postcard::to_allocvec(&WireEnvelope::wrap(msg)?)
             .map_err(|e| crate::common::ActantError::Serialization(e.to_string()))?;
         tracing::debug!(
             "sending heartbeat from {} to topic {}",
@@ -774,6 +874,59 @@ impl FailoverManager {
             .collect()
     }
 
+    /// 成员或容量变更后使路由候选缓存失效。
+    fn bump_peers_version(&self) {
+        self.peers_version.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// 返回路由候选快照；同一版本内复用同一份 `Arc`。
+    ///
+    /// 路由是每任务路径：命中缓存只做版本比较 + `Arc::clone`。O(N) 构建只在
+    /// 成员/容量变更后的首次调用发生，且构建期间不持有缓存锁（写锁只换指针），
+    /// 避免阻塞其他路由线程。只搬运路由所需字段，不克隆 `platform` 等
+    /// 路由不用的数据。
+    pub(crate) fn route_candidates(&self) -> Arc<Vec<RouteCandidate>> {
+        let version = self.peers_version.load(Ordering::Acquire);
+        {
+            let cached = self.route_snapshot.read();
+            if let Some((cached_version, snapshot)) = cached.as_ref() {
+                if *cached_version == version {
+                    return Arc::clone(snapshot);
+                }
+            }
+        }
+        let built: Arc<Vec<RouteCandidate>> = Arc::new(
+            self.peers
+                .iter()
+                .map(|entry| {
+                    let peer = entry.value();
+                    RouteCandidate {
+                        node_id: peer.node_id.clone(),
+                        endpoint_addr: peer.endpoint_addr.clone(),
+                        available_slots: peer.available_slots,
+                        max_slots: peer.max_slots,
+                        role: peer.role,
+                        draining: peer.draining,
+                        last_heartbeat_ms: peer.last_heartbeat_ms,
+                        labels: peer.labels.clone(),
+                        available_quotas: peer.available_quotas.clone(),
+                    }
+                })
+                .collect(),
+        );
+        {
+            let mut cached = self.route_snapshot.write();
+            let stale = match cached.as_ref() {
+                Some((cached_version, _)) => *cached_version < version,
+                None => true,
+            };
+            if stale {
+                *cached = Some((version, Arc::clone(&built)));
+            }
+        }
+        built
+    }
+
     /// 返回当前在线的 peer 视图（节点可见性）。
     ///
     /// 在线判定复用心跳新鲜度语义：距上次心跳超过 `failure_timeout_ms` 或
@@ -793,6 +946,7 @@ impl FailoverManager {
 
     pub fn remove_peer(&self, node_id: &NodeId) {
         self.peers.remove(node_id);
+        self.bump_peers_version();
     }
 
     /// 故障注入：模拟本节点到 `node_id` 的单向网络分区。
@@ -804,6 +958,7 @@ impl FailoverManager {
         self.blocked_peers.insert(node_id.clone(), ());
         if self.peers.remove(node_id).is_some() {
             crate::metrics::dec_connected_peers();
+            self.bump_peers_version();
         }
         tracing::info!(node = %node_id.0, "fault injection: peer blocked");
     }
@@ -852,23 +1007,30 @@ impl FailoverManager {
                 removed.push((node_id.clone(), PeerInfo::from(&state)));
             }
         }
+        if !removed.is_empty() {
+            self.bump_peers_version();
+        }
         removed
     }
 
     /// 声明本节点接管指定 workflow。
     ///
+    /// 返回裁决而非 `()`：退让与接管都是成功，但只有接管才允许调用方重调度
+    /// 任务。把两者压成 `Ok(())` 会让调用方在退让后照旧重调度——它操作的仍是
+    /// 一份没人真正持有的本地状态，而真正的 owner 还在别处推进同一工作流。
+    ///
     /// # Errors
     ///
     /// 如果本地 `WorkflowActor` adopt 失败、租约持久化失败、claim 序列化失败
     /// 或网络广播失败，返回错误。
-    pub async fn claim_workflow(&self, workflow_id: &WorkflowId) -> Result<()> {
+    pub async fn claim_workflow(&self, workflow_id: &WorkflowId) -> Result<ClaimOutcome> {
         if !self.role.can_orchestrate() {
             tracing::debug!(
                 workflow = %workflow_id.0,
                 role = %self.role,
                 "skipping workflow claim: node role does not orchestrate"
             );
-            return Ok(());
+            return Ok(ClaimOutcome::NotOrchestrator);
         }
         let now_ms = crate::common::epoch_millis();
         let now_monotonic = std::time::Instant::now();
@@ -876,7 +1038,7 @@ impl FailoverManager {
         if let Some(existing) = self.leases.get(workflow_id) {
             if existing.is_valid(now_ms, now_monotonic) {
                 if existing.node_id == self.node_id {
-                    return Ok(());
+                    return Ok(ClaimOutcome::AlreadyOwned);
                 }
                 // 租约仍有效且不属于本节点：直接退让，不通过字典序抢占。
                 // 故障转移的仲裁统一由调用方 `should_claim_workflow`（一致性哈希）决定，
@@ -886,7 +1048,7 @@ impl FailoverManager {
                     workflow_id.0,
                     existing.node_id.0
                 );
-                return Ok(());
+                return Ok(ClaimOutcome::Deferred);
             }
         }
         let lease = LeaseEntry::new_with_monotonic(
@@ -896,11 +1058,16 @@ impl FailoverManager {
             lease_duration_ms,
         );
 
-        // 先 adopt workflow，成功后再持久化 lease，避免 adopt 失败但 lease 已写入
-        self.adopt_workflow(workflow_id).await?;
-
+        // 先落租约再 adopt：adopt 失败时回滚租约，避免“本地已接管但无租约”
+        // 的双主窗口。广播失败不回滚——本地租约已有效，peers 可通过后续
+        // 心跳/重试 claim 收敛。
         self.persist_lease(workflow_id, &lease)?;
         self.leases.insert(workflow_id.clone(), lease);
+
+        if let Err(e) = self.adopt_workflow(workflow_id).await {
+            self.remove_lease(workflow_id);
+            return Err(e);
+        }
 
         crate::metrics::inc_failover_claims();
 
@@ -909,10 +1076,74 @@ impl FailoverManager {
             workflow_id: workflow_id.clone(),
             timestamp_ms: now_ms,
         };
-        let msg = WireMessage::OrchestratorClaim(claim);
-        let data = postcard::to_allocvec(&WireEnvelope::wrap(msg))
+        let signature = self
+            .signing_key
+            .as_ref()
+            .map(|key| {
+                key.sign(&Self::claim_signing_payload(&claim))
+                    .to_bytes()
+                    .to_vec()
+            })
+            .unwrap_or_default();
+        let msg =
+            WireMessage::SignedOrchestratorClaim(SignedOrchestratorClaim { claim, signature });
+        let data = postcard::to_allocvec(&WireEnvelope::wrap(msg)?)
             .map_err(|e| crate::common::ActantError::Serialization(e.to_string()))?;
-        self.network.broadcast(TOPIC_FAILOVER, data).await
+        if let Err(e) = self.network.broadcast(TOPIC_FAILOVER, data).await {
+            tracing::warn!(
+                workflow = %workflow_id.0,
+                error = %e,
+                "claim lease persisted locally but broadcast failed; peers will converge via retry"
+            );
+        }
+        Ok(ClaimOutcome::Adopted)
+    }
+
+    /// 验签后处理远端 claim。
+    ///
+    /// 签名覆盖 `(node_id, workflow_id, timestamp_ms)`；`node_id` 本身是
+    /// endpoint 公钥字符串，因此验证通过即证明发送者持有该身份私钥。
+    pub async fn handle_signed_claim(&self, signed: &SignedOrchestratorClaim) {
+        if signed.signature.is_empty() {
+            if self.require_signed_records {
+                tracing::warn!(
+                    workflow = %signed.claim.workflow_id.0,
+                    claimant = %signed.claim.node_id.0,
+                    "rejecting unsigned claim while signed records are required"
+                );
+                return;
+            }
+            self.handle_claim(&signed.claim).await;
+            return;
+        }
+        let Ok(peer_id) = signed.claim.node_id.0.parse::<iroh::EndpointId>() else {
+            tracing::warn!(
+                claimant = %signed.claim.node_id.0,
+                "rejecting claim: node_id is not a valid endpoint identity"
+            );
+            return;
+        };
+        let Ok(sig_arr) = <[u8; iroh::Signature::LENGTH]>::try_from(signed.signature.as_slice())
+        else {
+            tracing::warn!(
+                claimant = %signed.claim.node_id.0,
+                "rejecting claim: malformed signature"
+            );
+            return;
+        };
+        let signature = iroh::Signature::from_bytes(&sig_arr);
+        if peer_id
+            .verify(&Self::claim_signing_payload(&signed.claim), &signature)
+            .is_err()
+        {
+            tracing::warn!(
+                workflow = %signed.claim.workflow_id.0,
+                claimant = %signed.claim.node_id.0,
+                "rejecting claim: signature verification failed"
+            );
+            return;
+        }
+        self.handle_claim(&signed.claim).await;
     }
 
     /// 处理远端节点广播的 workflow claim。
@@ -921,6 +1152,64 @@ impl FailoverManager {
     /// 的 active 状态以避免双主推进。
     pub async fn handle_claim(&self, claim: &OrchestratorClaim) {
         let lease_duration_ms = self.lease_duration_ms;
+        let now_ms = crate::common::epoch_millis();
+        let now_monotonic = std::time::Instant::now();
+
+        // claim 必须来自编排角色；已知 Worker 的 claim 一律拒绝。
+        if let Some(peer) = self.peers.get(&claim.node_id) {
+            if !peer.role.can_orchestrate() {
+                tracing::warn!(
+                    workflow = %claim.workflow_id.0,
+                    claimant = %claim.node_id.0,
+                    role = %peer.role,
+                    "rejecting claim from non-orchestrator peer"
+                );
+                return;
+            }
+        }
+        // 签名模式下，claimant 必须已通过签名心跳建立身份且仍在失败检测窗口内，
+        // 防止未知节点凭一个裸 claim 移除本地 active workflow。
+        if self.require_signed_records {
+            let known = self.peers.get(&claim.node_id).is_some_and(|peer| {
+                peer.role.can_orchestrate()
+                    && now_ms.saturating_sub(peer.last_heartbeat_ms) <= self.failure_timeout_ms
+            });
+            if !known {
+                tracing::warn!(
+                    workflow = %claim.workflow_id.0,
+                    claimant = %claim.node_id.0,
+                    "rejecting claim from unknown or stale identity"
+                );
+                return;
+            }
+        }
+
+        // claim 必须按 (timestamp_ms, node_id) 全序仲裁，不能无条件覆盖。
+        // 否则延迟/重放的旧 claim 会夺走正在驱动的 workflow；并发 claim
+        // 也可能让双方互相让位，最终无人驱动。
+        //
+        // 租约过期/不存在时接受任意时间戳的 claim 是**持久化模型的一部分**
+        // （过期租约可写入、由恢复期 lease_expired_at 清理，见
+        // leases_survive_manager_rebuild_from_store），但这也意味着签名
+        // 关闭的开放部署里，被重放的陈旧 claim 可在过期窗口内写入租约表；
+        // require_signed_records 模式下有 claimant 心跳新鲜度校验兜底。
+        let supersedes = match self.leases.get(&claim.workflow_id) {
+            Some(existing) if existing.is_valid(now_ms, now_monotonic) => {
+                claim.timestamp_ms > existing.claimed_at_ms
+                    || (claim.timestamp_ms == existing.claimed_at_ms
+                        && claim.node_id.0 > existing.node_id.0)
+            }
+            _ => true,
+        };
+        if !supersedes {
+            tracing::debug!(
+                workflow = %claim.workflow_id.0,
+                claimant = %claim.node_id.0,
+                claim_ts = claim.timestamp_ms,
+                "ignoring stale or older orchestrator claim"
+            );
+            return;
+        }
 
         // 使用 claimant 的时间戳作为基准，使租期时长
         // 在所有节点上一致，不受时钟偏差 / 网络
@@ -952,56 +1241,76 @@ impl FailoverManager {
 
     pub async fn reschedule_workflow_tasks(&self, workflow_id: &WorkflowId) -> Result<()> {
         let result = self
-            .call_workflow(workflow_methods::RESCHEDULE_RUNNING_TASKS, workflow_id)
+            .call_workflow(workflow_methods::RESCHEDULE_INCOMPLETE_TASKS, workflow_id)
             .await?;
         let tasks: Vec<crate::common::TaskDefinition> = messaging::decode(&result.payload)?;
 
         for task_def in &tasks {
             crate::metrics::inc_failover_reschedules();
 
-            let hlc_ts = self.clock.tick();
-            let update = crate::common::WireDagStateUpdate {
-                workflow_id: workflow_id.clone(),
-                task_id: task_def.id.clone(),
-                task_state: crate::common::WireTaskState::Failed {
-                    error: "original orchestrator failed, rescheduling".into(),
-                },
-                hlc_timestamp: hlc_ts,
-                origin_node: self.node_id.clone(),
-            };
-            let msg = WireMessage::DagStateUpdate(update);
-            if let Ok(data) = postcard::to_allocvec(&WireEnvelope::wrap(msg)) {
-                if self
-                    .network
-                    .broadcast(crate::common::TOPIC_DAG_STATE, data)
-                    .await
-                    .is_err()
-                {
-                    tracing::warn!("failed to broadcast dag state update");
-                }
-            }
-
-            // 通过 scheduler 入队；不可用时记录警告
+            // 不再广播合成的 TaskFailed：它没有 attempt fencing，原 owner 仍可能
+            // 把它当成真实失败执行重试策略。新 attempt 的 Running/Completed
+            // 会以更高 HLC 覆盖旧状态。
             let sched_opt = self.scheduler.lock().clone();
-            if let Some(sched) = sched_opt {
-                if let Err(e) = sched.enqueue(task_def.clone()).await {
+            match sched_opt {
+                Some(sched) => match sched.enqueue(task_def.clone()).await {
+                    Ok(()) => {
+                        self.pending_reschedules.remove(&task_def.id);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "scheduler rejected rescheduled task {}/{}; queued for retry: {}",
+                            workflow_id.0,
+                            task_def.id.0,
+                            e
+                        );
+                        self.pending_reschedules
+                            .insert(task_def.id.clone(), task_def.clone());
+                    }
+                },
+                None => {
                     tracing::warn!(
-                        "scheduler rejected rescheduled task {}/{}: {}",
+                        "no scheduler set on FailoverManager; queued rescheduled task {}/{} for retry",
                         workflow_id.0,
-                        task_def.id.0,
-                        e
+                        task_def.id.0
                     );
+                    self.pending_reschedules
+                        .insert(task_def.id.clone(), task_def.clone());
                 }
-            } else {
-                tracing::warn!(
-                    "no scheduler set on FailoverManager, cannot enqueue rescheduled task {}/{}",
-                    workflow_id.0,
-                    task_def.id.0
-                );
             }
         }
 
         Ok(())
+    }
+
+    /// 重试上一轮入队失败的重调度任务。
+    async fn retry_pending_reschedules(&self) {
+        if self.pending_reschedules.is_empty() {
+            return;
+        }
+        let pending: Vec<(TaskId, crate::common::TaskDefinition)> = self
+            .pending_reschedules
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect();
+        let sched_opt = self.scheduler.lock().clone();
+        let Some(sched) = sched_opt else {
+            return;
+        };
+        for (task_id, task) in pending {
+            match sched.enqueue(task).await {
+                Ok(()) => {
+                    self.pending_reschedules.remove(&task_id);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        task = %task_id.0,
+                        error = %e,
+                        "rescheduled task still rejected; keeping for next retry"
+                    );
+                }
+            }
+        }
     }
 
     pub fn heartbeat_interval_ms(&self) -> u64 {
@@ -1033,6 +1342,15 @@ impl FailoverManager {
             .collect()
     }
 
+    /// 待接管工作流快照：`(workflow_id, 原 owner)`。
+    #[cfg(test)]
+    pub(crate) fn pending_claims_snapshot(&self) -> Vec<(String, String)> {
+        self.pending_claims
+            .iter()
+            .map(|e| (e.key().0.clone(), e.value().0.clone()))
+            .collect()
+    }
+
     /// 更新本地节点的容量信息（由工作线程调用，当运行任务数量变化时）。
     pub fn update_local_capacity(&self, available: u32, max: u32) {
         self.local_available_capacity
@@ -1045,6 +1363,8 @@ impl FailoverManager {
         if let Some(mut peer) = self.peers.get_mut(&node_id) {
             peer.available_slots = available;
             peer.max_slots = max;
+            drop(peer);
+            self.bump_peers_version();
         }
     }
 
@@ -1123,7 +1443,7 @@ impl FailoverManager {
 
     /// 检测失效 peer 并按一致性哈希接管 orphan workflow。
     ///
-    /// 先把失联 peer 清出视图并取得其最后快照：孤儿 workflow 列表来自快照，
+    /// 先把失联 peer 清出视图：孤儿 workflow 取自它最后一次心跳声明的活跃集，
     /// 而接管选举的候选集合只包含存活节点（活跃 peer + 本节点）——否则孤儿
     /// workflow 可能被哈希给已失联的节点，永远无人接管。
     ///
@@ -1162,6 +1482,9 @@ impl FailoverManager {
             to_check.push((node_id, info));
         }
 
+        // 本轮已判死并处置过的节点：探测腿跳过（fail-fast 重插的直提条目
+        // 目标仍是这些死节点，再探测无信息增量）。
+        let mut failed_nodes: HashSet<NodeId> = HashSet::new();
         for (node_id, info) in &to_check {
             let is_failed = info.last_heartbeat_ms > 0
                 && now_ms.saturating_sub(info.last_heartbeat_ms) > timeout_ms;
@@ -1173,7 +1496,10 @@ impl FailoverManager {
             // 身上的在途任务——死亡执行器的 active_workflows 为空，正是旧守卫
             // 让在途任务永久挂起的地方。
             let settled = self.fail_outbound_tasks_to(node_id).await;
+            failed_nodes.insert(node_id.clone());
 
+            // 孤儿清单取自 peer 最后一次心跳声明的活跃集：它在失联判定的时刻
+            // 之前一直由对端刷新，因此就是"对端失联时仍在驱动的工作流"。
             if info.active_workflows.is_empty() {
                 // 纯执行器失联：没有孤儿 workflow，第 2 腿已处置完毕。
                 if settled > 0 {
@@ -1198,17 +1524,36 @@ impl FailoverManager {
             // 存活节点，而非将所有 workflow 发往
             // ID 最低的单个节点。
             for wf_id in &info.active_workflows {
-                if should_claim_workflow(&wf_id.0, &my_id.0, candidate_ids.clone()) {
-                    if let Err(e) = self.claim_workflow(wf_id).await {
-                        tracing::error!("failed to claim workflow {}: {}", wf_id.0, e);
-                        continue;
+                if !should_claim_workflow(&wf_id.0, &my_id.0, candidate_ids.clone()) {
+                    continue;
+                }
+                match self.claim_workflow(wf_id).await {
+                    Ok(ClaimOutcome::Adopted) => {
+                        self.pending_claims.remove(wf_id);
+                        if let Err(e) = self.reschedule_workflow_tasks(wf_id).await {
+                            tracing::error!(
+                                "failed to reschedule tasks for workflow {}: {}",
+                                wf_id.0,
+                                e
+                            );
+                        }
                     }
-                    if let Err(e) = self.reschedule_workflow_tasks(wf_id).await {
-                        tracing::error!(
-                            "failed to reschedule tasks for workflow {}: {}",
-                            wf_id.0,
-                            e
+                    // 本节点原本就持有有效租约：已由本地驱动，不能再重调度，
+                    // 否则会把 Running 任务重置并重复入队。退让同样不是错误，
+                    // 但需要保留在待接管表中逐轮重试。
+                    Ok(ClaimOutcome::AlreadyOwned) => {
+                        self.pending_claims.remove(wf_id);
+                    }
+                    Ok(outcome) => {
+                        tracing::info!(
+                            workflow = %wf_id.0,
+                            ?outcome,
+                            "claim deferred; queued for retry"
                         );
+                        self.pending_claims.insert(wf_id.clone(), node_id.clone());
+                    }
+                    Err(e) => {
+                        tracing::error!("failed to claim workflow {}: {}", wf_id.0, e);
                     }
                 }
             }
@@ -1217,24 +1562,118 @@ impl FailoverManager {
         // 第 2 腿之二：心跳视图不可判的在途目标走主动探测。
         // 放在逐 peer 扫描之后——已被判失联的 peer 其条目已在上文被清空，
         // 此处只处理"连心跳都没来得及被观测到"的残余目标。
-        self.probe_outbound_targets().await;
+        self.probe_outbound_targets(&failed_nodes).await;
+
+        // 第 3 腿：重试上一轮被退让的接管。入口是本表而不是 peer 视图，
+        // 因为触发退让的 peer 当轮已被移出视图（见 `pending_claims` 的文档）。
+        self.retry_pending_claims().await;
+        // 第 4 腿：上一轮 scheduler 拒绝的重调度任务。
+        self.retry_pending_reschedules().await;
+    }
+
+    /// 重试被退让的接管。
+    ///
+    /// 每轮重新参加一致性哈希选举：失效 peer 已移出候选集，职责可能已经转移到
+    /// 本节点。三种结局：接管成功（从表里删除并重调度）、仍退让（保留待下轮）、
+    /// 原 owner 复活（从表里删除——工作流不再是孤儿）。
+    async fn retry_pending_claims(&self) {
+        if self.pending_claims.is_empty() {
+            return;
+        }
+        let now_ms = crate::common::epoch_millis();
+        let timeout_ms = self.failure_timeout_ms();
+        let candidate_ids: Vec<String> = {
+            let mut ids: Vec<_> = self
+                .peers
+                .iter()
+                .filter(|e| e.value().role.can_orchestrate())
+                .map(|e| e.key().0.clone())
+                .collect();
+            ids.push(self.node_id.0.clone());
+            ids
+        };
+        let pending: Vec<(WorkflowId, NodeId)> = self
+            .pending_claims
+            .iter()
+            .map(|e| (e.key().clone(), e.value().clone()))
+            .collect();
+
+        for (wf_id, owner) in pending {
+            // owner 既要在超时窗口内，也要仍在驱动该 workflow；仅“活着”不足以
+            // 证明孤儿已被接管（重启后尚未恢复状态的 owner 也会发心跳）。
+            let owner_alive = self.peers.get(&owner).is_some_and(|s| {
+                now_ms.saturating_sub(s.last_heartbeat_ms) <= timeout_ms
+                    && s.active_workflows.contains(&wf_id)
+            });
+            if owner_alive {
+                self.pending_claims.remove(&wf_id);
+                tracing::info!(
+                    workflow = %wf_id.0,
+                    owner = %owner.0,
+                    "original orchestrator is alive again; dropping pending claim"
+                );
+                continue;
+            }
+            if !should_claim_workflow(&wf_id.0, &self.node_id.0, candidate_ids.clone()) {
+                continue;
+            }
+            match self.claim_workflow(&wf_id).await {
+                Ok(ClaimOutcome::Adopted) => {
+                    self.pending_claims.remove(&wf_id);
+                    tracing::info!(
+                        workflow = %wf_id.0,
+                        "deferred claim succeeded on retry"
+                    );
+                    if let Err(e) = self.reschedule_workflow_tasks(&wf_id).await {
+                        tracing::error!(
+                            "failed to reschedule tasks for workflow {}: {}",
+                            wf_id.0,
+                            e
+                        );
+                    }
+                }
+                Ok(ClaimOutcome::AlreadyOwned) => {
+                    // 已持有有效租约：工作流已在驱动，不重复重调度。
+                    self.pending_claims.remove(&wf_id);
+                }
+                // 仍退让：租约尚未到期，保留待下轮。
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::error!("failed to claim workflow {} on retry: {}", wf_id.0, e);
+                }
+            }
+        }
     }
 
     /// 入站心跳的身份与信任校验。
     ///
-    /// 依次应用（任一失败拒绝并 warn）：
-    /// 1. 成员校验：`allowed_peer_ids` 非空时，心跳的 `endpoint_addr` 必须在
+    /// `endpoint_addr` 是完整 `EndpointAddr` 编码（hex postcard，或 bootstrap
+    /// 配置使用的 `id@ip:port` 简写），身份取其 endpoint id。依次应用
+    /// （任一失败拒绝并 warn）：
+    /// 1. 成员校验：`allowed_peer_ids` 非空时，心跳的 endpoint id 必须在
     ///    列表内（gossip 侧旁路的封闭；直连侧另有 ALPN 白名单）；
     /// 2. 签名校验：`require_signed_records` 开启时，心跳必须携带有效签名，
-    ///    且签名公钥（`endpoint_addr` 解析出的 endpoint id）须与声称的
-    ///    来源一致——节点无法伪造他人身份的节点记录。
+    ///    且签名公钥须等于 `endpoint_addr` 中的 endpoint id——节点无法伪造
+    ///    他人身份的节点记录。
     fn verify_heartbeat(&self, hb: &NodeHeartbeat) -> bool {
+        // 开放模式（无白名单、不要求签名）无需解析地址：心跳只用于容量视图。
+        if self.allowed_peer_ids.is_empty() && !self.require_signed_records {
+            return true;
+        }
+        // 身份只由完整地址携带：允许列表与验签都必须比较 endpoint id，
+        // 直接拿 hex 地址字符串比较永远不会命中。
+        let identity = hb
+            .endpoint_addr
+            .as_deref()
+            .and_then(|addr| crate::runtime::network::parse_endpoint_addr(addr).ok());
+
         if !self.allowed_peer_ids.is_empty() {
-            let Some(ref addr) = hb.endpoint_addr else {
-                tracing::warn!(node = %hb.node_id.0, "heartbeat rejected: no endpoint_addr while allowlist is active");
+            let Some(addr) = identity.as_ref() else {
+                tracing::warn!(node = %hb.node_id.0, "heartbeat rejected: no valid endpoint_addr while allowlist is active");
                 return false;
             };
-            if !self.allowed_peer_ids.iter().any(|a| a == addr) {
+            let peer_id = addr.id.to_string();
+            if !self.allowed_peer_ids.iter().any(|a| a == &peer_id) {
                 tracing::warn!(node = %hb.node_id.0, "heartbeat rejected: peer not in allowlist");
                 return false;
             }
@@ -1255,14 +1694,25 @@ impl FailoverManager {
             );
             return false;
         }
-        let (Some(sig_bytes), Some(ref addr)) = (&hb.signature, &hb.endpoint_addr) else {
+        let Some(sig_bytes) = &hb.signature else {
             tracing::warn!(node = %hb.node_id.0, "heartbeat rejected: unsigned while require_signed_records is on");
             return false;
         };
-        let Ok(pk) = addr.parse::<iroh::EndpointId>() else {
-            tracing::warn!(node = %hb.node_id.0, "heartbeat rejected: endpoint_addr is not a valid endpoint id");
+        let Some(addr) = identity.as_ref() else {
+            tracing::warn!(node = %hb.node_id.0, "heartbeat rejected: missing or invalid endpoint_addr for signature check");
             return false;
         };
+        // 身份必须与 node_id 一致：否则持有合法密钥的成员可以冒用他人
+        // node_id，让任务/结果/租约落到冒名者身上。展示名请用 node_labels。
+        if hb.node_id.as_str() != addr.id.to_string() {
+            tracing::warn!(
+                node = %hb.node_id.0,
+                endpoint_id = %addr.id,
+                "heartbeat rejected: node_id does not match endpoint identity"
+            );
+            return false;
+        }
+        let pk = &addr.id;
         let Ok(sig_arr) = <[u8; iroh::Signature::LENGTH]>::try_from(sig_bytes.as_slice()) else {
             tracing::warn!(node = %hb.node_id.0, "heartbeat rejected: malformed signature");
             return false;
@@ -1338,6 +1788,7 @@ impl FailoverManager {
             if is_new {
                 crate::metrics::inc_connected_peers();
             }
+            self.bump_peers_version();
         }
     }
 

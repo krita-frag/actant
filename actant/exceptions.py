@@ -245,8 +245,14 @@ class FlowReplayError(_HintedActantError):
 # - WorkflowCancelledError (kind="workflow_cancelled")：同上，对应终态 "Cancelled"。
 _KIND_TO_EXCEPTION: dict[str, type[ActantError]] = {
     "storage": StorageError,
+    # Rust `Heed` 变体在 PyErr 路径映射为 StorageError（见 src/py/error.rs），
+    # kind 前缀路径必须给出一致结果，否则同一错误经不同通道会退化为基类。
+    "heed": StorageError,
+    "storage_io": StorageError,
     "network": NetworkError,
     "serialization": SerializationError,
+    # 同 `heed`：Rust `Postcard` 在 PyErr 路径映射为 SerializationError。
+    "postcard": SerializationError,
     "actor": ActorError,
     "workflow": WorkflowError,
     "task": TaskError,

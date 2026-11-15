@@ -175,7 +175,8 @@ impl Orchestrator {
     /// 任何等待点的历史事件存在，满足"查历史"的前置要求），并写入内存
     /// 缓冲表供 `register_wait_point` 命中。
     ///
-    /// 调用方保证：工作流存在且非终态，且同 `wait_key` 尚无缓冲。
+    /// 调用方保证：工作流存在，且同 `wait_key` 尚无缓冲。终态工作流不拒绝
+    /// 信号递交（见 `signal_wait_point`），因此这里不假设非终态。
     fn buffer_signal(
         &self,
         workflow_id: &WorkflowId,

@@ -11,11 +11,14 @@ async fn store_handler_roundtrip() {
     let dir = tempdir().unwrap();
     let store = StateStore::open(dir.path()).unwrap();
     let runtime = Arc::new(CapabilityRuntime::new());
-    register_defaults(&runtime);
+    register_defaults(&runtime).unwrap();
     register_store_handler(&runtime, store).unwrap();
     // 强制走 Actor 路径：必须 bind_actor_system 后才能 perform。
     let actor_system = Arc::new(crate::runtime::actor::ActorSystem::new());
-    Arc::clone(&runtime).bind_actor_system(actor_system).await;
+    Arc::clone(&runtime)
+        .bind_actor_system(actor_system)
+        .await
+        .expect("bind actor system");
 
     let put = StoreReq::Put {
         key: b"hello".to_vec(),
@@ -35,13 +38,14 @@ async fn store_handler_roundtrip_via_actor() {
     let dir = tempdir().unwrap();
     let store = StateStore::open(dir.path()).unwrap();
     let runtime = Arc::new(CapabilityRuntime::new());
-    register_defaults(&runtime);
+    register_defaults(&runtime).unwrap();
     register_store_handler(&runtime, store).unwrap();
 
     let actor_system = Arc::new(crate::runtime::actor::ActorSystem::new());
     Arc::clone(&runtime)
         .bind_actor_system(actor_system.clone())
-        .await;
+        .await
+        .expect("bind actor system");
 
     let put = StoreReq::Put {
         key: b"actor".to_vec(),
@@ -213,7 +217,7 @@ fn runtime_register_increments_count() {
 #[test]
 fn runtime_register_codec_does_not_register_layer() {
     let rt = CapabilityRuntime::new();
-    rt.register_codec::<Store>();
+    rt.register_codec::<Store>().unwrap();
     // register_codec 只注册 codec，不注册 layer
     assert_eq!(rt.capability_count(), 0);
     assert!(rt.handler_count::<Store>().eq(&0));
@@ -245,7 +249,10 @@ fn runtime_chain_without_registration_returns_error() {
 async fn runtime_register_after_bind_returns_error() {
     let rt = Arc::new(CapabilityRuntime::new());
     let actor_system = Arc::new(crate::runtime::actor::ActorSystem::new());
-    Arc::clone(&rt).bind_actor_system(actor_system).await;
+    Arc::clone(&rt)
+        .bind_actor_system(actor_system)
+        .await
+        .expect("bind actor system");
 
     let layer = Layer::<Store>::for_capability("Store", EffectKind::Perform);
     let result = rt.register(layer);
@@ -259,7 +266,10 @@ async fn runtime_chain_after_bind_returns_error() {
     register_store_handler(&rt, store).unwrap();
 
     let actor_system = Arc::new(crate::runtime::actor::ActorSystem::new());
-    Arc::clone(&rt).bind_actor_system(actor_system).await;
+    Arc::clone(&rt)
+        .bind_actor_system(actor_system)
+        .await
+        .expect("bind actor system");
 
     let store2 = StateStore::open(tempdir().unwrap().path()).unwrap();
     let handler = erase_handler(StoreHandler::new(store2));
@@ -270,7 +280,7 @@ async fn runtime_chain_after_bind_returns_error() {
 #[tokio::test]
 async fn ask_without_bound_actor_system_returns_error() {
     let rt = CapabilityRuntime::new();
-    rt.register_codec::<Store>();
+    rt.register_codec::<Store>().unwrap();
     let result = rt.ask::<Store>(StoreReq::Get { key: b"k".to_vec() }).await;
     assert!(matches!(result, Err(ActantError::Internal(_))));
 }
@@ -278,7 +288,7 @@ async fn ask_without_bound_actor_system_returns_error() {
 #[tokio::test]
 async fn perform_without_bound_actor_system_returns_error() {
     let rt = CapabilityRuntime::new();
-    rt.register_codec::<Store>();
+    rt.register_codec::<Store>().unwrap();
     let result = rt
         .perform::<Store>(StoreReq::Get { key: b"k".to_vec() })
         .await;
@@ -288,7 +298,7 @@ async fn perform_without_bound_actor_system_returns_error() {
 #[tokio::test]
 async fn emit_without_bound_actor_system_returns_error() {
     let rt = CapabilityRuntime::new();
-    rt.register_codec::<TaskLifecycle>();
+    rt.register_codec::<TaskLifecycle>().unwrap();
     let result = rt
         .emit::<TaskLifecycle>(TaskEvent::Started {
             task_id: TaskId::from("t-1".to_string()),
@@ -304,7 +314,10 @@ async fn ask_without_codec_returns_error() {
     // 不调用 register_codec
     let actor_system = Arc::new(crate::runtime::actor::ActorSystem::new());
     let rt = Arc::new(rt);
-    Arc::clone(&rt).bind_actor_system(actor_system).await;
+    Arc::clone(&rt)
+        .bind_actor_system(actor_system)
+        .await
+        .expect("bind actor system");
 
     let result = rt.ask::<Store>(StoreReq::Get { key: b"k".to_vec() }).await;
     assert!(matches!(result, Err(ActantError::Internal(_))));
@@ -323,7 +336,7 @@ fn builtin_capabilities_returns_all_wired() {
 #[test]
 fn register_defaults_registers_all_codecs() {
     let rt = CapabilityRuntime::new();
-    register_defaults(&rt);
+    register_defaults(&rt).unwrap();
     // register_defaults 注册 codec 与空 layer（ensure_layer），
     // 使所有内置 capability 都有 layer entry。
     assert_eq!(rt.capability_count(), 3);
@@ -401,7 +414,10 @@ async fn ensure_layer_after_bind_still_allowed() {
     rt.ensure_layer::<Store>(Store::meta());
     let rt = Arc::new(rt);
     let actor_system = Arc::new(crate::runtime::actor::ActorSystem::new());
-    Arc::clone(&rt).bind_actor_system(actor_system).await;
+    Arc::clone(&rt)
+        .bind_actor_system(actor_system)
+        .await
+        .expect("bind actor system");
     // bind 后 ensure_layer 不会报错
     rt.ensure_layer::<Store>(Store::meta());
 }
@@ -411,17 +427,34 @@ async fn ensure_layer_after_bind_does_not_spawn_actor() {
     // bind 后调用 ensure_layer 不会为新 capability spawn CapabilityActor
     // （因为没有 codec 注册 + actor 已 snapshot）
     let rt = CapabilityRuntime::new();
-    rt.register_codec::<Store>();
+    rt.register_codec::<Store>().unwrap();
     rt.ensure_layer::<Store>(Store::meta());
     let rt = Arc::new(rt);
     let actor_system = Arc::new(crate::runtime::actor::ActorSystem::new());
-    Arc::clone(&rt).bind_actor_system(actor_system).await;
+    Arc::clone(&rt)
+        .bind_actor_system(actor_system)
+        .await
+        .expect("bind actor system");
 
     // bind 后 ensure_layer 不 spawn 新 CapabilityActor：
     // actor 表已 snapshot，新 layer 不会出现 actor 条目。
     rt.ensure_layer::<TaskLifecycle>(TaskLifecycle::meta());
     let type_id = std::any::TypeId::of::<TaskLifecycle>();
     assert!(rt.actor_ids.get(&type_id).is_none());
+}
+
+#[tokio::test]
+async fn register_codec_after_bind_is_rejected() {
+    // bind 后注册 codec 不会 spawn actor，必须显式失败而不是留下不可达 codec。
+    let rt = Arc::new(CapabilityRuntime::new());
+    let actor_system = Arc::new(crate::runtime::actor::ActorSystem::new());
+    Arc::clone(&rt)
+        .bind_actor_system(actor_system)
+        .await
+        .expect("bind actor system");
+
+    let result = rt.register_codec::<Store>();
+    assert!(matches!(result, Err(ActantError::Internal(_))));
 }
 
 #[test]
@@ -548,10 +581,13 @@ async fn ask_with_bound_actor_system_returns_response() {
     let dir = tempdir().unwrap();
     let store = StateStore::open(dir.path()).unwrap();
     let rt = Arc::new(CapabilityRuntime::new());
-    register_defaults(&rt);
+    register_defaults(&rt).unwrap();
     register_store_handler(&rt, store).unwrap();
     let actor_system = Arc::new(crate::runtime::actor::ActorSystem::new());
-    Arc::clone(&rt).bind_actor_system(actor_system).await;
+    Arc::clone(&rt)
+        .bind_actor_system(actor_system)
+        .await
+        .expect("bind actor system");
 
     // 先 Put 一个值
     let _ = rt
@@ -580,10 +616,13 @@ async fn ask_with_bound_actor_system_no_handler_returns_none() {
     // 注册 codec + 空 layer（无 handler），ask 时无 handler 决策
     // → actor 返回 payload=[0] → ask 返回 Ok(None)
     let rt = Arc::new(CapabilityRuntime::new());
-    register_defaults(&rt);
+    register_defaults(&rt).unwrap();
     // 不注册任何 handler，仅 ensure_layer（register_defaults 已做）
     let actor_system = Arc::new(crate::runtime::actor::ActorSystem::new());
-    Arc::clone(&rt).bind_actor_system(actor_system).await;
+    Arc::clone(&rt)
+        .bind_actor_system(actor_system)
+        .await
+        .expect("bind actor system");
 
     let result = rt
         .ask::<Store>(StoreReq::Get {
@@ -607,11 +646,14 @@ async fn ask_with_bound_actor_system_returns_none_when_handler_returns_none() {
     }
 
     let rt = Arc::new(CapabilityRuntime::new());
-    register_defaults(&rt);
+    register_defaults(&rt).unwrap();
     rt.register(Layer::<Store>::new(Store::meta()).chain_erased(erase_handler(NoneStoreHandler)))
         .unwrap();
     let actor_system = Arc::new(crate::runtime::actor::ActorSystem::new());
-    Arc::clone(&rt).bind_actor_system(actor_system).await;
+    Arc::clone(&rt)
+        .bind_actor_system(actor_system)
+        .await
+        .expect("bind actor system");
 
     let result = rt.ask::<Store>(StoreReq::Get { key: b"k".to_vec() }).await;
     assert!(matches!(result, Ok(None)));
@@ -621,9 +663,12 @@ async fn ask_with_bound_actor_system_returns_none_when_handler_returns_none() {
 async fn perform_with_no_local_handler_returns_error() {
     // 注册 codec + 空 layer（无 handler）→ perform 应报错
     let rt = Arc::new(CapabilityRuntime::new());
-    register_defaults(&rt);
+    register_defaults(&rt).unwrap();
     let actor_system = Arc::new(crate::runtime::actor::ActorSystem::new());
-    Arc::clone(&rt).bind_actor_system(actor_system).await;
+    Arc::clone(&rt)
+        .bind_actor_system(actor_system)
+        .await
+        .expect("bind actor system");
 
     let result = rt
         .perform::<Store>(StoreReq::Get { key: b"k".to_vec() })
@@ -650,14 +695,17 @@ async fn emit_with_local_handler_calls_actor() {
     }
 
     let rt = Arc::new(CapabilityRuntime::new());
-    register_defaults(&rt);
+    register_defaults(&rt).unwrap();
     rt.register(
         Layer::<TaskLifecycle>::new(TaskLifecycle::meta())
             .chain_erased(erase_handler(CountingEmitHandler)),
     )
     .unwrap();
     let actor_system = Arc::new(crate::runtime::actor::ActorSystem::new());
-    Arc::clone(&rt).bind_actor_system(actor_system).await;
+    Arc::clone(&rt)
+        .bind_actor_system(actor_system)
+        .await
+        .expect("bind actor system");
 
     let before = EMIT_COUNT.load(Ordering::SeqCst);
     rt.emit::<TaskLifecycle>(TaskEvent::Started {
@@ -674,9 +722,12 @@ async fn emit_with_local_handler_calls_actor() {
 async fn emit_without_local_handler_and_no_peers_succeeds() {
     // 无 handler → emit 跳过本地 actor 调用，直接成功
     let rt = Arc::new(CapabilityRuntime::new());
-    register_defaults(&rt);
+    register_defaults(&rt).unwrap();
     let actor_system = Arc::new(crate::runtime::actor::ActorSystem::new());
-    Arc::clone(&rt).bind_actor_system(actor_system).await;
+    Arc::clone(&rt)
+        .bind_actor_system(actor_system)
+        .await
+        .expect("bind actor system");
 
     let result = rt
         .emit::<TaskLifecycle>(TaskEvent::Started {
@@ -704,14 +755,17 @@ async fn emit_with_local_handler_error_propagates() {
     // HandlerAdapter::emit 对 Some/None 均返回 Ok，
     // 所以这个测试验证 emit 不因 Handler 返回 None 而失败。
     let rt = Arc::new(CapabilityRuntime::new());
-    register_defaults(&rt);
+    register_defaults(&rt).unwrap();
     rt.register(
         Layer::<TaskLifecycle>::new(TaskLifecycle::meta())
             .chain_erased(erase_handler(FailingEmitHandler)),
     )
     .unwrap();
     let actor_system = Arc::new(crate::runtime::actor::ActorSystem::new());
-    Arc::clone(&rt).bind_actor_system(actor_system).await;
+    Arc::clone(&rt)
+        .bind_actor_system(actor_system)
+        .await
+        .expect("bind actor system");
 
     let result = rt
         .emit::<TaskLifecycle>(TaskEvent::Started {
@@ -732,12 +786,15 @@ async fn emit_with_local_handler_error_propagates() {
 #[tokio::test]
 async fn bind_actor_system_spawns_actors_for_registered_codecs() {
     let rt = Arc::new(CapabilityRuntime::new());
-    register_defaults(&rt);
+    register_defaults(&rt).unwrap();
     let store = StateStore::open(tempdir().unwrap().path()).unwrap();
     register_store_handler(&rt, store).unwrap();
 
     let actor_system = Arc::new(crate::runtime::actor::ActorSystem::new());
-    Arc::clone(&rt).bind_actor_system(actor_system).await;
+    Arc::clone(&rt)
+        .bind_actor_system(actor_system)
+        .await
+        .expect("bind actor system");
 
     // 3 个内置 capability（Store/TaskLifecycle/WorkflowLifecycle）均注册了
     // codec + layer → 应有 3 个 actor_ids（Store 有 handler，其余 2 个空 layer）
@@ -748,11 +805,12 @@ async fn bind_actor_system_spawns_actors_for_registered_codecs() {
 }
 
 #[tokio::test]
-async fn bind_actor_system_with_duplicate_actor_id_warns_but_continues() {
-    // 预先在 ActorSystem 中 spawn 一个同名 actor，bind 时 spawn 会失败
-    // → 走 warn 路径，但不 panic
+async fn bind_actor_system_fails_when_capability_spawn_is_rejected() {
+    // 预先在 ActorSystem 中 spawn 一个同名 actor，bind 时 spawn 失败。
+    // 新契约：绑定失败必须显式返回 Err，而不是让该 capability 在运行期
+    // 才报 “not bound”。
     let rt = Arc::new(CapabilityRuntime::new());
-    register_defaults(&rt);
+    register_defaults(&rt).unwrap();
 
     let actor_system = Arc::new(crate::runtime::actor::ActorSystem::new());
     // 预先占用 Store capability actor id
@@ -780,14 +838,17 @@ async fn bind_actor_system_with_duplicate_actor_id_warns_but_continues() {
         .await
         .unwrap();
 
-    // bind_actor_system 应不 panic，Store actor spawn 失败走 warn 路径
-    Arc::clone(&rt).bind_actor_system(actor_system).await;
-    // Store 的 actor_id 不应被插入到 rt.actor_ids（spawn 失败）
+    let err = Arc::clone(&rt)
+        .bind_actor_system(actor_system)
+        .await
+        .expect_err("duplicate capability actor id must fail bind");
+    assert!(
+        matches!(err, crate::common::ActantError::Actor(_)),
+        "unexpected error: {err:?}"
+    );
+    // 失败不标记为已绑定。
     let type_id_store = std::any::TypeId::of::<Store>();
     assert!(rt.actor_ids.get(&type_id_store).is_none());
-    // 但其他 capability 应正常 spawn
-    let type_id_lifecycle = std::any::TypeId::of::<TaskLifecycle>();
-    assert!(rt.actor_ids.get(&type_id_lifecycle).is_some());
 }
 
 // =========================================================================

@@ -19,6 +19,36 @@ use crate::runtime::actor::mailbox::MailboxRegistry;
 use crate::runtime::actor::runtime::{Actor, ActorContext};
 use crate::runtime::event_bus::{BusEvent, EventBus};
 
+/// 单次 actor 调用的默认上限。
+///
+/// 绑定层以「释放 GIL 后 `block_on`」的方式使用 [`ActorSystem::call`]：无上限的
+/// 等待会在 actor 卡死时让调用线程永久阻塞（进程也无法退场）。上限只用于把
+/// 「永不返回」降级为可诊断的超时错误，取值远高于任何合法的消息处理耗时。
+pub(crate) const DEFAULT_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 测试专用：记录每个 actor 的退出结算次数。
+///
+/// `active_actors` 是进程级全局指标，并行测试下读数不可靠（无法判断某次
+/// 增减是否来自本用例）。按 actor id 计数可以精确定位「恰好一次」，且不同
+/// 用例使用不同 id，互不干扰。仅 `cfg(test)` 编译，生产路径只有指标调用。
+#[cfg(test)]
+fn settlement_counts() -> &'static dashmap::DashMap<ActorId, usize> {
+    static COUNTS: std::sync::OnceLock<dashmap::DashMap<ActorId, usize>> =
+        std::sync::OnceLock::new();
+    COUNTS.get_or_init(dashmap::DashMap::new)
+}
+
+#[cfg(test)]
+pub(crate) fn record_settlement(actor_id: &ActorId) {
+    *settlement_counts().entry(actor_id.clone()).or_insert(0) += 1;
+}
+
+/// 测试专用：读取某 actor 的退出结算次数。
+#[cfg(test)]
+pub(crate) fn settlement_count(actor_id: &ActorId) -> usize {
+    settlement_counts().get(actor_id).map(|v| *v).unwrap_or(0)
+}
+
 struct ActorEntry {
     cancel: watch::Sender<bool>,
     task: JoinHandle<()>,
@@ -99,7 +129,7 @@ impl RunningActor {
             }
         }
 
-        self.cleanup();
+        // 在途计数由 `Drop for RunningActor` 结算，覆盖 abort 路径。
     }
 
     fn handle_message_error(
@@ -172,10 +202,20 @@ impl RunningActor {
             );
         }
     }
+}
 
-    fn cleanup(self) {
+/// 退出计数挂在 `Drop` 上，而不是 `run()` 的收尾代码。
+///
+/// 三种退出方式都在此处收敛：正常结束（mailbox 关闭 / cancel）、`kill` 的
+/// `JoinHandle::abort`、`stop_timeout` 超时后的 abort。abort 会直接丢弃
+/// future，`run()` 末尾的语句不执行；把计数写在 `Drop` 里才能保证「每个
+/// spawn 恰好扣减一次」——否则 `active_actors` 只增不减。
+impl Drop for RunningActor {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        record_settlement(&self.actor_id);
         // registry 的注销由 ActorSystem::cleanup_actor 统一完成（stop/kill
-        // 路径都会走到）；此处仅扣减在途计数。
+        // 路径都会走到）；此处仅结算在途计数。
         crate::metrics::inc_actors_stopped();
         crate::metrics::dec_active_actors();
     }
@@ -183,25 +223,44 @@ impl RunningActor {
 
 pub struct ActorSystem {
     actors: Arc<DashMap<ActorId, ActorEntry>>,
+    /// 已预留但尚未完成 spawn 的 actor id。
+    ///
+    /// `on_start` 是 await 点，check-then-insert 必须跨过它；预留表与
+    /// `actors` 一起构成「存在或在途」的原子判据。
+    spawning: DashMap<ActorId, ()>,
+    /// 串行化 spawn 的 check → reserve → insert，避免并发 spawn 同 id。
+    spawn_lock: tokio::sync::Mutex<()>,
     registry: MailboxRegistry,
     pub(crate) event_bus: EventBus,
     node_id: Option<NodeId>,
     pub(crate) config: ActorConfig,
+    /// `call` 的等待上限；见 [`DEFAULT_CALL_TIMEOUT`]。
+    pub(crate) call_timeout: std::time::Duration,
 }
 
 impl ActorSystem {
     pub fn new() -> Self {
         Self {
             actors: Arc::new(DashMap::new()),
+            spawning: DashMap::new(),
+            spawn_lock: tokio::sync::Mutex::new(()),
             registry: MailboxRegistry::new(),
             event_bus: EventBus::new(),
             node_id: None,
             config: ActorConfig::default(),
+            call_timeout: DEFAULT_CALL_TIMEOUT,
         }
     }
 
     pub fn with_config(mut self, config: ActorConfig) -> Self {
         self.config = config;
+        self
+    }
+
+    /// 覆盖 `call` 的等待上限。仅供测试缩短上限，生产使用默认值。
+    #[cfg(test)]
+    pub(crate) fn with_call_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.call_timeout = timeout;
         self
     }
 
@@ -228,11 +287,18 @@ impl ActorSystem {
     }
 
     async fn spawn_boxed(&self, actor_id: ActorId, mut actor: Box<dyn Actor>) -> Result<()> {
-        if self.actors.contains_key(&actor_id) {
-            return Err(ActantError::AlreadyExists(format!(
-                "actor {} already exists",
-                actor_id.as_str()
-            )));
+        // check → reserve 必须在同一临界区完成：on_start 是 await 点，
+        // 若先查后等再插入，两个并发 spawn 会同时通过判重并互相覆盖
+        // mailbox / actors 条目，留下一个不可达但仍运行的 actor 任务。
+        {
+            let _guard = self.spawn_lock.lock().await;
+            if self.actors.contains_key(&actor_id) || self.spawning.contains_key(&actor_id) {
+                return Err(ActantError::AlreadyExists(format!(
+                    "actor {} already exists",
+                    actor_id.as_str()
+                )));
+            }
+            self.spawning.insert(actor_id.clone(), ());
         }
 
         // 生命周期敏感操作按 "失败不留残留" 顺序执行：on_start 在注册
@@ -240,7 +306,10 @@ impl ActorSystem {
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let ctx = ActorContext::new(actor_id.clone());
 
-        self.run_actor_on_start(&actor_id, &mut actor).await?;
+        if let Err(e) = self.run_actor_on_start(&actor_id, &mut actor).await {
+            self.spawning.remove(&actor_id);
+            return Err(e);
+        }
 
         let (tx, rx) = mpsc::channel::<ActorMessage>(self.config.mailbox_capacity);
         self.registry.register(actor_id.clone(), tx);
@@ -264,12 +333,15 @@ impl ActorSystem {
         });
 
         self.actors.insert(
-            actor_id,
+            actor_id.clone(),
             ActorEntry {
                 cancel: cancel_tx,
                 task,
             },
         );
+        // 先落 actors 再撤销预留：两者之间不存在「既不在 actors 也不在
+        // spawning」的窗口，并发 spawn 始终能看到该 id。
+        self.spawning.remove(&actor_id);
 
         Ok(())
     }
@@ -310,16 +382,30 @@ impl ActorSystem {
         self.registry.send(actor_id, msg).await
     }
 
+    /// 发送消息并等待应答，等待上限为 [`DEFAULT_CALL_TIMEOUT`]。
+    ///
+    /// 超时返回 [`ActantError::Timeout`]；actor 自身的业务失败仍封在
+    /// `Ok(ActorMessageResult { error: Some(..) })` 内——两者语义不同，
+    /// 前者表示「没有拿到应答」，后者表示「应答是失败」。
     pub async fn call(
         &self,
         actor_id: &ActorId,
         method: &str,
         payload: Vec<u8>,
     ) -> Result<ActorMessageResult> {
-        let (msg, rx) = ActorMessage::with_reply(actor_id.clone(), method.to_string(), payload);
+        let method_name = method.to_string();
+        let (msg, rx) = ActorMessage::with_reply(actor_id.clone(), method_name.clone(), payload);
         self.registry.send(actor_id, msg).await?;
-        rx.await
-            .map_err(|e| ActantError::Actor(format!("call failed: {}", e)))
+        match tokio::time::timeout(self.call_timeout, rx).await {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(e)) => Err(ActantError::Actor(format!("call failed: {}", e))),
+            Err(_elapsed) => Err(ActantError::Timeout(format!(
+                "actor {} call '{}' timed out after {:?}",
+                actor_id.as_str(),
+                method_name,
+                self.call_timeout
+            ))),
+        }
     }
 
     pub async fn stop(&self, actor_id: &ActorId) -> Result<()> {
@@ -357,10 +443,21 @@ impl ActorSystem {
             drop(entry);
         }
 
-        if let Some((_, entry)) = self.actors.remove(actor_id) {
-            let result = tokio::time::timeout(timeout, entry.task).await;
+        if let Some((_, mut entry)) = self.actors.remove(actor_id) {
+            let result = tokio::time::timeout(timeout, &mut entry.task).await;
             if result.is_err() {
-                tracing::warn!("actor {} stop timed out, aborting", actor_id.as_str());
+                // timeout 只消费了等待 future；JoinHandle 仍归本函数所有。
+                // 必须显式 abort 并等待退出，否则 actor 会在 stop_timeout
+                // 返回后继续运行，而 mailbox 已被 cleanup_actor 注销。
+                entry.task.abort();
+                if let Err(e) = entry.task.await {
+                    tracing::debug!(
+                        actor = %actor_id.as_str(),
+                        error = %e,
+                        "actor task aborted after stop timeout"
+                    );
+                }
+                tracing::warn!("actor {} stop timed out, aborted", actor_id.as_str());
             }
         }
 

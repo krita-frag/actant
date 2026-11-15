@@ -28,7 +28,6 @@ def test_node_view_from_peer_and_candidate() -> None:
         "labels": {"pool": "a"},
         "available_slots": 3,
         "max_slots": 8,
-        "active_workflows": ["w1"],
         "platform": "linux",
         "last_heartbeat_ms": 123,
         "endpoint": "abc",
@@ -38,7 +37,6 @@ def test_node_view_from_peer_and_candidate() -> None:
     assert view.labels["pool"] == "a"
     assert view.available_slots == 3
     assert view.max_slots == 8
-    assert view.active_workflows == ("w1",)
     assert view.platform == "linux"
     assert view.endpoint == "abc"
 

@@ -13,7 +13,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import pickle
 import threading
 from collections.abc import Callable
@@ -22,10 +21,9 @@ from typing import Any, cast
 
 import cloudpickle
 
-from actant._internal.runtime import get_current_runtime
+from actant._internal.runtime import _request_cancel, get_current_runtime
 from actant._internal.tasks.context import TaskContext, TaskState
 from actant._internal.tasks.helpers import (
-    _emit_task_event,
     _invoke_callback,
     _invoke_callbacks,
     _suppress_pickle_errors,
@@ -37,8 +35,6 @@ from actant.exceptions import (
     BlockingInEventLoopError,
     TaskCancelledError,
 )
-
-_logger = logging.getLogger("actant.tasks")
 
 
 def _raise_if_blocking_in_loop() -> None:
@@ -127,11 +123,13 @@ class AsyncResult:
 
     __slots__ = (
         "_callbacks",
+        "_cancel_event_published",
         "_context",
         "_error_payload",
         "_future",
         "_lock",
         "_result",
+        "_silent",
         "_state",
         "_workflow_id",
         "task_id",
@@ -143,10 +141,12 @@ class AsyncResult:
         *,
         context: TaskContext | None = None,
         workflow_id: str = "",
+        silent: bool = False,
     ) -> None:
         self.task_id = task_id
         self._context = context
         self._workflow_id = workflow_id
+        self._silent = silent
         self._future = _CompletionFuture()
         # _result 单字段两态（见模块 docstring）：
         # - 小结果：结果对象本身（worker 结果帧反序列化产物，含 bytes 返回值）。
@@ -156,6 +156,11 @@ class AsyncResult:
         self._state: TaskState = "pending"
         self._callbacks: list[Callable[[AsyncResult], None]] = []
         self._lock = threading.Lock()
+        # 取消事件一次性标记：取消帧有两条到达路径（Rust CANCELLED 帧 /
+        # COMPLETED 帧携带 TaskCancelledError），并发到达时第二条不得重复
+        # 上报 orchestrator 与发布 cancelled 事件。不能用「state 已是
+        # cancelled 就跳过」——预取消占位终态之后仍要发布唯一一次事件。
+        self._cancel_event_published = False
 
     @property
     def state(self) -> TaskState:
@@ -173,6 +178,15 @@ class AsyncResult:
     @property
     def workflow_id(self) -> str:
         return self._workflow_id
+
+    @property
+    def silent(self) -> bool:
+        """是否抑制本任务的 ``TaskLifecycle`` 事件。
+
+        来自 ``@task(silent=True)``。事件由父进程在结果回调中发布，因此抑制
+        必须在这里可见：worker 子进程侧的事件通道恒定关闭（不依赖父 runtime）。
+        """
+        return self._silent
 
     def done(self) -> bool:
         """任务是否已完成（成功/失败/取消）。"""
@@ -268,71 +282,32 @@ class AsyncResult:
         Returns:
             ``True`` 表示取消请求已提交（或任务已被取消，幂等语义）；
             ``False`` 表示任务已完成（成功/失败），无法取消。
-        """
-        # 0. 已完成任务不可取消（成功/失败状态）。
-        # 已取消任务返回 True（幂等）。
-        with self._lock:
-            state = self._state
-        if state in ("completed", "failed"):
-            return False
-        if state == "cancelled":
-            return True
 
-        # 1. 协作式取消上下文
+        本方法**只提交请求，不发布事件**。``TaskLifecycle(kind="cancelled")``
+        由 ``Runtime`` 在句柄真正进入取消终态时发布（唯一出口
+        ``Runtime._finalize_cancelled``）：取消是尽力而为的，任务可能抢在
+        检查点之前跑完，此时先发 cancelled 再发 completed 会把"请求"谎报成
+        "结果"。事件必须与句柄终态同源。
+
+        实现委托给 ``Runtime._request_cancel`` 同一份协议——``Runtime.cancel_task``
+        与本方法不允许出现两套副作用（协作上下文 / 预取消标记 / cancel_flag /
+        P2P 广播 / 级联）。
+        """
+        return _request_cancel(
+            get_current_runtime(),
+            self,
+            propagate=propagate,
+            force_after=force_after,
+        )
+
+    def _cancel_context(self, force_after: float | None) -> None:
+        """把取消信号置入协作上下文（无上下文时为空操作）。
+
+        由 ``_request_cancel`` 调用：上下文属于句柄内部状态，取用与置位都留在
+        本类内，取消协议不必知道 ``TaskContext`` 的形状。
+        """
         if self._context is not None:
             self._context._cancel(force_after=force_after)
-
-        # 1b. 通知 Rust Worker 设置 cancel_flag（若任务正在运行），
-        # 并标记预取消（若任务仍在排队）。直接操作避免递归调用 handle.cancel()。
-        runtime = get_current_runtime()
-        if runtime is not None:
-            runtime._mark_task_cancelled(self.task_id)
-            if runtime._rust_core is not None:
-                # 取消请求是尽力而为语义：失败不阻止本地级联取消，但不可静默。
-                try:
-                    runtime._rust_core.cancel_task(self.task_id)
-                except Exception:
-                    _logger.warning(
-                        "cancel_task failed for %s",
-                        self.task_id,
-                        exc_info=True,
-                    )
-
-        # 2. 本地广播：emit TaskLifecycle cancelled
-        if self._context is not None and self._context.is_cancelled():
-            _emit_task_event("cancelled", self.task_id, self._workflow_id)
-
-        # 3. 跨节点 P2P 广播取消
-        if self._workflow_id:
-            runtime = get_current_runtime()
-            if runtime is not None and runtime._rust_core is not None:
-                try:
-                    runtime._rust_core.broadcast_cancel(self.task_id, self._workflow_id)
-                except Exception:
-                    # P2P 广播失败不应阻止本地级联取消，记录 warning 后继续。
-                    _logger.warning(
-                        "task %s: broadcast_cancel failed",
-                        self.task_id,
-                        exc_info=True,
-                    )
-
-        # 4. 级联传播到同一 workflow 的其他任务
-        # 通过 runtime.cancel_task() 走完整路径：设置预取消标记 + Rust cancel_flag +
-        # handle.cancel()，确保排队中和运行中的任务都能被取消。
-        if propagate and self._workflow_id:
-            runtime = get_current_runtime()
-            if runtime is not None:
-                for tid in runtime._list_tasks():
-                    if tid == self.task_id:
-                        continue
-                    other = runtime._get_task(tid)
-                    if other is not None and other.workflow_id == self._workflow_id:
-                        runtime.cancel_task(tid)
-
-        # 取消请求已提交（无论 _context 是否存在，Rust cancel_task /
-        # broadcast_cancel / 预取消标记均已设置）。返回 True 表示请求已提交，
-        # 与 docstring 语义一致。已完成的任务在前面的 early return 中处理。
-        return True
 
     def wait(self, timeout: float | None = None) -> bool:
         """等待任务完成，不取结果。
@@ -379,11 +354,27 @@ class AsyncResult:
         *,
         result: Any = _UNSET,
         error_payload: Any = _UNSET,
-    ) -> None:
-        """统一的终态写入：置 state/结果、清空回调、唤醒 future。"""
+    ) -> bool:
+        """统一的终态写入：置 state/结果、清空回调、唤醒 future。
+
+        Returns:
+            ``True`` 表示本次调用真正写入了终态；``False`` 表示句柄已是终态
+            且新状态不允许覆盖。
+
+        终态 first-wins，**唯一例外是真实结局覆盖「预取消」**：
+        ``Runtime.cancel_task`` 对仍在排队的任务会立即把句柄置为 ``cancelled``
+        （提交方不必等到 worker 回应），但该任务可能已被 worker 取走并跑完，
+        也可能真的失败。真实结局必须能覆盖这个占位终态，否则同一个任务会有
+        三个互相矛盾的真相：句柄说 cancelled、Store 里是 Completed、事件流报
+        completed。反向不成立——真实取消不得覆盖已到达的成功/失败结局。
+        """
         with self._lock:
-            if self._future.is_set():
-                return
+            supersedes_cancel = self._state == "cancelled" and state in (
+                "completed",
+                "failed",
+            )
+            if self._state in _TERMINAL_STATES and not supersedes_cancel:
+                return False
             if result is not _UNSET:
                 self._result = result
             if error_payload is not _UNSET:
@@ -399,25 +390,32 @@ class AsyncResult:
             self,
             label=f"AsyncResult {self.task_id}: done callback",
         )
+        return True
 
-    def _set_result(self, result_obj: Any) -> None:
+    def _set_result(self, result_obj: Any) -> bool:
         """设置任务成功结果（对象缓存态）并触发回调。
 
         Args:
             result_obj: 任务返回值（worker 结果帧反序列化产物，任意类型，
                 包括 bytes）。
-        """
-        self._finish("completed", result=result_obj)
 
-    def _set_result_ref(self, ref_bytes: bytes) -> None:
+        Returns:
+            是否真正写入（见 :meth:`_finish`）。
+        """
+        return self._finish("completed", result=result_obj)
+
+    def _set_result_ref(self, ref_bytes: bytes) -> bool:
         """设置任务成功结果为 ``Ref``（大结果态）并触发回调。
 
         Args:
             ref_bytes: 结果帧字节落 blob 后的 BlobRef wire 编码。
-        """
-        self._finish("completed", result=Ref(ref_bytes))
 
-    def _set_error(self, error_payload_or_msg: bytes | str | BaseException) -> None:
+        Returns:
+            是否真正写入（见 :meth:`_finish`）。
+        """
+        return self._finish("completed", result=Ref(ref_bytes))
+
+    def _set_error(self, error_payload_or_msg: bytes | str | BaseException) -> bool:
         """设置任务失败结果并触发回调。
 
         Args:
@@ -426,6 +424,9 @@ class AsyncResult:
                 - ``str``：错误消息字符串，包装为 ``ActantError`` 再序列化。
                 - ``BaseException``：异常对象（本地 dispatch 的优化路径），
                   序列化后存入 ``_error_payload`` 供 ``result()`` 重新抛出。
+
+        Returns:
+            是否真正写入（见 :meth:`_finish`）。
         """
         if isinstance(error_payload_or_msg, bytes):
             payload = error_payload_or_msg
@@ -433,11 +434,15 @@ class AsyncResult:
             payload = cloudpickle.dumps(error_payload_or_msg)
         else:
             payload = cloudpickle.dumps(ActantError(error_payload_or_msg))
-        self._finish("failed", error_payload=payload)
+        return self._finish("failed", error_payload=payload)
 
-    def _set_cancelled(self) -> None:
-        """标记任务为已取消并触发回调。"""
-        self._finish("cancelled")
+    def _set_cancelled(self) -> bool:
+        """标记任务为已取消并触发回调。
+
+        Returns:
+            是否真正写入（见 :meth:`_finish`）。
+        """
+        return self._finish("cancelled")
 
     def __repr__(self) -> str:
         return f"AsyncResult(task_id={self.task_id!r}, state={self.state!r})"

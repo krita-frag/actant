@@ -120,7 +120,7 @@ async fn prefetch_tasks(
         // 先尝试批量拉取：若队列有积压，一次拉满 limit。
         // dequeue_batch 在队列为空时返回空 Vec（不阻塞），故需配合信号等待。
         let batch = if let Some(inner) = fast {
-            inner.dequeue_batch(limit)
+            inner.dequeue_batch(limit).await
         } else {
             scheduler.dequeue_batch(limit).await
         };
@@ -517,7 +517,7 @@ impl Worker {
     /// drain/关闭路径的出队：优先直连共享队列（大载荷安全），否则退化 trait。
     async fn try_dequeue_drain(&self) -> Option<TaskDefinition> {
         if let Some(inner) = &self.fast_scheduler {
-            return inner.try_dequeue();
+            return inner.try_dequeue().await;
         }
         self.scheduler.try_dequeue().await
     }
@@ -562,17 +562,22 @@ impl Worker {
                 None => false,
             }
         };
+        let mut registered_new = false;
         if !running {
             let mut pending = self.cancelled_tasks.lock();
             // 仅新插入时增加 pending 计数；重复取消不重复计数（与远端路径一致）。
-            if pending
+            registered_new = pending
                 .insert(task_id.to_string(), Instant::now())
-                .is_none()
-            {
+                .is_none();
+            if registered_new {
                 crate::metrics::inc_cancelled_tasks_pending();
             }
         }
-        crate::metrics::inc_tasks_cancelled();
+        // 指标口径是「确认的取消」：flag 命中或登记新插入。task_id 不存在
+        // 的取消请求不计入，避免取消计数 ≥ 实际取消数的乐观偏差。
+        if running || registered_new {
+            crate::metrics::inc_tasks_cancelled();
+        }
         running
     }
 
@@ -702,6 +707,9 @@ impl Worker {
         // 因此必须按 `Option` 解码——直接解码成二元组会读到判别字节当结构体
         // 头部而报 "Hit the end of buffer"。
         let verdict: Option<(TaskDefinition, u64)> = if result.payload.is_empty() {
+            // 生产 handler 总是 encode（None 也有判别字节）；空载荷意味着
+            // 协议被破坏，显性化「可能丢失的重试裁决」而不是静默当终局。
+            tracing::warn!("empty ON_TASK_RESULT response payload; treating verdict as terminal");
             None
         } else {
             decode(&result.payload)?
@@ -805,8 +813,8 @@ impl Worker {
         tokio_handle.spawn(async move {
             let topics = [
                 Topic::task(&node_id),
-                Topic::workflow_state_req(&node_id),
-                Topic::workflow_state_resp(&node_id),
+                Topic::workflow_state_req(),
+                Topic::workflow_state_resp(),
                 Topic::from(crate::common::wire::constants::TOPIC_CANCEL),
             ];
             for topic in &topics {
@@ -960,7 +968,7 @@ impl Worker {
 
             // 直提任务租约检查点：远端执行超时未回结果则重新入队。
             // 放在循环顶部，保证有 inflight 任务持续 dispatch 时也按期检查。
-            self.expire_standalone_leases(&node_id, network.as_ref(), &event_bus, pending_tx)
+            self.expire_standalone_leases(&node_id, network.clone(), &event_bus, pending_tx)
                 .await;
 
             // 取下一个任务：优先从 inflight 队列取（避免 dequeue 调用）；
@@ -1116,14 +1124,22 @@ impl Worker {
                             continue;
                         }
                         // 退避重入队：不阻塞主循环，延迟后重新交给路由器。
-                        let scheduler = self.scheduler.clone();
-                        let delay = self.remote_fallback_delay;
-                        tokio::spawn(async move {
-                            tokio::time::sleep(delay).await;
-                            if let Err(e) = scheduler.enqueue(task).await {
-                                tracing::warn!("failed to re-enqueue deferred task: {}", e);
-                            }
-                        });
+                        // 重入队失败会重试，drain/耗尽时补发终态。
+                        let ctx = ReenqueueCtx {
+                            node_id: node_id.clone(),
+                            network: network.clone(),
+                            event_bus: event_bus.clone(),
+                            pending_results: pending_tx.clone(),
+                            pending_capacity: self.pending_result_channel_capacity,
+                            state: self.state.subscribe(),
+                        };
+                        tokio::spawn(reenqueue_after_delay(
+                            self.scheduler.clone(),
+                            task,
+                            self.remote_fallback_delay,
+                            ctx,
+                            "deferred task",
+                        ));
                         continue;
                     }
                 }
@@ -1185,7 +1201,18 @@ impl Worker {
                     task_name: task.name.clone(),
                     target_node: task.target_node.clone(),
                 };
-                event_bus.publish(BusEvent::TaskCancelled(completion));
+                // 走统一完成投递：远端 origin 直连回传 Cancelled，本地任务
+                // 发布 `BusEvent::TaskCancelled`，避免远端提交方永久等待。
+                publish_task_completion(
+                    completion,
+                    &task,
+                    &node_id,
+                    network.as_ref(),
+                    &event_bus,
+                    pending_tx,
+                    self.pending_result_channel_capacity,
+                )
+                .await;
                 cancelled_tasks.lock().remove(task.id.as_str());
                 crate::metrics::dec_cancelled_tasks_pending();
                 self.clear_task_tracking(task.id.as_str());
@@ -1261,19 +1288,23 @@ impl Worker {
                             // 退避由独立 spawn 触发：延迟 remote_fallback_delay 后
                             // 再 enqueue，主循环不阻塞，可继续处理其他任务。
                             // target_node 已清空，重新入队后由路由器选择新目标。
-                            let scheduler = self.scheduler.clone();
-                            let delay = self.remote_fallback_delay;
-                            tokio::spawn(async move {
-                                tokio::time::sleep(delay).await;
-                                let mut rerouted = task;
-                                rerouted.target_node = None;
-                                if let Err(e) = scheduler.enqueue(rerouted).await {
-                                    tracing::warn!(
-                                        "failed to re-enqueue task for re-routing: {}",
-                                        e
-                                    );
-                                }
-                            });
+                            let mut rerouted = task;
+                            rerouted.target_node = None;
+                            let ctx = ReenqueueCtx {
+                                node_id: node_id.clone(),
+                                network: network.clone(),
+                                event_bus: event_bus.clone(),
+                                pending_results: pending_tx.clone(),
+                                pending_capacity: self.pending_result_channel_capacity,
+                                state: self.state.subscribe(),
+                            };
+                            tokio::spawn(reenqueue_after_delay(
+                                self.scheduler.clone(),
+                                rerouted,
+                                self.remote_fallback_delay,
+                                ctx,
+                                "task re-route",
+                            ));
                             continue;
                         }
                     }
@@ -1325,14 +1356,21 @@ impl Worker {
                     continue;
                 }
                 // 同上：退避由独立 spawn 触发，延迟 enqueue 避免主循环阻塞。
-                let scheduler = self.scheduler.clone();
-                let delay = self.remote_fallback_delay;
-                tokio::spawn(async move {
-                    tokio::time::sleep(delay).await;
-                    if let Err(e) = scheduler.enqueue(task).await {
-                        tracing::warn!("failed to re-enqueue submit-only task: {}", e);
-                    }
-                });
+                let ctx = ReenqueueCtx {
+                    node_id: node_id.clone(),
+                    network: network.clone(),
+                    event_bus: event_bus.clone(),
+                    pending_results: pending_tx.clone(),
+                    pending_capacity: self.pending_result_channel_capacity,
+                    state: self.state.subscribe(),
+                };
+                tokio::spawn(reenqueue_after_delay(
+                    self.scheduler.clone(),
+                    task,
+                    self.remote_fallback_delay,
+                    ctx,
+                    "submit-only task",
+                ));
                 continue;
             }
 
@@ -1390,8 +1428,6 @@ impl Worker {
                         self.notify_capacity();
                         continue;
                     }
-                    let scheduler = self.scheduler.clone();
-                    let delay = self.remote_fallback_delay;
                     // 配额是节点级资源：路由器选择的目标（`pinned_target=false`）
                     // 在本节点容量耗尽时不是提交方意图，必须清空以重新参与路由。
                     // 否则任务会一直钉在本节点轮询直到 starvation 失败，即使其他
@@ -1400,14 +1436,23 @@ impl Worker {
                     let mut retry_task = task;
                     Self::release_routing_target_on_quota_defer(&mut retry_task);
                     let tracker = self.quota_tracker.clone();
+                    let scheduler = self.scheduler.clone();
+                    let delay = self.remote_fallback_delay;
+                    let ctx = ReenqueueCtx {
+                        node_id: node_id.clone(),
+                        network: network.clone(),
+                        event_bus: event_bus.clone(),
+                        pending_results: pending_tx.clone(),
+                        pending_capacity: self.pending_result_channel_capacity,
+                        state: self.state.subscribe(),
+                    };
                     tokio::spawn(async move {
                         tokio::select! {
                             _ = tokio::time::sleep(delay) => {}
                             _ = tracker.wait_for_release() => {}
                         }
-                        if let Err(e) = scheduler.enqueue(retry_task).await {
-                            tracing::warn!("failed to re-enqueue quota-deferred task: {}", e);
-                        }
+                        reenqueue_with_retry(scheduler, retry_task, &ctx, "quota-deferred task")
+                            .await;
                     });
                     drop(permit);
                     self.notify_capacity();
@@ -1584,6 +1629,7 @@ impl Worker {
                 );
             }
 
+            let reenqueue_state = state_sender.subscribe();
             tokio::spawn(async move {
                 let _permit = permit;
                 // 配额守卫随任务生命周期存在，闭包内任意 return 都会在 Drop 归还。
@@ -1637,6 +1683,8 @@ impl Worker {
                     .await;
                     drop(_permit);
                     cleanup();
+                    // 派发前取消不经过 build_completion，需显式归还运行中计数。
+                    crate::metrics::dec_running_tasks();
                     if let Some(ref cb) = capacity_cb {
                         let available = semaphore_for_cb.available_permits();
                         cb(
@@ -1690,21 +1738,26 @@ impl Worker {
                     }
                     // 退避由独立 spawn 触发，主循环不阻塞。target_node 已清空，
                     // 重新入队后由路由器选择新的执行节点（本地或远端）。
-                    let scheduler = scheduler_for_failover.clone();
-                    let delay = failover_delay;
                     let mut rerouted = task;
                     rerouted.attempt += 1;
                     rerouted.target_node = None;
-                    let rerouted_id = rerouted.id.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(delay).await;
-                        if let Err(e) = scheduler.enqueue(rerouted).await {
-                            tracing::warn!(
-                                task_id = %rerouted_id.as_str(),
-                                "failed to re-enqueue crashed task for failover: {e}"
-                            );
-                        }
-                    });
+                    let ctx = ReenqueueCtx {
+                        node_id: node_id_for_spawn.clone(),
+                        network: network.clone(),
+                        event_bus: event_bus.clone(),
+                        pending_results: pending_results.clone(),
+                        pending_capacity,
+                        state: reenqueue_state.clone(),
+                    };
+                    tokio::spawn(reenqueue_after_delay(
+                        scheduler_for_failover.clone(),
+                        rerouted,
+                        failover_delay,
+                        ctx,
+                        "crashed task failover",
+                    ));
+                    // 崩溃路径不经过 build_completion，需显式归还运行中计数。
+                    crate::metrics::dec_running_tasks();
                     return;
                 }
 
@@ -1870,28 +1923,41 @@ impl Worker {
             required_quota: task.quota.clone(),
             local_available_quotas: self.quota_tracker.available_map(),
         };
-        let candidates: Vec<crate::runtime::workflow::RouteCandidate> = failover
-            .get_peer_infos()
-            .into_iter()
-            .map(|(node_id, info)| crate::runtime::workflow::RouteCandidate {
-                node_id,
-                endpoint_addr: info.endpoint_addr,
-                available_slots: info.available_slots,
-                max_slots: info.max_slots,
-                role: info.role,
-                draining: info.draining,
-                last_heartbeat_ms: info.last_heartbeat_ms,
-                labels: info.labels,
-                available_quotas: info.available_quotas,
-            })
-            .collect();
-        match self.route_policy.select_target(&ctx, &candidates) {
+        let candidates = failover.route_candidates();
+        match self.route_policy.select_target(&ctx, candidates.as_slice()) {
             RouteDecision::Local if !local_fits => RouteDecision::Defer {
                 reason: match task.quota.as_deref() {
                     Some(key) if !local_quota_ok => unschedulable_quota_reason(key),
                     _ => unschedulable_reason(&task.tags),
                 },
             },
+            RouteDecision::Remote {
+                node_id,
+                endpoint_addr,
+            } => {
+                // 自定义策略（含 Python callable）不得绕过候选资格：draining /
+                // 满槽 / 角色不可执行 / 标签或配额不匹配的节点一律降级为 Defer。
+                let now_ms = crate::common::epoch_millis();
+                let eligible = candidates
+                    .iter()
+                    .find(|candidate| candidate.node_id == node_id)
+                    .is_some_and(|candidate| {
+                        crate::runtime::workflow::route::is_eligible(&ctx, candidate, now_ms)
+                    });
+                if eligible {
+                    RouteDecision::Remote {
+                        node_id,
+                        endpoint_addr,
+                    }
+                } else {
+                    RouteDecision::Defer {
+                        reason: format!(
+                            "route policy chose ineligible candidate '{}'",
+                            node_id.as_str()
+                        ),
+                    }
+                }
+            }
             other => other,
         }
     }
@@ -1933,7 +1999,7 @@ impl Worker {
     async fn expire_standalone_leases(
         &self,
         node_id: &NodeId,
-        network: &dyn Transport,
+        network: Arc<dyn Transport>,
         event_bus: &EventBus,
         pending_results: &tokio::sync::mpsc::Sender<PendingResult>,
     ) {
@@ -1976,7 +2042,7 @@ impl Worker {
                     completion,
                     &task,
                     node_id,
-                    network,
+                    network.as_ref(),
                     event_bus,
                     pending_results,
                     self.pending_result_channel_capacity,
@@ -1997,13 +2063,24 @@ impl Worker {
             task.target_endpoint_addr = None;
             // 旧租约随重投作废：下一次转发会重新授予。
             task.relinquish_lease();
-            let id = task.id.clone();
-            if let Err(e) = self.scheduler.enqueue(task).await {
-                tracing::warn!(
-                    task_id = %id.as_str(),
-                    "failed to re-enqueue leased standalone task: {e}"
-                );
-            }
+            // 重入队复用统一重试路径（3 次退避；draining 发 Cancelled、
+            // 耗尽发 Failed 终态）：登记已被 take_expired_standalone 移除，
+            // 此处失败若静默丢弃，任务既不在队列也不在登记，提交方永久等待。
+            let ctx = ReenqueueCtx {
+                node_id: node_id.clone(),
+                network: network.clone(),
+                event_bus: event_bus.clone(),
+                pending_results: pending_results.clone(),
+                pending_capacity: self.pending_result_channel_capacity,
+                state: self.state.subscribe(),
+            };
+            reenqueue_with_retry(
+                self.scheduler.clone(),
+                task,
+                &ctx,
+                "lease-expired standalone task",
+            )
+            .await;
         }
     }
 
@@ -2046,8 +2123,8 @@ mod completion;
 #[allow(unused_imports)]
 pub(crate) use completion::DispatchResult;
 use completion::{
-    build_completion_from_dispatch_result, is_worker_crash, settle_local_completion,
-    OrchestratorBridge,
+    build_completion_from_dispatch_result, is_worker_crash, reenqueue_after_delay,
+    reenqueue_with_retry, settle_local_completion, OrchestratorBridge, ReenqueueCtx,
 };
 use completion::{publish_drained_task_cancellation, publish_task_completion, DrainNotifyCtx};
 

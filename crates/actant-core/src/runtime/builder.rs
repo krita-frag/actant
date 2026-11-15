@@ -111,6 +111,23 @@ pub fn init_actor_system(
     Ok(system)
 }
 
+/// 读取 `data_dir/identity.key`；不存在时返回 `None`。
+fn read_identity_key(data_dir: &Path) -> Result<Option<iroh::SecretKey>, ActantError> {
+    let path = data_dir.join("identity.key");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(&path)
+        .map_err(|e| ActantError::Config(format!("failed to read identity.key: {e}")))?;
+    let seed: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
+        ActantError::Config(format!(
+            "identity.key corrupt: expected 32 bytes, got {}",
+            v.len()
+        ))
+    })?;
+    Ok(Some(iroh::SecretKey::from_bytes(&seed)))
+}
+
 /// 加载或创建节点身份密钥（identity.key）。
 ///
 /// 节点身份 = iroh endpoint keypair：`data_dir/identity.key` 存 raw 32 字节
@@ -119,17 +136,9 @@ pub fn init_actor_system(
 /// 已存在（`validate_data_dir` 之后）。
 fn load_or_create_identity(data_dir: &Path) -> Result<iroh::SecretKey, ActantError> {
     let path = data_dir.join("identity.key");
-    if path.exists() {
-        let bytes = std::fs::read(&path)
-            .map_err(|e| ActantError::Config(format!("failed to read identity.key: {e}")))?;
-        let seed: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
-            ActantError::Config(format!(
-                "identity.key corrupt: expected 32 bytes, got {}",
-                v.len()
-            ))
-        })?;
+    if let Some(key) = read_identity_key(data_dir)? {
         tracing::info!("loaded node identity key from {}", path.display());
-        return Ok(iroh::SecretKey::from_bytes(&seed));
+        return Ok(key);
     }
     let key = iroh::SecretKey::generate();
     #[cfg(unix)]
@@ -152,6 +161,56 @@ fn load_or_create_identity(data_dir: &Path) -> Result<iroh::SecretKey, ActantErr
     }
     tracing::info!("generated new node identity key at {}", path.display());
     Ok(key)
+}
+
+/// 未显式命名节点的默认 ID：`data_dir` 中持久身份的 endpoint id。
+///
+/// 与 iroh endpoint 公钥一致，因此集群内唯一、重启稳定（`identity.key`
+/// 持久化）。显式命名仍由调用方负责唯一性；需要读得懂的展示名请用
+/// `node_labels`。
+pub fn resolve_node_id(data_dir: &str) -> Result<NodeId, ActantError> {
+    validate_data_dir(data_dir)?;
+    let dir = Path::new(data_dir);
+    std::fs::create_dir_all(dir)
+        .map_err(|e| ActantError::Config(format!("failed to create data_dir: {e}")))?;
+    let key = load_or_create_identity(dir)?;
+    Ok(NodeId::new(key.public().to_string()))
+}
+
+/// 只读读取已持久化身份的 endpoint id；`identity.key` 不存在时返回 `None`。
+///
+/// 供部署流水线在**启动前**登记 `allowed_peer_ids`：先用 [`resolve_node_id`]
+/// 生成身份（CLI: `actant identity init`），再用本函数读取（`actant identity
+/// show`）。不创建目录、不生成密钥。
+pub fn read_node_id(data_dir: &str) -> Result<Option<NodeId>, ActantError> {
+    Ok(read_identity_key(Path::new(data_dir))?.map(|key| NodeId::new(key.public().to_string())))
+}
+
+/// 校验并规范化 `allowed_peer_ids`：元素必须是 iroh endpoint id（z32）。
+///
+/// 写成完整 `endpoint_addr` 虽然看起来像"节点地址"，但永远不会与对端
+/// 心跳/直连里的 endpoint id 相等，结果是节点静默失联；此处提前失败。
+fn normalize_allowed_peer_ids(peers: &[String]) -> Result<Vec<String>, ActantError> {
+    let mut normalized: Vec<String> = Vec::with_capacity(peers.len());
+    for raw in peers {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(ActantError::Config(
+                "invalid allowed_peer_ids entry '': empty entries are not allowed".into(),
+            ));
+        }
+        let id: iroh::EndpointId = trimmed.parse().map_err(|e| {
+            ActantError::Config(format!(
+                "invalid allowed_peer_ids entry '{raw}': expected iroh endpoint id \
+                 (z32, e.g. Runtime.peer_id), not a full endpoint_addr: {e}"
+            ))
+        })?;
+        let canonical = id.to_string();
+        if !normalized.contains(&canonical) {
+            normalized.push(canonical);
+        }
+    }
+    Ok(normalized)
 }
 
 /// 初始化 orchestrator，可选持久化。
@@ -451,7 +510,7 @@ impl RuntimeBuilder {
         self
     }
 
-    pub async fn build(self) -> Result<Arc<crate::runtime::Runtime>, ActantError> {
+    pub async fn build(mut self) -> Result<Arc<crate::runtime::Runtime>, ActantError> {
         use crate::runtime::capability::register_defaults;
         use crate::runtime::capability::register_store_handler;
         use crate::runtime::capability::CapabilityRuntime;
@@ -467,6 +526,10 @@ impl RuntimeBuilder {
         // 启动前校验所有配置约束：未知 discovery/scheduler、Failover 时序、
         // payload 签名硬失败（require_payload_signing=true 且 key 为空时直接报错）。
         self.config.validate()?;
+        // 白名单元素必须是 endpoint id；写成完整地址会让成员校验永远失败，
+        // 表现为"启动正常但 peers 恒空"，在启动期直接拒绝。
+        self.config.network.allowed_peer_ids =
+            normalize_allowed_peer_ids(&self.config.network.allowed_peer_ids)?;
 
         // 空 payload_signing_key 会禁用 payload 完整性验证，仅适用于开发/测试。
         // 生产环境必须配置非空密钥，否则恶意节点可投递伪造 cloudpickle payload。
@@ -534,6 +597,21 @@ impl RuntimeBuilder {
             }
         };
 
+        // 心跳签名把节点身份绑定到 endpoint 公钥：`node_id` 必须与之一致，
+        // 否则持合法密钥的成员可以冒用他人 node_id 接收任务与结果。这里在
+        // 启动期失败，而不是让对端静默拒绝所有心跳。
+        if self.config.network.require_signed_records
+            && self.node_id.as_str() != network.local_peer_id()
+        {
+            return Err(ActantError::Config(format!(
+                "require_signed_records requires node_id to equal the endpoint id \
+                 (node_id='{}', endpoint_id='{}'); omit name to derive it from the \
+                 persisted identity, and use node_labels for human-readable names",
+                self.node_id.as_str(),
+                network.local_peer_id()
+            )));
+        }
+
         let event_bus = EventBus::new();
 
         tracing::info!("build: init_actor_system enter");
@@ -584,11 +662,11 @@ impl RuntimeBuilder {
         // 再 bind_actor_system，确保 CapabilityActor spawn 时持有最新 handlers。
         tracing::info!("build: capability register enter");
         let capability = Arc::new(CapabilityRuntime::new());
-        register_defaults(&capability);
+        register_defaults(&capability)?;
         register_store_handler(&capability, lmdb_store.clone())?;
         Arc::clone(&capability)
             .bind_actor_system(actor_system.clone())
-            .await;
+            .await?;
         tracing::info!("build: capability register done");
 
         // ── WorkflowActor ──────────────────────────────────────────────
@@ -734,14 +812,16 @@ impl RuntimeBuilder {
         //（register_background_loop_cancel 只借用 &self，未 clone Arc），
         // 故 Arc::get_mut 可直接获取可变引用，无需克隆（克隆会
         // 引用计数变为 2，get_mut 永远返回 None → worker 从未注入。
-        if let Some(rt) = Arc::get_mut(&mut runtime) {
-            rt.set_worker(worker.clone());
-            rt.set_orchestrator(orchestrator_handle);
-        } else {
-            tracing::warn!(
-                "build: runtime Arc has multiple owners, worker and orchestrator not injected"
-            );
-        }
+        // 若出现额外引用，构建必须失败：返回未注入 worker 的 Runtime 会让
+        // 调用方拿到一个“构建成功但永不执行任务”的半初始化对象。
+        let Some(rt) = Arc::get_mut(&mut runtime) else {
+            return Err(ActantError::Internal(
+                "runtime Arc has multiple owners during build; worker and orchestrator cannot be injected"
+                    .into(),
+            ));
+        };
+        rt.set_worker(worker.clone());
+        rt.set_orchestrator(orchestrator_handle);
         // failover 拿到 scheduler（worker 的 actor_scheduler 句柄）。
         failover.set_scheduler(worker.scheduler_clone());
         // 把恢复出的 ready 任务重新入队。经 SchedulerActor 的

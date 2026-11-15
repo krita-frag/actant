@@ -94,6 +94,16 @@ pub trait CapabilityCodec: Send + Sync {
     ) -> Result<Box<dyn std::any::Any + Send + Sync>, ActantError>;
 }
 
+/// capability 的 actor 通道：actor id、codec 与 actor system。
+///
+/// `ask`/`perform`/`emit` 的前导逐行相同，只差错误文案里的动词；抽出类型别名
+/// 让 [`CapabilityRuntime::channel`] 的签名可读，也避免三处各自拼装这三件套。
+type CapabilityChannel = (
+    ActorId,
+    Arc<dyn CapabilityCodec>,
+    Arc<crate::runtime::actor::ActorSystem>,
+);
+
 /// 为具体 capability 类型实现的编解码器。
 #[derive(Clone, Copy, Default)]
 pub struct TypedCodec<C: Capability>(std::marker::PhantomData<C>);
@@ -363,12 +373,16 @@ impl CapabilityRuntime {
     /// `bind_actor_system` **之前**完成；绑定后再调用会返回错误。
     /// CapabilityRuntime 不持有后台任务或更新通道：handlers 只在 Actor
     /// spawn 时从 `layers` snapshot，故不存在运行期热更新窗口。
+    ///
+    /// # Errors
+    ///
+    /// 任一 `CapabilityActor` spawn 失败时返回 [`ActantError::Actor`]；
+    /// 绑定视为失败，不会标记为已绑定。调用方（`RuntimeBuilder::build`）
+    /// 应中止启动，而不是让该 capability 在运行期才报 “not bound”。
     pub async fn bind_actor_system(
         self: Arc<Self>,
         actor_system: Arc<crate::runtime::actor::ActorSystem>,
-    ) {
-        *self.actor_system.write() = Some(actor_system.clone());
-
+    ) -> Result<(), ActantError> {
         // 遍历 layers，为每个已注册 codec 的 capability spawn 一个 CapabilityActor。
         // handlers 在此时 snapshot，确保 bind 前的覆盖式注册生效。
         type SpawnTask = (
@@ -397,26 +411,42 @@ impl CapabilityRuntime {
                     self.actor_ids.insert(type_id, actor_id);
                 }
                 Err(e) => {
+                    // 绑定失败必须向上传播：继续运行会让该 capability 的后续
+                    // 调用只能得到 “not bound” 错误，问题被推迟到业务路径。
                     warn!(
                         error = %e,
                         capability = %actor_id.as_str(),
                         "failed to spawn capability actor"
                     );
+                    return Err(ActantError::Actor(format!(
+                        "failed to spawn capability actor '{}': {e}",
+                        actor_id.as_str()
+                    )));
                 }
             }
         }
+
+        // 全部 spawn 成功后才标记绑定完成（register_codec / chain 的冻结检查
+        // 依赖该字段）。
+        *self.actor_system.write() = Some(actor_system);
+        Ok(())
     }
 
     /// 显式注册一个 capability 的序列化 codec。只有注册了 codec 的 capability
     /// 才会走 Actor 化执行路径。
-    pub fn register_codec<C: Capability>(&self)
+    ///
+    /// 必须在 `bind_actor_system` 之前调用；绑定后再注册不会 spawn 新
+    /// `CapabilityActor`，调用会返回错误而不是静默产生一个永远不可达的 codec。
+    pub fn register_codec<C: Capability>(&self) -> Result<(), ActantError>
     where
         C::Request: Serialize + for<'de> Deserialize<'de> + Clone + Any + Send + Sync,
         C::Response: Serialize + for<'de> Deserialize<'de> + Any + Send + Sync,
     {
+        self.ensure_not_bound()?;
         let type_id = TypeId::of::<C>();
         self.codecs
             .insert(type_id, Arc::new(TypedCodec::<C>::new()));
+        Ok(())
     }
 
     fn ensure_not_bound(&self) -> Result<(), ActantError> {
@@ -480,30 +510,31 @@ impl CapabilityRuntime {
         Ok(())
     }
 
-    pub async fn ask<C: Capability>(
-        &self,
-        req: C::Request,
-    ) -> Result<Option<C::Response>, ActantError>
-    where
-        C::Request: Any + Clone + Send + Sync,
-        C::Response: Any + Send + Sync,
-    {
+    /// 取某个 capability 的 actor 通道：actor id、codec 与 actor system 三件套。
+    ///
+    /// `ask`/`perform`/`emit` 的前导逐行相同（查 actor 绑定 → 查 codec → 克隆
+    /// actor system），只有错误文案里的动词不同。三处各抄一遍意味着任何绑定
+    /// 语义调整都要改三处，且容易漏。
+    fn channel<C: Capability>(&self, verb: &str) -> Result<CapabilityChannel, ActantError> {
         let type_id = TypeId::of::<C>();
-
-        // 统一走 Actor 路径。未绑定 ActorSystem 或未注册 codec 视为配置错误。
-        let actor_id = self.actor_ids.get(&type_id).map(|e| e.clone()).ok_or_else(|| {
-            ActantError::Internal(format!(
-                "ask: capability {:?} not bound to actor system (register codec + bind_actor_system first)",
-                std::any::type_name::<C>()
-            ))
-        })?;
+        let actor_id = self
+            .actor_ids
+            .get(&type_id)
+            .map(|e| e.clone())
+            .ok_or_else(|| {
+                ActantError::Internal(format!(
+                    "{verb}: capability {:?} not bound to actor system \
+                     (register codec + bind_actor_system first)",
+                    std::any::type_name::<C>()
+                ))
+            })?;
         let codec = self
             .codecs
             .get(&type_id)
             .map(|e| e.clone())
             .ok_or_else(|| {
                 ActantError::Internal(format!(
-                    "ask: capability {:?} has no codec",
+                    "{verb}: capability {:?} has no codec",
                     std::any::type_name::<C>()
                 ))
             })?;
@@ -513,6 +544,18 @@ impl CapabilityRuntime {
             .as_ref()
             .cloned()
             .ok_or_else(|| ActantError::Internal("actor system not bound".into()))?;
+        Ok((actor_id, codec, actor_system))
+    }
+
+    pub async fn ask<C: Capability>(
+        &self,
+        req: C::Request,
+    ) -> Result<Option<C::Response>, ActantError>
+    where
+        C::Request: Any + Clone + Send + Sync,
+        C::Response: Any + Send + Sync,
+    {
+        let (actor_id, codec, actor_system) = self.channel::<C>("ask")?;
 
         let req_arc: Arc<dyn Any + Send + Sync> = Arc::new(req);
         let req_bytes = codec
@@ -549,34 +592,7 @@ impl CapabilityRuntime {
         C::Request: Any + Clone + Send + Sync,
         C::Response: Any + Send + Sync,
     {
-        let type_id = TypeId::of::<C>();
-
-        let actor_id = self
-            .actor_ids
-            .get(&type_id)
-            .map(|e| e.clone())
-            .ok_or_else(|| {
-                ActantError::Internal(format!(
-                    "perform: capability {:?} not bound to actor system",
-                    std::any::type_name::<C>()
-                ))
-            })?;
-        let codec = self
-            .codecs
-            .get(&type_id)
-            .map(|e| e.clone())
-            .ok_or_else(|| {
-                ActantError::Internal(format!(
-                    "perform: capability {:?} has no codec",
-                    std::any::type_name::<C>()
-                ))
-            })?;
-        let actor_system = self
-            .actor_system
-            .read()
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| ActantError::Internal("actor system not bound".into()))?;
+        let (actor_id, codec, actor_system) = self.channel::<C>("perform")?;
 
         let req_arc: Arc<dyn Any + Send + Sync> = Arc::new(req);
         let req_bytes = codec
@@ -615,36 +631,11 @@ impl CapabilityRuntime {
     where
         C::Request: Any + Clone + Send + Sync,
     {
-        let type_id = TypeId::of::<C>();
+        let (actor_id, codec, actor_system) = self.channel::<C>("emit")?;
+        let local_handlers = self
+            .handler_count_by_type_id(TypeId::of::<C>())
+            .unwrap_or(0);
 
-        let actor_id = self
-            .actor_ids
-            .get(&type_id)
-            .map(|e| e.clone())
-            .ok_or_else(|| {
-                ActantError::Internal(format!(
-                    "emit: capability {:?} not bound to actor system",
-                    std::any::type_name::<C>()
-                ))
-            })?;
-        let codec = self
-            .codecs
-            .get(&type_id)
-            .map(|e| e.clone())
-            .ok_or_else(|| {
-                ActantError::Internal(format!(
-                    "emit: capability {:?} has no codec",
-                    std::any::type_name::<C>()
-                ))
-            })?;
-        let actor_system = self
-            .actor_system
-            .read()
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| ActantError::Internal("actor system not bound".into()))?;
-
-        let local_handlers = self.handler_count_by_type_id(type_id).unwrap_or(0);
         let req_arc: Arc<dyn Any + Send + Sync> = Arc::new(req);
         let req_bytes = codec
             .serialize_request(req_arc)

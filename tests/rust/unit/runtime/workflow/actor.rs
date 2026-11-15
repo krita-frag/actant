@@ -291,6 +291,10 @@ fn count_events(event_log: &MemoryEventLog, wf_id: &WorkflowId) -> HashMap<Strin
             JournalEvent::TimerFired { .. } => "TimerFired",
             JournalEvent::ContextValue { .. } => "ContextValue",
             JournalEvent::Recovered { .. } => "Recovered",
+            JournalEvent::NodesSealed { .. } => "NodesSealed",
+            JournalEvent::DeadlineSet { .. } => "DeadlineSet",
+            JournalEvent::Evicted { .. } => "Evicted",
+            JournalEvent::StartedAt { .. } => "StartedAt",
         };
         *counts.entry(name.to_string()).or_default() += 1;
     }
@@ -364,32 +368,15 @@ async fn task_result_three_paths_idempotent() {
         ResultSource::Remote,
         ResultSource::Gossip,
     ] {
-        if source == ResultSource::Local {
-            system
-                .call(
-                    &actor_id,
-                    workflow_methods::FAIL_TASK,
-                    encode(&(
-                        wf_id.clone(),
-                        task_id.clone(),
-                        "late failure".to_string(),
-                        crate::runtime::workflow::FailureScope::WorkflowLevel,
-                    ))
-                    .unwrap(),
-                )
-                .await
-                .unwrap();
-        } else {
-            inject_result(
-                &system,
-                &actor_id,
-                &wf_id,
-                &task_id,
-                TaskResultOutcome::Failed("late failure".to_string()),
-                source,
-            )
-            .await;
-        }
+        inject_result(
+            &system,
+            &actor_id,
+            &wf_id,
+            &task_id,
+            TaskResultOutcome::Failed("late failure".to_string()),
+            source,
+        )
+        .await;
     }
 
     // 状态：a Completed（结果未被改写）、工作流非终态（b 未决）。
@@ -566,21 +553,16 @@ async fn gossip_failure_continue_strategy_consistent_across_paths() {
     assert_eq!(exec.tasks[&TaskId::from("a")].state, Phase::Failed);
     assert!(!exec.is_terminal(), "continue strategy must not fail yet");
 
-    // 同一失败经 Local（legacy FAIL_TASK）与 Remote 重复注入：不重复推进。
-    system
-        .call(
-            &actor_id,
-            workflow_methods::FAIL_TASK,
-            encode(&(
-                wf_id.clone(),
-                TaskId::from("a"),
-                "boom".to_string(),
-                crate::runtime::workflow::FailureScope::TaskOnly,
-            ))
-            .unwrap(),
-        )
-        .await
-        .unwrap();
+    // 同一失败经 Local 与 Remote 重复注入：不重复推进。
+    inject_result(
+        &system,
+        &actor_id,
+        &wf_id,
+        &TaskId::from("a"),
+        TaskResultOutcome::Failed("boom".to_string()),
+        ResultSource::Local,
+    )
+    .await;
     inject_result(
         &system,
         &actor_id,
@@ -621,5 +603,97 @@ async fn gossip_failure_continue_strategy_consistent_across_paths() {
     // Failed（不记 TaskCompleted / Completed）。
     assert_eq!(counts.get("Failed"), Some(&1), "{counts:?}");
 
+    system.stop(&actor_id).await.unwrap();
+}
+
+/// 迟到结果守卫：工作流按 retention 淘汰后，再经 ON_TASK_RESULT 回灌的
+/// 结果必须按终局 Settled 返回，而不是 NotFound 上抛——后者会被执行侧
+/// network_router 归类为「origin 拒绝」，进入对确定性拒绝没有终结条件的
+/// 重投队列（每次重投都是一次 origin 直连 + actor 往返的常驻负载）。
+#[tokio::test]
+async fn late_result_for_evicted_workflow_settles_without_error() {
+    use crate::common::ActantConfig;
+    use crate::runtime::state::Store;
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let event_log = Arc::new(MemoryEventLog::default());
+    let mut config = ActantConfig::default();
+    config.workflow.completed_retention_count = 0;
+    let orchestrator = Orchestrator::new()
+        .with_config(config)
+        .with_store(store)
+        .with_event_log(event_log.clone());
+
+    let system = ActorSystem::new();
+    let actor_id = ActorId::from("wf-actor-evicted-result");
+    system
+        .spawn(actor_id.clone(), WorkflowActor::new(orchestrator))
+        .await
+        .unwrap();
+
+    let wf_id = WorkflowId::from("wf-evicted-result");
+    let mut dag = Dag::new();
+    dag.add_node(make_node("only", "only")).unwrap();
+    system
+        .call(
+            &actor_id,
+            workflow_methods::SUBMIT,
+            encode(&(wf_id.clone(), dag, None::<WorkflowInvocation>)).unwrap(),
+        )
+        .await
+        .unwrap();
+    system
+        .call(
+            &actor_id,
+            workflow_methods::START,
+            encode(&wf_id.clone()).unwrap(),
+        )
+        .await
+        .unwrap();
+    system
+        .call(
+            &actor_id,
+            workflow_methods::MARK_TASK_RUNNING,
+            encode(&(wf_id.clone(), TaskId::from("only"))).unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // 任务完成 → 工作流终态 → retention=0 立即淘汰。
+    inject_result(
+        &system,
+        &actor_id,
+        &wf_id,
+        &TaskId::from("only"),
+        TaskResultOutcome::Completed(b"r".to_vec()),
+        ResultSource::Local,
+    )
+    .await;
+
+    // 淘汰后的迟到结果：必须 Ok 且无重试裁决，而不是 NotFound 错误。
+    let resp = system
+        .call(
+            &actor_id,
+            workflow_methods::ON_TASK_RESULT,
+            encode(&(
+                wf_id.clone(),
+                TaskId::from("only"),
+                TaskResultOutcome::Failed("[actant:worker] late delivery".to_string()),
+                None::<u32>,
+                ResultSource::Remote,
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        resp.error.is_none(),
+        "淘汰工作流的迟到结果不得上抛 NotFound: {:?}",
+        resp.error
+    );
+    let retry: Option<(crate::common::TaskDefinition, u64)> = decode(&resp.payload).unwrap();
+    assert!(retry.is_none(), "淘汰工作流的迟到结果不得产生重试裁决");
     system.stop(&actor_id).await.unwrap();
 }

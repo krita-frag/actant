@@ -38,16 +38,12 @@ fn topic_heads_is_constant() {
 
 #[test]
 fn topic_workflow_state_req_resp_are_distinct() {
-    let n = node("worker-9");
-    let req = Topic::workflow_state_req(&n);
-    let resp = Topic::workflow_state_resp(&n);
+    let req = Topic::workflow_state_req();
+    let resp = Topic::workflow_state_resp();
     assert_ne!(req, resp);
-    assert!(req
-        .as_str()
-        .starts_with(constants::TOPIC_WORKFLOW_STATE_REQ));
-    assert!(resp
-        .as_str()
-        .starts_with(constants::TOPIC_WORKFLOW_STATE_RESP_PREFIX));
+    // 全局话题：不含节点后缀，节点定址由载荷里的 target_node 完成。
+    assert_eq!(req.as_str(), constants::TOPIC_WORKFLOW_STATE_REQ);
+    assert_eq!(resp.as_str(), constants::TOPIC_WORKFLOW_STATE_RESP);
 }
 
 // --- Topic::classify 路由分发（关键路径） ---
@@ -63,12 +59,12 @@ fn classify_task_extracts_node() {
 #[test]
 fn classify_workflow_state_req_resp() {
     assert_eq!(
-        Topic::workflow_state_req(&node("n")).classify(),
-        TopicRoute::WorkflowStateReq("n".to_string())
+        Topic::workflow_state_req().classify(),
+        TopicRoute::WorkflowStateReq
     );
     assert_eq!(
-        Topic::workflow_state_resp(&node("n")).classify(),
-        TopicRoute::WorkflowStateResp("n".to_string())
+        Topic::workflow_state_resp().classify(),
+        TopicRoute::WorkflowStateResp
     );
 }
 
@@ -97,10 +93,12 @@ fn classify_task_prefix_is_exact() {
 // --- Topic::from 边界保护 ---
 
 #[test]
-fn from_truncates_oversized_topic() {
+fn from_rejects_oversized_topic_as_unknown() {
     let huge = "x".repeat(constants::MAX_TOPIC_LEN + 10);
     let t = Topic::from(huge.as_str());
-    assert_eq!(t.as_str().len(), constants::MAX_TOPIC_LEN);
+    // 拒绝而非截断：映射到哨兵，classify 归入 Unknown 由路由器丢弃。
+    assert_eq!(t.classify(), crate::common::wire::TopicRoute::Unknown);
+    assert_ne!(t.as_str(), huge.as_str());
 }
 
 #[test]
@@ -110,14 +108,12 @@ fn from_preserves_normal_length_topic() {
     assert_eq!(t.as_str(), s);
 }
 
-/// 回归测试：UTF-8 多字节字符在 MAX_TOPIC_LEN 边界处截断不应 panic。
+/// 回归测试：UTF-8 多字节字符 + 超长输入不应 panic。
 ///
-/// 截断实现使用字符边界安全切片（`floor_char_boundary`），避免按字节
-/// 切片落在多字节 UTF-8 字符内部导致 panic。
+/// 拒绝路径不按字节切片，因此不存在落在多字节字符内部的问题。
 #[test]
-fn from_truncation_at_utf8_boundary_should_not_panic() {
+fn from_rejection_at_utf8_boundary_should_not_panic() {
     // 构造：255 个 ASCII + 1 个 3 字节中文字符 = 258 字节
-    // 截断点 256 会切到中文字符的第二个字节
     let mut s = "a".repeat(255);
     s.push('中'); // U+4E2D, 3 字节 UTF-8
     assert!(
@@ -125,10 +121,8 @@ fn from_truncation_at_utf8_boundary_should_not_panic() {
         "test string must exceed MAX_TOPIC_LEN"
     );
 
-    // 修复后应成功返回，截断到 char 边界
     let t = Topic::from(s.as_str());
-    // 应截断到 255 字节（中文字符完整被移除）
-    assert_eq!(t.as_str().len(), 255);
+    assert_eq!(t.classify(), crate::common::wire::TopicRoute::Unknown);
     assert!(t.as_str().is_char_boundary(t.as_str().len()));
 }
 
@@ -276,7 +270,7 @@ fn wire_envelope_wrap_injects_w3c_traceparent() {
         role: crate::common::NodeRole::Both,
         draining: false,
     });
-    let envelope = WireEnvelope::wrap(msg);
+    let envelope = WireEnvelope::wrap(msg).expect("wire envelope wrap");
     // traceparent 字段必须非空，且为合法 W3C 格式。
     let tp = envelope
         .traceparent
@@ -305,7 +299,7 @@ fn wire_envelope_roundtrip_preserves_traceparent() {
         role: crate::common::NodeRole::Both,
         draining: false,
     });
-    let envelope = WireEnvelope::wrap(msg);
+    let envelope = WireEnvelope::wrap(msg).expect("wire envelope wrap");
     let original_tp = envelope.traceparent.clone().unwrap();
     let bytes = crate::common::encode_postcard(&envelope).unwrap();
     let (decoded_msg, decoded_tp) = WireEnvelope::decode(&bytes).expect("decode should succeed");
@@ -336,7 +330,7 @@ fn wire_envelope_wrap_within_scope_produces_child_traceparent() {
         role: crate::common::NodeRole::Both,
         draining: false,
     });
-    let envelope = WireEnvelope::wrap(msg);
+    let envelope = WireEnvelope::wrap(msg).expect("wire envelope wrap");
     let child_tp = envelope.traceparent.as_ref().unwrap();
     let child = TraceContext::parse(child_tp).unwrap();
 
@@ -370,7 +364,8 @@ fn wire_envelope_wrap_after_scope_drop_returns_to_root() {
             endpoint_addr: None,
             role: crate::common::NodeRole::Both,
             draining: false,
-        }));
+        }))
+        .expect("wire envelope wrap");
         envelope.traceparent.unwrap()
     };
 
@@ -388,7 +383,8 @@ fn wire_envelope_wrap_after_scope_drop_returns_to_root() {
         endpoint_addr: None,
         role: crate::common::NodeRole::Both,
         draining: false,
-    }));
+    }))
+    .expect("wire envelope wrap");
     let root_tp = envelope.traceparent.unwrap();
     let root = TraceContext::parse(&root_tp).unwrap();
     let child = TraceContext::parse(&child_tp).unwrap();
@@ -420,7 +416,8 @@ fn wire_mac_protects_traceparent_field() {
         endpoint_addr: None,
         role: crate::common::NodeRole::Both,
         draining: false,
-    }));
+    }))
+    .expect("wire envelope wrap");
     let original_tp = envelope.traceparent.clone().unwrap();
     let mut bytes = crate::common::encode_postcard(&envelope).unwrap();
 
@@ -520,7 +517,7 @@ fn envelope_roundtrip_without_signing() {
     // 确保全局密钥为空（其他测试可能设置过）。
     set_wire_signing_key(Vec::new());
 
-    let env = WireEnvelope::wrap(heartbeat_msg("n1"));
+    let env = WireEnvelope::wrap(heartbeat_msg("n1")).expect("wire envelope wrap");
     // 禁用签名时 mac 为 None。
     assert!(env.mac.is_none(), "mac must be None when key is empty");
 
@@ -539,7 +536,7 @@ fn envelope_wrap_with_key_produces_mac() {
     let _guard = MAC_TEST_LOCK.lock().unwrap();
     set_wire_signing_key(b"cluster-secret-123".to_vec());
 
-    let env = WireEnvelope::wrap(heartbeat_msg("n2"));
+    let env = WireEnvelope::wrap(heartbeat_msg("n2")).expect("wire envelope wrap");
     assert!(
         env.mac.is_some(),
         "mac must be Some when signing key is set"
@@ -564,7 +561,7 @@ fn envelope_decode_rejects_mismatched_key() {
     let _guard = MAC_TEST_LOCK.lock().unwrap();
     set_wire_signing_key(b"key-sender".to_vec());
 
-    let env = WireEnvelope::wrap(heartbeat_msg("n3"));
+    let env = WireEnvelope::wrap(heartbeat_msg("n3")).expect("wire envelope wrap");
     let bytes = postcard::to_allocvec(&env).unwrap();
 
     // 接收方使用不同密钥。
@@ -585,7 +582,7 @@ fn envelope_decode_rejects_unsigned_message_when_key_set() {
     let _guard = MAC_TEST_LOCK.lock().unwrap();
     set_wire_signing_key(Vec::new());
     // 在禁用签名的状态下 wrap（不会产生 MAC）。
-    let unsigned_env = WireEnvelope::wrap(heartbeat_msg("n4"));
+    let unsigned_env = WireEnvelope::wrap(heartbeat_msg("n4")).expect("wire envelope wrap");
     assert!(unsigned_env.mac.is_none());
     let bytes = postcard::to_allocvec(&unsigned_env).unwrap();
 
@@ -606,7 +603,7 @@ fn envelope_decode_rejects_unsigned_message_when_key_set() {
 fn envelope_decode_rejects_tampered_bytes() {
     let _guard = MAC_TEST_LOCK.lock().unwrap();
     set_wire_signing_key(b"cluster-key".to_vec());
-    let env = WireEnvelope::wrap(heartbeat_msg("n5"));
+    let env = WireEnvelope::wrap(heartbeat_msg("n5")).expect("wire envelope wrap");
     let mut bytes = postcard::to_allocvec(&env).unwrap();
 
     // 翻转最后一个字节（属于 payload 区，非 MAC 本身）。
@@ -648,6 +645,7 @@ fn trace_scope_guard_restore_recovers_previous_scope() {
             role: crate::common::NodeRole::Both,
             draining: false,
         }))
+        .expect("wire envelope wrap")
         .traceparent
         .unwrap()
     };
@@ -748,14 +746,14 @@ fn two_runtimes_with_different_keys_do_not_interfere() {
     let node_a = node("rt-a");
     let node_b = node("rt-b");
     crate::common::register_wire_signing_key(&node_a, b"cluster-key-a".to_vec());
-    let env_a_before = WireEnvelope::wrap(heartbeat_msg("rt-a"));
+    let env_a_before = WireEnvelope::wrap(heartbeat_msg("rt-a")).expect("wire envelope wrap");
     assert!(env_a_before.mac.is_some());
 
     // 另一 Runtime 以不同密钥注册（旧全局单密钥行为会在此覆盖 rt-a 的密钥）。
     crate::common::register_wire_signing_key(&node_b, b"cluster-key-b".to_vec());
 
     // rt-a 出站仍用 key-a 签名：以 key-a 手工重算 MAC 必须一致。
-    let env_a_after = WireEnvelope::wrap(heartbeat_msg("rt-a"));
+    let env_a_after = WireEnvelope::wrap(heartbeat_msg("rt-a")).expect("wire envelope wrap");
     let bytes_a = postcard::to_allocvec(&env_a_after).unwrap();
     let mac_a = env_a_after.mac.expect("rt-a envelope must be signed");
     let unsigned_a = WireEnvelope {
@@ -773,7 +771,7 @@ fn two_runtimes_with_different_keys_do_not_interfere() {
     );
 
     // rt-b 出站用 key-b 签名。
-    let env_b = WireEnvelope::wrap(heartbeat_msg("rt-b"));
+    let env_b = WireEnvelope::wrap(heartbeat_msg("rt-b")).expect("wire envelope wrap");
     let bytes_b = postcard::to_allocvec(&env_b).unwrap();
     let mac_b = env_b.mac.expect("rt-b envelope must be signed");
     let unsigned_b = WireEnvelope { mac: None, ..env_b };
@@ -831,12 +829,12 @@ fn clearing_node_key_clears_primary_it_owned() {
     crate::common::register_wire_signing_key(&n, b"rt-reset-key".to_vec());
 
     // 注册密钥后，该节点的消息带 MAC。
-    let signed = WireEnvelope::wrap(heartbeat_msg("rt-reset"));
+    let signed = WireEnvelope::wrap(heartbeat_msg("rt-reset")).expect("wire envelope wrap");
     assert!(signed.mac.is_some());
 
     // 以空密钥重新注册：该节点及它留下的 primary 一并清除。
     crate::common::register_wire_signing_key(&n, Vec::new());
-    let unsigned = WireEnvelope::wrap(heartbeat_msg("rt-reset"));
+    let unsigned = WireEnvelope::wrap(heartbeat_msg("rt-reset")).expect("wire envelope wrap");
     assert!(
         unsigned.mac.is_none(),
         "clearing node key must also clear the primary it registered"
@@ -869,11 +867,13 @@ fn clearing_primary_owner_falls_back_to_remaining_node() {
     let response = WireEnvelope::wrap(WireMessage::WorkflowStateResponse(
         crate::common::WorkflowStateResponse {
             workflow_id: crate::common::WorkflowId::from("wf-fallback"),
+            target_node: node("rt-fallback-a"),
             dag: None,
             execution: None,
             pending: None,
         },
-    ));
+    ))
+    .expect("wire envelope wrap");
     assert!(
         response.mac.is_some(),
         "origin-less message must still be signed via the remaining node key"
@@ -897,7 +897,7 @@ fn wire_mac_matches_oneshot_unsigned_serialization() {
     let key = b"segment-compat-key".to_vec();
     set_wire_signing_key(key.clone());
 
-    let env = WireEnvelope::wrap(heartbeat_msg("mac-oneshot"));
+    let env = WireEnvelope::wrap(heartbeat_msg("mac-oneshot")).expect("wire envelope wrap");
     let wrapped_mac = env.mac.expect("mac must be present with signing key");
     set_wire_signing_key(Vec::new());
 
@@ -907,5 +907,26 @@ fn wire_mac_matches_oneshot_unsigned_serialization() {
     assert_eq!(
         wrapped_mac, oneshot,
         "segment-assembled MAC input must equal one-shot unsigned serialization"
+    );
+}
+
+/// W3C traceparent 的 hex 必须小写，`flags` 不得带符号：当前
+/// `u8::from_str_radix("+1", 16)` 与大写 hex 都会被接受。
+#[test]
+fn trace_context_parse_rejects_signed_flags_and_uppercase_hex() {
+    let base = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7";
+    assert!(TraceContext::parse(&format!("{base}-01")).is_some());
+    assert!(
+        TraceContext::parse(&format!("{base}-+1")).is_none(),
+        "flags 含 '+' 不是合法 hex，必须拒绝"
+    );
+    assert!(
+        TraceContext::parse(&format!("{base}-0A")).is_none(),
+        "W3C 要求小写 hex，flags 大写必须拒绝"
+    );
+    let upper_trace = base.replace("4bf9", "4BF9");
+    assert!(
+        TraceContext::parse(&format!("{upper_trace}-01")).is_none(),
+        "trace-id 大写 hex 必须拒绝"
     );
 }

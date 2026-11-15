@@ -274,11 +274,20 @@ def test_emit_task_event_on_error_collect_returns(monkeypatch: pytest.MonkeyPatc
 # ───────────────────────── EventBatcher.close() 显式 join 测试 ─────────────────────────
 
 
+def _render_via_emit(
+    kind: str, task_id: str, workflow_id: str, kwargs: dict[str, object]
+) -> None:
+    """测试用渲染器：等价于 Runtime 传入的 ``_publish_task_event``（上下文绑定除外）。"""
+    _emit_task_event(kind, task_id, workflow_id, **kwargs)
+
+
+
+
 def test_event_batcher_close_joins_flush_thread() -> None:
     """close() 应显式 join 后台 flush 线程，避免线程泄漏。"""
     from actant._internal.tasks.helpers import _EventBatcher
 
-    batcher = _EventBatcher(flush_interval_ms=1, flush_threshold=100)
+    batcher = _EventBatcher(render=_render_via_emit, flush_interval_ms=1, flush_threshold=100)
     flush_thread = batcher._flush_thread
     assert flush_thread is not None
     assert flush_thread.is_alive()
@@ -303,7 +312,7 @@ def test_event_batcher_close_flushes_pending_events(monkeypatch: pytest.MonkeyPa
     )
 
     # 仅按 threshold flush（interval=0 不启动后台线程），确保事件滞留 buffer。
-    batcher = _EventBatcher(flush_interval_ms=0, flush_threshold=100)
+    batcher = _EventBatcher(render=_render_via_emit, flush_interval_ms=0, flush_threshold=100)
     batcher.add("started", "t1", "wf1")
     batcher.add("completed", "t1", "wf1")
     assert emitted == [], "no threshold flush should have fired yet"
@@ -333,7 +342,7 @@ def test_event_batcher_close_aborts_join_on_stuck_flush(monkeypatch: pytest.Monk
 
     monkeypatch.setattr("actant.effects.emit", _stuck_emit)
 
-    batcher = _EventBatcher(flush_interval_ms=1, flush_threshold=100)
+    batcher = _EventBatcher(render=_render_via_emit, flush_interval_ms=1, flush_threshold=100)
     flush_thread = batcher._flush_thread
     assert flush_thread is not None
     # 等待后台线程进入第一次 flush（卡在 emit 上）。
@@ -351,3 +360,29 @@ def test_event_batcher_close_aborts_join_on_stuck_flush(monkeypatch: pytest.Monk
     # 释放阻塞，让后台线程退出（避免泄漏到其他测试）。
     blocker.set()
     flush_thread.join(timeout=2.0)
+
+
+def test_event_batcher_flush_failure_is_logged_at_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """渲染失败会丢事件，至少必须在 WARNING 级别可见。
+
+    flush 先把 buffer 清空再逐条渲染，单条失败不会回灌；只记 DEBUG 会让
+    订阅者事件在默认日志级别下静默消失。
+    """
+    import logging
+
+    from actant._internal.tasks.helpers import _EventBatcher
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("render failed")
+
+    batcher = _EventBatcher(render=_boom, flush_interval_ms=0, flush_threshold=100)
+    batcher.add("started", "t-batcher", "wf1")
+    with caplog.at_level(logging.WARNING, logger="actant.tasks"):
+        batcher.flush()
+
+    assert any(
+        r.levelno >= logging.WARNING and "EventBatcher" in r.getMessage()
+        for r in caplog.records
+    ), "渲染失败必须留下 WARNING 级记录，否则事件是无声丢失"

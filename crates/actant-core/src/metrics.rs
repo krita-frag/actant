@@ -182,7 +182,9 @@ impl Instruments {
                 .build(),
             gossip_updates_dropped: meter
                 .u64_counter("actant.gossip.updates.dropped")
-                .with_description("Gossip updates dropped (stale)")
+                .with_description(
+                    "Gossip updates dropped (stale, oversized, unauthorized, or lagged)",
+                )
                 .build(),
 
             // -- 故障转移计数器 --
@@ -468,16 +470,21 @@ pub fn init() -> Result<(), crate::common::ActantError> {
 
 /// 生成所有已注册指标的 Prometheus 文本展示格式。
 ///
-/// 若未调用 `init()`，返回空字符串。
+/// 若未调用 `init()`，返回空字符串。编码失败（理论上仅 fmt 错误）记录 warn
+/// 并返回空字符串，不把错误静默吞掉。
 pub fn prometheus_text() -> String {
     let guard = REGISTRY.lock();
     match guard.as_ref() {
         Some(registry) => {
             let encoder = TextEncoder::new();
             let metric_families = registry.gather();
-            encoder
-                .encode_to_string(&metric_families)
-                .unwrap_or_default()
+            match encoder.encode_to_string(&metric_families) {
+                Ok(text) => text,
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to encode Prometheus metrics text");
+                    String::new()
+                }
+            }
         }
         None => String::new(),
     }

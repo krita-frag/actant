@@ -62,7 +62,9 @@ jobs:
       # run_bench.py 输出 Markdown 表格 + JSON 报告；--json 落到 run 专属路径
       # （results/ 不入库，见 .gitignore；run_bench 不建父目录，这里先 mkdir）。
       - name: 运行 Python 基准
+        shell: bash
         run: |
+          set -o pipefail
           mkdir -p benches/python/results
           uv run python benches/python/run_bench.py \
             --json "benches/python/results/py_bench_${{ github.run_id }}.json" \

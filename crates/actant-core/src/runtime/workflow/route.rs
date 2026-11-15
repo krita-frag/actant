@@ -12,6 +12,7 @@
 //! `Defer` 表达「本节点不适合且暂无可转发目标」，由 Worker 走退避重入队，
 //! 而不是像旧版 `None` 那样静默本地执行。
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use crate::common::{NodeId, NodeRole};
@@ -116,33 +117,43 @@ pub trait RoutePolicy: Send + Sync {
     fn select_target(&self, ctx: &RouteContext, candidates: &[RouteCandidate]) -> RouteDecision;
 }
 
-/// 过滤出「心跳新鲜、有可用槽位、标签满足诉求」的候选，并按剩余槽位降序排列。
-fn eligible_peers<'a>(
+/// 候选过滤谓词：心跳新鲜、有可用槽位、角色可执行、未 draining、标签与配额满足。
+pub(crate) fn is_eligible(ctx: &RouteContext, candidate: &RouteCandidate, now_ms: u64) -> bool {
+    candidate.role.can_execute_locally()
+        && !candidate.draining
+        && candidate.available_slots > 0
+        && candidate.max_slots > 0
+        && candidate.last_heartbeat_ms > 0
+        && now_ms.saturating_sub(candidate.last_heartbeat_ms) <= ctx.heartbeat_ttl_ms
+        && labels_match(&candidate.labels, &ctx.required_tags)
+        && quota_available(&candidate.available_quotas, ctx.required_quota.as_deref())
+}
+
+/// 候选的全序：角色优先、槽位降序、最大槽位降序、节点名稳定排序。
+///
+/// 排序之后的首元素与 [`best_peer`] 的单遍结果一致。
+fn compare_candidates(a: &RouteCandidate, b: &RouteCandidate) -> Ordering {
+    role_rank(a.role)
+        .cmp(&role_rank(b.role))
+        .then_with(|| b.available_slots.cmp(&a.available_slots))
+        .then_with(|| b.max_slots.cmp(&a.max_slots))
+        .then_with(|| a.node_id.as_str().cmp(b.node_id.as_str()))
+}
+
+/// 单遍选出最优候选。
+///
+/// 内置策略只需要一个目标：避免每任务分配 Vec 并对全部候选排序。比较器是
+/// 全序，因此结果与「先过滤、再按该序排序后取首元素」完全一致（并列时取
+/// 节点名最小者，见 [`compare_candidates`]）。
+fn best_peer<'a>(
     ctx: &RouteContext,
     candidates: &'a [RouteCandidate],
-) -> Vec<&'a RouteCandidate> {
+) -> Option<&'a RouteCandidate> {
     let now_ms = crate::common::epoch_millis();
-    let mut peers: Vec<&RouteCandidate> = candidates
+    candidates
         .iter()
-        .filter(|c| {
-            c.role.can_execute_locally()
-                && !c.draining
-                && c.available_slots > 0
-                && c.max_slots > 0
-                && c.last_heartbeat_ms > 0
-                && now_ms.saturating_sub(c.last_heartbeat_ms) <= ctx.heartbeat_ttl_ms
-                && labels_match(&c.labels, &ctx.required_tags)
-                && quota_available(&c.available_quotas, ctx.required_quota.as_deref())
-        })
-        .collect();
-    peers.sort_by(|a, b| {
-        role_rank(a.role)
-            .cmp(&role_rank(b.role))
-            .then_with(|| b.available_slots.cmp(&a.available_slots))
-            .then_with(|| b.max_slots.cmp(&a.max_slots))
-            .then_with(|| a.node_id.as_str().cmp(b.node_id.as_str()))
-    });
-    peers
+        .filter(|c| is_eligible(ctx, c, now_ms))
+        .min_by(|a, b| compare_candidates(a, b))
 }
 
 /// 候选排序中的角色优先级：专用 worker 先于 both 节点。
@@ -157,12 +168,20 @@ fn role_rank(role: NodeRole) -> u8 {
 }
 
 fn remote(candidate: &RouteCandidate) -> RouteDecision {
-    RouteDecision::Remote {
-        node_id: candidate.node_id.clone(),
-        endpoint_addr: candidate
-            .endpoint_addr
-            .clone()
-            .unwrap_or_else(|| candidate.node_id.as_str().to_string()),
+    match candidate.endpoint_addr.clone() {
+        Some(addr) => RouteDecision::Remote {
+            node_id: candidate.node_id.clone(),
+            endpoint_addr: addr,
+        },
+        // 与 PyRoutePolicy::remote_decision 同口径：无 endpoint 的候选尚未
+        // 完成对端发现，node_id 不是可拨号地址。降级 Defer 走退避重入队，
+        // 而不是发起一次必败转发（转发失败要消耗 reroute bounce 上限）。
+        None => RouteDecision::Defer {
+            reason: format!(
+                "candidate {} has no endpoint address yet",
+                candidate.node_id.as_str()
+            ),
+        },
     }
 }
 
@@ -181,8 +200,8 @@ impl RoutePolicy for DefaultRoutePolicy {
             && !ctx.local_draining
             && labels_match(&ctx.local_labels, &ctx.required_tags)
             && quota_available(&ctx.local_available_quotas, ctx.required_quota.as_deref());
-        let peers = eligible_peers(ctx, candidates);
-        if peers.is_empty() {
+        let best = best_peer(ctx, candidates);
+        let Some(best) = best else {
             return if local_fits {
                 RouteDecision::Local
             } else {
@@ -190,8 +209,7 @@ impl RoutePolicy for DefaultRoutePolicy {
                     reason: defer_reason(ctx),
                 }
             };
-        }
-        let best = peers[0];
+        };
         if local_fits && best.available_slots <= ctx.local_available_slots {
             return RouteDecision::Local;
         }
@@ -215,7 +233,7 @@ impl RoutePolicy for LabelAffinityRoutePolicy {
         {
             return RouteDecision::Local;
         }
-        match eligible_peers(ctx, candidates).first() {
+        match best_peer(ctx, candidates) {
             Some(best) => remote(best),
             None => RouteDecision::Defer {
                 reason: defer_reason(ctx),
@@ -273,6 +291,23 @@ mod tests {
 
     fn quotas(pairs: &[(&str, u32)]) -> BTreeMap<String, u32> {
         pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    }
+
+    #[test]
+    fn best_peer_filters_ineligible_and_breaks_ties_by_node_id() {
+        let ctx = ctx();
+        let stale = cand("stale", 9, 8, 60_000);
+        let mut draining = cand("draining", 9, 8, 100);
+        draining.draining = true;
+        let tie_b = cand("bbbbbbbb", 5, 8, 100);
+        let tie_a = cand("aaaaaaaa", 5, 8, 100);
+
+        let candidates = [stale, draining, tie_b, tie_a];
+        assert_eq!(
+            best_peer(&ctx, &candidates).map(|c| c.node_id.as_str()),
+            Some("aaaaaaaa"),
+            "并列时取节点名最小者，且过滤过期/draining 候选"
+        );
     }
 
     #[test]
@@ -382,16 +417,17 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_node_id_when_no_endpoint() {
+    fn defers_when_no_endpoint() {
+        // 与 PyRoutePolicy::remote_decision 同口径：无 endpoint 降级 Defer
+        // （退避重入队），不再回退 node_id 拨号。
         let mut c = cand("b", 5, 8, 100);
         c.endpoint_addr = None;
-        assert_eq!(
-            DefaultRoutePolicy.select_target(&ctx(), &[c]),
-            RouteDecision::Remote {
-                node_id: NodeId::from("b".to_string()),
-                endpoint_addr: "b".to_string(),
+        match DefaultRoutePolicy.select_target(&ctx(), &[c]) {
+            RouteDecision::Defer { reason } => {
+                assert!(reason.contains("no endpoint address"), "{reason}");
             }
-        );
+            other => panic!("expected Defer, got {other:?}"),
+        }
     }
 
     #[test]

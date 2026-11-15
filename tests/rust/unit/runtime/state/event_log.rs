@@ -107,6 +107,31 @@ fn lmdb_event_log_sequence_recovers_across_reopen() {
 // ───────────────────────── 序号元数据与迁移 ─────────────────────────
 
 #[test]
+fn lmdb_event_log_restores_clock_above_persisted_events() {
+    // 重启后物理时钟可能回拨；EventLog 必须用已持久化的最大事件 ID
+    // 建立 HLC 下界，否则新事件会排在重放水位之前而被永久跳过。
+    let dir = tempdir().unwrap();
+    let store = LmdbStore::open(dir.path()).unwrap();
+    let log = LmdbEventLog::new(store);
+    let id1 = log.append("wf", b"before").unwrap();
+    drop(log);
+
+    let store2 = LmdbStore::open(dir.path()).unwrap();
+    let log2 = LmdbEventLog::new(store2);
+    // 模拟重启后物理时钟回拨 60 秒。
+    log2.clock.inject_drift_ms(-60_000);
+    let id2 = log2.append("wf", b"after").unwrap();
+
+    assert!(
+        id2 > id1,
+        "restored clock must keep new events after the persisted watermark"
+    );
+    let entries = log2.read_after("wf", Some(&id1)).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].payload, b"after");
+}
+
+#[test]
 fn lmdb_event_log_persists_sequence_metadata_atomically() {
     let dir = tempdir().unwrap();
     let store = LmdbStore::open(dir.path()).unwrap();
@@ -211,4 +236,48 @@ fn lmdb_event_log_trim_keeps_watermark_tail() {
 
     // 水位之后的条目永不裁剪。
     assert_eq!(log.latest("trim").unwrap().unwrap().payload, b"e9");
+}
+
+/// 隐藏 topic 跨重启：hide_topic 把 seq 元数据移入 hidden 命名空间，
+/// 重启后同 id 重用的序号必须继续单调、时钟下界必须覆盖隐藏期间写入的
+/// 历史事件（否则回拨时钟会让新事件键排进旧代事件中间，破坏审计序）。
+#[test]
+fn lmdb_event_log_hidden_topic_sequence_and_clock_recover_across_reopen() {
+    let dir = tempdir().unwrap();
+    let store = LmdbStore::open(dir.path()).unwrap();
+    let log = LmdbEventLog::new(store);
+    let id1 = log.append("wf-hidden", b"e1").unwrap();
+    let id2 = log.append("wf-hidden", b"e2").unwrap();
+    assert_eq!(id1.sequence, 1);
+    let max_wall_time = id2.timestamp.wall_time();
+    log.hide_topic("wf-hidden").unwrap();
+    assert!(
+        !log.list_topics()
+            .unwrap()
+            .contains(&"wf-hidden".to_string()),
+        "hide_topic 后 topic 不得出现在 list_topics"
+    );
+    // 审计面不受隐藏影响。
+    assert_eq!(log.read_after("wf-hidden", None).unwrap().len(), 2);
+    drop(log);
+
+    // 重开：topic 仍隐藏，但序号与时钟下界均已恢复。
+    let store2 = LmdbStore::open(dir.path()).unwrap();
+    let log2 = LmdbEventLog::new(store2);
+    assert!(
+        !log2
+            .list_topics()
+            .unwrap()
+            .contains(&"wf-hidden".to_string()),
+        "重启后隐藏 topic 仍不得出现在 list_topics"
+    );
+    let id3 = log2.append("wf-hidden", b"e3").unwrap();
+    assert_eq!(
+        id3.sequence, 3,
+        "hidden topic 的序号必须跨重启继续，不得重置为 1"
+    );
+    assert!(
+        id3.timestamp.wall_time() >= max_wall_time,
+        "时钟下界必须覆盖隐藏 topic 的历史事件"
+    );
 }

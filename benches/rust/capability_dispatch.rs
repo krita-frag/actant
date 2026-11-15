@@ -94,13 +94,17 @@ impl Handler<EmitCap> for EmitHandler {
 /// 创建绑定到 ActorSystem 的 CapabilityRuntime，注册 EchoCap handler。
 fn setup_echo_runtime(rt: &Runtime) -> Arc<CapabilityRuntime> {
     let cap_rt = Arc::new(CapabilityRuntime::new());
-    cap_rt.register_codec::<EchoCap>();
+    cap_rt.register_codec::<EchoCap>().unwrap();
     let layer = Layer::<EchoCap>::new(EchoCap::meta()).chain(EchoHandler);
     cap_rt.register(layer).unwrap();
 
     let actor_system = Arc::new(ActorSystem::new());
     rt.block_on(async {
-        cap_rt.clone().bind_actor_system(actor_system).await;
+        cap_rt
+            .clone()
+            .bind_actor_system(actor_system)
+            .await
+            .expect("bind actor system");
     });
     cap_rt
 }
@@ -108,13 +112,17 @@ fn setup_echo_runtime(rt: &Runtime) -> Arc<CapabilityRuntime> {
 /// 创建绑定到 ActorSystem 的 CapabilityRuntime，注册 EmitCap handler。
 fn setup_emit_runtime(rt: &Runtime) -> Arc<CapabilityRuntime> {
     let cap_rt = Arc::new(CapabilityRuntime::new());
-    cap_rt.register_codec::<EmitCap>();
+    cap_rt.register_codec::<EmitCap>().unwrap();
     let layer = Layer::<EmitCap>::new(EmitCap::meta()).chain(EmitHandler);
     cap_rt.register(layer).unwrap();
 
     let actor_system = Arc::new(ActorSystem::new());
     rt.block_on(async {
-        cap_rt.clone().bind_actor_system(actor_system).await;
+        cap_rt
+            .clone()
+            .bind_actor_system(actor_system)
+            .await
+            .expect("bind actor system");
     });
     cap_rt
 }

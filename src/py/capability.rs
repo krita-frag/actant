@@ -19,6 +19,7 @@ use actant_core::runtime::capability::{
 };
 use actant_core::runtime::capability::{Store, TaskLifecycle, WorkflowLifecycle};
 
+use super::error::actant_error_to_pyerr;
 use super::gil_thread::GilThread;
 
 /// Rust `CapabilityRuntime` 的 PyO3 包装。
@@ -65,7 +66,7 @@ impl PyCapabilityRuntime {
             ))
         })?);
         let inner = Arc::new(CapabilityRuntime::new());
-        register_defaults(&inner);
+        register_defaults(&inner).map_err(actant_error_to_pyerr)?;
         Ok(Self {
             inner,
             tokio,

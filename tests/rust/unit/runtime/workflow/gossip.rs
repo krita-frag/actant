@@ -493,6 +493,7 @@ async fn handle_workflow_state_response_empty_returns_ok() {
 
     let response = WorkflowStateResponse {
         workflow_id: WorkflowId("wf-empty".to_string()),
+        target_node: NodeId::from("node-A".to_string()),
         dag: None,
         execution: None,
         pending: None,
@@ -524,6 +525,7 @@ async fn handle_workflow_state_request_no_state_returns_ok() {
     let request = WorkflowStateRequest {
         workflow_id: WorkflowId("wf-no-state".to_string()),
         requesting_node: NodeId::from("node-B".to_string()),
+        target_node: NodeId::from("node-A".to_string()),
     };
 
     // 没有注册 WorkflowActor，call_workflow 会失败，
@@ -912,6 +914,7 @@ async fn handle_workflow_state_request_unknown_workflow_returns_ok() {
     let request = WorkflowStateRequest {
         workflow_id: WorkflowId("unknown-wf".to_string()),
         requesting_node: NodeId::from("node-B".to_string()),
+        target_node: NodeId::from("node-req-1".to_string()),
     };
 
     // WorkflowActor 存在，但 orchestrator 没有该 workflow → 返回空 bytes → Ok
@@ -926,6 +929,7 @@ async fn handle_workflow_state_response_with_dag_only_returns_ok() {
     let g = make_gossip_with_actor("node-resp-1", GossipConfig::default());
     let response = WorkflowStateResponse {
         workflow_id: WorkflowId("wf-restore".to_string()),
+        target_node: NodeId::from("node-resp-1".to_string()),
         dag: Some(vec![1, 2, 3]),
         execution: None,
         pending: None,
@@ -961,8 +965,12 @@ async fn handle_heads_exchange_remote_node_with_heads_succeeds() {
     assert!(result.is_ok(), "should succeed: adopt + request");
 }
 
-// ───────────────────────── request_workflow_state topic 格式 ─────────────────────────
+// ───────────────────────── request_workflow_state 目标定址 ─────────────────────────
 
+/// 状态请求走**全局**话题，目标节点写在载荷里。
+///
+/// 不用 `wf-state-req:<node>`：运行期新建的话题拿不到已连接的邻居，
+/// `broadcast` 返回成功却无人接收——接管方永远等不到状态副本。
 #[tokio::test]
 async fn request_workflow_state_broadcasts_to_correct_topic() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -971,6 +979,7 @@ async fn request_workflow_state_broadcasts_to_correct_topic() {
         node_id: NodeId,
         broadcast_count: AtomicUsize,
         last_topic: std::sync::Mutex<String>,
+        last_payload: std::sync::Mutex<Vec<u8>>,
     }
 
     #[async_trait::async_trait]
@@ -981,9 +990,10 @@ async fn request_workflow_state_broadcasts_to_correct_topic() {
         fn local_peer_id(&self) -> &str {
             "peer-cap"
         }
-        async fn broadcast(&self, topic: &str, _data: Vec<u8>) -> Result<()> {
+        async fn broadcast(&self, topic: &str, data: Vec<u8>) -> Result<()> {
             self.broadcast_count.fetch_add(1, Ordering::Relaxed);
             *self.last_topic.lock().unwrap() = topic.to_string();
+            *self.last_payload.lock().unwrap() = data;
             Ok(())
         }
         async fn subscribe(&self, _topic: &str) -> Result<()> {
@@ -1032,6 +1042,7 @@ async fn request_workflow_state_broadcasts_to_correct_topic() {
         node_id: NodeId::from("node-cap".to_string()),
         broadcast_count: AtomicUsize::new(0),
         last_topic: std::sync::Mutex::new(String::new()),
+        last_payload: std::sync::Mutex::new(Vec::new()),
     });
     let network: Arc<dyn Transport> = transport.clone();
     let actor_system = Arc::new(ActorSystem::new());
@@ -1044,11 +1055,25 @@ async fn request_workflow_state_broadcasts_to_correct_topic() {
 
     assert_eq!(transport.broadcast_count.load(Ordering::Relaxed), 1);
     let topic = transport.last_topic.lock().unwrap().clone();
-    assert!(
-        topic.contains("node-target"),
-        "topic should contain target node id, got: {}",
-        topic
+    assert_eq!(
+        topic,
+        crate::common::Topic::workflow_state_req().as_str(),
+        "状态请求必须走全局话题（节点定址在载荷内）"
     );
+
+    let payload = transport.last_payload.lock().unwrap().clone();
+    let (message, _) = crate::common::WireEnvelope::decode(&payload).expect("decode envelope");
+    match message {
+        crate::common::WireMessage::WorkflowStateRequest(request) => {
+            assert_eq!(request.target_node, target, "载荷必须携带目标节点");
+            assert_eq!(
+                request.requesting_node,
+                NodeId::from("node-cap".to_string())
+            );
+            assert_eq!(request.workflow_id, wf);
+        }
+        other => panic!("unexpected wire message: {other:?}"),
+    }
 }
 
 // ───────────────────────── broadcast_update 非终态路径覆盖 ─────────────────────────
