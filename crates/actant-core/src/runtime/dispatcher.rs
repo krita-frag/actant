@@ -59,17 +59,28 @@ const FRAME_HEADER_LEN: usize = 4;
 /// 子进程 stdout，读端必须在分配正文缓冲前据此拒绝被腐蚀的值。
 const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
 
+/// Cancel poller 持有的子进程 stdin 写端。
+///
+/// Unix：`dup(2)` 出的 O_NONBLOCK fd 包装为 tokio File（异步写）；
+/// Windows：`DuplicateHandle` 克隆出的同步句柄包装为 std File（写帧经
+/// spawn_blocking，不阻塞 runtime 线程）。
+#[cfg(unix)]
+type CancelStdinFile = tokio::fs::File;
+#[cfg(not(unix))]
+type CancelStdinFile = std::fs::File;
+
 /// 一个 worker 子进程：同一时刻恰好执行一个任务。
 struct WorkerProc {
     child: Child,
     /// worker 写端（hot path）：派发独占持有，**无 Mutex**。
     ///
-    /// 取消轮询不与派发抢同一把锁——取消通过独立 dup 出来的 `cancel_stdin` 写入。
-    /// Cancel 帧固定 5 字节（< PIPE_BUF 512），内核保证原子写入不会与 hot-path
-    /// 写交错（任何 < PIPE_BUF 单次 write 到 pipe 均为原子）。
+    /// 取消轮询不与派发抢同一把锁——取消通过独立克隆出来的 `cancel_stdin` 写入。
+    /// Cancel 帧固定 5 字节（< PIPE_BUF 512），Unix 内核保证原子写入不会与
+    /// hot-path 写交错（任何 < PIPE_BUF 单次 write 到 pipe 均为原子）。
     stdin: ChildStdin,
-    /// 取消帧的独立写端（dup(2) of stdin），仅供 `spawn_cancel_poller` 使用。
-    cancel_stdin: Option<tokio::fs::File>,
+    /// 取消帧的独立写端（Unix: dup(2)；Windows: DuplicateHandle），仅供
+    /// `spawn_cancel_poller` 使用。
+    cancel_stdin: Option<CancelStdinFile>,
     /// stdout 由当前在途的分发独占读取；空闲时缓存于此供复用。
     stdout: ChildStdout,
 }
@@ -407,7 +418,7 @@ impl ProcessTaskDispatcher {
     /// 写交错（POSIX 保证任何 < PIPE_BUF 的单次 write 到 pipe 为原子）。
     /// 非 Unix 返回 `None`，降级为 dispatcher 自身发送 Cancel（语义等价）。
     #[cfg(unix)]
-    fn try_clone_cancel_stdin(stdin: &ChildStdin) -> Option<tokio::fs::File> {
+    fn try_clone_cancel_stdin(stdin: &ChildStdin) -> Option<CancelStdinFile> {
         // 变参符号必须经 libc crate 调用：手工声明的变参 extern 在当前工具链上
         // 会丢失第三个实参（F_SETFL 静默失效，O_NONBLOCK 落不到 fd 上）。
         let raw = stdin.as_raw_fd();
@@ -433,9 +444,51 @@ impl ProcessTaskDispatcher {
         Some(tokio::fs::File::from_std(std_file))
     }
 
+    /// Windows：`DuplicateHandle` 克隆 stdin 写端（DUPLICATE_SAME_ACCESS）。
+    ///
+    /// 没有克隆就没有 Cancel 帧可写：协作取消从此在 Windows 上整体失效
+    /// （子进程收不到通知，宽限耗尽后一律强杀，on_cancel 清理钩子永不执行），
+    /// 因此克隆失败时显式 warn 而非静默降级。kernel32 绑定手工声明——
+    /// DuplicateHandle 非变参，不存在 unix 侧变参 extern 丢实参的问题，
+    /// 不为此引入 windows-sys 依赖。
     #[cfg(not(unix))]
-    fn try_clone_cancel_stdin(_stdin: &ChildStdin) -> Option<tokio::fs::File> {
-        None
+    fn try_clone_cancel_stdin(stdin: &ChildStdin) -> Option<CancelStdinFile> {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle};
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetCurrentProcess() -> *mut core::ffi::c_void;
+            fn DuplicateHandle(
+                h_source_process_handle: *mut core::ffi::c_void,
+                h_source_handle: *mut core::ffi::c_void,
+                h_target_process_handle: *mut core::ffi::c_void,
+                lp_target_handle: *mut *mut core::ffi::c_void,
+                dw_desired_access: u32,
+                b_inherit_handle: i32,
+                dw_options: u32,
+            ) -> i32;
+        }
+        const DUPLICATE_SAME_ACCESS: u32 = 0x0000_0002;
+
+        unsafe {
+            let mut dup: *mut core::ffi::c_void = std::ptr::null_mut();
+            let ok = DuplicateHandle(
+                GetCurrentProcess(),
+                stdin.as_raw_handle(),
+                GetCurrentProcess(),
+                &mut dup,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            );
+            if ok == 0 || dup.is_null() {
+                tracing::warn!(
+                    "failed to duplicate worker stdin for cancel poller;                      cooperative cancel degrades to grace-kill on this node"
+                );
+                return None;
+            }
+            Some(std::fs::File::from_raw_handle(dup))
+        }
     }
 
     /// 拉起单个 worker 子进程并把 stderr 转发到 tracing。
@@ -698,13 +751,13 @@ impl ProcessTaskDispatcher {
     /// future 即关闭 fd，且复用路径不会重建（仅 `spawn_one` 创建 cancel_stdin），
     /// 复用 worker 将永久失去协作取消能力。
     fn spawn_cancel_poller(
-        cancel_stdin: Option<tokio::fs::File>,
+        cancel_stdin: Option<CancelStdinFile>,
         cancel_flag: CancelFlag,
         active: Arc<AtomicBool>,
         writing: Arc<AtomicBool>,
     ) -> (
         tokio::task::JoinHandle<()>,
-        tokio::sync::oneshot::Receiver<Option<tokio::fs::File>>,
+        tokio::sync::oneshot::Receiver<Option<CancelStdinFile>>,
         tokio::sync::oneshot::Sender<()>,
     ) {
         // 向 poller task 传入 cancel_stdin 所有权；结束后通过 oneshot 归还给 dispatch。
@@ -726,13 +779,12 @@ impl ProcessTaskDispatcher {
                 if cancel_flag.load(Ordering::Relaxed) {
                     if let Some(c) = cs.as_mut().filter(|_| active.load(Ordering::Relaxed)) {
                         // 先置写帧标记再进入写路径：dispatch 据此得知「不能复用」。
-                        // 标记仅在确有写端时置位——无写端（非 Unix / dup 失败）时
+                        // 标记仅在确有写端时置位——无写端（克隆失败）时
                         // poller 不可能写帧，置位会让结果臂不必要地回收健康 worker。
                         writing.store(true, Ordering::Release);
                         // 取消帧是对正被终止的子进程尽力而为的通知：
                         // 管道已关闭时写入必然失败，由进程组强杀兜底。
-                        let _ = c.write_all(&CANCEL_FRAME_BYTES).await;
-                        let _ = c.flush().await;
+                        Self::write_cancel_frame(c).await;
                     }
                     // 归还 cancel_stdin；接收端已丢弃时发送失败，File 随之
                     // Drop 关闭 fd（此路径仅剩 poller panic 的兜底场景）。
@@ -742,6 +794,32 @@ impl ProcessTaskDispatcher {
             }
         });
         (handle, ret_rx, shutdown_tx)
+    }
+
+    /// 把 5 字节 Cancel 帧写入 poller 持有的 stdin 克隆。
+    #[cfg(unix)]
+    async fn write_cancel_frame(f: &mut CancelStdinFile) {
+        let _ = f.write_all(&CANCEL_FRAME_BYTES).await;
+        let _ = f.flush().await;
+    }
+
+    /// Windows：克隆句柄是同步语义，阻塞写经 spawn_blocking 执行（不卡
+    /// runtime 线程）；5 字节帧几乎不可能填满管道缓冲，真正的无进展场景由
+    /// grace 后的强杀兜底。与派发写端的并发交错在 Windows 匿名管道上无
+    /// 原子性保证——cancel 是该 worker 的终局事件，最坏情形（帧交错损坏
+    /// 一个 dispatch 帧）随强杀与替补一并恢复。
+    #[cfg(not(unix))]
+    async fn write_cancel_frame(f: &mut CancelStdinFile) {
+        let frame = CANCEL_FRAME_BYTES;
+        let mut dup = match f.try_clone() {
+            Ok(dup) => dup,
+            Err(_) => return,
+        };
+        let _ = tokio::task::spawn_blocking(move || {
+            use std::io::Write as _;
+            dup.write_all(&frame)
+        })
+        .await;
     }
 
     /// 协作结束取消轮询任务并等待其归还写端，返回 `(cancel_stdin, poller 可能已写帧)`。
@@ -758,9 +836,9 @@ impl ProcessTaskDispatcher {
     async fn stop_cancel_poller(
         shutdown_tx: tokio::sync::oneshot::Sender<()>,
         canceller: tokio::task::JoinHandle<()>,
-        cancel_stdin_rx: tokio::sync::oneshot::Receiver<Option<tokio::fs::File>>,
+        cancel_stdin_rx: tokio::sync::oneshot::Receiver<Option<CancelStdinFile>>,
         writing: &AtomicBool,
-    ) -> (Option<tokio::fs::File>, bool) {
+    ) -> (Option<CancelStdinFile>, bool) {
         // 发送失败说明 poller 已通过取消路径自行退出并归还，无需通知。
         let _ = shutdown_tx.send(());
         match cancel_stdin_rx.await {
@@ -1010,7 +1088,7 @@ impl TaskDispatcher for ProcessTaskDispatcher {
             }
             _ = Self::wait_for_cancel(&cancel_flag, &active, self.cancel_grace) => {
                 // 第一段宽限（wait_for_cancel 内）是协作窗口：Cancel 帧已由
-                // poller 送达（无 cancel_stdin 时无帧可发），窗口内无结果帧
+                // poller 送达（cancel_stdin 克隆失败时无帧可发），窗口内无结果帧
                 // ⇒ worker 阻塞在不可中断代码（或从未收到通知）。两者都只剩
                 // 强杀一条路——发帧后二次宽限是纯死等（原实现两段宽限串行，
                 // 取消延迟翻倍），直接强杀并替补保持池容量。

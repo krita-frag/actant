@@ -126,6 +126,66 @@ fn cancel_frame_bytes_layout() {
     assert_eq!(FRAME_DISPATCH, 0x01);
 }
 
+// ───────────────────────── cancel_stdin 克隆与真实子进程投递 ─────────────────────
+//
+// 协作取消的送达链 = `try_clone_cancel_stdin` 克隆写端 + poller 写帧 + 子进程
+// 读到帧后协作退出。Windows 曾因克隆函数返回 `None` 使整条链失效（协作取消
+// 从未送达，宽限耗尽一律强杀，on_cancel 钩子永不执行）。下面的用例在真实
+// 子进程管道上验证「克隆成功 → 帧完整到达子进程」，任何平台上该链断裂即红。
+
+/// Unix：`cat` 子进程回显验证帧经克隆写端完整到达其 stdin。
+#[cfg(unix)]
+#[tokio::test]
+async fn cancel_stdin_clone_delivers_frame_through_real_child() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut child = Command::new("cat")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn cat");
+    let stdin = child.stdin.take().expect("stdin piped");
+
+    let mut clone = ProcessTaskDispatcher::try_clone_cancel_stdin(&stdin)
+        .expect("cancel_stdin clone must succeed on supported platforms");
+    // 派发写端先行关闭：cat 在读尽缓冲字节后看到 EOF 并退出。
+    drop(stdin);
+
+    clone
+        .write_all(&CANCEL_FRAME_BYTES)
+        .await
+        .expect("write cancel frame through clone");
+    clone.flush().await.expect("flush clone");
+    drop(clone);
+
+    let mut stdout = child.stdout.take().expect("stdout piped");
+    let mut buf = [0u8; CANCEL_FRAME_BYTES.len()];
+    tokio::time::timeout(Duration::from_secs(5), stdout.read_exact(&mut buf))
+        .await
+        .expect("read frame within timeout")
+        .expect("read frame");
+    assert_eq!(buf, CANCEL_FRAME_BYTES);
+    let _ = child.kill().await;
+}
+
+/// Windows：`DuplicateHandle` 克隆必须成功（修复前返回 `None`——协作取消
+/// 整体失效的根源）。帧投递语义由 Unix 用例与 Python 冒烟共同覆盖。
+#[cfg(not(unix))]
+#[tokio::test]
+async fn cancel_stdin_clone_succeeds_on_windows() {
+    let mut child = Command::new("cmd")
+        .args(["/c", "more"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .expect("spawn cmd");
+    let stdin = child.stdin.take().expect("stdin piped");
+
+    let clone = ProcessTaskDispatcher::try_clone_cancel_stdin(&stdin)
+        .expect("cancel_stdin clone must succeed on Windows via DuplicateHandle");
+    drop(clone);
+    let _ = child.kill().await;
+}
+
 // ───────────────────────── send_frame 短写推进（大载荷回归） ─────────────────────
 //
 // `write_vectored` 是单次写入尝试：pipe 容量（64KB）小于正文时只写入前缀，

@@ -123,9 +123,16 @@ def test_async_driver_parks_many_flows_on_one_loop(flows: int) -> None:
     # “单条 signal → 唤醒”的绝对延迟会随递交进度线性增长（旧断言在递交耗时
     # 超过阈值时必然失败，与驱动调度无关）。这里从最后一条 signal 返回起算：
     # 此时所有等待点都已置为 Signaled，剩余延迟只反映单 loop 恢复协程与
-    # 收尾的调度能力。阈值是回归护栏（防止 O(N²) 级退化），不是延迟 SLA。
+    # 收尾的调度能力。阈值是回归护栏（防止 O(N²) 级退化），不是延迟 SLA——
+    # 且随同一运行实测的递交耗时缩放：2 核 CI runner 与本地开发机的绝对
+    # 时间差约 2×，固定 10s 阈值在慢 runner 上会误报（O(N²) 级退化仍会
+    # 远超该界，护栏目的不变）。
+    signal_delivery_s = delivered_at - signal_started
     tail_wake = max(wake_times) - delivered_at
-    assert tail_wake < 10.0, f"slowest wake after delivery: {tail_wake:.2f}s"
+    assert tail_wake < max(10.0, 3.0 * signal_delivery_s), (
+        f"slowest wake after delivery: {tail_wake:.2f}s "
+        f"(signal delivery took {signal_delivery_s:.2f}s)"
+    )
     print(
         f"\n[{flows} async flows] total={elapsed:.1f}s "
         f"signal_delivery={delivered_at - signal_started:.1f}s "
