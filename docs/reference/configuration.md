@@ -44,6 +44,21 @@ Worker 相关默认值（均取自 Rust 侧默认值）：
 
 ## `_NetworkConfig`
 
+P2P 网络配置。
+
+``preset`` 是发现模式封闭白名单（``"none"`` / ``"local"`` / ``"dns"``）；
+环境变量 ``ACTANT_DISCOVERY`` 设置时覆盖 ``preset``（CI 用
+``ACTANT_DISCOVERY=none`` 强制离线）。跨机内网组网可配合
+``bootstrap_nodes``（自包含 NodeAddr，无 DNS/relay 依赖）。
+
+``max_message_size``（默认 16 MiB）只是**传输帧层**上限：所有远端输入
+随后还要过解码层 4 MiB 上限，4–16 MiB 的消息能过帧检查但必在解码处
+失败，调大本值不解除限制——超过 4 MiB 的载荷应走 blob 通道（独立
+ALPN，不受此约束）。
+
+``allowed_peer_ids`` 元素必须是 iroh endpoint id（z32）；写成完整
+``endpoint_addr`` 会在启动时报 Config 错误。
+
 | 参数 | 类型 | 默认值 |
 | --- | --- | --- |
 | `preset` | `str \| None` | `None` |
@@ -76,10 +91,6 @@ Gossip 同步配置。所有字段的默认值取自 Rust ``GossipConfig::defaul
 
 | 参数 | 类型 | 默认值 |
 | --- | --- | --- |
-| `dedup_window_size` | `int \| None` | `None` |
-| `dedup_ttl_secs` | `int \| None` | `None` |
-| `retry_attempts` | `int \| None` | `None` |
-| `retry_base_delay_ms` | `int \| None` | `None` |
 | `heads_broadcast_interval_ms` | `int \| None` | `None` |
 
 ## `_RetryPolicy`

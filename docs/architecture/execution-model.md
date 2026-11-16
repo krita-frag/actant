@@ -114,15 +114,15 @@ with actant.Runtime() as rt:
 `benches/python/flow_concurrency.py` 用于量化该基线：
 
 ```bash
-uv run --extra dev python benches/python/flow_concurrency.py --mode threads --flows 200
-uv run --extra dev python benches/python/flow_concurrency.py --mode detached --flows 200
+uv run python benches/python/flow_concurrency.py --mode threads --flows 200
+uv run python benches/python/flow_concurrency.py --mode detached --flows 200
 ```
 
 `benches/python/task_throughput.py` 用于量化任务吞吐、超时与崩溃恢复：
 
 ```bash
-uv run --extra dev python benches/python/task_throughput.py --tasks 500 --workers 8 --task-ms 5
-uv run --extra dev python benches/python/task_throughput.py --tasks 20 --timeout-case --crash-case
+uv run python benches/python/task_throughput.py --tasks 500 --workers 8 --task-ms 5
+uv run python benches/python/task_throughput.py --tasks 20 --timeout-case --crash-case
 ```
 
 ## 契约测试索引

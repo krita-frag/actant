@@ -127,7 +127,7 @@ async fn adopt_workflow_inserts_placeholder_when_no_local_data() {
 
     // on_task_completed 也应拒绝占位符
     let err = orch
-        .on_task_completed(&wf, &TaskId::from("t1"), b"r".to_vec())
+        .on_task_completed(&wf, &TaskId::from("t1"), b"r".to_vec(), None)
         .await
         .unwrap_err();
     assert!(
@@ -195,7 +195,7 @@ async fn completing_task_returns_ready_successors() {
     orch.start(&wf).unwrap();
 
     let (ready, terminal) = orch
-        .on_task_completed(&wf, &TaskId::from("t1"), b"r1".to_vec())
+        .on_task_completed(&wf, &TaskId::from("t1"), b"r1".to_vec(), None)
         .await
         .unwrap();
     assert_eq!(ready.len(), 1);
@@ -213,14 +213,14 @@ async fn completing_last_task_signals_workflow_terminal() {
     orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
     orch.start(&wf).unwrap();
 
-    orch.on_task_completed(&wf, &TaskId::from("t1"), b"r1".to_vec())
+    orch.on_task_completed(&wf, &TaskId::from("t1"), b"r1".to_vec(), None)
         .await
         .unwrap();
-    orch.on_task_completed(&wf, &TaskId::from("t2"), b"r2".to_vec())
+    orch.on_task_completed(&wf, &TaskId::from("t2"), b"r2".to_vec(), None)
         .await
         .unwrap();
     let (ready, terminal) = orch
-        .on_task_completed(&wf, &TaskId::from("t3"), b"r3".to_vec())
+        .on_task_completed(&wf, &TaskId::from("t3"), b"r3".to_vec(), None)
         .await
         .unwrap();
 
@@ -244,21 +244,21 @@ async fn completing_diamond_join_waits_for_both_predecessors() {
 
     // Complete root t1 → t2 and t3 become ready
     let (ready, _) = orch
-        .on_task_completed(&wf, &TaskId::from("t1"), b"r1".to_vec())
+        .on_task_completed(&wf, &TaskId::from("t1"), b"r1".to_vec(), None)
         .await
         .unwrap();
     assert_eq!(ready.len(), 2);
 
     // Complete t2 → t4 NOT ready (still waiting on t3)
     let (ready, _) = orch
-        .on_task_completed(&wf, &TaskId::from("t2"), b"r2".to_vec())
+        .on_task_completed(&wf, &TaskId::from("t2"), b"r2".to_vec(), None)
         .await
         .unwrap();
     assert!(ready.is_empty());
 
     // Complete t3 → t4 NOW ready
     let (ready, _) = orch
-        .on_task_completed(&wf, &TaskId::from("t3"), b"r3".to_vec())
+        .on_task_completed(&wf, &TaskId::from("t3"), b"r3".to_vec(), None)
         .await
         .unwrap();
     assert_eq!(ready.len(), 1);
@@ -410,6 +410,7 @@ async fn fail_fast_terminal_broadcasts_cancel_to_running_siblings() {
         &TaskId::from("t2"),
         "boom".to_string(),
         FailureScope::WorkflowLevel,
+        None,
     )
     .await
     .unwrap();
@@ -831,7 +832,7 @@ async fn get_result_returns_packed_group_after_completion() {
     orch.submit(wf.clone(), dag).await.unwrap();
     orch.start(&wf).unwrap();
 
-    orch.on_task_completed(&wf, &TaskId::from("t1"), b"final".to_vec())
+    orch.on_task_completed(&wf, &TaskId::from("t1"), b"final".to_vec(), None)
         .await
         .unwrap();
 
@@ -862,13 +863,13 @@ async fn get_results_orders_by_task_id_deterministically() {
     orch.start(&wf).unwrap();
 
     // 按非字典序完成，排除"提交即排序"的巧合。
-    orch.on_task_completed(&wf, &TaskId::from("t2"), b"r2".to_vec())
+    orch.on_task_completed(&wf, &TaskId::from("t2"), b"r2".to_vec(), None)
         .await
         .unwrap();
-    orch.on_task_completed(&wf, &TaskId::from("t3"), b"r3".to_vec())
+    orch.on_task_completed(&wf, &TaskId::from("t3"), b"r3".to_vec(), None)
         .await
         .unwrap();
-    orch.on_task_completed(&wf, &TaskId::from("t1"), b"r1".to_vec())
+    orch.on_task_completed(&wf, &TaskId::from("t1"), b"r1".to_vec(), None)
         .await
         .unwrap();
 
@@ -985,7 +986,7 @@ async fn high_fanout_dag_completes_correctly() {
 
         // 完成 root，应一次性释放全部 fanout 个子任务。
         let (ready, terminal) = orch
-            .on_task_completed(&wf, &TaskId::from("root"), b"r".to_vec())
+            .on_task_completed(&wf, &TaskId::from("root"), b"r".to_vec(), None)
             .await
             .unwrap();
         assert!(
@@ -1002,7 +1003,7 @@ async fn high_fanout_dag_completes_correctly() {
         for i in 0..fanout {
             let child_id = TaskId::from(format!("c{i}"));
             let (_, terminal) = orch
-                .on_task_completed(&wf, &child_id, b"c".to_vec())
+                .on_task_completed(&wf, &child_id, b"c".to_vec(), None)
                 .await
                 .unwrap();
             let is_last = i == fanout - 1;
@@ -1051,7 +1052,7 @@ async fn recover_reconstructs_workflow_and_resumes_to_terminal() {
     assert_eq!(roots.len(), 1);
     orch.mark_task_running(&wf, &roots[0].id).unwrap();
     let (ready, _) = orch
-        .on_task_completed(&wf, &TaskId::from("t1"), b"r1".to_vec())
+        .on_task_completed(&wf, &TaskId::from("t1"), b"r1".to_vec(), None)
         .await
         .unwrap();
     assert_eq!(ready.len(), 1);
@@ -1090,11 +1091,11 @@ async fn recover_reconstructs_workflow_and_resumes_to_terminal() {
 
     // 恢复后的 Orchestrator 可继续推进：完成 t2、t3 后工作流进入 Completed。
     recovered
-        .on_task_completed(&wf, &TaskId::from("t2"), b"r2".to_vec())
+        .on_task_completed(&wf, &TaskId::from("t2"), b"r2".to_vec(), None)
         .await
         .unwrap();
     let (_, terminal) = recovered
-        .on_task_completed(&wf, &TaskId::from("t3"), b"r3".to_vec())
+        .on_task_completed(&wf, &TaskId::from("t3"), b"r3".to_vec(), None)
         .await
         .unwrap();
     assert!(terminal);
@@ -1131,15 +1132,15 @@ async fn recover_resumes_workflow_submitted_before_progress_flush() {
     assert_eq!(roots.len(), 1);
     assert_eq!(roots[0].id, TaskId::from("t1"));
     recovered
-        .on_task_completed(&wf, &TaskId::from("t1"), b"r1".to_vec())
+        .on_task_completed(&wf, &TaskId::from("t1"), b"r1".to_vec(), None)
         .await
         .unwrap();
     recovered
-        .on_task_completed(&wf, &TaskId::from("t2"), b"r2".to_vec())
+        .on_task_completed(&wf, &TaskId::from("t2"), b"r2".to_vec(), None)
         .await
         .unwrap();
     let (_, terminal) = recovered
-        .on_task_completed(&wf, &TaskId::from("t3"), b"r3".to_vec())
+        .on_task_completed(&wf, &TaskId::from("t3"), b"r3".to_vec(), None)
         .await
         .unwrap();
     assert!(terminal);
@@ -1160,7 +1161,7 @@ async fn late_completion_after_cancel_does_not_change_terminal_state() {
     orch.cancel(&wf).await.unwrap();
 
     let (ready, terminal) = orch
-        .on_task_completed(&wf, &TaskId::from("t1"), b"late".to_vec())
+        .on_task_completed(&wf, &TaskId::from("t1"), b"late".to_vec(), None)
         .await
         .unwrap();
 
@@ -1194,13 +1195,14 @@ async fn late_completion_after_failure_does_not_revive_workflow() {
         &TaskId::from("t1"),
         "boom".to_string(),
         FailureScope::WorkflowLevel,
+        None,
     )
     .await
     .unwrap();
     assert_eq!(orch.get_state(&wf).unwrap().state, Phase::Failed);
 
     let (ready, terminal) = orch
-        .on_task_completed(&wf, &TaskId::from("t1"), b"late".to_vec())
+        .on_task_completed(&wf, &TaskId::from("t1"), b"late".to_vec(), None)
         .await
         .unwrap();
 
@@ -1313,7 +1315,7 @@ async fn handle_task_failure_retries_with_incremented_attempt_and_carries_it_on_
     // 真实失败结果只能来自已派发的任务：先标记 Running 再回灌失败。
     orch.mark_task_running(&wf, &TaskId::from("t1")).unwrap();
     let FailureOutcome::Retry(task_def, _delay_ms) = orch
-        .handle_task_failure(&wf, &TaskId::from("t1"), "boom".into())
+        .handle_task_failure(&wf, &TaskId::from("t1"), "boom".into(), None)
         .await
         .unwrap()
     else {
@@ -1361,7 +1363,7 @@ async fn handle_task_failure_applies_retry_backoff_and_cap() {
     for _ in 0..3 {
         orch.mark_task_running(&wf, &TaskId::from("t1")).unwrap();
         let FailureOutcome::Retry(_, delay) = orch
-            .handle_task_failure(&wf, &TaskId::from("t1"), "boom".into())
+            .handle_task_failure(&wf, &TaskId::from("t1"), "boom".into(), None)
             .await
             .unwrap()
         else {
@@ -1397,7 +1399,7 @@ async fn handle_task_failure_exhausts_budget_then_fails_workflow() {
 
     // 第一次失败：余量 1 → 重试。
     let retry = orch
-        .handle_task_failure(&wf, &TaskId::from("t1"), "boom-1".into())
+        .handle_task_failure(&wf, &TaskId::from("t1"), "boom-1".into(), None)
         .await
         .unwrap();
     assert!(
@@ -1408,7 +1410,7 @@ async fn handle_task_failure_exhausts_budget_then_fails_workflow() {
     // 第二次失败前任务处于重试 Pending：先标记 Running 再失败（余量 0）。
     orch.mark_task_running(&wf, &TaskId::from("t1")).unwrap();
     let final_verdict = orch
-        .handle_task_failure(&wf, &TaskId::from("t1"), "boom-2".into())
+        .handle_task_failure(&wf, &TaskId::from("t1"), "boom-2".into(), None)
         .await
         .unwrap();
     assert!(
@@ -1442,7 +1444,7 @@ async fn handle_task_failure_ignores_late_duplicate_while_retry_pending() {
     orch.mark_task_running(&wf, &TaskId::from("t1")).unwrap();
 
     let retry = orch
-        .handle_task_failure(&wf, &TaskId::from("t1"), "boom".into())
+        .handle_task_failure(&wf, &TaskId::from("t1"), "boom".into(), None)
         .await
         .unwrap();
     assert!(
@@ -1453,7 +1455,7 @@ async fn handle_task_failure_ignores_late_duplicate_while_retry_pending() {
     // 重试已排定（任务回到 Pending 且 retry_count=1）：迟到重复失败被忽略，
     // 且裁决必须显式为 Ignored——调用方据此不发布终态、不结算句柄。
     let late = orch
-        .handle_task_failure(&wf, &TaskId::from("t1"), "boom-duplicate".into())
+        .handle_task_failure(&wf, &TaskId::from("t1"), "boom-duplicate".into(), None)
         .await
         .unwrap();
     assert!(
@@ -1595,7 +1597,7 @@ async fn on_task_completed_without_attempt_info_still_accepts_results() {
     orch.start(&wf).unwrap();
 
     let (ready, terminal) = orch
-        .on_task_completed(&wf, &TaskId::from("t1"), b"r1".to_vec())
+        .on_task_completed(&wf, &TaskId::from("t1"), b"r1".to_vec(), None)
         .await
         .unwrap();
     assert!(!terminal);
@@ -1727,7 +1729,7 @@ async fn recover_replays_events_after_snapshot_watermark() {
     orch.flush_dirty().await.unwrap();
     // 崩溃前未落盘的完成：TaskCompleted 事件只存在于历史。
     let (ready, _) = orch
-        .on_task_completed(&wf, &TaskId::from("t1"), b"r1".to_vec())
+        .on_task_completed(&wf, &TaskId::from("t1"), b"r1".to_vec(), None)
         .await
         .unwrap();
     assert_eq!(ready.len(), 1);
@@ -1842,7 +1844,7 @@ async fn workflow_history_covers_all_state_transitions() {
     orch.start(&wf).unwrap();
     orch.mark_task_running(&wf, &TaskId::from("only")).unwrap();
     orch.log_task_dispatched(&wf, &TaskId::from("only"));
-    orch.on_task_completed(&wf, &TaskId::from("only"), b"r".to_vec())
+    orch.on_task_completed(&wf, &TaskId::from("only"), b"r".to_vec(), None)
         .await
         .unwrap();
 
@@ -1855,6 +1857,7 @@ async fn workflow_history_covers_all_state_transitions() {
         &TaskId::from("t1"),
         "boom".to_string(),
         FailureScope::WorkflowLevel,
+        None,
     )
     .await
     .unwrap();
@@ -2086,7 +2089,7 @@ async fn terminal_settlement_survives_store_write_failure() {
 
     // 末任务结果远大于残留空间 ⇒ 终态快照 put_batch 必然失败。
     let outcome = orch
-        .on_task_completed(&wf, &TaskId::from("only"), vec![7u8; 1 << 20])
+        .on_task_completed(&wf, &TaskId::from("only"), vec![7u8; 1 << 20], None)
         .await;
     assert!(
         outcome.is_ok(),
@@ -2200,6 +2203,47 @@ async fn waitpoints_survive_recover_and_stay_reachable() {
     recovered
         .register_wait_point(&wf, "go", WaitCondition::Signal { name: "go".into() })
         .unwrap();
+}
+
+/// 重放遇到无法解码的事件时必须整份丢弃工作流。
+///
+/// 只跳过该事件会让它的状态变更永久缺失；而 `recover` 已把 Running 重置为
+/// Pending，随后 `recover_ready_tasks` 会把「其实已完成」的任务重新派发。
+#[tokio::test]
+async fn undecodable_journal_event_discards_workflow() {
+    let dir = tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let event_log = Arc::new(MemoryEventLog::default());
+    let wf = WorkflowId::from("wf-corrupt-event");
+    let topic = format!("workflow:{}", wf.as_str());
+
+    let orch = Orchestrator::new()
+        .with_signing_key(TEST_SIGNING_KEY.to_vec())
+        .with_store(store.clone())
+        .with_event_log(event_log.clone());
+    orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
+    drop(orch);
+
+    // 注入一条无法解码的事件（模拟位腐或事件布局漂移）。
+    event_log.append(&topic, b"\xff\xff\xff").unwrap();
+
+    let recovered = Orchestrator::recover(store, recover_config(), Some(event_log.clone()))
+        .await
+        .unwrap();
+    assert!(
+        !recovered.has_workflow(&wf),
+        "unreplayable workflow must be discarded instead of left half-replayed"
+    );
+
+    let entries = event_log.read_after(&topic, None).unwrap();
+    let has_tombstone = entries.iter().any(|entry| {
+        postcard::from_bytes::<JournalEvent>(&entry.payload)
+            .is_ok_and(|event| event.kind() == "evicted")
+    });
+    assert!(
+        has_tombstone,
+        "discarding a corrupt workflow must write the eviction tombstone first"
+    );
 }
 
 /// journal-first 提交在快照落盘前崩溃：快照三键缺失，恢复必须从 journal
@@ -2710,7 +2754,7 @@ async fn workflow_history_returns_events_and_empty_without_log() {
     let wf = WorkflowId::from("wf-hist");
     orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
     orch.start(&wf).unwrap();
-    orch.on_task_completed(&wf, &TaskId::from("t1"), b"r".to_vec())
+    orch.on_task_completed(&wf, &TaskId::from("t1"), b"r".to_vec(), None)
         .await
         .unwrap();
 
@@ -2750,7 +2794,7 @@ async fn history_trim_only_touches_events_absorbed_by_watermark() {
     orch.submit(wf.clone(), make_linear_dag()).await.unwrap();
     orch.start(&wf).unwrap();
     // 第一条完成后落盘：水位落在"t1 完成"处。
-    orch.on_task_completed(&wf, &TaskId::from("t1"), b"r1".to_vec())
+    orch.on_task_completed(&wf, &TaskId::from("t1"), b"r1".to_vec(), None)
         .await
         .unwrap();
     orch.flush_dirty().await.unwrap();
@@ -2758,7 +2802,7 @@ async fn history_trim_only_touches_events_absorbed_by_watermark() {
     let total_before = event_log.count(&topic).unwrap();
 
     // 水位之后再追加事件（模拟崩溃窗口内的增量）。
-    orch.on_task_completed(&wf, &TaskId::from("t2"), b"r2".to_vec())
+    orch.on_task_completed(&wf, &TaskId::from("t2"), b"r2".to_vec(), None)
         .await
         .unwrap();
     let after_watermark_before = event_log.read_after(&topic, Some(&watermark)).unwrap();
@@ -2889,14 +2933,14 @@ async fn retry_with_predecessors_remains_reschedulable_after_failover() {
 
     orch.mark_task_running(&wf, &TaskId::from("a")).unwrap();
     let (ready, _) = orch
-        .on_task_completed(&wf, &TaskId::from("a"), b"r".to_vec())
+        .on_task_completed(&wf, &TaskId::from("a"), b"r".to_vec(), None)
         .await
         .unwrap();
     assert_eq!(ready.len(), 1, "b must become ready after a completes");
 
     orch.mark_task_running(&wf, &TaskId::from("b")).unwrap();
     let retry = orch
-        .handle_task_failure(&wf, &TaskId::from("b"), "boom".into())
+        .handle_task_failure(&wf, &TaskId::from("b"), "boom".into(), None)
         .await
         .unwrap();
     assert!(
@@ -2939,6 +2983,7 @@ async fn recovery_keeps_failed_tasks_terminal_under_continue() {
         &TaskId::from("t1"),
         "boom".into(),
         FailureScope::WorkflowLevel,
+        None,
     )
     .await
     .unwrap();
@@ -2990,6 +3035,7 @@ async fn continue_cascade_cancels_unreachable_descendants() {
         &TaskId::from("t1"),
         "boom".into(),
         FailureScope::WorkflowLevel,
+        None,
     )
     .await
     .unwrap();
@@ -3039,6 +3085,7 @@ async fn continue_cascade_survives_journal_replay() {
         &TaskId::from("t1"),
         "boom".into(),
         FailureScope::WorkflowLevel,
+        None,
     )
     .await
     .unwrap();
@@ -3146,6 +3193,7 @@ async fn adopt_workflow_preserves_failed_and_recomputes_pending() {
         &TaskId::from("t1"),
         "boom".into(),
         FailureScope::WorkflowLevel,
+        None,
     )
     .await
     .unwrap();
@@ -3179,7 +3227,7 @@ async fn adopt_workflow_uses_persisted_pending() {
     orch.start(&wf).unwrap();
     orch.mark_task_running(&wf, &TaskId::from("t1")).unwrap();
     let (ready, _) = orch
-        .on_task_completed(&wf, &TaskId::from("t1"), b"r1".to_vec())
+        .on_task_completed(&wf, &TaskId::from("t1"), b"r1".to_vec(), None)
         .await
         .unwrap();
     assert_eq!(ready.len(), 1);
@@ -3218,7 +3266,7 @@ async fn restore_stale_full_state_does_not_regress_progress() {
     orch.start(&wf).unwrap();
     orch.mark_task_running(&wf, &TaskId::from("t1")).unwrap();
     let (ready, _) = orch
-        .on_task_completed(&wf, &TaskId::from("t1"), b"r1".to_vec())
+        .on_task_completed(&wf, &TaskId::from("t1"), b"r1".to_vec(), None)
         .await
         .unwrap();
     assert_eq!(ready.len(), 1);
@@ -3263,7 +3311,7 @@ async fn zero_retention_eviction_leaves_no_event_seq_residue() {
     orch.submit(wf.clone(), dag).await.unwrap();
     let roots = orch.start(&wf).unwrap();
     orch.mark_task_running(&wf, &roots[0].id).unwrap();
-    orch.on_task_completed(&wf, &TaskId::from("only"), b"r".to_vec())
+    orch.on_task_completed(&wf, &TaskId::from("only"), b"r".to_vec(), None)
         .await
         .unwrap();
 
@@ -3301,7 +3349,7 @@ async fn evicted_workflow_is_not_resurrected_by_recover() {
     orch.submit(wf.clone(), dag).await.unwrap();
     let roots = orch.start(&wf).unwrap();
     orch.mark_task_running(&wf, &roots[0].id).unwrap();
-    orch.on_task_completed(&wf, &TaskId::from("only"), b"r".to_vec())
+    orch.on_task_completed(&wf, &TaskId::from("only"), b"r".to_vec(), None)
         .await
         .unwrap();
     assert!(!orch.has_workflow(&wf), "retention=0 时终态必须已淘汰");
@@ -3355,7 +3403,7 @@ async fn journal_only_submit_restores_seal_and_reaches_terminal() {
     );
     for id in ["t1", "t2", "t3"] {
         recovered
-            .on_task_completed(&wf, &TaskId::from(id), b"r".to_vec())
+            .on_task_completed(&wf, &TaskId::from(id), b"r".to_vec(), None)
             .await
             .unwrap();
     }
@@ -3394,6 +3442,7 @@ async fn task_failure_terminal_path_shares_terminal_settlement() {
         &TaskId::from("only"),
         "boom".into(),
         FailureScope::WorkflowLevel,
+        None,
     )
     .await
     .unwrap();
@@ -3457,7 +3506,7 @@ async fn retention_count_evicts_oldest_terminal_workflows() {
         orch.submit(wf.clone(), dag).await.unwrap();
         let roots = orch.start(&wf).unwrap();
         orch.mark_task_running(&wf, &roots[0].id).unwrap();
-        orch.on_task_completed(&wf, &TaskId::from("only"), b"r".to_vec())
+        orch.on_task_completed(&wf, &TaskId::from("only"), b"r".to_vec(), None)
             .await
             .unwrap();
     }
@@ -3547,6 +3596,7 @@ async fn evicted_terminal_summary_stays_queryable() {
         &TaskId::from("only"),
         "boom".into(),
         FailureScope::WorkflowLevel,
+        None,
     )
     .await
     .unwrap();
@@ -3558,7 +3608,7 @@ async fn evicted_terminal_summary_stays_queryable() {
     orch.submit(newer.clone(), dag).await.unwrap();
     let roots = orch.start(&newer).unwrap();
     orch.mark_task_running(&newer, &roots[0].id).unwrap();
-    orch.on_task_completed(&newer, &TaskId::from("only"), b"r".to_vec())
+    orch.on_task_completed(&newer, &TaskId::from("only"), b"r".to_vec(), None)
         .await
         .unwrap();
 
@@ -3597,7 +3647,7 @@ async fn recover_rebuilds_terminal_retention_order() {
         orch.submit(wf.clone(), dag).await.unwrap();
         let roots = orch.start(&wf).unwrap();
         orch.mark_task_running(&wf, &roots[0].id).unwrap();
-        orch.on_task_completed(&wf, &TaskId::from("only"), b"r".to_vec())
+        orch.on_task_completed(&wf, &TaskId::from("only"), b"r".to_vec(), None)
             .await
             .unwrap();
     }
@@ -3617,7 +3667,7 @@ async fn recover_rebuilds_terminal_retention_order() {
     let roots = recovered.start(&wf).unwrap();
     recovered.mark_task_running(&wf, &roots[0].id).unwrap();
     recovered
-        .on_task_completed(&wf, &TaskId::from("only"), b"r".to_vec())
+        .on_task_completed(&wf, &TaskId::from("only"), b"r".to_vec(), None)
         .await
         .unwrap();
 
@@ -3660,7 +3710,7 @@ async fn reused_workflow_id_is_not_dropped_by_stale_eviction_marker() {
     for id in ["t1", "t2", "t3"] {
         first.mark_task_running(&wf, &TaskId::from(id)).unwrap();
         first
-            .on_task_completed(&wf, &TaskId::from(id), b"r".to_vec())
+            .on_task_completed(&wf, &TaskId::from(id), b"r".to_vec(), None)
             .await
             .unwrap();
     }
@@ -3712,6 +3762,16 @@ impl crate::runtime::state::event_log::EventLog for FailingAppendEventLog {
             return Err(ActantError::Internal("injected append failure".into()));
         }
         self.inner.append(topic, payload)
+    }
+    fn append_batch(
+        &self,
+        topic: &str,
+        payloads: &[Vec<u8>],
+    ) -> Result<Vec<crate::runtime::state::event_log::EventId>> {
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(ActantError::Internal("injected append failure".into()));
+        }
+        self.inner.append_batch(topic, payloads)
     }
     fn read_after(
         &self,
@@ -3804,7 +3864,7 @@ async fn reused_id_with_snapshot_but_no_watermark_replays_only_current_generatio
     for id in ["t1", "t2", "t3"] {
         first.mark_task_running(&wf, &TaskId::from(id)).unwrap();
         first
-            .on_task_completed(&wf, &TaskId::from(id), b"r".to_vec())
+            .on_task_completed(&wf, &TaskId::from(id), b"r".to_vec(), None)
             .await
             .unwrap();
     }
@@ -3873,7 +3933,7 @@ async fn evicted_topic_leaves_topic_list_but_keeps_journal_history() {
     orch.submit(wf.clone(), dag).await.unwrap();
     let roots = orch.start(&wf).unwrap();
     orch.mark_task_running(&wf, &roots[0].id).unwrap();
-    orch.on_task_completed(&wf, &TaskId::from("only"), b"r".to_vec())
+    orch.on_task_completed(&wf, &TaskId::from("only"), b"r".to_vec(), None)
         .await
         .unwrap();
     assert!(!orch.has_workflow(&wf));
@@ -3955,4 +4015,71 @@ async fn corrupt_workflow_cleanup_writes_eviction_marker() {
         !event_log.list_topics().unwrap().contains(&topic),
         "corrupt 清理后 topic 应从恢复期扫描中隐藏"
     );
+}
+
+// ───────────────────────── 过期代数结果丢弃（attempt fencing） ─────────────────────────
+
+/// 重试把任务推进到 attempt=1 后，attempt=0 的迟到完成结果必须被丢弃：
+/// 不写任务结果、不推进后继。这是 fencing 真正生效的行为判据——修复前
+/// 四条回灌路径都传 `None`（放行），旧代结果会被当作合法完成写入。
+#[tokio::test]
+async fn stale_generation_completion_is_dropped_after_retry() {
+    let orch = Orchestrator::new().with_signing_key(TEST_SIGNING_KEY.to_vec());
+    let wf = WorkflowId::from("wf-attempt-fence");
+
+    let mut dag = Dag::new();
+    let mut node = make_node("t1", "retryable");
+    node.retry_policy = Some(RetryPolicy {
+        max_retries: 2,
+        delay_ms: 0,
+        backoff_multiplier: 1.0,
+        max_delay_ms: 0,
+    });
+    dag.add_node(node).unwrap();
+    dag.add_node(make_node("t2", "successor")).unwrap();
+    dag.add_edge(TaskId::from("t1"), TaskId::from("t2"))
+        .unwrap();
+    orch.submit(wf.clone(), dag).await.unwrap();
+    orch.start(&wf).unwrap();
+
+    // 第一次执行失败 → 重试裁决，attempt 推进到 1。
+    orch.mark_task_running(&wf, &TaskId::from("t1")).unwrap();
+    orch.handle_task_failure(&wf, &TaskId::from("t1"), "boom".into(), Some(0))
+        .await
+        .unwrap();
+    orch.mark_task_running(&wf, &TaskId::from("t1")).unwrap();
+
+    // 旧代（attempt 0）结果迟到：入口裁决拒绝，且状态推进路径同样拒绝。
+    assert!(
+        !orch.result_attempt_accepted(&wf, &TaskId::from("t1"), 0),
+        "stale generation must be rejected at the entry decision"
+    );
+    let (ready, terminal) = orch
+        .on_task_completed(&wf, &TaskId::from("t1"), b"stale".to_vec(), Some(0))
+        .await
+        .unwrap();
+    assert!(ready.is_empty(), "过期结果不得推进后继");
+    assert!(!terminal, "过期结果不得封口工作流");
+
+    let state = orch.get_state(&wf).unwrap();
+    let t1 = &state.tasks[&TaskId::from("t1")];
+    assert_eq!(t1.state, Phase::Running, "过期结果不得改变任务状态");
+    assert!(
+        t1.result.is_none(),
+        "过期结果不得写入任务结果（旧执行已被放弃）"
+    );
+    assert_eq!(
+        state.tasks[&TaskId::from("t2")].state,
+        Phase::Pending,
+        "后继必须仍等待新一代结果"
+    );
+
+    // 新一代结果正常生效。
+    assert!(orch.result_attempt_accepted(&wf, &TaskId::from("t1"), 1));
+    let (ready, _) = orch
+        .on_task_completed(&wf, &TaskId::from("t1"), b"ok".to_vec(), Some(1))
+        .await
+        .unwrap();
+    assert_eq!(ready.len(), 1, "当前代结果必须推进后继");
+    assert_eq!(ready[0].id.as_str(), "t2");
 }

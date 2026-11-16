@@ -2,11 +2,11 @@
 //!
 //! 测量 ERH 架构的核心分发路径：
 //! - `perform` 延迟（含编解码 + Actor 消息往返）
-//! - `ask` 延迟（含编解码 + Actor 消息往返）
 //! - `emit` 吞吐量
 //!
-//! 这些路径是用户层 `ask`/`perform`/`emit` effect 的底层实现，
-//! 其延迟直接决定任务编排的整体响应时间。
+//! 这些路径是用户层 `perform`/`emit` effect 的底层实现，
+//! 其延迟直接决定任务编排的整体响应时间。`ask` 是纯 Python 决策链
+//! （`_ask_chain`），不经 Rust 分发路径，不在本基准范围内。
 //!
 //! 运行：`cargo bench --bench capability_dispatch`
 
@@ -24,7 +24,7 @@ use actant_core::runtime::capability::{
 
 // ── 测试用 Capability 定义 ──────────────────────────────────────────
 
-/// Echo capability：perform 返回原始 payload，ask 返回 payload 长度。
+/// Echo capability：perform 返回原始 payload。
 struct EchoCap;
 
 impl Capability for EchoCap {
@@ -48,7 +48,7 @@ struct EchoResp {
     payload: Vec<u8>,
 }
 
-/// Echo handler：perform 和 ask 都返回原始 payload。
+/// Echo handler：perform 返回原始 payload。
 struct EchoHandler;
 
 #[async_trait]
@@ -156,33 +156,6 @@ fn bench_perform_latency(c: &mut Criterion) {
     group.finish();
 }
 
-/// `ask` 延迟：编解码 + Actor 消息往返 + handler 返回值。
-fn bench_ask_latency(c: &mut Criterion) {
-    let rt = Runtime::new().unwrap();
-    let cap_rt = setup_echo_runtime(&rt);
-    let req = EchoReq {
-        payload: vec![0u8; 64],
-    };
-
-    let mut group = c.benchmark_group("capability/ask_latency");
-    for &n in &[1_000usize, 10_000] {
-        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
-            b.iter(|| {
-                rt.block_on(async {
-                    for _ in 0..n {
-                        let resp = cap_rt.ask::<EchoCap>(req.clone()).await;
-                        match resp {
-                            Ok(r) => black_box(r),
-                            Err(e) => panic!("ask failed: {:?}", e),
-                        };
-                    }
-                });
-            });
-        });
-    }
-    group.finish();
-}
-
 /// `emit` 吞吐量：编解码 + Actor 投递（无回复）。
 fn bench_emit_throughput(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
@@ -245,7 +218,6 @@ fn bench_concurrent_perform(c: &mut Criterion) {
 criterion_group!(
     capability_benches,
     bench_perform_latency,
-    bench_ask_latency,
     bench_emit_throughput,
     bench_concurrent_perform,
 );

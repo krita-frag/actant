@@ -388,15 +388,14 @@ class Task:
             k: _degrade_large_values(v, _store) for k, v in resolved_kwargs.items()
         }
 
+        # 只放 `_build_v2_envelope` 真正写进头部的四个键：放置/超时/静默语义各有
+        # 自己的承载（`_TaskDef` 的 tags/priority/timeout_ms、句柄的 silent），
+        # 重复塞进 options 只会让读代码的人以为头部携带这些字段。
         options = {
             "retries": 0 if flow_mode else self._retries,
             "retry_delay_ms": 0 if flow_mode else self._retry_delay_ms,
-            "timeout_ms": self._timeout_ms,
             "task_id": task_id,
             "workflow_id": workflow_id,
-            "tags": self._tags,
-            "priority": self._priority,
-            "silent": self._silent,
         }
         payload = _safe_serialize(
             self._func, resolved_args, resolved_kwargs, options, task_id=self._name,

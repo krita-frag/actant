@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use super::*;
-use crate::common::{ActorId, RetryPolicy};
+use crate::common::{ActorId, NodeId, RetryPolicy};
 use crate::runtime::actor::ActorSystem;
 use crate::runtime::network::Transport;
 use crate::runtime::workflow::DagNode;
@@ -25,30 +25,47 @@ fn make_node(id: &str, name: &str) -> DagNode {
 }
 
 #[tokio::test]
-async fn workflow_actor_submit_and_start_roundtrip() {
+async fn workflow_actor_submit_shell_and_incremental_start_roundtrip() {
     let system = ActorSystem::new();
     let actor_id = ActorId::from("wf-actor-1");
-    // START 消息已从 actor 协议移除（无生产发送方）：Rust 原生提交路径的
-    // start 由编排器句柄直接驱动，actor 协议保留 SUBMIT/COMPLETE_TASK 等。
+    // actor 协议只承载「空 DAG 外壳 + 逐节点 ADD_NODE」的增量提交；整图提交
+    // 是 Rust 嵌入方直连路径（Orchestrator::submit + start）。START 消息已随
+    // 协议收敛删除，SUBMIT 对非空 DAG 必须显式拒绝——否则整图登记后停在
+    // Pending 无人派发，重启才被 recover 捡起。
     let orchestrator = Orchestrator::new();
     let actor = WorkflowActor::new(orchestrator.clone());
     system.spawn(actor_id.clone(), actor).await.unwrap();
-
-    let mut dag = Dag::new();
-    dag.add_node(make_node("a", "task_a")).unwrap();
-    dag.add_node(make_node("b", "task_b")).unwrap();
-    dag.add_edge(TaskId::from("a"), TaskId::from("b")).unwrap();
 
     let wf_id = WorkflowId::from("wf-1");
     system
         .call(
             &actor_id,
             workflow_methods::SUBMIT,
-            encode(&(wf_id.clone(), dag, None::<WorkflowInvocation>)).unwrap(),
+            encode(&(wf_id.clone(), Dag::new(), None::<WorkflowInvocation>)).unwrap(),
         )
         .await
         .unwrap();
 
+    let mut full = Dag::new();
+    full.add_node(make_node("a", "task_a")).unwrap();
+    let rejected = system
+        .call(
+            &actor_id,
+            workflow_methods::SUBMIT,
+            encode(&(wf_id.clone(), full, None::<WorkflowInvocation>)).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        rejected.error.is_some(),
+        "non-empty DAG must be rejected at the actor"
+    );
+
+    // 增量加节点后由编排器句柄直接启动（生产路径：add_node 自动启动或直连 start）。
+    orchestrator
+        .add_node(&wf_id, make_node("a", "task_a"), vec![])
+        .await
+        .unwrap();
     let roots: Vec<TaskDefinition> = orchestrator
         .start(&wf_id)
         .expect("start must return root tasks");
@@ -146,7 +163,7 @@ async fn failover_actor_update_capacity_and_get_peers() {
 }
 
 #[tokio::test]
-async fn scheduler_actor_close_and_is_empty() {
+async fn scheduler_actor_close_rejects_late_enqueue() {
     let system = ActorSystem::new();
     let actor_id = ActorId::from("sched-actor-2");
     system
@@ -182,22 +199,80 @@ async fn scheduler_actor_close_and_is_empty() {
         .await
         .unwrap();
 
-    let result = system
-        .call(&actor_id, scheduler_methods::IS_EMPTY, vec![])
+    // 队列非空以出队行为观察（IS_EMPTY 消息已随接口收缩删除）。
+    let dequeued = system
+        .call(&actor_id, scheduler_methods::TRY_DEQUEUE, vec![])
         .await
         .unwrap();
-    assert!(!decode::<bool>(&result.payload).unwrap());
+    let got: Option<TaskDefinition> = decode(&dequeued.payload).unwrap();
+    assert!(got.is_some(), "enqueued task must be dequeueable");
+
+    // 出队后再入队一个任务供 close 保留语义验证。
+    system
+        .call(
+            &actor_id,
+            scheduler_methods::ENQUEUE,
+            encode(&TaskDefinition {
+                tags: Vec::new(),
+                quota: None,
+                pinned_target: false,
+                id: TaskId::from("t1b"),
+                name: "task1b".into(),
+                payload: Vec::new(),
+                workflow_id: None,
+                target_node: None,
+                origin_node: None,
+                retry_policy: None,
+                priority: 0,
+                timeout_ms: None,
+                attempt: 0,
+                enqueued_at_ms: 0,
+                target_endpoint_addr: None,
+                origin_endpoint_addr: None,
+                lease_deadline_ms: 0,
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
 
     system
         .call(&actor_id, scheduler_methods::CLOSE, vec![])
         .await
         .unwrap();
 
-    let result = system
-        .call(&actor_id, scheduler_methods::IS_CLOSED, vec![])
+    // close 之后的入队必须被 Actor 侧拒绝（closed 状态经 ENQUEUE 观察）。
+    let rejected = system
+        .call(
+            &actor_id,
+            scheduler_methods::ENQUEUE,
+            encode(&TaskDefinition {
+                tags: Vec::new(),
+                quota: None,
+                pinned_target: false,
+                id: TaskId::from("t2"),
+                name: "task2".into(),
+                payload: Vec::new(),
+                workflow_id: None,
+                target_node: None,
+                origin_node: None,
+                retry_policy: None,
+                priority: 0,
+                timeout_ms: None,
+                attempt: 0,
+                enqueued_at_ms: 0,
+                target_endpoint_addr: None,
+                origin_endpoint_addr: None,
+                lease_deadline_ms: 0,
+            })
+            .unwrap(),
+        )
         .await
         .unwrap();
-    assert!(decode::<bool>(&result.payload).unwrap());
+    assert!(
+        rejected.error.is_some(),
+        "closed scheduler must reject enqueue at the actor"
+    );
 
     system.stop(&actor_id).await.unwrap();
 }
@@ -261,7 +336,7 @@ async fn inject_result(
         .call(
             actor_id,
             workflow_methods::ON_TASK_RESULT,
-            encode(&(wf_id.clone(), task_id.clone(), outcome, None::<u32>, source)).unwrap(),
+            encode(&(wf_id.clone(), task_id.clone(), outcome, 0u32, source)).unwrap(),
         )
         .await
         .unwrap()
@@ -319,14 +394,7 @@ async fn task_result_three_paths_idempotent() {
     dag.add_node(make_node("a", "task_a")).unwrap();
     dag.add_node(make_node("b", "task_b")).unwrap();
 
-    system
-        .call(
-            &actor_id,
-            workflow_methods::SUBMIT,
-            encode(&(wf_id.clone(), dag, None::<WorkflowInvocation>)).unwrap(),
-        )
-        .await
-        .unwrap();
+    orchestrator.submit(wf_id.clone(), dag).await.unwrap();
     orchestrator
         .start(&wf_id)
         .expect("start must return root tasks");
@@ -338,7 +406,7 @@ async fn task_result_three_paths_idempotent() {
         .call(
             &actor_id,
             workflow_methods::COMPLETE_TASK,
-            encode(&(wf_id.clone(), task_id.clone(), vec![1u8, 2, 3])).unwrap(),
+            encode(&(wf_id.clone(), task_id.clone(), vec![1u8, 2, 3], 0u32)).unwrap(),
         )
         .await
         .unwrap();
@@ -346,25 +414,19 @@ async fn task_result_three_paths_idempotent() {
     let completion: TaskCompletionResponse = decode(&resp.payload).unwrap();
     assert!(!completion.workflow_terminal, "b is still pending");
 
-    // 路径 2 / 3：远端直连与 gossip 携带同一结果重复注入。
-    for source in [ResultSource::Remote, ResultSource::Gossip] {
-        inject_result(
-            &system,
-            &actor_id,
-            &wf_id,
-            &task_id,
-            TaskResultOutcome::Completed(vec![1u8, 2, 3]),
-            source,
-        )
-        .await;
-    }
-
-    // 迟到失败结果经三条路径注入：终态不可被改写。
-    for source in [
-        ResultSource::Local,
+    // 路径 2：远端直连携带同一结果重复注入。
+    inject_result(
+        &system,
+        &actor_id,
+        &wf_id,
+        &task_id,
+        TaskResultOutcome::Completed(vec![1u8, 2, 3]),
         ResultSource::Remote,
-        ResultSource::Gossip,
-    ] {
+    )
+    .await;
+
+    // 迟到失败结果经两条路径注入：终态不可被改写。
+    for source in [ResultSource::Local, ResultSource::Remote] {
         inject_result(
             &system,
             &actor_id,
@@ -402,7 +464,7 @@ async fn task_result_three_paths_idempotent() {
         .call(
             &actor_id,
             workflow_methods::COMPLETE_TASK,
-            encode(&(wf_id.clone(), TaskId::from("b"), vec![9u8])).unwrap(),
+            encode(&(wf_id.clone(), TaskId::from("b"), vec![9u8], 0u32)).unwrap(),
         )
         .await
         .unwrap();
@@ -441,14 +503,7 @@ async fn remote_failure_fail_fast_fails_workflow() {
     dag.add_node(make_node("b", "task_b")).unwrap();
     dag.add_edge(TaskId::from("a"), TaskId::from("b")).unwrap();
 
-    system
-        .call(
-            &actor_id,
-            workflow_methods::SUBMIT,
-            encode(&(wf_id.clone(), dag, None::<WorkflowInvocation>)).unwrap(),
-        )
-        .await
-        .unwrap();
+    orchestrator.submit(wf_id.clone(), dag).await.unwrap();
     orchestrator
         .start(&wf_id)
         .expect("start must return root tasks");
@@ -504,26 +559,19 @@ async fn gossip_failure_continue_strategy_consistent_across_paths() {
     dag.add_node(make_node("a", "task_a")).unwrap();
     dag.add_node(make_node("b", "task_b")).unwrap();
 
-    system
-        .call(
-            &actor_id,
-            workflow_methods::SUBMIT,
-            encode(&(wf_id.clone(), dag, None::<WorkflowInvocation>)).unwrap(),
-        )
-        .await
-        .unwrap();
+    orchestrator.submit(wf_id.clone(), dag).await.unwrap();
     orchestrator
         .start(&wf_id)
         .expect("start must return root tasks");
 
-    // gossip 路径报告 a 失败：任务 Failed，工作流非终态（b 未终态）。
+    // 报告 a 失败：任务 Failed，工作流非终态（b 未终态）。
     inject_result(
         &system,
         &actor_id,
         &wf_id,
         &TaskId::from("a"),
         TaskResultOutcome::Failed("boom".to_string()),
-        ResultSource::Gossip,
+        ResultSource::Local,
     )
     .await;
 
@@ -565,7 +613,7 @@ async fn gossip_failure_continue_strategy_consistent_across_paths() {
         .call(
             &actor_id,
             workflow_methods::COMPLETE_TASK,
-            encode(&(wf_id.clone(), TaskId::from("b"), vec![9u8])).unwrap(),
+            encode(&(wf_id.clone(), TaskId::from("b"), vec![9u8], 0u32)).unwrap(),
         )
         .await
         .unwrap();
@@ -623,14 +671,7 @@ async fn late_result_for_evicted_workflow_settles_without_error() {
     let wf_id = WorkflowId::from("wf-evicted-result");
     let mut dag = Dag::new();
     dag.add_node(make_node("only", "only")).unwrap();
-    system
-        .call(
-            &actor_id,
-            workflow_methods::SUBMIT,
-            encode(&(wf_id.clone(), dag, None::<WorkflowInvocation>)).unwrap(),
-        )
-        .await
-        .unwrap();
+    orchestrator.submit(wf_id.clone(), dag).await.unwrap();
     orchestrator
         .start(&wf_id)
         .expect("start must return root tasks");
@@ -663,7 +704,7 @@ async fn late_result_for_evicted_workflow_settles_without_error() {
                 wf_id.clone(),
                 TaskId::from("only"),
                 TaskResultOutcome::Failed("[actant:worker] late delivery".to_string()),
-                None::<u32>,
+                0u32,
                 ResultSource::Remote,
             ))
             .unwrap(),

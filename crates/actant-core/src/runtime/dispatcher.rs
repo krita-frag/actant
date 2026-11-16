@@ -421,7 +421,7 @@ impl ProcessTaskDispatcher {
         let flags = unsafe { libc::fcntl(dup_raw, libc::F_GETFL) };
         if flags < 0 {
             // 拿不到 flags（罕见）→ 就地关闭 dup fd（防泄漏），退回 fallback 路径
-            // （poller 不写 Cancel，dispatcher 自己 terminate_and_replace 兜底发 Cancel）。
+            // （poller 不写 Cancel，worker 收不到通知，宽限耗尽后由强杀兜底）。
             unsafe { libc::close(dup_raw) };
             return None;
         }
@@ -591,6 +591,11 @@ impl ProcessTaskDispatcher {
     /// 仅当窗口耗尽仍未收到结果帧（不可协作 worker）才返回，触发本臂强杀兜底。
     /// `active` 为真时才轮询，避免分发已结束（worker 释放复用后）的残留取消信号
     /// 误触发取消分支。
+    /// 轮询取消旗标；置位后保持 `grace` 时长再返回——这段窗口供协作 worker
+    /// 经结果臂交付取消结果（poller 已把 Cancel 帧送达，协作任务可在窗口内
+    /// 收尾）。窗口耗尽仍无结果帧 ⇒ worker 阻塞在不可中断代码，由调用方
+    /// 直接强杀。强杀侧**不再二次宽限**（原实现两段宽限串行
+    /// ≈ 2×`worker_cancel_grace_ms`，工作流超时强还原实测 4.4s）。
     async fn wait_for_cancel(flag: &CancelFlag, active: &AtomicBool, grace: Duration) {
         loop {
             if !active.load(Ordering::Relaxed) {
@@ -602,31 +607,6 @@ impl ProcessTaskDispatcher {
             }
             tokio::time::sleep(Duration::from_millis(15)).await;
         }
-    }
-
-    /// 取消强杀：向 worker 发送 `Cancel` 帧 → 宽限等待协作退出 → 未退出则强杀，
-    /// 并替补新 worker 以保持进程池容量恒定。调用方持有该 worker 的槽位许可。
-    async fn terminate_and_replace(&self, mut worker: WorkerProc) {
-        if let Err(e) = worker.send_frame(FRAME_CANCEL, &[]).await {
-            // 写帧失败通常意味着 worker 已退出；继续走宽限/强杀路径收尾。
-            tracing::warn!(error = %e, "failed to send cancel frame; falling back to grace/kill");
-        }
-        let grace = tokio::time::sleep(self.cancel_grace);
-        tokio::pin!(grace);
-        let child = &mut worker.child;
-        tokio::select! {
-            _ = &mut grace => {
-                // 宽限期耗尽仍未退出，强杀。
-                Self::force_kill(child).await;
-            }
-            _status = child.wait() => {
-                // worker 在宽限期内协作退出。
-            }
-        }
-        if let Err(e) = self.ensure_replacement() {
-            tracing::warn!(error = %e, "failed to respawn worker after cancel; pool shrunk");
-        }
-        drop(worker);
     }
 
     /// 强制终止 worker 进程树并等待回收，避免僵尸与孙进程泄漏。
@@ -705,8 +685,8 @@ impl ProcessTaskDispatcher {
     /// 使用独立 dup 出的 `cancel_stdin`：hot-path dispatch 不再与 poller 竞争同一把
     /// Mutex。Cancel 帧固定 5 字节（< PIPE_BUF），Unix 内核保证 write 原子，不与
     /// dispatch 的并发写交错。若 `cancel_stdin` 不可用（非 Unix / dup 失败），
-    /// poller 不写帧——dispatcher 侧 `terminate_and_replace` 兜底自行发 Cancel，
-    /// 语义等价，仅延迟 ≤ 15ms（一轮 poll interval）。
+    /// poller 不写帧——worker 收不到通知，协作窗口自然耗尽后由强杀兜底
+    /// （宽限时长不变，仅损失协作退出的可能）。
     ///
     /// `writing` 由 dispatch 与 poller 共享：poller 进入写帧路径前置位，dispatch
     /// 在 poller 结束后据此判断 worker stdin 是否可能残留 Cancel 帧
@@ -1029,9 +1009,11 @@ impl TaskDispatcher for ProcessTaskDispatcher {
                 }
             }
             _ = Self::wait_for_cancel(&cancel_flag, &active, self.cancel_grace) => {
-                // 取消尚未被协作 worker 以结果帧响应（非协作 worker 阻塞在
-                // 不可中断代码）：发送 `Cancel`、宽限等待协作退出，宽限耗尽才强杀，
-                // 兜底回收槽位与进程池容量。
+                // 第一段宽限（wait_for_cancel 内）是协作窗口：Cancel 帧已由
+                // poller 送达（无 cancel_stdin 时无帧可发），窗口内无结果帧
+                // ⇒ worker 阻塞在不可中断代码（或从未收到通知）。两者都只剩
+                // 强杀一条路——发帧后二次宽限是纯死等（原实现两段宽限串行，
+                // 取消延迟翻倍），直接强杀并替补保持池容量。
                 active.store(false, Ordering::Relaxed);
                 let (cancel_stdin, _) = Self::stop_cancel_poller(
                     shutdown_tx,
@@ -1041,8 +1023,10 @@ impl TaskDispatcher for ProcessTaskDispatcher {
                 )
                 .await;
                 worker.cancel_stdin = cancel_stdin;
-                tracing::warn!("task cancelled, granting grace before killing worker");
-                self.terminate_and_replace(worker).await;
+                tracing::warn!("task cancelled, grace elapsed without cooperative result; killing worker");
+                if let Err(e) = self.recover_crash(worker).await {
+                    tracing::warn!(error = %e, "failed to respawn worker; pool shrunk");
+                }
                 Err(ActantError::Cancelled("task cancelled".into()))
             }
             _ = tokio::time::sleep(timeout) => {

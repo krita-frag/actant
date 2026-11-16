@@ -28,6 +28,13 @@ use crate::runtime::network::Transport;
 use crate::runtime::workflow::actor::{ResultSource, TaskCompletionResponse, TaskResultOutcome};
 use crate::runtime::workflow::messaging::{decode, encode};
 
+/// 判定一次派发是否为**进程崩溃**（worker 子进程异常退出），而非业务失败或硬超时。
+///
+/// `Ok(Err(ActantError::Worker(_)))`：dispatcher 在读取结果帧时读到 EOF / 写入失败 /
+/// worker 被强杀，即 worker 进程本身死亡。这是基础设施级失败，区别于
+/// `Ok(Err(ActantError::Timeout))`（硬超时）与 Python 内抛出的业务异常（同样以
+/// `Ok(Err(_))` 返回但非 `Worker` 变体）。崩溃是该类唯一需要触发「故障转移重路由」
+/// 的信号，超时与业务失败保持原有失败语义。
 pub(super) fn is_worker_crash(result: &DispatchResult) -> bool {
     matches!(result, Ok(Err(ActantError::Worker(_))))
 }
@@ -59,6 +66,7 @@ pub(super) fn build_completion_from_dispatch_result(
                 task_name: task.name.clone(),
                 result,
                 target_node: task.target_node.clone(),
+                attempt: task.attempt,
             }
         }
         Ok(Err(e)) => {
@@ -84,6 +92,7 @@ pub(super) fn build_completion_from_dispatch_result(
                             &format!("task timed out after {}ms", effective_timeout.as_millis()),
                         ),
                         target_node: task.target_node.clone(),
+                        attempt: task.attempt,
                     }
                 }
                 ActantError::Cancelled(_) => {
@@ -96,6 +105,7 @@ pub(super) fn build_completion_from_dispatch_result(
                         task_id: task.id.clone(),
                         task_name: task.name.clone(),
                         target_node: task.target_node.clone(),
+                        attempt: task.attempt,
                     }
                 }
                 other => {
@@ -104,12 +114,22 @@ pub(super) fn build_completion_from_dispatch_result(
                     crate::metrics::observe_task_duration_ms(
                         crate::common::epoch_millis().saturating_sub(dispatch_start_ms),
                     );
+                    // kind 决定 Python 侧重建哪个异常子类（`[actant:kind] msg`）。
+                    // worker 进程崩溃类失败（`ActantError::Worker`，含崩溃重路由
+                    // 预算耗尽）必须保持 `worker`：`fail_outbound_tasks_to` 对
+                    // 「执行节点失联」用的也是这个 kind，同一类基础设施失败在
+                    // 两条路径上不能给出不同异常类型。
+                    let (kind, message) = match &other {
+                        ActantError::Worker(msg) => ("worker", msg.clone()),
+                        other => ("task", other.to_string()),
+                    };
                     TaskCompletion::Failed {
                         workflow_id,
                         task_id: task.id.clone(),
                         task_name: task.name.clone(),
-                        error: format_error_kind("task", &other.to_string()),
+                        error: format_error_kind(kind, &message),
                         target_node: task.target_node.clone(),
+                        attempt: task.attempt,
                     }
                 }
             }
@@ -147,6 +167,7 @@ pub(super) fn build_completion_from_dispatch_result(
                 task_name: task.name.clone(),
                 error: format_error_kind("internal", "dispatcher panicked"),
                 target_node: task.target_node.clone(),
+                attempt: task.attempt,
             }
         }
     }
@@ -181,6 +202,7 @@ pub(super) async fn publish_drained_task_cancellation(
         task_id: task.id.clone(),
         task_name: task.name.clone(),
         target_node: task.target_node.clone(),
+        attempt: task.attempt,
     };
     // drain 丢弃不回灌 orchestrator：任务未执行，Cancelled 经事件路径让
     // 提交方终止（与既有语义一致）；workflow 视图由失联接管路径兜底。
@@ -252,6 +274,7 @@ pub(super) async fn reenqueue_with_retry(
                 task_id: task.id.clone(),
                 task_name: task.name.clone(),
                 target_node: task.target_node.clone(),
+                attempt: task.attempt,
             };
             publish_reenqueue_terminal(&task, ctx, completion).await;
             return;
@@ -291,6 +314,7 @@ pub(super) async fn reenqueue_with_retry(
                         ),
                     ),
                     target_node: task.target_node.clone(),
+                    attempt: task.attempt,
                 };
                 publish_reenqueue_terminal(&task, ctx, completion).await;
                 return;
@@ -431,7 +455,7 @@ async fn retry_local_orchestration_ingest(
 ///
 /// `initial_delay` 用于尊重编排器给出的重试延迟。重试耗尽后记录 error：
 /// 任务保持未入队状态，由工作流恢复/失联接管重新评估。
-async fn enqueue_with_retry(
+pub(super) async fn enqueue_with_retry(
     scheduler: Arc<dyn crate::runtime::workflow::Scheduler>,
     tasks: Vec<TaskDefinition>,
     initial_delay: Duration,
@@ -550,7 +574,12 @@ impl OrchestratorBridge {
                 // Completed 走 COMPLETE_TASK 通道：响应是 TaskCompletionResponse
                 //（含 ready_successors——Rust 原生 DAG 提交路径的后继派发腿，
                 // Python 路径由提交方阻塞解析依赖而无需此腿）。
-                let payload = encode(&(workflow_id.clone(), task.id.clone(), result.clone()))?;
+                let payload = encode(&(
+                    workflow_id.clone(),
+                    task.id.clone(),
+                    result.clone(),
+                    Some(task.attempt),
+                ))?;
                 let response = self
                     .actor_system
                     .call(
@@ -575,7 +604,7 @@ impl OrchestratorBridge {
             TaskCompletion::Failed { error, .. } => {
                 let outcome = TaskResultOutcome::Failed(error.clone());
                 let verdict = self
-                    .ingest_for_retry(workflow_id, &task.id, outcome)
+                    .ingest_for_retry(workflow_id, &task.id, outcome, task.attempt)
                     .await?;
                 Ok(match verdict {
                     crate::runtime::workflow::FailureOutcome::Retry(task, delay_ms) => {
@@ -603,12 +632,13 @@ impl OrchestratorBridge {
         workflow_id: &crate::common::WorkflowId,
         task_id: &crate::common::TaskId,
         outcome: TaskResultOutcome,
+        attempt: u32,
     ) -> crate::common::Result<crate::runtime::workflow::FailureOutcome> {
         let payload = encode(&(
             workflow_id.clone(),
             task_id.clone(),
             outcome,
-            None::<u32>,
+            Some(attempt),
             ResultSource::Local,
         ))?;
         let result = self

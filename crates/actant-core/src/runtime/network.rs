@@ -440,6 +440,10 @@ pub struct NetworkManager {
     /// 引导集，**不会**把"已建连接但当时未加入该话题"的邻居自动补进来。
     /// 缺了这一步，运行期新建的话题（如按对端节点命名的 `wf-state-req:<node>`）
     /// 在本节点看来订阅成功、`broadcast` 也返回 `Ok`，但一个接收方都没有。
+    /// 已知 gossip 邻居端点集，**只增不减**（刻意延后淘汰）：节点退出后仍会
+    /// 留在运行期新建话题的引导集里，代价是新话题建订时的无效拨号；既有话题
+    /// 内的死邻居由 iroh 自行清理。规模化边界与裁定见
+    /// `docs/operations/sla-baseline.md` §已知边界（gossip 引导集条目）。
     known_gossip_peers: Arc<RwLock<Vec<EndpointId>>>,
     max_message_size: usize,
     allowed_peer_ids: Arc<HashSet<String>>,
@@ -635,7 +639,6 @@ impl NetworkManager {
 
         let (event_tx, event_rx) = mpsc::channel(config.event_channel_capacity);
 
-        let max_message_size = config.max_message_size;
         let direct_request_timeout = Duration::from_millis(config.direct_request_timeout_ms);
 
         let manager = Self {
@@ -663,10 +666,23 @@ impl NetworkManager {
 
     /// 向已订阅 topic 广播 gossip 消息。
     ///
+    /// 消息尺寸在发送前校验：超过 `max_message_size` 的消息会被**所有**接收方
+    /// 在入口丢弃（`inc_gossip_updates_dropped`），发送方却拿到 `Ok`——发送侧
+    /// 快速失败让这种不对称在源头暴露，而不是静默丢遍全网。
+    ///
     /// # Errors
     ///
-    /// 如果 topic 未订阅或底层 gossip 广播失败，返回错误。
+    /// 如果 topic 未订阅、消息超过 `max_message_size`，或底层 gossip 广播失败，
+    /// 返回错误。
     pub async fn broadcast(&self, topic: &str, data: Vec<u8>) -> crate::common::Result<()> {
+        if data.len() > self.max_message_size {
+            return Err(ActantError::Network(format!(
+                "gossip broadcast to '{topic}' rejected: {} bytes exceeds max_message_size \
+                 ({}); every receiver would silently drop it",
+                data.len(),
+                self.max_message_size
+            )));
+        }
         let subs = self.topic_subscriptions.read().await;
         if let Some((_topic_id, sender)) = subs.get(topic) {
             sender
@@ -881,7 +897,16 @@ impl NetworkManager {
         }
     }
 
+    /// 本节点 iroh endpoint（crate 内测试复用：直接驱动 `BlobFetch`
+    /// 等以 endpoint 为入参的原语，不必绕道公开传输接口）。
+    #[cfg(test)]
+    pub(crate) fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
+    }
+
     /// 返回 endpoint id、relay URL、direct addresses 和 hex 编码 endpoint address。
+    ///
+    /// `Transport::listen_addresses` 的实现：当前 endpoint 的地址集合。
     ///
     /// # Errors
     ///
@@ -958,15 +983,18 @@ impl NetworkManager {
         // 连接 + fsm 握手必须有界：不可达或故意不响应的 provider 否则会让
         // 取值线程永久阻塞（Python `_blob_fetch` 直接 await 此调用）。
         let timeout = self.direct_request_timeout;
-        tokio::time::timeout(timeout, BlobFetch::start(&self.endpoint, addr, hash))
-            .await
-            .map_err(|_| {
-                ActantError::Timeout(format!(
-                    "blob fetch handshake to '{}' timed out after {:?}",
-                    node.as_str(),
-                    timeout
-                ))
-            })?
+        tokio::time::timeout(
+            timeout,
+            BlobFetch::start(&self.endpoint, addr, hash, timeout),
+        )
+        .await
+        .map_err(|_| {
+            ActantError::Timeout(format!(
+                "blob fetch handshake to '{}' timed out after {:?}",
+                node.as_str(),
+                timeout
+            ))
+        })?
     }
 
     /// 发送一次直连请求并等待响应。

@@ -194,7 +194,6 @@ pub struct TaskState {
     pub state: Phase,
     pub result: Option<Vec<u8>>,
     /// 任务进入 `Failed` 状态时捕获的错误消息。
-    #[serde(default)]
     pub error: Option<String>,
     retry_count: u32,
     /// 任务派发代数（dispatch generation）：每次重派发/重试（`reset_task`
@@ -239,15 +238,12 @@ pub struct WorkflowExecution {
     deadline_ms: Option<u64>,
     started_at_ms: Option<u64>,
     /// 工作流在任务失败时的反应策略。
-    #[serde(default)]
     pub failure_strategy: FailureStrategy,
     /// 工作流进入 `Failed` 状态时捕获的错误消息。
-    #[serde(default)]
     pub error: Option<String>,
     /// 节点集是否封口：整图提交（`submit`）立即封口；flow 增量提交
     /// 在函数体返回后经 `seal_workflow` 封口。未封口时全部已知节点终态
     /// 不代表提交序列结束，`check_workflow_completion` 不做终态判定。
-    #[serde(default)]
     nodes_sealed: bool,
 }
 
@@ -381,6 +377,9 @@ impl WorkflowExecution {
     pub fn is_expired(&self) -> bool {
         if let (Some(deadline), Some(started)) = (self.deadline_ms, self.started_at_ms) {
             let now_ms = crate::common::epoch_millis();
+            // 边界归属：恰等于 deadline 的时刻不判超时（严格大于）。到期靠
+            // timeout watcher 轮询发现，粒度为 `state_poll_interval_ms`（默认
+            // 500ms），边界差异至多一个周期内收敛；重放经同一函数，口径一致。
             // 用饱和减法避免 `started + deadline` 溢出：超大 timeout_ms 下原先会
             // 在 debug 构建里 panic、release 构建里回绕成「立即过期」。
             now_ms.saturating_sub(started) > deadline
@@ -404,9 +403,9 @@ impl WorkflowExecution {
     /// - attempt fencing（[`Self::attempt_fencing_passes`]）：结果所属派发代数
     ///   落后于任务当前记录的代数——重派发/重试后旧代在途执行的迟到结果被丢弃。
     ///
-    /// `result_attempt` 为 `None` 表示结果通路未携带派发代数（wire 协议尚未
-    /// 扩展 `WireTaskResult` / `WireDagStateUpdate`），无法判定代数，fencing
-    /// 放行。
+    /// `result_attempt` 为 `None` 只在 journal 重放时出现：历史事件不记录派发
+    /// 代数，而重放是在重建状态、不存在「迟到结果」，必须放行。在线写入路径
+    /// 一律携带具体代数。
     pub fn mark_task_completed(
         &mut self,
         task_id: &TaskId,
@@ -438,9 +437,8 @@ impl WorkflowExecution {
     /// 终态守卫校验状态机合法性。任务不存在时放行（NotFound 由上层处理）。
     ///
     /// `pub(crate)`：`WorkflowActor::on_task_result` 在回灌前用它做唯一的
-    /// 代数裁决；DAG 写入方法内部保留同一次校验作为绕行写入的防线。
-    /// 当前 wire 结果通路未携带派发代数，生产写入路径传 `None`（放行），
-    /// 因此生效的是 actor 入口的前置裁决。
+    /// 代数裁决；DAG 写入方法内部保留同一次校验作为绕行写入的防线。四条
+    /// 在线回灌路径都携带具体代数，`None` 仅由 journal 重放传入。
     pub(crate) fn attempt_fencing_passes(
         &self,
         task_id: &TaskId,
@@ -698,6 +696,10 @@ impl WorkflowExecution {
             }
             task.state = Phase::Pending;
             task.result = None;
+            // 重置即新代开始：上次失败的 error 不得跨代残留——重试成功后
+            // 任务状态为 Completed，error 与 Completed 并存会污染查询视图
+            // （`Existing { error }` 回传依赖「终态与 error 一致」）。
+            task.error = None;
         }
     }
 
@@ -721,6 +723,9 @@ impl WorkflowExecution {
         task.increment_attempt();
         task.state = Phase::Pending;
         task.result = None;
+        // 与 `reset_task` 同口径：重试重置清 result 也清 error，不允许
+        // 上次失败的错误串跨代残留到重试成功后的 Completed 状态。
+        task.error = None;
         true
     }
 
@@ -828,10 +833,8 @@ pub struct Dag {
     predecessors: HashMap<TaskId, Vec<TaskId>>,
     successors: HashMap<TaskId, Vec<TaskId>>,
     /// 默认重试策略，应用于未指定自己重试策略的任务。
-    #[serde(default)]
     pub default_retry_policy: Option<RetryPolicy>,
     /// 如何处理任务失败。
-    #[serde(default)]
     pub failure_strategy: FailureStrategy,
 }
 
@@ -955,8 +958,11 @@ impl Dag {
             .unwrap_or_default()
     }
 
+    /// 根节点（无前驱）。按 `task_id` 排序返回：`HashMap` 迭代序不稳定，
+    /// 排序使同一 DAG 的根任务派发顺序与 journal 内节点记录顺序可复现。
     pub fn roots(&self) -> Vec<&DagNode> {
-        self.nodes
+        let mut roots: Vec<&DagNode> = self
+            .nodes
             .keys()
             .filter(|id| {
                 self.predecessors
@@ -965,7 +971,9 @@ impl Dag {
                     .unwrap_or(true)
             })
             .filter_map(|id| self.nodes.get(id))
-            .collect()
+            .collect();
+        roots.sort_by(|a, b| a.task_id.as_str().cmp(b.task_id.as_str()));
+        roots
     }
 
     pub fn sinks(&self) -> Vec<&DagNode> {
@@ -987,11 +995,16 @@ impl Dag {
             in_degree.insert(id, self.predecessors.get(id).map(|p| p.len()).unwrap_or(0));
         }
 
-        let mut queue: VecDeque<&TaskId> = in_degree
+        // 初始队列按 task_id 排序后入队：HashMap 迭代序不稳定会带来同 DAG
+        // 多次提交的拓扑序漂移（journal 内 NodeAdded 顺序随之漂移）；排序后
+        // 多根 DAG 的执行顺序可复现，与 flow 重放的确定性基调一致。
+        let mut initial: Vec<&TaskId> = in_degree
             .iter()
             .filter(|(_, &deg)| deg == 0)
             .map(|(id, _)| *id)
             .collect();
+        initial.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        let mut queue: VecDeque<&TaskId> = initial.into();
 
         let mut sorted = Vec::new();
 

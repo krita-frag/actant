@@ -349,6 +349,10 @@ def reconstruct_error(error_str: str) -> ActantError:
 def raise_for_state(state: str, error: str, *, failed_tasks: list[list[str]] | None = None) -> None:
     """根据 workflow 终态抛出对应的 Python 异常。
 
+    公开便捷接口：供用户从终态快照（``get_workflow_state`` 的 ``state`` /
+    ``error`` / ``failed_tasks`` 字段）直接重建异常。引擎内部路径
+    （``_wait_terminal_and_emit`` / ``AsyncResult``）直接构造子类，不经此函数。
+
     Args:
         state: Workflow 终态（如 "Failed", "Cancelled", "Timeout"）。
         error: 错误消息字符串。
@@ -363,7 +367,8 @@ def raise_for_state(state: str, error: str, *, failed_tasks: list[list[str]] | N
                 task_name = first[1] if len(first) > 1 else None
                 task_error = first[2] if len(first) > 2 else error
                 raise WorkflowFailedError(error, task_name=task_name, task_error=task_error)
-            # 回退：解析错误字符串以保持向后兼容
+            # failed_tasks 缺省时宽容解析 "task X failed: msg" 格式的
+            # 错误消息提取首任务名；无法解析时 task_name 为 None。
             task_name = None
             task_error = error
             if error.startswith("task ") and " failed" in error:

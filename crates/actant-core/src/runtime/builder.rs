@@ -314,7 +314,8 @@ pub async fn init_worker(params: WorkerInitParams<'_>) -> Result<Worker, ActantE
     };
     // 在 spawn 前提取共享内部状态引用，用于 ActorScheduler 的 enqueue 快路径。
     // shared_inner 返回 Arc<InnerScheduler>，Actor 持有同一 Arc 的克隆。
-    // 此后 ActorScheduler::enqueue 直接调用 InnerScheduler::enqueue 同步方法，
+    // 此后 ActorScheduler::enqueue 直接调用 InnerScheduler::enqueue（async，
+    // 但不经 actor 往返），
     // 绕过 Actor 消息往返（postcard 编解码 + 邮箱调度 + 响应通道）。
     let fast_inner = scheduler_actor.shared_inner();
     params
@@ -579,7 +580,7 @@ impl RuntimeBuilder {
 
         // 将 payload 签名密钥同时作为 wire message 签名密钥。
         // 设计：单一密钥承担双重职责（payload + wire），简化运维配置。
-        // 空密钥 = 禁用 wire 签名验证，向后兼容 0.2（无 mac 字段）。
+        // 空密钥 = 禁用 wire 签名验证（未配置集群共享密钥的开发/单机模式）。
         // 非空密钥 = 集群内所有节点必须共享同一密钥；任一节点密钥不匹配
         // 将导致其跨节点消息被对端丢弃，提供端到端集群身份认证。
         // 按 node 注册——同进程多 Runtime 各自密钥互不覆盖，

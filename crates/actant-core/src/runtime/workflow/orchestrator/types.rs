@@ -199,6 +199,13 @@ struct CompletedOrder {
 
 pub struct OrchestratorState {
     pub(crate) slots: DashMap<WorkflowId, WorkflowSlot>,
+    /// flush 互斥：定期落盘循环与 `flush_dirty`（actor on_stop）共用。
+    ///
+    /// 两条路径各自 `drain_dirty` → 捕获水位 → 写快照 → 按该水位裁剪历史。
+    /// 若不互斥，旧快照可能在新快照之后提交，而 `(W_old, W_new]` 的历史已被
+    /// 裁掉——恢复时那段状态凭空丢失。锁必须覆盖整个「drain → 写 → 裁剪」
+    /// 区间，只在写快照处互斥不够。
+    pub(crate) flush_lock: tokio::sync::Mutex<()>,
     pub(crate) wait_waiters: WaiterRegistry,
     pub(crate) waitpoints: DashMap<WorkflowId, DashMap<String, WaitPoint>>,
     /// 信号缓冲：`workflow → (wait_key → payload)`。等待点**注册前**抵达的信号
@@ -233,6 +240,7 @@ impl OrchestratorState {
     pub fn new() -> Self {
         Self {
             slots: DashMap::new(),
+            flush_lock: tokio::sync::Mutex::new(()),
             wait_waiters: WaiterRegistry::new(),
             waitpoints: DashMap::new(),
             pending_signals: DashMap::new(),

@@ -87,6 +87,7 @@ fn take_result_receiver_is_exactly_once() {
     // 取走的接收端功能完好。
     rt.result_feed()
         .send(crate::runtime::events::TaskLifecycleEvent::TaskStarted {
+            attempt: 0,
             workflow_id: crate::common::WorkflowId::from("wf-take"),
             task_id: crate::common::TaskId::from("t-take"),
         });

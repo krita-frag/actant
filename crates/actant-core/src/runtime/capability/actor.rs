@@ -18,9 +18,8 @@ use crate::runtime::capability::{
 /// Capability 执行 Actor。
 ///
 /// 关键设计：不持有固定 `kind`，而是根据每条消息的
-/// [`CapabilityEnvelope::kind`] 分发。这允许同一个 capability
-/// 同时支持 `ask`（决策查询）、`perform`（副作用执行）、`emit`（事件广播）
-/// 三种调用语义，由调用方按需选择。
+/// [`CapabilityEnvelope::kind`] 分发（`perform` / `emit`）。
+/// ask 型能力不经本 Actor：Python 侧 `_ask_chain` 纯 Python handler 决策。
 pub struct CapabilityActor {
     handlers: Vec<Arc<dyn ErasedHandler>>,
     codec: Arc<dyn CapabilityCodec>,
@@ -80,20 +79,7 @@ impl Actor for CapabilityActor {
         };
 
         // 关键：根据 envelope.kind 分发，而非固定 kind。
-        // 这样同一 capability 可同时被 ask/perform/emit 调用。
         match envelope.kind {
-            EffectKind::Ask => {
-                for handler in self.handlers.iter().rev() {
-                    if let Some(resp) = handler.ask(req.clone()).await {
-                        let bytes = match self.codec.serialize_response(resp) {
-                            Ok(b) => b,
-                            Err(e) => return Ok(Self::error(msg_id, e)),
-                        };
-                        return Ok(Self::payload(msg_id, encode_handled(bytes)));
-                    }
-                }
-                Ok(Self::payload(msg_id, vec![0u8]))
-            }
             EffectKind::Perform => {
                 if let Some(handler) = self.handlers.last() {
                     match handler.perform(req).await {

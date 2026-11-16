@@ -142,13 +142,11 @@ fn prefix_upper_bound(prefix: &str) -> Option<String> {
 /// 校验（或首次创建时写入）store 格式版本 meta 条目。
 ///
 /// - 无 meta 条目且 store 为空 → 首次创建，写入当前版本；
-/// - 无 meta 条目但 store 已有数据 → 存量库（版本化之前写入），显式告警后
-///   标记为当前版本。0.x 不承诺向后兼容，不做迁移；若旧布局与当前 rkyv
-///   布局不兼容，会在恢复期以 “corrupt workflow 被清理” 的形式暴露；
+/// - 无 meta 条目但 store 已有数据 → 拒绝启动。0.x 不承诺向后兼容，也没有
+///   迁移路径：把未知布局当作当前版本读，只会在恢复期以「workflow 被当作
+///   corrupt 整体清除」的形式丢数据，且现场已被删掉；
 /// - 条目与当前版本匹配 → 放行；
-/// - 条目存在但不匹配 → 返回语义化 [`ActantError::Storage`]，拒绝启动——
-///   旧格式数据在新代码上读取会静默损坏（rkyv 字节校验失败表现为 workflow
-///   整体被当作 corrupt 清除），显式失败优于静默丢数据。
+/// - 条目存在但不匹配 → 返回语义化 [`ActantError::Storage`]，拒绝启动。
 fn ensure_fmt_version(db: &Database<Str, Bytes>, env: &Env) -> Result<()> {
     let expected = STORE_FMT_VERSION.to_le_bytes();
     let current = {
@@ -164,13 +162,12 @@ fn ensure_fmt_version(db: &Database<Str, Bytes>, env: &Env) -> Result<()> {
                     .entries
             };
             if existing_entries > 0 {
-                tracing::warn!(
-                    entries = existing_entries,
-                    format_version = STORE_FMT_VERSION,
-                    "store has data but no format version meta (pre-versioning store); \
-                     marking it as current format — incompatible legacy layouts will \
-                     surface as corrupt workflow cleanup during recovery"
-                );
+                return Err(ActantError::Storage(format!(
+                    "store at this path has {existing_entries} entries but no format \
+                     version meta: it was written by a build that predates format \
+                     versioning (or by a different tool). This build requires v{STORE_FMT_VERSION} \
+                     and has no migration path; use a fresh data directory"
+                )));
             }
             let mut wtxn = env.write_txn()?;
             db.put(&mut wtxn, STORE_FMT_VERSION_KEY, &expected)?;
@@ -947,6 +944,9 @@ impl Store {
     ///
     /// 批量写入场景应使用 [`Store::put_batch`]，后者始终单事务批量提交。
     pub async fn put(&self, key: &str, value: &[u8]) -> Result<()> {
+        // 与同步路径同口径：非法键在入队前拒绝，否则整批事务会因单条超长
+        // 键失败，并在 flusher 里反复重投同一批。
+        validate_key(key)?;
         // GroupCommit 快路径：入队成功即返回，避免 spawn_blocking 开销。
         if let Some(ref batcher) = self.batcher {
             if batcher
@@ -982,6 +982,7 @@ impl Store {
     /// 在后台 flush 后才确定。调用方若依赖删除结果，应在关键点调用
     /// [`Store::flush`]（返回 `Ok` 即保证该删除已提交）后再读。
     pub async fn delete(&self, key: &str) -> Result<bool> {
+        validate_key(key)?;
         if let Some(ref batcher) = self.batcher {
             if batcher.try_enqueue_delete(key.to_string()).is_ok() {
                 // 合并提交下无法同步返回真实 existed 值；返回 false 表示

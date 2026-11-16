@@ -47,8 +47,6 @@ struct Instruments {
     capability_invocations: Counter<u64>,
 
     // -- Gossip 计数器 --
-    gossip_updates_sent: Counter<u64>,
-    gossip_updates_received: Counter<u64>,
     gossip_updates_dropped: Counter<u64>,
 
     // -- 故障转移计数器 --
@@ -57,6 +55,8 @@ struct Instruments {
     failover_reschedules: Counter<u64>,
     /// 因执行节点失联而被终结的在途任务数（失联扫描补腿）。
     failover_node_lost_tasks: Counter<u64>,
+    /// 因让位（对端 claim 胜出）而撤销的本地排队任务数。
+    failover_relinquished_tasks: Counter<u64>,
 
     // -- Actor 计数器 --
     actors_spawned: Counter<u64>,
@@ -85,6 +85,8 @@ struct Instruments {
     task_forward_reroute: Counter<u64>,
     /// 因无匹配节点被延后（`Defer`）的任务次数。
     task_deferred: Counter<u64>,
+    /// 因工作流已让位给对端而丢弃的已出队任务数。
+    task_relinquished: Counter<u64>,
 
     // -- UpDownCounter（可增可减的仪表）--
     running_tasks: UpDownCounter<i64>,
@@ -170,14 +172,6 @@ impl Instruments {
                 .build(),
 
             // -- Gossip 计数器 --
-            gossip_updates_sent: meter
-                .u64_counter("actant.gossip.updates.sent")
-                .with_description("Gossip updates sent")
-                .build(),
-            gossip_updates_received: meter
-                .u64_counter("actant.gossip.updates.received")
-                .with_description("Gossip updates received")
-                .build(),
             gossip_updates_dropped: meter
                 .u64_counter("actant.gossip.updates.dropped")
                 .with_description(
@@ -197,6 +191,10 @@ impl Instruments {
             failover_reschedules: meter
                 .u64_counter("actant.failover.reschedules")
                 .with_description("Failover task reschedules")
+                .build(),
+            failover_relinquished_tasks: meter
+                .u64_counter("actant.failover.relinquished_tasks")
+                .with_description("Queued tasks dropped because another node claimed the workflow")
                 .build(),
             failover_node_lost_tasks: meter
                 .u64_counter("actant.failover.node_lost_tasks")
@@ -276,6 +274,12 @@ impl Instruments {
                 .u64_counter("actant.tasks.deferred")
                 .with_description("Tasks deferred because no node satisfies placement requirements")
                 .build(),
+            task_relinquished: meter
+                .u64_counter("actant.tasks.relinquished")
+                .with_description(
+                    "Dequeued tasks dropped because another node holds the workflow lease",
+                )
+                .build(),
 
             // -- UpDownCounter --
             running_tasks: meter
@@ -348,12 +352,12 @@ impl Instruments {
 
 /// 包装为 `Arc`，使 `Instruments` 句柄可从锁中克隆并在不持有锁的情况下使用。
 /// OTel instrument 句柄克隆开销很小。
-static INSTRUMENTS: std::sync::RwLock<Option<Arc<Instruments>>> = std::sync::RwLock::new(None);
+static INSTRUMENTS: parking_lot::RwLock<Option<Arc<Instruments>>> = parking_lot::RwLock::new(None);
 static REGISTRY: Mutex<Option<Arc<Registry>>> = Mutex::new(None);
 
 fn instruments() -> Arc<Instruments> {
     // 读快路径无锁：任务结算热路径（每任务 ≥2 次指标调用）不再过全局互斥。
-    if let Some(inst) = INSTRUMENTS.read().unwrap().clone() {
+    if let Some(inst) = INSTRUMENTS.read().clone() {
         return inst;
     }
     // 兜底：从全局 meter 创建（若未调用 init() 则为 no-op）。
@@ -361,7 +365,7 @@ fn instruments() -> Arc<Instruments> {
     let inst = Arc::new(Instruments::from_meter(&meter));
     // 写路径仍互斥；双检防并发兜底重复构造（重复构造也无观测差异，
     // 因两者都来自同一全局 meter）。
-    let mut guard = INSTRUMENTS.write().unwrap();
+    let mut guard = INSTRUMENTS.write();
     if guard.is_none() {
         *guard = Some(inst.clone());
     }
@@ -380,7 +384,7 @@ fn instruments() -> Arc<Instruments> {
 ///
 /// 另支持 `OTEL_EXPORTER_OTLP_HEADERS`（`key=value,key=value` 格式）传递认证头。
 ///
-/// 若环境变量未设置或为空，仅使用 Prometheus exporter（向后兼容 0.2 行为）。
+/// 若环境变量未设置或为空，仅使用 Prometheus exporter（未配置 OTLP 时的默认形态）。
 ///
 /// # 多 reader 协同
 ///
@@ -456,7 +460,7 @@ pub fn init() -> Result<(), crate::common::ActantError> {
 
     // 从已配置的 provider 创建所有 instrument。
     let meter = opentelemetry::global::meter("actant");
-    *INSTRUMENTS.write().unwrap() = Some(Arc::new(Instruments::from_meter(&meter)));
+    *INSTRUMENTS.write() = Some(Arc::new(Instruments::from_meter(&meter)));
     *REGISTRY.lock() = Some(Arc::new(registry));
     Ok(())
 }
@@ -559,14 +563,6 @@ pub fn inc_capability_invocation(capability: &str, effect: &str) {
     instruments().capability_invocations.add(1, &labels);
 }
 
-pub fn inc_gossip_updates_sent() {
-    instruments().gossip_updates_sent.add(1, &[]);
-}
-
-pub fn inc_gossip_updates_received() {
-    instruments().gossip_updates_received.add(1, &[]);
-}
-
 pub fn inc_gossip_updates_dropped() {
     instruments().gossip_updates_dropped.add(1, &[]);
 }
@@ -581,6 +577,12 @@ pub fn inc_failover_claims() {
 
 pub fn inc_failover_reschedules() {
     instruments().failover_reschedules.add(1, &[]);
+}
+
+pub fn inc_failover_relinquished_tasks(count: u64) {
+    if count > 0 {
+        instruments().failover_relinquished_tasks.add(count, &[]);
+    }
 }
 
 pub fn inc_failover_node_lost_tasks() {
@@ -651,6 +653,10 @@ pub fn inc_task_forward_reroute() {
 }
 
 /// 记录一次任务因无匹配节点被延后（`Defer`）。
+pub fn inc_task_relinquished() {
+    instruments().task_relinquished.add(1, &[]);
+}
+
 pub fn inc_task_deferred() {
     instruments().task_deferred.add(1, &[]);
 }

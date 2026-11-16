@@ -70,8 +70,12 @@
 ## 状态副本：接管的前提
 
 接管方必须先持有工作流的状态副本（DAG + 执行状态），否则手里只有空壳，
-没有任何任务可重调度。副本经 heads 交换（`actant:heads`）扩散：接收方本地
-没有该工作流、或节点数/成功数落后于对端时，向对端请求全量状态。
+没有任何任务可重调度。副本经 heads 交换（`actant:heads`）扩散：`DagGossipActor`
+每 `gossip.heads_broadcast_interval_ms` 广播一次「活跃工作流 + 总数/成功数」，
+接收方本地没有该工作流、或计数落后于对端时，向对端请求全量状态。
+
+复制粒度是**快照**，不是逐任务状态：任务结果只走直连 `TaskResult`（带派发代数），
+否则同一份结果会有两条权威来源，`attempt` 与终态裁决都将失去唯一入口。
 
 两个实现约束：
 
@@ -98,6 +102,23 @@
 
 获选节点遇到尚未到期的租约时退让，退让项落到 `pending_claims`，由第 3 腿逐轮重试——
 若就此作罢，租约到期被 `expire_leases` 删除后工作流永久无人驱动。
+
+## 让位：编排层与执行层必须同时退
+
+收到对端 claim 且对端胜出时，本节点做两件事，缺一不可：
+
+1. **编排层**：`remove_active_workflow` 摘除本地 slot（不再驱动该工作流）。
+2. **执行层**：`Scheduler::remove_workflow_tasks(workflow_id)` 撤销本地排队任务，
+   否则已入队但未出队的任务仍会被 Worker 取出执行——副作用在新旧两个主上各发生一次，
+   而完成回灌时 slot 已删、结果被静默丢弃。
+
+排队之外，还有一部分任务已经出队（预取到 `inflight`）或正在等并发槽位，撤不回来。
+这部分由派发前的唯一闸口 `FailoverManager::dispatch_permitted(workflow_id)` 拦截：判据
+只有租约归属——无租约（单机/未参与协调）放行、租约归本节点放行、租约归对端丢弃。
+
+丢弃而不结算：工作流已归对端，对端会重新派发该任务；发 `Failed` / `Cancelled` 会让
+origin 侧做无谓的重试裁决，而 origin 已不是本节点。计数进
+`actant.tasks.relinquished` 与 `actant.failover.relinquished_tasks`。
 
 ## 直提任务租约与 attempt fencing
 

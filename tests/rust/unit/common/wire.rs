@@ -7,6 +7,22 @@ fn node(s: &str) -> NodeId {
     NodeId::from(s.to_string())
 }
 
+/// 以固定测试节点注册/清除签名密钥。
+///
+/// 等价于进程级 primary 语义：同一节点反复注册，空密钥即注销该节点并
+/// 清除 primary（见 [`register_wire_signing_key`] 的回落逻辑）。
+fn set_test_signing_key(key: Vec<u8>) {
+    register_wire_signing_key(&node("wire-mac-test"), key);
+}
+
+/// 单段形态的 wire MAC：整块字节作为单一分段喂 keyed hasher。
+///
+/// 生产实现只有 incremental 形态；本包装保留"单缓冲等价"的测试表达
+/// （MAC 覆盖字节 = 序列化整个 `mac: None` 的 unsigned envelope）。
+fn wire_mac(key: &[u8], bytes: &[u8]) -> Option<[u8; crate::common::payload::WIRE_MAC_LEN]> {
+    crate::common::payload::wire_mac_incremental(key, &[bytes])
+}
+
 // --- Topic 构造器 ---
 
 #[test]
@@ -14,11 +30,6 @@ fn topic_task_uses_correct_prefix() {
     let t = Topic::task(&node("worker-1"));
     assert_eq!(t.as_str(), "actant:task:worker-1");
     assert!(t.as_str().starts_with(constants::TOPIC_TASK_PREFIX));
-}
-
-#[test]
-fn topic_dag_state_is_constant() {
-    assert_eq!(Topic::dag_state().as_str(), constants::TOPIC_DAG_STATE);
 }
 
 #[test]
@@ -69,8 +80,7 @@ fn classify_workflow_state_req_resp() {
 }
 
 #[test]
-fn classify_dag_state_heartbeat_failover_heads() {
-    assert_eq!(Topic::dag_state().classify(), TopicRoute::DagState);
+fn classify_heartbeat_failover_heads() {
     assert_eq!(Topic::heartbeat().classify(), TopicRoute::Heartbeat);
     assert_eq!(Topic::failover().classify(), TopicRoute::Failover);
     assert_eq!(Topic::heads().classify(), TopicRoute::Heads);
@@ -401,7 +411,7 @@ fn wire_mac_protects_traceparent_field() {
     // 复用模块级 MAC_TEST_LOCK，与 MAC 测试串行执行避免全局密钥污染。
     let _guard = MAC_TEST_LOCK.lock().unwrap();
 
-    crate::common::set_wire_signing_key(b"test-key-c3".to_vec());
+    set_test_signing_key(b"test-key-c3".to_vec());
 
     let envelope = WireEnvelope::wrap(WireMessage::NodeHeartbeat(NodeHeartbeat {
         signature: None,
@@ -449,27 +459,10 @@ fn wire_mac_protects_traceparent_field() {
     assert_eq!(decoded_tp.as_deref(), Some(original_tp.as_str()));
 
     // 清理全局状态。
-    crate::common::set_wire_signing_key(Vec::new());
+    set_test_signing_key(Vec::new());
 }
 
-// --- WireTaskState / WireTaskOutcome 字符串映射 ---
-
-#[test]
-fn wire_task_state_as_str_returns_canonical_values() {
-    assert_eq!(WireTaskState::Running.as_str(), state_str::RUNNING);
-    assert_eq!(
-        WireTaskState::Completed { result: vec![] }.as_str(),
-        state_str::COMPLETED
-    );
-    assert_eq!(
-        WireTaskState::Failed {
-            error: "e".to_string()
-        }
-        .as_str(),
-        state_str::FAILED
-    );
-    assert_eq!(WireTaskState::Cancelled.as_str(), state_str::CANCELLED);
-}
+// --- WireTaskOutcome 字符串映射 ---
 
 #[test]
 fn wire_task_outcome_as_str_returns_canonical_values() {
@@ -515,7 +508,7 @@ fn heartbeat_msg(n: &str) -> WireMessage {
 fn envelope_roundtrip_without_signing() {
     let _guard = MAC_TEST_LOCK.lock().unwrap();
     // 确保全局密钥为空（其他测试可能设置过）。
-    set_wire_signing_key(Vec::new());
+    set_test_signing_key(Vec::new());
 
     let env = WireEnvelope::wrap(heartbeat_msg("n1")).expect("wire envelope wrap");
     // 禁用签名时 mac 为 None。
@@ -534,7 +527,7 @@ fn envelope_roundtrip_without_signing() {
 #[test]
 fn envelope_wrap_with_key_produces_mac() {
     let _guard = MAC_TEST_LOCK.lock().unwrap();
-    set_wire_signing_key(b"cluster-secret-123".to_vec());
+    set_test_signing_key(b"cluster-secret-123".to_vec());
 
     let env = WireEnvelope::wrap(heartbeat_msg("n2")).expect("wire envelope wrap");
     assert!(
@@ -546,7 +539,7 @@ fn envelope_wrap_with_key_produces_mac() {
     let (decoded, _) = WireEnvelope::decode(&bytes).expect("valid MAC should decode");
 
     // 清理：恢复禁用状态避免影响后续测试。
-    set_wire_signing_key(Vec::new());
+    set_test_signing_key(Vec::new());
 
     if let WireMessage::NodeHeartbeat(hb) = decoded {
         assert_eq!(hb.node_id.as_str(), "n2");
@@ -559,16 +552,16 @@ fn envelope_wrap_with_key_produces_mac() {
 #[test]
 fn envelope_decode_rejects_mismatched_key() {
     let _guard = MAC_TEST_LOCK.lock().unwrap();
-    set_wire_signing_key(b"key-sender".to_vec());
+    set_test_signing_key(b"key-sender".to_vec());
 
     let env = WireEnvelope::wrap(heartbeat_msg("n3")).expect("wire envelope wrap");
     let bytes = postcard::to_allocvec(&env).unwrap();
 
     // 接收方使用不同密钥。
-    set_wire_signing_key(b"key-receiver".to_vec());
+    set_test_signing_key(b"key-receiver".to_vec());
     let result = WireEnvelope::decode(&bytes);
 
-    set_wire_signing_key(Vec::new()); // 清理
+    set_test_signing_key(Vec::new()); // 清理
 
     assert!(
         result.is_none(),
@@ -580,17 +573,17 @@ fn envelope_decode_rejects_mismatched_key() {
 #[test]
 fn envelope_decode_rejects_unsigned_message_when_key_set() {
     let _guard = MAC_TEST_LOCK.lock().unwrap();
-    set_wire_signing_key(Vec::new());
+    set_test_signing_key(Vec::new());
     // 在禁用签名的状态下 wrap（不会产生 MAC）。
     let unsigned_env = WireEnvelope::wrap(heartbeat_msg("n4")).expect("wire envelope wrap");
     assert!(unsigned_env.mac.is_none());
     let bytes = postcard::to_allocvec(&unsigned_env).unwrap();
 
     // 接收方启用签名验证：缺少 MAC 的消息必须被丢弃。
-    set_wire_signing_key(b"cluster-key".to_vec());
+    set_test_signing_key(b"cluster-key".to_vec());
     let result = WireEnvelope::decode(&bytes);
 
-    set_wire_signing_key(Vec::new()); // 清理
+    set_test_signing_key(Vec::new()); // 清理
 
     assert!(
         result.is_none(),
@@ -602,7 +595,7 @@ fn envelope_decode_rejects_unsigned_message_when_key_set() {
 #[test]
 fn envelope_decode_rejects_tampered_bytes() {
     let _guard = MAC_TEST_LOCK.lock().unwrap();
-    set_wire_signing_key(b"cluster-key".to_vec());
+    set_test_signing_key(b"cluster-key".to_vec());
     let env = WireEnvelope::wrap(heartbeat_msg("n5")).expect("wire envelope wrap");
     let mut bytes = postcard::to_allocvec(&env).unwrap();
 
@@ -612,7 +605,7 @@ fn envelope_decode_rejects_tampered_bytes() {
 
     let result = WireEnvelope::decode(&bytes);
 
-    set_wire_signing_key(Vec::new()); // 清理
+    set_test_signing_key(Vec::new()); // 清理
 
     assert!(
         result.is_none(),
@@ -713,7 +706,7 @@ fn mac_input_segments_match_unsigned_envelope_serialization() {
         &mac_input_segments(&version_bytes, &message_bytes, &traceparent_bytes),
     )
     .unwrap();
-    let buffered = crate::common::payload::wire_mac(b"k", &joined).unwrap();
+    let buffered = wire_mac(b"k", &joined).unwrap();
     assert_eq!(incremental, buffered);
 
     // traceparent 为 None 时同样成立。
@@ -760,7 +753,7 @@ fn two_runtimes_with_different_keys_do_not_interfere() {
         mac: None,
         ..env_a_after
     };
-    let expected_a = crate::common::payload::wire_mac(
+    let expected_a = wire_mac(
         b"cluster-key-a",
         &crate::common::encode_postcard(&unsigned_a).unwrap(),
     )
@@ -775,7 +768,7 @@ fn two_runtimes_with_different_keys_do_not_interfere() {
     let bytes_b = postcard::to_allocvec(&env_b).unwrap();
     let mac_b = env_b.mac.expect("rt-b envelope must be signed");
     let unsigned_b = WireEnvelope { mac: None, ..env_b };
-    let expected_b = crate::common::payload::wire_mac(
+    let expected_b = wire_mac(
         b"cluster-key-b",
         &crate::common::encode_postcard(&unsigned_b).unwrap(),
     )
@@ -796,7 +789,7 @@ fn two_runtimes_with_different_keys_do_not_interfere() {
         traceparent: Some(TraceContext::new_root(true).to_header()),
         mac: None,
     };
-    let rogue_mac = crate::common::payload::wire_mac(
+    let rogue_mac = wire_mac(
         b"cluster-key-c",
         &crate::common::encode_postcard(&rogue_unsigned).unwrap(),
     )
@@ -814,7 +807,7 @@ fn two_runtimes_with_different_keys_do_not_interfere() {
     // 清理全局注册表，避免污染其他 MAC 测试。
     crate::common::register_wire_signing_key(&node_a, Vec::new());
     crate::common::register_wire_signing_key(&node_b, Vec::new());
-    set_wire_signing_key(Vec::new());
+    set_test_signing_key(Vec::new());
 }
 
 /// 回归测试：节点以空密钥重新注册时必须清除它留下的 `primary`。
@@ -825,7 +818,7 @@ fn two_runtimes_with_different_keys_do_not_interfere() {
 fn clearing_node_key_clears_primary_it_owned() {
     let _guard = MAC_TEST_LOCK.lock().unwrap();
     let n = node("rt-reset");
-    set_wire_signing_key(Vec::new());
+    set_test_signing_key(Vec::new());
     crate::common::register_wire_signing_key(&n, b"rt-reset-key".to_vec());
 
     // 注册密钥后，该节点的消息带 MAC。
@@ -845,7 +838,7 @@ fn clearing_node_key_clears_primary_it_owned() {
         "unsigned message must decode after the node key is cleared"
     );
 
-    set_wire_signing_key(Vec::new());
+    set_test_signing_key(Vec::new());
 }
 
 /// 回归测试：注销 primary 拥有者后，primary 必须回落到其余已注册节点。
@@ -857,7 +850,7 @@ fn clearing_primary_owner_falls_back_to_remaining_node() {
     let _guard = MAC_TEST_LOCK.lock().unwrap();
     let a = node("rt-fallback-a");
     let b = node("rt-fallback-b");
-    set_wire_signing_key(Vec::new());
+    set_test_signing_key(Vec::new());
     crate::common::register_wire_signing_key(&a, b"rt-fallback-key".to_vec());
     crate::common::register_wire_signing_key(&b, b"rt-fallback-key".to_vec());
 
@@ -886,7 +879,7 @@ fn clearing_primary_owner_falls_back_to_remaining_node() {
 
     // 清理全局注册表，避免污染其他 MAC 测试。
     crate::common::register_wire_signing_key(&a, Vec::new());
-    set_wire_signing_key(Vec::new());
+    set_test_signing_key(Vec::new());
 }
 
 /// 兼容性红线测试：wrap() 用分段字节计算的 MAC 必须与对完整 unsigned envelope
@@ -895,15 +888,15 @@ fn clearing_primary_owner_falls_back_to_remaining_node() {
 fn wire_mac_matches_oneshot_unsigned_serialization() {
     let _guard = MAC_TEST_LOCK.lock().unwrap();
     let key = b"segment-compat-key".to_vec();
-    set_wire_signing_key(key.clone());
+    set_test_signing_key(key.clone());
 
     let env = WireEnvelope::wrap(heartbeat_msg("mac-oneshot")).expect("wire envelope wrap");
     let wrapped_mac = env.mac.expect("mac must be present with signing key");
-    set_wire_signing_key(Vec::new());
+    set_test_signing_key(Vec::new());
 
     let unsigned = WireEnvelope { mac: None, ..env };
     let whole = crate::common::encode_postcard(&unsigned).unwrap();
-    let oneshot = crate::common::payload::wire_mac(&key, &whole).unwrap();
+    let oneshot = wire_mac(&key, &whole).unwrap();
     assert_eq!(
         wrapped_mac, oneshot,
         "segment-assembled MAC input must equal one-shot unsigned serialization"

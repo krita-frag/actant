@@ -908,3 +908,44 @@ fn bootstrap_nodes_endpoint_ids_join_gossip_bootstrap() {
         merged_gossip_bootstrap_peers(&[key.public().to_string()], std::slice::from_ref(&addr));
     assert_eq!(merged.len(), 1);
 }
+
+/// 超过 `max_message_size` 的广播在发送侧快速失败——否则会被所有接收方
+/// 静默丢弃（`inc_gossip_updates_dropped`）而发送方拿到 `Ok`。
+///
+/// 判别力：移除 `broadcast` 入口的尺寸预检后，小上限 + 小消息仍走
+/// iroh 层成功，本用例红。
+#[tokio::test]
+async fn broadcast_oversized_message_fails_fast() {
+    let config = NetworkConfig {
+        discovery_mode: crate::common::DiscoveryMode::parse(discovery_mode::NONE).unwrap(),
+        listen_ip: "127.0.0.1".into(),
+        listen_port: 0,
+        max_message_size: 1024,
+        direct_request_timeout_ms: 100,
+        ..NetworkConfig::default()
+    };
+
+    let manager = NetworkManager::new(NodeId::from("test-bcast-big"), config)
+        .await
+        .expect("create manager");
+
+    manager.subscribe("oversized-topic").await.unwrap();
+
+    // 超上限：发送前拒绝，错误信息指明上限。
+    let oversized = vec![0u8; 2048];
+    let err = manager
+        .broadcast("oversized-topic", oversized)
+        .await
+        .expect_err("oversized broadcast must fail fast");
+    assert!(
+        err.to_string().contains("max_message_size"),
+        "error must name the limit: {err}"
+    );
+
+    // 上限内：仍然成功（防止预检误伤正常路径）。
+    let within = vec![1u8; 512];
+    manager
+        .broadcast("oversized-topic", within)
+        .await
+        .expect("broadcast within limit must succeed");
+}

@@ -267,3 +267,30 @@ def test_list_workflows_unstarted_raises() -> None:
         rt.list_workflows(include_archived=True)
 
 
+
+
+def test_aio_ctx_sleep_timeout_ms_bounds_wait() -> None:
+    """``ctx.sleep`` 的 ``timeout_ms`` 上界先于 ``seconds`` 生效。
+
+    判别力：移除 ``timeout_ms or state.timeout_ms`` 的上界传播（退回仅
+    workflow deadline 兜底）后，本用例须等满 ``seconds``（5s）才超时，
+    耗时断言即红——证明参数真正到达 park 上界。
+    """
+    import asyncio
+
+    from actant import aio
+
+    @aio.flow(name="ctx-sleep-bound")
+    async def sleeper(ctx: Any) -> None:
+        await ctx.sleep(5.0, timeout_ms=80)
+
+    with Runtime() as rt:
+        rt.start()
+        try:
+            start = time.monotonic()
+            with pytest.raises(ActantTimeoutError):
+                asyncio.run(sleeper())
+            elapsed = time.monotonic() - start
+        finally:
+            rt.stop()
+    assert elapsed < 3.0, f"expected ~80ms timeout, took {elapsed:.1f}s"

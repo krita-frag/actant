@@ -35,8 +35,10 @@ jobs:
 
       - uses: astral-sh/setup-uv@v5
 
+      # dev 是默认依赖组，`uv sync` 即安装；文档工具链属于 docs 组，
+      # 只有本 job 需要（末尾的 mkdocs build --strict）。
       - name: Sync Python 依赖
-        run: uv sync --extra dev
+        run: uv sync --group docs
 
       - name: 构建 PyO3 扩展（maturin develop）
         run: uv run maturin develop
@@ -167,7 +169,7 @@ jobs:
         run: cargo test --lib --no-default-features
 
       - name: Sync Python 依赖
-        run: uv sync --extra dev
+        run: uv sync
 
       - name: 构建 PyO3 扩展（maturin develop）
         run: uv run maturin develop

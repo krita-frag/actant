@@ -19,8 +19,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::common::{
-    ActantError, ActorMessage, ActorMessageResult, NodeId, OrchestratorClaim, Result,
-    TaskDefinition, TaskId, WorkflowId, WorkflowInvocation,
+    ActantError, ActorMessage, ActorMessageResult, OrchestratorClaim, Result, TaskDefinition,
+    TaskId, WorkflowId, WorkflowInvocation,
 };
 use crate::runtime::actor::Actor;
 use crate::runtime::workflow::messaging::{decode, encode, ok_result, payload_result};
@@ -42,7 +42,7 @@ pub const WORKFLOW_ACTOR_TYPE: &str = "WorkflowActor";
 /// 调用方据此决定后续动作：本地完成通道取完成响应；结果回灌路径取重试
 /// 任务（入队调度器）或终局/忽略标志（是否向提交方发布结果事件）。
 enum TaskResultIngest {
-    /// 任务完成且未被 fencing 拒绝：legacy `COMPLETE_TASK` 消息的响应载荷。
+    /// 任务完成且未被 fencing 拒绝：本地 `COMPLETE_TASK` 消息通道的响应载荷。
     Completed(TaskCompletionResponse),
     /// orchestrator 驱动重试：调用方须把任务入队调度器（延迟 `1` 毫秒）。
     Retry(Box<TaskDefinition>, u64),
@@ -74,9 +74,8 @@ pub enum TaskResultVerdict {
 
 /// 任务终态结果载荷：[`WorkflowActor::on_task_result`] 唯一入口的 `outcome` 参数。
 ///
-/// 由三条结果回灌路径统一构造：本地完成通道（legacy `COMPLETE_TASK`
-/// 消息）、远端 TaskResult 直连（network_router）、gossip 状态
-/// 同步（DagGossip apply_remote_update）。
+/// 由两条结果回灌路径统一构造：本地完成通道（`COMPLETE_TASK`
+/// 消息）与远端 TaskResult 直连（network_router）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TaskResultOutcome {
     Completed(Vec<u8>),
@@ -89,12 +88,10 @@ pub enum TaskResultOutcome {
 /// failure_strategy）决定。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResultSource {
-    /// 本节点产生（flow 本地回灌，legacy `COMPLETE_TASK` 消息）。
+    /// 本节点产生（flow 本地回灌，`COMPLETE_TASK` 消息通道）。
     Local,
     /// 执行节点经 TaskResult 直连回传（network_router）。
     Remote,
-    /// gossip DAG 状态同步（DagGossip apply_remote_update）。
-    Gossip,
 }
 
 /// WorkflowActor 支持的方法名。
@@ -166,16 +163,19 @@ impl WorkflowActor {
 
     /// 任务结果回灌唯一入口。
     ///
-    /// 三条路径（本地完成通道 / 远端 TaskResult 直连 / gossip 状态同步）全部
-    /// 收敛于此：attempt fencing、失败语义（FailureScope）决策、终态推进均在
-    /// 此处统一定夺，调用方不再各自决定。
+    /// 两条路径（本地完成通道 / 远端 TaskResult 直连）全部收敛于此：
+    /// attempt fencing、失败语义（FailureScope）决策、终态推进均在此处
+    /// 统一定夺，调用方不再各自决定。gossip 不复制任务结果——它只传工作流
+    /// 快照，结果唯一权威来源是执行方的这次回灌。
     ///
     /// - **attempt fencing**：`attempt` 为结果所属派发代数。入口先经
     ///   `Orchestrator::result_attempt_accepted` 做唯一接受决策，过期代数的
-    ///   结果直接丢弃（返回 `Settled`，不推进状态、不发事件）。wire 协议
-    ///   尚未携带派发代数，三条路径当前均传 `None`（fencing 放行），协议
-    ///   扩展后无需改动入口签名。DAG 写入方法内部的 fencing 校验保留为防
-    ///   绕过的最终防线（recover / 重派发等不经本入口的写入路径）。
+    ///   结果直接丢弃（返回 `Settled`，不推进状态、不发事件）。两条回灌路径
+    ///   都必须携带派发代数：本地完成通道与 Python 上报取 `TaskDefinition` /
+    ///   结果事件的 attempt，远端直连取 `DirectRequest::TaskResult.attempt`。
+    ///   入口参数是**必填**的 u32，
+    ///   没有「传 None 即放行」的旁路。DAG 写入方法内部的 fencing 校验保留为
+    ///   防绕过的最终防线（recover 重放不经本入口，按 `None` 跳过校验）。
     ///
     /// - **失败语义统一裁决**：失败先经 `Orchestrator::handle_task_failure`
     ///   做重试裁决（节点 RetryPolicy 有余量 → 重置任务并返回重派发
@@ -192,7 +192,7 @@ impl WorkflowActor {
     /// - `source` 仅用于日志与指标，不影响状态语义。
     ///
     /// 返回 `TaskResultIngest::Completed` 仅当 outcome 为 `Completed` 且未被
-    /// fencing 拒绝（legacy `COMPLETE_TASK` 消息的响应载荷）；重试裁决返回
+    /// fencing 拒绝（本地 `COMPLETE_TASK` 消息通道的响应载荷）；重试裁决返回
     /// `Retry`；终局失败返回 `FinalFailure`；被忽略的迟到重复失败返回
     /// `Ignored`；其余（取消入账 / fencing 拒绝 / 淘汰守卫）返回 `Settled`。
     async fn on_task_result(
@@ -200,7 +200,7 @@ impl WorkflowActor {
         workflow_id: &WorkflowId,
         task_id: &TaskId,
         outcome: TaskResultOutcome,
-        attempt: Option<u32>,
+        attempt: u32,
         source: ResultSource,
     ) -> Result<TaskResultIngest> {
         tracing::debug!(
@@ -239,7 +239,7 @@ impl WorkflowActor {
             TaskResultOutcome::Completed(result) => {
                 let (ready, workflow_terminal) = self
                     .orchestrator
-                    .on_task_completed(workflow_id, task_id, result)
+                    .on_task_completed(workflow_id, task_id, result, Some(attempt))
                     .await?;
                 Ok(TaskResultIngest::Completed(TaskCompletionResponse {
                     workflow_terminal,
@@ -249,7 +249,7 @@ impl WorkflowActor {
             TaskResultOutcome::Failed(error) => {
                 match self
                     .orchestrator
-                    .handle_task_failure(workflow_id, task_id, error)
+                    .handle_task_failure(workflow_id, task_id, error, Some(attempt))
                     .await?
                 {
                     crate::runtime::workflow::FailureOutcome::Retry(task, delay_ms) => {
@@ -319,6 +319,18 @@ impl Actor for WorkflowActor {
             workflow_methods::SUBMIT => {
                 let (workflow_id, dag, invocation): (WorkflowId, Dag, Option<WorkflowInvocation>) =
                     decode(&msg.payload)?;
+                // actor 协议只承载「空 DAG 外壳 + 逐节点 ADD_NODE」的增量提交
+                // （Python 生产路径）。整图提交是 Rust 嵌入方的直连路径
+                // （`Orchestrator::submit` + `start`，不经 actor）：START 消息
+                // 已随协议收敛删除，此处若静默登记整图，工作流会停在 Pending
+                // 且无人派发、重启后才被 recover 捡起——显式拒绝而非无声空档。
+                if dag.node_count() > 0 {
+                    return Err(crate::common::ActantError::InvalidState(format!(
+                        "actor SUBMIT only accepts an empty workflow shell, workflow {} carries {} node(s); full-DAG submission is the direct-embedder path (Orchestrator::submit + start)",
+                        workflow_id.as_str(),
+                        dag.node_count()
+                    )));
+                }
                 self.orchestrator
                     .submit_with_invocation(workflow_id, dag, invocation)
                     .await?;
@@ -331,13 +343,21 @@ impl Actor for WorkflowActor {
                     u64,
                     Option<WorkflowInvocation>,
                 ) = decode(&msg.payload)?;
+                // 与 SUBMIT 同契约：拒绝非空 DAG（见上）。
+                if dag.node_count() > 0 {
+                    return Err(crate::common::ActantError::InvalidState(format!(
+                        "actor SUBMIT_WITH_TIMEOUT only accepts an empty workflow shell, workflow {} carries {} node(s); full-DAG submission is the direct-embedder path (Orchestrator::submit + start)",
+                        workflow_id.as_str(),
+                        dag.node_count()
+                    )));
+                }
                 self.orchestrator
                     .submit_with_timeout_and_invocation(workflow_id, dag, timeout_ms, invocation)
                     .await?;
                 Ok(ok_result(msg_id))
             }
             workflow_methods::COMPLETE_TASK => {
-                let (workflow_id, task_id, result): (WorkflowId, TaskId, Vec<u8>) =
+                let (workflow_id, task_id, result, attempt): (WorkflowId, TaskId, Vec<u8>, u32) =
                     decode(&msg.payload)?;
                 // 本地完成通道：经唯一入口回灌。fencing 拒绝或非完成结果时
                 // 返回空响应（与拒绝路径的响应形状一致）。
@@ -346,7 +366,7 @@ impl Actor for WorkflowActor {
                         &workflow_id,
                         &task_id,
                         TaskResultOutcome::Completed(result),
-                        None,
+                        attempt,
                         ResultSource::Local,
                     )
                     .await?
@@ -385,7 +405,7 @@ impl Actor for WorkflowActor {
                     WorkflowId,
                     TaskId,
                     TaskResultOutcome,
-                    Option<u32>,
+                    u32,
                     ResultSource,
                 ) = decode(&msg.payload)?;
                 // 三态裁决随响应返回：Retry 由调用方入队调度器（gossip 路径
@@ -575,10 +595,9 @@ pub mod scheduler_methods {
     pub const DEQUEUE: &str = "dequeue";
     pub const DEQUEUE_BATCH: &str = "dequeue_batch";
     pub const TRY_DEQUEUE: &str = "try_dequeue";
-    pub const LEN: &str = "len";
-    pub const IS_EMPTY: &str = "is_empty";
     pub const CLOSE: &str = "close";
-    pub const IS_CLOSED: &str = "is_closed";
+    /// 撤销某工作流尚未出队的任务（见 [`Scheduler::remove_workflow_tasks`]）。
+    pub const REMOVE_WORKFLOW_TASKS: &str = "remove_workflow_tasks";
 }
 
 /// 调度器内部队列状态。
@@ -609,7 +628,14 @@ pub(crate) enum InnerScheduler {
     },
     /// 注入缝：使用者提供的调度策略实现。所有操作转发给该实现——
     /// fast-path enqueue（SharedInner 直调）与 Actor 消息路径行为一致。
-    External(Arc<dyn crate::runtime::workflow::Scheduler>),
+    ///
+    /// 仍持有共享的 `notify`：外部实现只负责队列，唤醒语义必须由本层补齐。
+    /// 否则 Worker 等待 `notify.notified()` 时，enqueue 转发成功后永远不会
+    /// 唤醒消费者，只能靠主循环的 1s 租约检查兜底（吞吐被压成 1 次/秒）。
+    External {
+        scheduler: Arc<dyn crate::runtime::workflow::Scheduler>,
+        notify: Arc<tokio::sync::Notify>,
+    },
 }
 
 impl InnerScheduler {
@@ -666,7 +692,7 @@ impl InnerScheduler {
                 max_queued,
                 ..
             } => (Arc::clone(notify), closed, *max_queued),
-            Self::External(_) => {
+            Self::External { .. } => {
                 return; // 外部实现的策略由实现方持有，切换 no-op
             }
         };
@@ -680,13 +706,22 @@ impl InnerScheduler {
         };
     }
 
+    /// 入队唤醒信号（三种实现共用）。
+    pub(crate) fn notify(&self) -> &Arc<tokio::sync::Notify> {
+        match self {
+            Self::Fifo { notify, .. }
+            | Self::Priority { notify, .. }
+            | Self::External { notify, .. } => notify,
+        }
+    }
+
     pub(crate) fn is_closed(&self) -> bool {
         use std::sync::atomic::Ordering;
         match self {
             Self::Fifo { closed, .. } | Self::Priority { closed, .. } => {
                 closed.load(Ordering::Acquire)
             }
-            Self::External(scheduler) => scheduler.is_closed(),
+            Self::External { scheduler, .. } => scheduler.is_closed(),
         }
     }
 
@@ -697,11 +732,18 @@ impl InnerScheduler {
                 closed.store(true, Ordering::Release);
                 notify.notify_waiters();
             }
-            Self::External(scheduler) => scheduler.close(),
+            Self::External { scheduler, notify } => {
+                scheduler.close();
+                // 外部实现的 close 不认识本层的 notify：显式唤醒等待者，
+                // 否则 dequeue 循环会一直挂在 notified() 上。
+                notify.notify_waiters();
+            }
         }
     }
 
     pub(crate) async fn enqueue(&self, mut task: TaskDefinition) -> Result<()> {
+        // 统一在分发前打时间戳：外部实现（注入缝）不会自己设置，队列延迟
+        // 指标会恒为 0。
         task.enqueued_at_ms = crate::common::epoch_millis();
         match self {
             Self::Fifo {
@@ -759,18 +801,23 @@ impl InnerScheduler {
             }
             // 外部调度器是 async：在 async 调用链内直接 await，绝不
             // 在 tokio worker/Actor 任务里 block_on（会阻塞运行时线程）。
-            Self::External(scheduler) => {
+            Self::External { scheduler, notify } => {
                 scheduler.enqueue(task).await?;
+                notify.notify_one();
             }
         }
         Ok(())
     }
 
-    pub(crate) async fn enqueue_batch(&self, tasks: Vec<TaskDefinition>) -> Result<()> {
+    pub(crate) async fn enqueue_batch(&self, mut tasks: Vec<TaskDefinition>) -> Result<()> {
         if tasks.is_empty() {
             return Ok(());
         }
+        // 同 `enqueue`：时间戳在分发前统一设置。
         let now_ms = crate::common::epoch_millis();
+        for task in &mut tasks {
+            task.enqueued_at_ms = now_ms;
+        }
         match self {
             Self::Fifo {
                 queue,
@@ -794,8 +841,7 @@ impl InnerScheduler {
                         tasks.len()
                     )));
                 }
-                for mut task in tasks {
-                    task.enqueued_at_ms = now_ms;
+                for task in tasks {
                     q.push_back(task);
                 }
                 drop(q);
@@ -821,16 +867,16 @@ impl InnerScheduler {
                         tasks.len()
                     )));
                 }
-                for mut task in tasks {
-                    task.enqueued_at_ms = now_ms;
+                for task in tasks {
                     let key = std::cmp::Reverse(task.priority);
                     qs.entry(key).or_default().push_back(task);
                 }
                 drop(qs);
                 notify.notify_one();
             }
-            Self::External(scheduler) => {
+            Self::External { scheduler, notify } => {
                 scheduler.enqueue_batch(tasks).await?;
+                notify.notify_one();
             }
         }
         Ok(())
@@ -855,22 +901,18 @@ impl InnerScheduler {
                     qs.retain(|_, q| !q.is_empty());
                     task
                 }
-                Self::External(scheduler) => scheduler.dequeue().await,
+                Self::External { scheduler, .. } => scheduler.dequeue().await,
             };
             if task.is_some() {
                 return task;
             }
             if self.is_closed() {
-                // External 的 close 语义由实现方持有，无本地 notify 唤醒。
-                if let Self::Fifo { notify, .. } | Self::Priority { notify, .. } = self {
-                    notify.notify_waiters();
-                }
+                self.notify().notify_waiters();
                 return None;
             }
-            if let Self::Fifo { notify, .. } | Self::Priority { notify, .. } = self {
-                notify.notified().await;
-            }
-            // External：dequeue().await 由本循环顶部完成等待，无需 Notify。
+            // 三种实现都靠共享 notify 等待：External 的 `dequeue` 可能是不阻塞的
+            // 实现（立即返回 None），只靠循环重试会忙轮询。
+            self.notify().notified().await;
         }
     }
 
@@ -883,13 +925,13 @@ impl InnerScheduler {
                 qs.retain(|_, q| !q.is_empty());
                 task
             }
-            Self::External(scheduler) => scheduler.try_dequeue().await,
+            Self::External { scheduler, .. } => scheduler.try_dequeue().await,
         }
     }
 
     pub(crate) async fn dequeue_batch(&self, limit: usize) -> Vec<TaskDefinition> {
         match self {
-            Self::External(scheduler) => scheduler.dequeue_batch(limit).await,
+            Self::External { scheduler, .. } => scheduler.dequeue_batch(limit).await,
             Self::Fifo { queue, .. } => {
                 let mut q = queue.lock();
                 let count = limit.min(q.len());
@@ -919,19 +961,31 @@ impl InnerScheduler {
         }
     }
 
-    async fn len(&self) -> usize {
+    /// 撤销某工作流尚未出队的任务，返回移除数量。
+    ///
+    /// 只做队列过滤：不发终态事件、不重排、不重试——工作流已归对端所有，
+    /// 撤销的任务由对端重新派发。已出队（`inflight` / 执行中）的任务由
+    /// 派发前的租约所有权校验拦截。
+    pub(crate) async fn remove_workflow_tasks(&self, workflow_id: &WorkflowId) -> usize {
         match self {
-            Self::Fifo { queue, .. } => queue.lock().len(),
-            Self::Priority { queues, .. } => queues.lock().values().map(|q| q.len()).sum(),
-            Self::External(scheduler) => scheduler.len().await,
-        }
-    }
-
-    async fn is_empty(&self) -> bool {
-        match self {
-            Self::Fifo { queue, .. } => queue.lock().is_empty(),
-            Self::Priority { queues, .. } => queues.lock().values().all(|q| q.is_empty()),
-            Self::External(scheduler) => scheduler.is_empty().await,
+            Self::Fifo { queue, .. } => {
+                let mut q = queue.lock();
+                let before = q.len();
+                q.retain(|task| task.workflow_id.as_ref() != Some(workflow_id));
+                before - q.len()
+            }
+            Self::Priority { queues, .. } => {
+                let mut qs = queues.lock();
+                let mut removed = 0;
+                for q in qs.values_mut() {
+                    let before = q.len();
+                    q.retain(|task| task.workflow_id.as_ref() != Some(workflow_id));
+                    removed += before - q.len();
+                }
+                qs.retain(|_, q| !q.is_empty());
+                removed
+            }
+            Self::External { scheduler, .. } => scheduler.remove_workflow_tasks(workflow_id).await,
         }
     }
 }
@@ -989,7 +1043,13 @@ impl SchedulerActor {
                     .into(),
             )
         })?;
-        *inner = InnerScheduler::External(scheduler);
+        let notify = match inner {
+            InnerScheduler::Fifo { notify, .. } | InnerScheduler::Priority { notify, .. } => {
+                Arc::clone(notify)
+            }
+            InnerScheduler::External { notify, .. } => Arc::clone(notify),
+        };
+        *inner = InnerScheduler::External { scheduler, notify };
         Ok(self)
     }
 
@@ -1047,10 +1107,9 @@ impl Actor for SchedulerActor {
             scheduler_methods::ENQUEUE => {
                 let task: TaskDefinition = decode(&msg.payload)?;
                 self.inner.enqueue(task).await?;
-                // 信号驱动唤醒 Worker：通过 Notify 触发唤醒信号，
-                // 正在 .notified().await 的 Worker 立即被唤醒拉取任务。
-                // notify_waiters() 无队列无丢弃——信号仅唤醒当前等待者，
-                // 无等待者时信号丢失但不影响正确性（Worker 下次 try_dequeue 仍会拉取）。
+                // 入队已在 `InnerScheduler::enqueue` 内 `notify_one()` 唤醒
+                // 一个 Worker：`Notify` 在无等待者时保留一个许可，因此
+                // 「入队后 Worker 才进入 notified()」不会丢唤醒。此处不再重复通知。
                 Ok(ok_result(msg_id))
             }
             scheduler_methods::ENQUEUE_BATCH => {
@@ -1077,23 +1136,16 @@ impl Actor for SchedulerActor {
                 let task = self.inner.try_dequeue().await;
                 Ok(payload_result(msg_id, encode(&task)?))
             }
-            scheduler_methods::LEN => {
-                let len = self.inner.len().await;
-                Ok(payload_result(msg_id, encode(&len)?))
-            }
-            scheduler_methods::IS_EMPTY => {
-                let empty = self.inner.is_empty().await;
-                Ok(payload_result(msg_id, encode(&empty)?))
+            scheduler_methods::REMOVE_WORKFLOW_TASKS => {
+                let workflow_id: WorkflowId = decode(&msg.payload)?;
+                let removed = self.inner.remove_workflow_tasks(&workflow_id).await;
+                Ok(payload_result(msg_id, encode(&removed)?))
             }
             scheduler_methods::CLOSE => {
                 self.inner.close();
                 // close 后发布事件，唤醒等待的 Worker 使其 try_dequeue
                 // 得到 None 并退出主循环。
                 Ok(ok_result(msg_id))
-            }
-            scheduler_methods::IS_CLOSED => {
-                let closed = self.inner.is_closed();
-                Ok(payload_result(msg_id, encode(&closed)?))
             }
             other => Err(ActantError::Actor(format!(
                 "SchedulerActor: unknown method {}",
@@ -1109,7 +1161,6 @@ pub const FAILOVER_ACTOR_TYPE: &str = "FailoverActor";
 pub mod failover_methods {
     pub const SEND_HEARTBEAT: &str = "send_heartbeat";
     pub const GET_PEER_INFOS: &str = "get_peer_infos";
-    pub const CLAIM_WORKFLOW: &str = "claim_workflow";
     pub const HANDLE_CLAIM: &str = "handle_claim";
     pub const EXPIRE_STALE_PEERS: &str = "expire_stale_peers";
     pub const UPDATE_LOCAL_CAPACITY: &str = "update_local_capacity";
@@ -1149,19 +1200,6 @@ impl Actor for FailoverActor {
                 let peers = self.manager.get_peer_infos();
                 Ok(payload_result(msg_id, encode(&peers)?))
             }
-            failover_methods::CLAIM_WORKFLOW => {
-                let workflow_id: WorkflowId = decode(&msg.payload)?;
-                // 故障检测循环直接调用 `FailoverManager::claim_workflow`，
-                // 不经过本消息；此处是外部触发的单次 claim 入口，无人消费裁决，
-                // 记录后返回成功即可。
-                let outcome = self.manager.claim_workflow(&workflow_id).await?;
-                tracing::debug!(
-                    workflow = %workflow_id.0,
-                    ?outcome,
-                    "claim_workflow requested via actor"
-                );
-                Ok(ok_result(msg_id))
-            }
             failover_methods::HANDLE_CLAIM => {
                 let claim: OrchestratorClaim = decode(&msg.payload)?;
                 self.manager.handle_claim(&claim).await;
@@ -1188,17 +1226,13 @@ pub const DAG_GOSSIP_ACTOR_TYPE: &str = "DagGossipActor";
 
 /// DagGossipActor 支持的方法名。
 pub mod gossip_methods {
-    pub const BROADCAST_STATE_UPDATE: &str = "broadcast_state_update";
-    pub const BROADCAST_TASK_RUNNING: &str = "broadcast_task_running";
-    pub const APPLY_REMOTE_UPDATE: &str = "apply_remote_update";
     pub const BROADCAST_HEADS: &str = "broadcast_heads";
     pub const HANDLE_HEADS_EXCHANGE: &str = "handle_heads_exchange";
-    pub const REQUEST_WORKFLOW_STATE: &str = "request_workflow_state";
     pub const HANDLE_WORKFLOW_STATE_REQUEST: &str = "handle_workflow_state_request";
     pub const HANDLE_WORKFLOW_STATE_RESPONSE: &str = "handle_workflow_state_response";
 }
 
-/// 封装 [`DagGossip`] 的 Actor，负责 DAG 状态的 Gossip 同步。
+/// 封装 [`DagGossip`] 的 Actor：周期性广播 heads、应答全量状态请求、落地对端快照。
 pub struct DagGossipActor {
     gossip: DagGossip,
     heads_broadcast_cancel: Option<tokio::sync::watch::Sender<bool>>,
@@ -1278,29 +1312,6 @@ impl Actor for DagGossipActor {
     async fn handle_message(&mut self, msg: ActorMessage) -> Result<ActorMessageResult> {
         let msg_id = msg.id.clone();
         match msg.method.as_str() {
-            gossip_methods::BROADCAST_STATE_UPDATE => {
-                let (workflow_id, task_id, task_state): (
-                    WorkflowId,
-                    TaskId,
-                    crate::common::WireTaskState,
-                ) = decode(&msg.payload)?;
-                self.gossip
-                    .broadcast_update(&workflow_id, &task_id, task_state)
-                    .await?;
-                Ok(ok_result(msg_id))
-            }
-            gossip_methods::BROADCAST_TASK_RUNNING => {
-                let (workflow_id, task_id): (WorkflowId, TaskId) = decode(&msg.payload)?;
-                self.gossip
-                    .broadcast_task_running(&workflow_id, &task_id)
-                    .await?;
-                Ok(ok_result(msg_id))
-            }
-            gossip_methods::APPLY_REMOTE_UPDATE => {
-                let update: crate::common::WireDagStateUpdate = decode(&msg.payload)?;
-                self.gossip.apply_remote_update(update).await?;
-                Ok(ok_result(msg_id))
-            }
             gossip_methods::BROADCAST_HEADS => {
                 self.gossip.broadcast_heads().await?;
                 self.gossip.retry_pending_state_requests().await;
@@ -1309,13 +1320,6 @@ impl Actor for DagGossipActor {
             gossip_methods::HANDLE_HEADS_EXCHANGE => {
                 let exchange: crate::common::HeadsExchange = decode(&msg.payload)?;
                 self.gossip.handle_heads_exchange(&exchange).await?;
-                Ok(ok_result(msg_id))
-            }
-            gossip_methods::REQUEST_WORKFLOW_STATE => {
-                let (workflow_id, target_node): (WorkflowId, NodeId) = decode(&msg.payload)?;
-                self.gossip
-                    .request_workflow_state(&workflow_id, &target_node)
-                    .await?;
                 Ok(ok_result(msg_id))
             }
             gossip_methods::HANDLE_WORKFLOW_STATE_REQUEST => {

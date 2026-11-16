@@ -33,6 +33,8 @@ pub enum TaskLifecycleEvent {
     TaskStarted {
         workflow_id: WorkflowId,
         task_id: TaskId,
+        /// 本次执行的派发代数，与随后的终态事件一致。
+        attempt: u32,
     },
     TaskCompleted(TaskCompletion),
     TaskFailed(TaskCompletion),

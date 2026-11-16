@@ -44,7 +44,7 @@ jobs:
           enable-cache: true
 
       - name: Sync Python 依赖
-        run: uv sync --extra dev
+        run: uv sync
 
       - name: 构建 PyO3 扩展（maturin develop）
         run: uv run maturin develop

@@ -23,13 +23,42 @@
 
 ### 变更
 
-- **journal 事件集合扩展（schema 2）**：尾部追加 `nodes_sealed` /
-  `deadline_set` / `evicted` / `started_at` 四种事件，`JOURNAL_SCHEMA_VERSION`
-  升至 2。`get_workflow_history` / `get_workflow_journal` 的 `kind` 取值集合
+- **blob 拉取的停滞防护**：`BlobFetch::next_chunk` 的单次等待受 `idle_timeout`
+  （生产装配取 `direct_request_timeout`）约束——provider 在 size 头之后停滞不发
+  也不 FIN 时，调用方拿到 `Err(Timeout)`，不再依赖 QUIC idle timeout 兜底
+  （时长不可配置且远大于请求超时，恢复流程的取值路径会被拖住）。`Stream`
+  实现仍是无界直通，走 `Stream` 的消费者需自行处理停滞。
+- **gossip 广播发送侧尺寸预检**：超过 `max_message_size` 的 `broadcast` 在发送前
+  直接 `Err`（错误信息指明上限）。此前超限消息被所有接收方在入口静默丢弃
+  （`inc_gossip_updates_dropped`）而发送方拿到 `Ok`，一旦有新发送者即静默故障。
+- **`max_message_size` 语义澄清**：配置 doc 显式声明它只是传输帧层上限，有效
+  消息上限受 `MAX_DECODE_SIZE`（4 MiB）约束，调大不解除；超 4 MiB 载荷应走
+  blob 通道（独立 ALPN，不受此约束）。
+- **注入外部 Scheduler 时补上入队唤醒**：`InnerScheduler::External` 现在保留
+  `with_notify` 建立的共享 `Notify`，`enqueue` / `enqueue_batch` 转发成功后
+  `notify_one()`、`close` 时 `notify_waiters()`，`dequeue` 三种实现统一等待同一信号。
+  此前注入外部调度器会让 Worker 失去事件驱动唤醒，只能靠 1s 轮询兜底；不阻塞的
+  外部 `dequeue` 还会忙轮询。`SchedulerActor` 的 `IS_CLOSED` 消息与
+  `ActorScheduler::join`（均无调用者）一并删除。
+
+- **移除逐任务状态 gossip（`DagStateUpdate`）**：`actant:dag-state` 话题、
+  `WireDagStateUpdate` / `WireTaskState`、`WireMessage::DagStateUpdate`、
+  `DagGossip::apply_remote_update` / `broadcast_update` 及其去重表（`seen`）与
+  状态优先级合并全部删除——这条链没有生产发送者，是一套只能由运行旧代码的
+  对端触发的死路径。工作流状态复制改由**快照**一条通道承担：`actant:heads`
+  周期广播 + `actant:wf-state-req`/`wf-state-resp` 拉取全量状态。任务结果
+  原本就走直连 `TaskResult`，唯一权威来源不变。**不向后兼容**：
+  `WireMessage` 变体序号随之变化，新旧节点不能混跑。`_GossipConfig` 只剩
+  `heads_broadcast_interval_ms`（`dedup_window_size` / `dedup_ttl_secs` /
+  `retry_attempts` / `retry_base_delay_ms` 随该链路一并删除）。
+
+- **journal 事件集合扩展**：尾部追加 `nodes_sealed` /
+  `deadline_set` / `evicted` / `started_at` 四种事件。
+  `get_workflow_history` / `get_workflow_journal` 的 `kind` 取值集合
   随之扩大，跨语言消费方须容忍未知 kind；`evicted` 可能出现在终态事件之后，
   故 journal 末条不再是稳定的终态事件。前三种用于恢复期区分「已淘汰」与
   「快照落盘前崩溃」、重建封口与 deadline；`started_at` 使工作流级硬超时
-  跨重启不重新计时。**不向后兼容**：schema 1 journal 不被恢复语义支持，
+  跨重启不重新计时。**不向后兼容**：旧 journal 不被恢复语义支持，
   存在历史数据时升级前必须重建（见 `docs/architecture/recovery.md`）。
 
 - **`EventLog` trait 新增 `hide_topic`**：把 topic 从 `list_topics` 中隐藏但
@@ -38,7 +67,64 @@
   `get_workflow_journal` 仍返回完整历史；同 id 重用时下一次追加会让 topic
   自动重新可见。
 
+- **删除兼容层（无迁移路径）**：`EventLog` 不再对缺序号元数据的存量 topic 做
+  启动期全量扫描迁移；store 打开时若库非空且缺 `meta:fmt_version`，直接拒绝
+  启动而不是认领为当前版本——未知布局只会在恢复期以「工作流被当作 corrupt
+  清除」的形式丢数据。`EventLog::append_batch` 取消非原子的默认实现（新实现
+  必须自己保证单事务），`Dag` / `TaskState` / `WorkflowExecution` 上的
+  `#[serde(default)]` 一并删除：持久化走 rkyv，serde 缺省对归档字节不生效，
+  只制造「能读旧快照」的错觉。
+
 ### 缺陷修复
+
+- **worker 崩溃类失败保持 `[actant:worker]` kind**：`build_completion_from_dispatch_result`
+  原先对除 Timeout / Cancelled 之外的所有错误统一标 `task`，包括 `ActantError::Worker`
+  （worker 进程崩溃、崩溃重路由预算耗尽）。Python 侧按 kind 前缀重建异常子类，
+  于是同一类「执行进程死了」的失败在两条路径上给出不同异常：本地派发得到
+  `TaskError`，执行节点失联（`fail_outbound_tasks_to`）得到 `WorkerError`。
+  现在按错误变体映射：`Worker` → `worker`，其余 → `task`。
+
+- **结果回灌的传输失败改为重试**：`report_task_result` 由 Python 结果泵调用，泵已把
+  事件出队——上报失败没有第二条路径再送一次，工作流节点会永久停在 `Running`
+  （Python 侧只记一条 warning 并照常终结句柄）。现在 actor 调用失败按 100ms 起
+  指数退避重试 3 次；actor 明确拒绝（工作流已终态 / 已淘汰 / 路由错误）仍立即返回。
+
+- **重试裁决的入队复用统一重试路径**：`report_task_result` 拿到 `Retry` 裁决后只
+  `enqueue` 一次，失败仅记日志——调度器 drain 或队列满时重试任务凭空消失、句柄
+  永久等待。改用 `enqueue_with_retry`（3 次退避），与远端结果路径一致。
+
+- **结果投递重试配置收敛**：`WorkerConfig::broadcast_retry_attempts` 实际只影响一条
+  日志（重试按设计不设放弃阈值），`broadcast_retry_base_delay_ms` 驱动的也是结果
+  投递而非广播（广播重试路径已随逐任务 gossip 删除）。删除前者，后者改名
+  `result_retry_base_delay_ms`；「长期投不出去」的告警阈值改为内部常量。
+
+- **让位时执行层一并退**：收到对端的 `OrchestratorClaim` 后，本节点此前只摘编排
+  状态（`remove_active_workflow`），排队中的任务仍会被 Worker 取出执行——副作用在
+  新旧两个主上各发生一次，而完成回灌时 slot 已删、结果被静默丢弃。现在让位同时
+  调 `Scheduler::remove_workflow_tasks(workflow_id)` 撤销本地排队任务，并在派发前
+  加唯一闸口 `FailoverManager::dispatch_permitted`（判据只有租约归属：无租约放行、
+  自持放行、对端持有丢弃），兜住已经出队（`inflight`/等槽位）那部分。丢弃不结算：
+  工作流已归对端，对端会重新派发；发 `Failed`/`Cancelled` 只会让已经不是 origin 的
+  本节点触发无谓的重试裁决。新增 `actant.tasks.relinquished` 与
+  `actant.failover.relinquished_tasks` 计数。`Scheduler` trait 因此增加一个必需方法
+  （外部实现须补）。
+
+- **执行节点失联时不再静默丢弃在途登记**：`fail_outbound_tasks_to` 在没有
+  `result_feed` 时先 `drain` 再 `continue`，登记被移除而任务从未结算——origin 的
+  编排任务永久停在 `Running`（没有终态事件、没有重试）。改为把登记放回表里并记
+  一条 error，下一轮再试。
+
+- **等待点与信号改为先落内存、后写历史**：flush 在序列化快照**之前**读取事件
+  水位，而 `register_wait_point` / `buffer_signal` 原先先追加事件再改内存表，
+  会产出「水位已吸收该事件、快照却没有它」的组合。崩溃恢复只重放水位之后的
+  事件，该等待点/先到信号因此永久丢失，阻塞其上的 flow 体永久 park（timer
+  扫描与 deadline 都看不到它）。事件追加同时移出 DashMap 分片写锁，避免持锁
+  做 LMDB 写。
+
+- **重放不可信的工作流整份丢弃**：恢复期读取失败或事件无法解码时，此前只记
+  warn 后跳过；而 `recover` 已把 Running 重置为 Pending，`recover_ready_tasks`
+  随后会把「其实已完成」的任务重新派发（重复副作用）。现在与槽位损坏同口径：
+  写墓碑 → 删快照 → 记 `Recovered{corrupt}` → 隐藏 topic。
 
 - **恢复期补齐水位与代际**：有快照但事件水位缺失时按最后一个 `Submitted`
   钉住重放起点，避免同 id 重用时旧代事件污染新 DAG；淘汰 topic 从
@@ -96,6 +182,18 @@
     `NetemRun.wait()` 现在会暴露故障注入失败，而不是让「未注入」被当作成功。
   - `_ActantConfig` 四个 workflow 配置项补上 Rust 默认值说明，并由
     `test_docs_contract.py` 与 `WorkflowConfig::default()` 绑定防漂移。
+
+### 新增
+
+- **`actant.ext` 新增 `PeerBeacon` / `Dialer`（LAN 内网节点发现）**：纯 Python
+  参考实现，Rust 核心零改动——`Dialer` 把发现源投喂的地址转化为 `rt.dial()`
+  （去重、按 `retry_interval_s` 退避重试至 `max_dial_attempts`、按
+  `reconnect_interval_s` 用 `rt.discover_peers()` 探测断线重连），任何来源
+  （组播信标、k8s API、中心登记服务、静态清单）都可投喂；`PeerBeacon` 用
+  UDP 组播周期广播 `listen_addresses()["endpoint_addr"]` 并监听对端信标。
+  适用于 n0/DNS 自动发现受阻的内网环境；与 CLI 的 `--discovery none` +
+  `--gossip-bootstrap-peers` 组合可完全脱离公网发现组件组网。
+  示例见 `examples/lan_discovery.py`。
 
 ## [0.4.0](https://github.com/actant/actant/compare/v0.3.5...v0.4.0) - 2026-11-12
 

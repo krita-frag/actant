@@ -50,34 +50,41 @@ impl Orchestrator {
             })
             .flatten();
 
-        let table = self
-            .state
-            .waitpoints
-            .entry(workflow_id.clone())
-            .or_default();
-        if table.contains_key(wait_key) {
-            // 幂等：同 wait_key 已注册 → 不重复追加事件、不改写条件。
-            // 缓冲已出队（若有）不回填：已注册的等待点按其自身状态为准。
-            return Ok(());
+        // 先落内存、后写历史。flush 在序列化快照**之前**读取事件水位，若事件
+        // 先入历史而等待点尚未插入，就会产出「水位已吸收该事件、快照不含该
+        // 等待点」的组合：崩溃恢复只重放水位之后的事件，该等待点永久丢失，
+        // 阻塞其上的 flow 体永久 park（timer 扫描与 deadline 都看不到它）。
+        {
+            let table = self
+                .state
+                .waitpoints
+                .entry(workflow_id.clone())
+                .or_default();
+            if table.contains_key(wait_key) {
+                // 幂等：同 wait_key 已注册 → 不重复追加事件、不改写条件。
+                // 缓冲已出队（若有）不回填：已注册的等待点按其自身状态为准。
+                return Ok(());
+            }
+            table.insert(
+                wait_key.to_string(),
+                WaitPoint {
+                    condition: condition.clone(),
+                    // 缓冲命中 → 直接生成为已唤醒态：历史里那条 `SignalReceived`
+                    // 早于本条 `WaitPointRegistered` 存在，重放会按同样
+                    // 顺序收敛到同一结果（"查历史——已收到 → 直接返回 payload"）。
+                    state: match buffered {
+                        Some(payload) => WaitPointState::Signaled { payload },
+                        None => WaitPointState::Waiting,
+                    },
+                },
+            );
         }
+        // 事件在守卫之外追加：append 是同步 LMDB 写，不应持分片写锁执行。
         self.log_event(JournalEvent::WaitPointRegistered {
             workflow_id: workflow_id.clone(),
             wait_key: wait_key.to_string(),
-            condition: condition.clone(),
+            condition,
         });
-        table.insert(
-            wait_key.to_string(),
-            WaitPoint {
-                condition,
-                // 缓冲命中 → 直接生成为已唤醒态：历史里那条 `SignalReceived`
-                // 早于本条 `WaitPointRegistered` 存在，重放会按同样
-                // 顺序收敛到同一结果（"查历史——已收到 → 直接返回 payload"）。
-                state: match buffered {
-                    Some(payload) => WaitPointState::Signaled { payload },
-                    None => WaitPointState::Waiting,
-                },
-            },
-        );
         self.state.mark_dirty(workflow_id);
         Ok(())
     }
@@ -183,16 +190,18 @@ impl Orchestrator {
         wait_key: &str,
         payload: Vec<u8>,
     ) -> Result<Option<Vec<u8>>> {
-        self.log_event(JournalEvent::SignalReceived {
-            workflow_id: workflow_id.clone(),
-            wait_key: wait_key.to_string(),
-            payload: payload.clone(),
-        });
+        // 与 `register_wait_point` 同一写序：先落缓冲、后写历史。否则水位可能
+        // 先吸收 `SignalReceived`，而快照里还没有这条缓冲信号。
         self.state
             .pending_signals
             .entry(workflow_id.clone())
             .or_default()
-            .insert(wait_key.to_string(), payload);
+            .insert(wait_key.to_string(), payload.clone());
+        self.log_event(JournalEvent::SignalReceived {
+            workflow_id: workflow_id.clone(),
+            wait_key: wait_key.to_string(),
+            payload,
+        });
         tracing::debug!(
             workflow = %workflow_id.as_str(),
             wait_key = %wait_key,

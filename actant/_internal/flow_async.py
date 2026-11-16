@@ -73,15 +73,22 @@ class AsyncFlowContext:
     - :meth:`submit` ↔ ``Task.submit``（节点先持久化再派发）。
     """
 
-    async def sleep(self, seconds: float) -> None:
+    async def sleep(self, seconds: float, *, timeout_ms: int = 0) -> None:
         """挂起指定秒数（``seconds`` 为非负数）。
 
         复用持久化 timer 等待点，键由**等待序号**决定（``timer-{n}``）。重放
         时若该等待点已到期，立即返回；否则等到原 deadline，不会重新计时。
 
+        Args:
+            seconds: 挂起秒数（非负）。
+            timeout_ms: 安全上界；``0`` 表示取 flow 自身的 ``timeout_ms``
+                （仍为 0 则不设上界）。与同步 ``sleep_until`` 的语义一致。
+
         Raises:
             ValueError: ``seconds`` 为负。
-            ActantTimeoutError: 工作流级 deadline 到期，或等待点被释放。
+            ActantTimeoutError: 上界内未被唤醒（含工作流级 deadline 到期），
+                或等待点被释放（工作流已终态，真实原因经
+                ``_raise_if_workflow_terminal`` 抛出）。
         """
         if seconds < 0:
             raise ValueError(f"ctx.sleep: seconds must be >= 0, got {seconds}")
@@ -94,10 +101,10 @@ class AsyncFlowContext:
             kind="timer",
             deadline_ms=deadline_ms,
         )
-        bound = state.timeout_ms
+        bound = timeout_ms or state.timeout_ms
         if await _park_payload_async(runtime, state.workflow_id, wait_key, bound_ms=bound) is None:
             raise ActantTimeoutError(
-                f"flow {state.workflow_id!r}: ctx.sleep({seconds}) was not woken up"
+                f"flow {state.workflow_id!r}: ctx.sleep({seconds}) 在 {bound}ms 内未被唤醒"
             )
 
     async def wait_signal(

@@ -37,82 +37,6 @@ fn make_message(kind: EffectKind, payload: &str) -> ActorMessage {
 }
 
 #[tokio::test]
-async fn ask_returns_first_some_response() {
-    let handler = {
-        struct H;
-        #[async_trait::async_trait]
-        impl ErasedHandler for H {
-            async fn ask(
-                &self,
-                _req: Arc<dyn std::any::Any + Send + Sync>,
-            ) -> Option<Box<dyn std::any::Any + Send + Sync>> {
-                Some(Box::new("pong".to_string()))
-            }
-            async fn perform(
-                &self,
-                _req: Arc<dyn std::any::Any + Send + Sync>,
-            ) -> crate::common::Result<Box<dyn std::any::Any + Send + Sync>> {
-                unreachable!()
-            }
-            async fn emit(
-                &self,
-                _req: Arc<dyn std::any::Any + Send + Sync>,
-            ) -> crate::common::Result<()> {
-                unreachable!()
-            }
-        }
-        Arc::new(H)
-    };
-
-    let mut actor = CapabilityActor::new(vec![handler], make_codec());
-    let result = actor
-        .handle_message(make_message(EffectKind::Ask, "ping"))
-        .await
-        .unwrap();
-    assert!(result.error.is_none());
-    assert_eq!(result.payload[0], 1); // 有返回值的标记
-    let resp: String = postcard::from_bytes(&result.payload[1..]).unwrap();
-    assert_eq!(resp, "pong");
-}
-
-#[tokio::test]
-async fn ask_returns_none_when_all_handlers_return_none() {
-    let handler = {
-        struct H;
-        #[async_trait::async_trait]
-        impl ErasedHandler for H {
-            async fn ask(
-                &self,
-                _req: Arc<dyn std::any::Any + Send + Sync>,
-            ) -> Option<Box<dyn std::any::Any + Send + Sync>> {
-                None
-            }
-            async fn perform(
-                &self,
-                _req: Arc<dyn std::any::Any + Send + Sync>,
-            ) -> crate::common::Result<Box<dyn std::any::Any + Send + Sync>> {
-                unreachable!()
-            }
-            async fn emit(
-                &self,
-                _req: Arc<dyn std::any::Any + Send + Sync>,
-            ) -> crate::common::Result<()> {
-                unreachable!()
-            }
-        }
-        Arc::new(H)
-    };
-
-    let mut actor = CapabilityActor::new(vec![handler], make_codec());
-    let result = actor
-        .handle_message(make_message(EffectKind::Ask, "ping"))
-        .await
-        .unwrap();
-    assert!(result.error.is_none());
-    assert_eq!(result.payload, vec![0u8]);
-}
-
-#[tokio::test]
 async fn perform_returns_last_handler_result() {
     let called = Arc::new(AtomicBool::new(false));
     let called_clone = called.clone();
@@ -120,12 +44,6 @@ async fn perform_returns_last_handler_result() {
         struct H(Arc<AtomicBool>);
         #[async_trait::async_trait]
         impl ErasedHandler for H {
-            async fn ask(
-                &self,
-                _req: Arc<dyn std::any::Any + Send + Sync>,
-            ) -> Option<Box<dyn std::any::Any + Send + Sync>> {
-                unreachable!()
-            }
             async fn perform(
                 &self,
                 _req: Arc<dyn std::any::Any + Send + Sync>,
@@ -150,7 +68,7 @@ async fn perform_returns_last_handler_result() {
         .unwrap();
     assert!(called.load(Ordering::SeqCst));
     assert!(result.error.is_none());
-    assert_eq!(result.payload[0], 1); // perform 与 ask 共用 handled tag
+    assert_eq!(result.payload[0], 1); // handled tag
     let resp: String = postcard::from_bytes(&result.payload[1..]).unwrap();
     assert_eq!(resp, "performed");
 }
@@ -173,12 +91,6 @@ async fn emit_calls_all_handlers() {
         struct H(Arc<AtomicBool>);
         #[async_trait::async_trait]
         impl ErasedHandler for H {
-            async fn ask(
-                &self,
-                _req: Arc<dyn std::any::Any + Send + Sync>,
-            ) -> Option<Box<dyn std::any::Any + Send + Sync>> {
-                unreachable!()
-            }
             async fn perform(
                 &self,
                 _req: Arc<dyn std::any::Any + Send + Sync>,
@@ -199,12 +111,6 @@ async fn emit_calls_all_handlers() {
         struct H(Arc<AtomicBool>);
         #[async_trait::async_trait]
         impl ErasedHandler for H {
-            async fn ask(
-                &self,
-                _req: Arc<dyn std::any::Any + Send + Sync>,
-            ) -> Option<Box<dyn std::any::Any + Send + Sync>> {
-                unreachable!()
-            }
             async fn perform(
                 &self,
                 _req: Arc<dyn std::any::Any + Send + Sync>,
@@ -246,12 +152,6 @@ async fn emit_handler_error_calls_remaining_handlers_and_aggregates_error() {
     struct FailingHandler;
     #[async_trait::async_trait]
     impl ErasedHandler for FailingHandler {
-        async fn ask(
-            &self,
-            _req: Arc<dyn std::any::Any + Send + Sync>,
-        ) -> Option<Box<dyn std::any::Any + Send + Sync>> {
-            unreachable!()
-        }
         async fn perform(
             &self,
             _req: Arc<dyn std::any::Any + Send + Sync>,
@@ -272,12 +172,6 @@ async fn emit_handler_error_calls_remaining_handlers_and_aggregates_error() {
     struct OkHandler(Arc<AtomicBool>);
     #[async_trait::async_trait]
     impl ErasedHandler for OkHandler {
-        async fn ask(
-            &self,
-            _req: Arc<dyn std::any::Any + Send + Sync>,
-        ) -> Option<Box<dyn std::any::Any + Send + Sync>> {
-            unreachable!()
-        }
         async fn perform(
             &self,
             _req: Arc<dyn std::any::Any + Send + Sync>,
@@ -315,12 +209,6 @@ async fn emit_aggregate_error_preserves_first_failure_kind() {
     struct StorageFailingHandler;
     #[async_trait::async_trait]
     impl ErasedHandler for StorageFailingHandler {
-        async fn ask(
-            &self,
-            _req: Arc<dyn std::any::Any + Send + Sync>,
-        ) -> Option<Box<dyn std::any::Any + Send + Sync>> {
-            unreachable!()
-        }
         async fn perform(
             &self,
             _req: Arc<dyn std::any::Any + Send + Sync>,
@@ -337,12 +225,6 @@ async fn emit_aggregate_error_preserves_first_failure_kind() {
     struct InternalFailingHandler;
     #[async_trait::async_trait]
     impl ErasedHandler for InternalFailingHandler {
-        async fn ask(
-            &self,
-            _req: Arc<dyn std::any::Any + Send + Sync>,
-        ) -> Option<Box<dyn std::any::Any + Send + Sync>> {
-            unreachable!()
-        }
         async fn perform(
             &self,
             _req: Arc<dyn std::any::Any + Send + Sync>,

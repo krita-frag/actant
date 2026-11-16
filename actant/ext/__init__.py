@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from actant.ext.cluster import ClusterChange, ClusterView
 from actant.ext.config import RuntimeConfigBuilder, runtime_config
+from actant.ext.discovery import Dialer, PeerBeacon
 from actant.ext.events import EventAdapter, EventEnvelope, EventSubscription
 from actant.ext.lifecycle import Component, Composition, compose
 from actant.ext.placement import PlacementPolicy, bind_placement_policy
@@ -25,10 +26,12 @@ __all__ = [
     "ClusterView",
     "Component",
     "Composition",
+    "Dialer",
     "EventAdapter",
     "EventEnvelope",
     "EventSubscription",
     "NodeView",
+    "PeerBeacon",
     "PlacementContext",
     "PlacementDecision",
     "PlacementPolicy",

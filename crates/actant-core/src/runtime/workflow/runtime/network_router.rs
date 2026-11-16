@@ -177,17 +177,6 @@ impl NetworkEventRouter {
                     }
                 }
             }
-            crate::common::TopicRoute::DagState => {
-                if let Some((WireMessage::DagStateUpdate(update), _)) = decoded {
-                    // 控制面直连：DAG 状态 CRDT 更新直接分发给 DagGossipActor，
-                    // 不经观测 tap（有损，不承载正确性语义）。
-                    self.handle_workflow_state_event(
-                        crate::runtime::workflow::gossip_methods::APPLY_REMOTE_UPDATE,
-                        &update,
-                    )
-                    .await;
-                }
-            }
             crate::common::TopicRoute::Heartbeat => {
                 if let Some((WireMessage::NodeHeartbeat(hb), _)) = decoded {
                     match &self.failover {
@@ -450,6 +439,7 @@ impl NetworkEventRouter {
                 &task_name,
                 &outcome,
                 &worker_node,
+                attempt,
             )
             .await;
             return true;
@@ -479,6 +469,7 @@ impl NetworkEventRouter {
                 &task_name,
                 &outcome,
                 &worker_node,
+                attempt,
             )
             .await;
             return true;
@@ -491,6 +482,7 @@ impl NetworkEventRouter {
                 &task_name,
                 &outcome,
                 &worker_node,
+                attempt,
             )
             .await;
             return true;
@@ -605,6 +597,7 @@ impl NetworkEventRouter {
                             &task_name,
                             &outcome_wire,
                             &worker_node,
+                            attempt,
                         )
                         .await;
                     }
@@ -618,6 +611,7 @@ impl NetworkEventRouter {
                                 &task_name,
                                 &outcome_wire,
                                 &worker_node,
+                                attempt,
                             )
                             .await;
                         }
@@ -663,6 +657,7 @@ impl NetworkEventRouter {
         task_name: &str,
         outcome: &WireTaskOutcome,
         worker_node: &NodeId,
+        attempt: u32,
     ) {
         let completion = match outcome {
             WireTaskOutcome::Completed(result) => TaskCompletion::Completed {
@@ -671,6 +666,7 @@ impl NetworkEventRouter {
                 task_name: task_name.to_string(),
                 result: result.clone(),
                 target_node: Some(worker_node.clone()),
+                attempt,
             },
             WireTaskOutcome::Failed(error) => TaskCompletion::Failed {
                 workflow_id: workflow_id.clone(),
@@ -678,12 +674,14 @@ impl NetworkEventRouter {
                 task_name: task_name.to_string(),
                 error: error.clone(),
                 target_node: Some(worker_node.clone()),
+                attempt,
             },
             WireTaskOutcome::Cancelled => TaskCompletion::Cancelled {
                 workflow_id: workflow_id.clone(),
                 task_id: task_id.clone(),
                 task_name: task_name.to_string(),
                 target_node: Some(worker_node.clone()),
+                attempt,
             },
         };
         let lifecycle_event = match completion {

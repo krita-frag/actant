@@ -122,6 +122,7 @@ class AsyncResult:
     """
 
     __slots__ = (
+        "_attempt",
         "_callbacks",
         "_cancel_event_published",
         "_context",
@@ -144,6 +145,9 @@ class AsyncResult:
         silent: bool = False,
     ) -> None:
         self.task_id = task_id
+        # 结果所属派发代数：由 Rust 结果通道在每条事件上带回，结果上报时
+        # 原样交回 orchestrator 做 attempt fencing（丢弃被放弃那次执行的迟到结果）。
+        self._attempt = 0
         self._context = context
         self._workflow_id = workflow_id
         self._silent = silent

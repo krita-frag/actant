@@ -2,32 +2,20 @@
 //!
 //! journal 是工作流历史的**唯一事实源**：恢复 = 快照 + 其后事件重放，导出与
 //! 重放读同一份记录。事件按 `workflow:{workflow_id}` topic 追加，载荷用
-//! postcard 编码；Rust 之外的语言只需遵守 [`JOURNAL_SCHEMA_VERSION`] 与
-//! [`JournalEvent`] 的字段形状，不依赖 Rust 内部类型。
+//! postcard 编码；Rust 之外的语言按 [`JournalEvent`] 的字段形状与
+//! [`JournalEvent::kind`] 的稳定字符串对齐，不依赖 Rust 内部类型。
 //!
 //! 设计约束：
 //! - 除 [`JournalEvent::TaskCompleted`] 携带结果字节（重放需要恢复结果）与
 //!   [`JournalEvent::NodeAdded`] 携带节点定义及前驱（journal 可独立重建
 //!   DAG 边与 pending）外，不携带完整 DAG / Execution，避免事件体积过大。
 //! - `payload` / `args` / `result` 一律是上层序列化的不透明字节，Rust 不解析。
-//! - 尾部追加新变体是兼容变更：postcard 按变体序号编码，旧记录仍可解码，
-//!   **不**提升 [`JOURNAL_SCHEMA_VERSION`]。该常量只在不兼容的字段/语义变更
-//!   时递增，且不写入记录、不参与运行时版本协商；非 Rust 消费方需按目标
-//!   版本自行对齐，并对未知 kind 显式容错。
+//! - 尾部追加新变体只需同步 `kind()`；**不兼容**的字段或语义变更要求重建
+//!   data_dir（见 `docs/architecture/recovery.md`），不做运行时版本协商。
 
 use serde::{Deserialize, Serialize};
 
 use super::model::{DagNode, TaskId, WaitCondition, WorkflowId, WorkflowInvocation};
-
-/// journal 事件 schema 版本。
-///
-/// 只在**不兼容**的字段/语义变更时递增；尾部追加枚举变体不递增（判别式
-/// 不变，旧记录可解码）。当前值 2 表示事件集合已含 `NodesSealed`、
-/// `DeadlineSet`、`Evicted`、`StartedAt` 四个尾部变体。
-///
-/// 这是编译期契约标识，不写入 [`JournalRecord`]；运行时版本协商不在本版
-/// 范围内，消费方以自身构建时的常量为准。
-pub const JOURNAL_SCHEMA_VERSION: u16 = 2;
 
 /// 工作流级别事件，写入 `EventLog` 的 `workflow:{workflow_id}` topic。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -156,7 +144,7 @@ pub enum JournalEvent {
     ///
     /// `Started` 本身不携带时刻，重放时用当前时间填充 `started_at_ms`，会让
     /// 工作流级 deadline 从重启时刻重新计时，反复重启可令硬超时永不触发。
-    /// 此事件把原始启动时刻变成历史事实；旧记录缺少它时退回近似行为。
+    /// 此事件把原始启动时刻变成历史事实。
     StartedAt {
         workflow_id: WorkflowId,
         started_at_ms: u64,

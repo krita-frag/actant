@@ -6,13 +6,15 @@
 //! - [`Layer`]：handler 链，支持多 handler 叠加
 //! - [`CapabilityRuntime`]：注册表 + dispatcher，提供 `ask`/`perform`/`emit` 三种执行模型
 //!
-//! # 三种 Effect 类型
+//! # Effect 执行模型
 //!
 //! | 类型   | 语义               | 执行模型                                 |
 //! |--------|--------------------|------------------------------------------|
-//! | `ask`  | 决策型，请求返回值 | chain 逆序调用（后注册=高优先级），首个返回 `Some` 的 handler 决定结果 |
 //! | `perform` | 副作用型，执行 Rust trait | 单 handler 执行，结果直接返回       |
 //! | `emit` | 反应型，触发订阅   | 所有 handler 顺序执行，无返回值          |
+//!
+//! ask（决策型）不经本模块：Python 侧 `_ask_chain` 纯 Python handler 链
+//! 逆序决策（首个非 `None` 结果生效），Rust 无 ask 型内置 handler。
 
 use std::any::{Any, TypeId};
 
@@ -33,9 +35,11 @@ pub trait Capability: Send + Sync + 'static {
 }
 
 /// Effect 执行语义。
+///
+/// ask 型能力不走本执行链：Python 侧 `_ask_chain` 纯 Python handler 决策
+/// （Rust 无 ask 型内置 handler），Rust 只承载 perform / emit。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EffectKind {
-    Ask,
     Perform,
     Emit,
 }
@@ -52,7 +56,7 @@ const RESPONSE_HANDLED: u8 = 1;
 
 /// 编码 capability 响应：`[1][codec bytes]`。
 ///
-/// `ask` 与 `perform` 共用同一编码，避免两条路径各自约定 tag。
+/// `perform` 成功响应的统一编码。
 pub(crate) fn encode_handled(body: Vec<u8>) -> Vec<u8> {
     let mut out = Vec::with_capacity(body.len() + 1);
     out.push(RESPONSE_HANDLED);
@@ -178,8 +182,6 @@ impl CapabilityMeta {
 
 #[async_trait]
 pub trait ErasedHandler: Send + Sync {
-    async fn ask(&self, req: Arc<dyn Any + Send + Sync>) -> Option<Box<dyn Any + Send + Sync>>;
-
     async fn perform(
         &self,
         req: Arc<dyn Any + Send + Sync>,
@@ -215,12 +217,6 @@ where
     C::Request: Any + Send + Sync + Clone,
     C::Response: Any + Send + Sync,
 {
-    async fn ask(&self, req: Arc<dyn Any + Send + Sync>) -> Option<Box<dyn Any + Send + Sync>> {
-        let req_ref = req.downcast_ref::<C::Request>()?;
-        let resp = Handler::handle(&self.handler, req_ref.clone()).await?;
-        Some(Box::new(resp))
-    }
-
     async fn perform(
         &self,
         req: Arc<dyn Any + Send + Sync>,
@@ -545,46 +541,6 @@ impl CapabilityRuntime {
             .cloned()
             .ok_or_else(|| ActantError::Internal("actor system not bound".into()))?;
         Ok((actor_id, codec, actor_system))
-    }
-
-    pub async fn ask<C: Capability>(
-        &self,
-        req: C::Request,
-    ) -> Result<Option<C::Response>, ActantError>
-    where
-        C::Request: Any + Clone + Send + Sync,
-        C::Response: Any + Send + Sync,
-    {
-        let (actor_id, codec, actor_system) = self.channel::<C>("ask")?;
-
-        let req_arc: Arc<dyn Any + Send + Sync> = Arc::new(req);
-        let req_bytes = codec
-            .serialize_request(req_arc)
-            .map_err(|e| ActantError::Internal(format!("ask codec: {}", e)))?;
-        let local_envelope = CapabilityEnvelope {
-            kind: EffectKind::Ask,
-            payload: req_bytes,
-        };
-        let bytes = postcard::to_allocvec(&local_envelope)
-            .map_err(|e| ActantError::Serialization(e.to_string()))?;
-        let result = actor_system
-            .call(&actor_id, "ask", bytes)
-            .await
-            .map_err(|e| ActantError::Actor(e.to_string()))?;
-        if let Some(err) = result.error {
-            return Err(ActantError::from(err));
-        }
-        let Some(response_bytes) = decode_handled(&result.payload) else {
-            return Ok(None);
-        };
-
-        let resp = codec
-            .deserialize_response(response_bytes)
-            .map_err(|e| ActantError::Internal(format!("ask decode: {}", e)))?;
-        let resp = resp
-            .downcast::<C::Response>()
-            .map_err(|_| ActantError::Internal("ask: response type mismatch".into()))?;
-        Ok(Some(*resp))
     }
 
     pub async fn perform<C: Capability>(&self, req: C::Request) -> Result<C::Response, ActantError>

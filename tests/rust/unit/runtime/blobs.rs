@@ -287,3 +287,123 @@ async fn blob_fetch_without_blob_protocol_fails_fast() {
         other => panic!("expected Network error, got {other:?}"),
     }
 }
+
+/// 挂起 blob provider：回应 8 字节 size 头后停滞，不发任何 bao 数据——
+/// 真实构造「size 头之后传输中途停滞」的 provider。
+///
+/// 流必须被显式持有（挂入长驻任务）：accept future 结束或流 drop 会 reset
+/// 客户端 fsm（表现为连接层错误而非内容停滞），与被测语义不符。
+#[derive(Debug)]
+struct StalledBlobProvider;
+
+// iroh 的 ProtocolHandler / Connection / AcceptError 经 use super::* 不可达
+// （blobs.rs 未转引），显式引入；`Result` 在本模块被 crate::common::Result
+// 遮蔽，accept 签名用 std 全限定。
+use iroh::protocol::{AcceptError, ProtocolHandler, Router};
+
+impl ProtocolHandler for StalledBlobProvider {
+    async fn accept(
+        &self,
+        conn: iroh::endpoint::Connection,
+    ) -> std::result::Result<(), AcceptError> {
+        let (send, recv) = conn.accept_bi().await.map_err(AcceptError::from_err)?;
+        tokio::spawn(async move {
+            let mut send = send;
+            // bao 响应头 = u64 LE blob size；此后故意停滞（不 finish，
+            // 客户端停在内容阶段等 bao 数据，QUIC 流保持打开）。
+            let _ = send.write_all(&1024u64.to_le_bytes()).await;
+            let held = (send, recv);
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            drop(held);
+        });
+        Ok(())
+    }
+
+    async fn shutdown(&self) {}
+}
+
+/// 内容阶段的停滞防护：provider 在 size 头之后停滞时，`next_chunk` 按
+/// `idle_timeout` 产出 `Err(Timeout)`，调用方不再依赖 QUIC idle timeout
+/// 兜底（不可配置且远大于请求超时）。
+///
+/// 判别力：移除 `next_chunk` 的超时包裹后，`rx.recv()` 永久 pending
+/// （挂起 provider 不发任何数据），外层 guard 必然触发，本用例红。
+#[tokio::test(flavor = "multi_thread")]
+async fn blob_content_idle_timeout_aborts_stalled_provider() {
+    let data = pseudo_random_bytes(1024);
+    let hash = BlobHash::from_bytes(*blake3::hash(&data).as_bytes());
+
+    let (alice, _alice_dir) = spawn_node("alice").await;
+
+    // 独立的挂起 provider 节点：裸 endpoint（显式监听 loopback，与
+    // NetworkManager 的默认装配路径一致）+ 仅挂 blobs ALPN 的 Router。
+    let bind_addr = std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0);
+    let stalled_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .bind_addr(bind_addr)
+        .expect("bind_addr")
+        .bind()
+        .await
+        .expect("bind stalled provider endpoint");
+    let mut stalled_addr = stalled_endpoint.addr();
+    // bind 返回时 direct addr 列表可能尚未填充（异步发现），先等非空再
+    // 连接——否则 connect 拿不到可达地址，表现为握手阶段悬挂。
+    for _ in 0..100 {
+        if !stalled_addr.addrs.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        stalled_addr = stalled_endpoint.addr();
+    }
+    assert!(
+        !stalled_addr.addrs.is_empty(),
+        "stalled provider must have a direct address after bind"
+    );
+    let stalled_router = Router::builder(stalled_endpoint.clone())
+        .accept(iroh_blobs::ALPN, StalledBlobProvider)
+        .spawn();
+
+    // 直接驱动 BlobFetch：idle_timeout 取短值（300ms）便于测试，
+    // 生产装配传 direct_request_timeout。
+    let mut fetch = tokio::time::timeout(
+        Duration::from_secs(10),
+        BlobFetch::start(
+            alice.endpoint(),
+            stalled_addr,
+            hash,
+            Duration::from_millis(300),
+        ),
+    )
+    .await
+    .expect("start must not hang: provider answers the size header")
+    .expect("handshake succeeds (size header arrives)");
+
+    let first = tokio::time::timeout(Duration::from_secs(10), fetch.next_chunk())
+        .await
+        .expect("must not hang: idle timeout bounds the wait")
+        .expect("stream yields a verdict");
+    let err = first.expect_err("stalled provider must surface Timeout, not data");
+    assert!(
+        matches!(err, crate::common::ActantError::Timeout(_)),
+        "expected Timeout, got {err:?}"
+    );
+    fetch.close();
+    let _ = stalled_router.shutdown().await;
+}
+
+/// 正常配置下 roundtrip 不受消费侧空闲超时影响：合法传输的 leaf 间隔
+/// 远小于超时值，数据完整交付。
+#[tokio::test(flavor = "multi_thread")]
+async fn blob_fetch_with_idle_timeout_roundtrip_unaffected() {
+    let data = pseudo_random_bytes(256 * 1024);
+    let (bob, _bob_dir) = spawn_node("bob").await;
+    let (alice, _alice_dir) = spawn_node("alice").await;
+
+    let hash = bob.blob_store(data.clone()).await.expect("store blob");
+    let mut fetch = alice
+        .blob_fetch(&addr_node_id(&bob), hash)
+        .await
+        .expect("fetch start");
+    let (computed, total, _) = drain(&mut fetch).await;
+    assert_eq!(total, data.len());
+    assert_eq!(computed, blake3::hash(&data));
+}

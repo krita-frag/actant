@@ -36,45 +36,41 @@ impl Orchestrator {
                     _ = cancel_rx.changed() => break,
                     _ = interval.tick() => {
                         let expired: Vec<WorkflowId> = state.expired_workflow_ids();
-                        // 收集 (workflow_id, task_id) 对，统一在终态收尾后广播取消。
-                        // 先收集再 mark_workflow_failed，因为 mark 会将 Running 状态
-                        // 改为 Failed，导致 running_task_ids 在后续读取时为空。
-                        let mut cancels_to_broadcast: Vec<(WorkflowId, TaskId)> = Vec::new();
-                        for wf_id in &expired {
-                            if let Some(slot) = state.slots.get(wf_id) {
-                                if !slot.execution.is_terminal() {
-                                    for task_id in slot.execution.tasks.keys() {
-                                        if slot.execution.tasks.get(task_id)
-                                            .map(|ts| ts.state == Phase::Running)
-                                            .unwrap_or(false)
-                                        {
-                                            cancels_to_broadcast.push((wf_id.clone(), task_id.clone()));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        // 先在写锁内翻转状态并克隆快照；complete_terminal 内部
-                        // 会再次读取同一 slot，持锁调用会造成 DashMap 重入死锁。
+                        // 采集与翻转在同一临界区：mark_workflow_failed 会把
+                        // Running 翻成 Failed，Running 集合必须在擦除前采集并经
+                        // `running_cancels` 传入收尾点（Pending 兄弟不被翻转，
+                        // 由 complete_terminal 的快照扫描覆盖）。先在写锁内翻转
+                        // 并克隆快照；complete_terminal 内部会再次读取同一 slot，
+                        // 持锁调用会造成 DashMap 重入死锁。
                         let mut terminal_snapshots: Vec<(
                             WorkflowId,
                             crate::runtime::workflow::WorkflowExecution,
+                            Vec<TaskId>,
                         )> = Vec::new();
                         for wf_id in expired {
                             if let Some(mut slot) = state.slots.get_mut(&wf_id) {
                                 if !slot.execution.is_terminal() {
+                                    let running_cancels: Vec<TaskId> = slot
+                                        .execution
+                                        .tasks
+                                        .iter()
+                                        .filter(|(_, ts)| ts.state == Phase::Running)
+                                        .map(|(id, _)| id.clone())
+                                        .collect();
                                     slot.execution.mark_workflow_failed("workflow timeout exceeded".into());
                                     crate::metrics::inc_workflow_timeouts();
                                     tracing::warn!("workflow {} timed out, marked as failed", wf_id.as_str());
-                                    terminal_snapshots.push((wf_id.clone(), slot.execution.clone()));
+                                    terminal_snapshots.push((wf_id.clone(), slot.execution.clone(), running_cancels));
                                 }
                             }
                         }
-                        // 统一终态收尾：终态事件、指标、等待者释放、淘汰与
-                        // 落盘失败容错与其它入口共用一处实现。
-                        for (wf_id, snapshot) in terminal_snapshots {
+                        // 统一终态收尾：终态事件、指标、取消传播、等待者释放、
+                        // 淘汰与落盘失败容错与其它入口共用一处实现。双腿广播
+                        // （gossip + 本地自投递）在收尾点内执行，即使持久化失败
+                        // 也不跳过——在途/排队任务不能占着 Worker 槽位等自身超时。
+                        for (wf_id, snapshot, running_cancels) in terminal_snapshots {
                             if let Err(e) = orchestrator
-                                .complete_terminal(&wf_id, None, &snapshot)
+                                .complete_terminal(&wf_id, None, &snapshot, running_cancels)
                                 .await
                             {
                                 tracing::error!(
@@ -83,16 +79,6 @@ impl Orchestrator {
                                     "failed to settle timed-out workflow terminal state"
                                 );
                             }
-                        }
-                        // 广播取消消息。即使持久化失败也要尝试取消，否则运行中的
-                        // 任务会继续占用 Worker 槽位直到自身完成或超时。
-                        // 双腿广播（gossip + 本地自投递）的实现与语义说明见
-                        // [`Orchestrator::broadcast_task_cancel`]——与用户级
-                        // `cancel` 共用同一实现，避免两类入口行为漂移。
-                        for (wf_id, task_id) in &cancels_to_broadcast {
-                            orchestrator
-                                .broadcast_task_cancel(wf_id, task_id)
-                                .await;
                         }
 
                         // 扫描到期的 `Timer` 等待点。

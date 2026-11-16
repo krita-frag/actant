@@ -2,9 +2,9 @@
 
 用法::
 
-    uv run --extra dev python benches/python/task_throughput.py --tasks 500 --workers 8 --task-ms 5
-    uv run --extra dev python benches/python/task_throughput.py --tasks 100 --timeout-case
-    uv run --extra dev python benches/python/task_throughput.py --tasks 20 --crash-case
+    uv run python benches/python/task_throughput.py --tasks 500 --workers 8 --task-ms 5
+    uv run python benches/python/task_throughput.py --tasks 100 --timeout-case
+    uv run python benches/python/task_throughput.py --tasks 20 --crash-case
 
 这些数据是后续 TaskSource / WorkerLease 改造的对照基线，不做通过/失败判定。
 """

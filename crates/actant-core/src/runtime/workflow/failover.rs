@@ -513,6 +513,22 @@ impl FailoverManager {
         self
     }
 
+    /// 本节点是否有权执行该工作流的任务（派发前唯一闸口）。
+    ///
+    /// 判据只有一条：租约表里该工作流归谁。三种情形：
+    /// - 无租约条目：本节点未参与租约协调（单机、或工作流从未被 claim），放行；
+    /// - 租约归本节点：放行（含已过期但尚未被对端夺走——被夺走会立刻改写条目）；
+    /// - 租约归对端：拒绝。这是「收到对端 claim 后只摘编排状态、执行层仍继续跑」
+    ///   的第二道闸：只摘 slot 的话，已经出队（`inflight`/执行中）的任务仍会被
+    ///   派发，副作用在新旧两个主上各发生一次；而完成回灌时 slot 已删、结果被
+    ///   静默丢弃。排队中的任务由 `remove_workflow_tasks` 撤销，本条兜住已出队部分。
+    pub fn dispatch_permitted(&self, workflow_id: &WorkflowId) -> bool {
+        match self.leases.get(workflow_id) {
+            Some(entry) => entry.node_id == self.node_id,
+            None => true,
+        }
+    }
+
     /// 注入用于 failover 重调度的 scheduler。
     pub fn set_scheduler(&self, scheduler: Arc<dyn crate::runtime::workflow::Scheduler>) {
         *self.scheduler.lock() = Some(scheduler);
@@ -713,6 +729,10 @@ impl FailoverManager {
         let result_feed = self.result_feed.as_ref();
         let mut failed = 0usize;
         let mut resent = 0usize;
+        // 无 result feed 时无法结算编排任务：把登记**放回**表里，下一轮再试。
+        // 直接丢弃会让 origin 的编排任务永久停在 Running（没有终态事件、没有重试），
+        // 而这是唯一一处能宣告「执行节点已失联」的地方。
+        let mut unsettled = 0usize;
         for (task_id, mut entry) in drained {
             if entry.workflow_id.as_str().is_empty() {
                 // 直提任务不在此处直接重投：放弃租约后由 origin 的租约检查点
@@ -725,11 +745,8 @@ impl FailoverManager {
                 continue;
             }
             let Some(result_feed) = result_feed else {
-                tracing::warn!(
-                    node = %dead.as_str(),
-                    task_id = %task_id,
-                    "no result feed on FailoverManager; in-flight task cannot be settled"
-                );
+                self.outbound.insert(task_id, entry);
+                unsettled += 1;
                 continue;
             };
             crate::metrics::inc_failover_node_lost_tasks();
@@ -758,6 +775,7 @@ impl FailoverManager {
                     ),
                 ),
                 target_node: Some(dead.clone()),
+                attempt: entry.task.attempt,
             };
             result_feed.send(TaskLifecycleEvent::TaskFailed(completion));
             failed += 1;
@@ -767,6 +785,13 @@ impl FailoverManager {
                 node = %dead.as_str(),
                 count = resent,
                 "executor node lost; standalone tasks are queued for lease re-dispatch"
+            );
+        }
+        if unsettled > 0 {
+            tracing::error!(
+                node = %dead.as_str(),
+                count = unsettled,
+                "no result feed on FailoverManager; in-flight tasks kept registered for a later pass"
             );
         }
         failed
@@ -781,9 +806,6 @@ impl FailoverManager {
         self.network.subscribe(TOPIC_HEARTBEAT).await?;
         self.network.subscribe(TOPIC_FAILOVER).await?;
         self.network.subscribe(TOPIC_HEADS).await?;
-        self.network
-            .subscribe(crate::common::TOPIC_DAG_STATE)
-            .await?;
         // 工作流状态同步：请求与响应都走全局话题（目标节点在载荷内）。
         // 用固定话题而非 `wf-state-req:<node>`：运行期新建的话题拿不到已连接
         // 的邻居，`broadcast` 返回成功却无人接收，跨节点状态复制会静默失效。
@@ -1289,10 +1311,28 @@ impl FailoverManager {
             if let Err(e) = self.remove_active_workflow(&claim.workflow_id).await {
                 tracing::warn!(error = %e, workflow_id = %claim.workflow_id.as_str(), "failover: failed to remove active workflow");
             }
+            // 编排层让位之后，执行层也必须让位：撤销本地排队任务。只摘 slot 的话，
+            // 已入队但尚未出队的任务仍会被 Worker 取出执行——副作用在新旧两个主上
+            // 各发生一次，而完成回灌时 slot 已删、结果被静默丢弃。
+            //
+            // 已经出队（`inflight`/执行中）的任务无法从队列撤销，由派发前的
+            // `dispatch_permitted` 租约所有权校验拦截。
+            // 先取出句柄再 await：`self.scheduler.lock()` 的临时守卫活到 match
+            // 结束，若把 await 放进 match 分支，parking_lot 守卫会跨 await 持有
+            // （每个分片都被它锁住，且 future 不再是 Send）。
+            let scheduler = self.scheduler.lock().clone();
+            let removed = match scheduler {
+                Some(scheduler) => scheduler.remove_workflow_tasks(&claim.workflow_id).await,
+                None => 0,
+            };
+            if removed > 0 {
+                crate::metrics::inc_failover_relinquished_tasks(removed as u64);
+            }
             tracing::info!(
-                "node {} claimed workflow {}, removed from local active set",
-                claim.node_id.0,
-                claim.workflow_id.0
+                claimant = %claim.node_id.0,
+                workflow = %claim.workflow_id.0,
+                cancelled_queued_tasks = removed,
+                "relinquished workflow to claimant: removed from local active set and dropped queued tasks"
             );
         }
     }
@@ -1898,17 +1938,6 @@ impl FailoverManager {
             );
             let is_new = !self.peers.contains_key(&hb.node_id);
             let received_at_ms = crate::common::epoch_millis();
-            // 快照路由相关字段的旧值：仅当它们变化时才 bump 版本——无条件
-            // bump 会让 N 节点集群每心跳周期做 N 次 O(N) 候选重建。
-            let routing_snapshot = self.peers.get(&hb.node_id).map(|p| {
-                (
-                    p.active_workflows.clone(),
-                    p.available_slots,
-                    p.max_slots,
-                    p.role,
-                    p.draining,
-                )
-            });
             let mut peer = self.peers.entry(hb.node_id.clone()).or_insert(PeerState {
                 node_id: hb.node_id.clone(),
                 last_heartbeat_ms: 0,
@@ -1946,21 +1975,13 @@ impl FailoverManager {
             if is_new {
                 crate::metrics::inc_connected_peers();
             }
-            // 路由相关字段变化（或新成员）才失效候选缓存；last_heartbeat_ms
-            // 不参与路由，纯保活心跳不触发 O(N) 重建。
-            let routing_changed = is_new
-                || routing_snapshot
-                    .as_ref()
-                    .is_none_or(|(wfs, slots, max, role, draining)| {
-                        *wfs != peer.active_workflows
-                            || *slots != peer.available_slots
-                            || *max != peer.max_slots
-                            || *role != peer.role
-                            || *draining != peer.draining
-                    });
-            if routing_changed {
-                self.bump_peers_version();
-            }
+            // 每条心跳都必须使候选快照失效：`last_heartbeat_ms` 参与
+            // `is_eligible` 的 TTL 判活（`now - last_heartbeat <= failure_timeout`），
+            // 保活心跳若不 bump 版本，快照里会残留过期时间戳——空闲期（无容量/
+            // 成员变更）超过 ttl 后该 peer 被路由永久判死，新提交只能 defer 到
+            // 饥饿失败。无条件的 bump 代价是每心跳一次 O(N) 快照重建，在目标
+            // 集群规模（≤ 百节点）下可忽略。
+            self.bump_peers_version();
         }
     }
 

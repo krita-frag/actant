@@ -4,7 +4,6 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use super::model::{NodeId, PlatformInfo, TaskDefinition, TaskId, WorkflowId};
-use crate::common::model::HlcTimestamp;
 
 /// 网络协议常量 — 所有魔法字符串与数值限制的唯一真相来源。
 ///
@@ -16,7 +15,6 @@ pub mod constants {
     // --- Gossip 话题前缀与名称 ---
 
     pub const TOPIC_TASK_PREFIX: &str = "actant:task:";
-    pub const TOPIC_DAG_STATE: &str = "actant:dag-state";
     pub const TOPIC_HEARTBEAT: &str = "actant:heartbeat";
     pub const TOPIC_FAILOVER: &str = "actant:failover";
     pub const TOPIC_HEADS: &str = "actant:heads";
@@ -393,8 +391,8 @@ pub use constants::{
         EXEC as STORE_KEY_EXEC, LEASE as STORE_KEY_LEASE, PENDING as STORE_KEY_PENDING,
         RESULT as STORE_KEY_RESULT, SIGNAL_BUF as STORE_KEY_SIGNAL_BUF, WAIT as STORE_KEY_WAIT,
     },
-    TOPIC_CANCEL, TOPIC_DAG_STATE, TOPIC_FAILOVER, TOPIC_HEADS, TOPIC_HEARTBEAT,
-    TOPIC_WORKFLOW_STATE_REQ, TOPIC_WORKFLOW_STATE_RESP, WIRE_PROTOCOL_VERSION,
+    TOPIC_CANCEL, TOPIC_FAILOVER, TOPIC_HEADS, TOPIC_HEARTBEAT, TOPIC_WORKFLOW_STATE_REQ,
+    TOPIC_WORKFLOW_STATE_RESP, WIRE_PROTOCOL_VERSION,
 };
 
 /// Gossip 话题标识符。
@@ -409,11 +407,6 @@ impl Topic {
     /// 构造节点作用域的任务话题：`actant:task:<node>`。
     pub fn task(node: &NodeId) -> Self {
         Self(format!("{}{}", constants::TOPIC_TASK_PREFIX, node.as_str()))
-    }
-
-    /// 构造 DAG 状态话题：`actant:dag-state`。
-    pub fn dag_state() -> Self {
-        Self(constants::TOPIC_DAG_STATE.to_string())
     }
 
     /// 构造心跳话题：`actant:heartbeat`。
@@ -459,7 +452,6 @@ impl Topic {
             TopicRoute::Task(node.to_string())
         } else {
             match s {
-                constants::TOPIC_DAG_STATE => TopicRoute::DagState,
                 constants::TOPIC_HEARTBEAT => TopicRoute::Heartbeat,
                 constants::TOPIC_FAILOVER => TopicRoute::Failover,
                 constants::TOPIC_HEADS => TopicRoute::Heads,
@@ -517,8 +509,6 @@ pub enum TopicRoute {
     WorkflowStateReq,
     /// 工作流状态同步响应（全局话题，目标节点在载荷内）。
     WorkflowStateResp,
-    /// DAG 状态更新广播话题。
-    DagState,
     /// 节点心跳广播话题。
     Heartbeat,
     /// 故障转移/租约声明广播话题。
@@ -554,11 +544,13 @@ pub struct WireEnvelope {
     /// 由 [`WireEnvelope::wrap`] 在序列化 message 后计算并填入；
     /// [`WireEnvelope::decode`] 恒定时间校验，签名不匹配则丢弃消息。
     ///
-    /// - 集群共享密钥非空（已注册，见 [`register_wire_signing_key`] / [`set_wire_signing_key`]）：
+    /// - 集群共享密钥非空（已注册，见 [`register_wire_signing_key`]）：
     ///   所有节点入站 gossip 消息必须携带正确 MAC；伪造者即使持有合法 iroh
     ///   EndpointId（TLS 层认证通过）也无法伪造 wire message，实现端到端
     ///   集群身份认证。
-    /// - 集群共享密钥为空：MAC 字段为 `None`，decode 时跳过验证（向后兼容 0.2）。
+    /// - 集群共享密钥为空：MAC 字段为 `None`，decode 时跳过验证（未配置
+    ///   集群签名的开发/单机模式；`require_payload_signing` 或生产 preset
+    ///   强制非空密钥的部署不存在此形态）。
     ///
     /// **边界**：MAC 只覆盖 gossip 面。直连协议（`DirectRequest` / `DirectResponse`：
     /// 任务分发、结果投递、Ping 探测）不经 envelope——其对端身份由 iroh TLS
@@ -575,9 +567,9 @@ pub struct WireEnvelope {
 /// 进程级 wire message 签名密钥注册表。
 ///
 /// 由 `RuntimeBuilder::build` 在构造 NetworkManager 前调用
-/// [`register_wire_signing_key`]（按 node 注册）或 [`set_wire_signing_key`]
-/// （无 node 作用域的 primary，测试用）写入。注册表为空（默认）= 禁用 wire
-/// 签名验证，保持 0.2 行为；存在密钥 = 入站消息必须携带有效 MAC。
+/// [`register_wire_signing_key`]（按 node 注册）写入。注册表为空（默认）=
+/// 禁用 wire 签名验证（未配置集群共享密钥的开发模式）；存在密钥 = 入站
+/// 消息必须携带有效 MAC。
 ///
 /// ## 同进程多 Runtime 不同密钥的行为
 ///
@@ -601,10 +593,10 @@ pub struct WireEnvelope {
 struct WireSigningKeys {
     /// node → 该节点 Runtime 的集群共享密钥。
     per_node: Vec<(NodeId, std::sync::Arc<Vec<u8>>)>,
-    /// 最近一次注册的密钥。用于无来源节点字段的消息及未按 node 注册的
-    /// 旧接口（[`set_wire_signing_key`]）。
+    /// 最近一次注册的密钥。用于无来源节点字段的消息
+    /// （`WorkflowStateResponse`、`TaskDispatch`）的出站签名。
     primary: Option<std::sync::Arc<Vec<u8>>>,
-    /// `primary` 对应的来源节点（`None` = 由 [`set_wire_signing_key`] 设置）。
+    /// `primary` 对应的来源节点（随 [`register_wire_signing_key`] 一并写入）。
     ///
     /// 用于在节点以空密钥重新注册（禁用签名）时精确清除它留下的 primary，
     /// 避免同进程后续无密钥 Runtime 被残留密钥强制要求 MAC。
@@ -716,22 +708,6 @@ pub fn register_wire_signing_key(node: &NodeId, key: Vec<u8>) {
     reg.primary_node = Some(node.clone());
 }
 
-/// 设置进程级 primary 签名密钥（无 node 作用域的旧接口）。
-///
-/// 仅替换 `primary`，不影响按 [`register_wire_signing_key`] 注册的节点条目。
-/// 生产路径必须使用 [`register_wire_signing_key`]；本函数保留给无节点上下文
-/// 的单元测试。重复调用覆盖前值；传入空 `Vec` 等价于清除 primary
-/// （禁用 primary 侧签名）。
-pub fn set_wire_signing_key(key: Vec<u8>) {
-    let mut reg = WIRE_SIGNING_KEYS.write();
-    reg.primary = if key.is_empty() {
-        None
-    } else {
-        Some(std::sync::Arc::new(key))
-    };
-    reg.primary_node = None;
-}
-
 /// 读取当前生效的签名密钥：优先按消息来源节点查找，退化到 primary。
 ///
 /// 返回 `None` 表示签名禁用（无任何已注册密钥）。
@@ -757,7 +733,6 @@ fn message_origin_node(msg: &WireMessage) -> Option<&NodeId> {
         WireMessage::OrchestratorClaim(m) => Some(&m.node_id),
         WireMessage::SignedOrchestratorClaim(m) => Some(&m.claim.node_id),
         WireMessage::HeadsExchange(m) => Some(&m.node_id),
-        WireMessage::DagStateUpdate(m) => Some(&m.origin_node),
         WireMessage::WorkflowStateRequest(m) => Some(&m.requesting_node),
         WireMessage::WorkflowStateResponse(_)
         | WireMessage::TaskDispatch(_)
@@ -885,7 +860,7 @@ impl WireEnvelope {
     ///
     /// MAC 验证依次尝试注册表中全部去重密钥（同进程多 Runtime 各自集群的
     /// 消息均可验证，见 [`WireSigningKeys`]）；注册表为空 = 跳过验证
-    /// （向后兼容 0.2）。
+    /// （未配置集群共享密钥的开发模式）。
     ///
     /// 返回的元组包含消息本体与可选的跨节点 trace 上下文字符串（W3C `traceparent`）；
     /// 调用方应使用该字符串创建 `wire.recv` 子 span 以串联跨节点日志与 OTLP span 树。
@@ -986,7 +961,6 @@ impl WireEnvelope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WireMessage {
     TaskDispatch(TaskDefinition),
-    DagStateUpdate(WireDagStateUpdate),
     NodeHeartbeat(NodeHeartbeat),
     OrchestratorClaim(OrchestratorClaim),
     SignedOrchestratorClaim(SignedOrchestratorClaim),
@@ -1019,7 +993,7 @@ pub struct NodeHeartbeat {
     /// Iroh endpoint ID（公钥），用于直连。
     #[serde(default)]
     pub endpoint_addr: Option<String>,
-    /// 节点宿主平台信息。`None` = 旧版本节点未上报。
+    /// 节点宿主平台信息。`None` = 节点未上报（调用方未填充）。
     #[serde(default)]
     pub platform: Option<PlatformInfo>,
     /// 用户自定义标签。发送侧校验 [`node_labels_within_limit`]，
@@ -1039,7 +1013,7 @@ pub struct NodeHeartbeat {
     #[serde(default)]
     pub signature: Option<Vec<u8>>,
     /// 节点拓扑角色。路由策略据此排除不执行任务的 orchestrator 节点。
-    /// 旧版本节点缺省为 [`crate::common::NodeRole::Both`]，保持 P2P 兼容。
+    /// 未声明角色的节点缺省为 [`crate::common::NodeRole::Both`]（全角色参与）。
     #[serde(default)]
     pub role: crate::common::NodeRole,
     /// 本节点是否正在 draining。路由策略据此跳过该节点的新任务。
@@ -1090,51 +1064,15 @@ pub struct CancelBroadcast {
     pub workflow_id: WorkflowId,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WireDagStateUpdate {
-    pub workflow_id: WorkflowId,
-    pub task_id: TaskId,
-    pub task_state: WireTaskState,
-    /// 混合逻辑时钟时间戳。wall_time 为 UNIX 纪元起的纳秒。
-    /// 用于跨分布式节点的 CRDT 式冲突解决。
-    pub hlc_timestamp: HlcTimestamp,
-    pub origin_node: NodeId,
-}
-
-/// [`WireTaskState`] 变体的稳定字符串标识符。
+/// 任务终态变体的稳定字符串标识符。
 ///
-/// 这是 Rust→Python 状态映射的唯一真相来源。
-/// `as_str()` 引用这些常量，确保不漂移。
-///
-/// 注意：此处无 `PENDING` 常量，因为 `WireTaskState` 仅携带分发后状态。
-/// Pending 由 `WireTaskState` 条目缺失表示，并在编排器侧以 `Phase::Pending` 呈现。
+/// 这是 Rust→Python 状态映射的唯一真相来源：`WireTaskOutcome::as_str` 引用
+/// 这些常量，确保不漂移。
 pub mod state_str {
     pub const RUNNING: &str = "Running";
     pub const COMPLETED: &str = "Completed";
     pub const FAILED: &str = "Failed";
     pub const CANCELLED: &str = "Cancelled";
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum WireTaskState {
-    Running,
-    Completed { result: Vec<u8> },
-    Failed { error: String },
-    Cancelled,
-}
-
-impl WireTaskState {
-    /// PyO3 边界使用的稳定字符串表示。
-    ///
-    /// 返回 `state_str` 常量之一 — 绝不返回字面量。
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            WireTaskState::Running => state_str::RUNNING,
-            WireTaskState::Completed { .. } => state_str::COMPLETED,
-            WireTaskState::Failed { .. } => state_str::FAILED,
-            WireTaskState::Cancelled => state_str::CANCELLED,
-        }
-    }
 }
 
 impl WireTaskOutcome {
@@ -1172,7 +1110,6 @@ pub struct WorkflowHead {
     /// 已成功完成的任务数。
     pub succeeded_count: usize,
     pub total_count: usize,
-    pub hlc_timestamp: HlcTimestamp,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

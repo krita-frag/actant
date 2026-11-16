@@ -113,9 +113,9 @@ assert_scheduler_contract(&my_scheduler).await;
 assert_transport_contract(&my_transport, "actant:contract").await;
 ```
 
-`assert_scheduler_contract` 覆盖：计数自洽、单任务/批量出队、`drain_unrouted`
-只取未路由任务、`close` 幂等且拒绝新入队、已排队任务在 `close` 后仍可取、
-关闭后 `dequeue` 返回 `None`。`assert_transport_contract` 覆盖：身份非空、
+`assert_scheduler_contract` 覆盖：计数自洽、单任务/批量出队、按工作流撤销
+（`remove_workflow_tasks` 只移除目标工作流的任务、直提任务保留、重复撤销返回 0）、
+`close` 幂等且拒绝新入队、已排队任务在 `close` 后仍可取、关闭后 `dequeue` 返回 `None`。`assert_transport_contract` 覆盖：身份非空、
 重复 `subscribe` 容忍、已订阅 topic 可广播、地址可读、`discover_peers` 不失败、
 重复 `shutdown` 容忍。契约测试不覆盖各实现特有的语义（优先级顺序、真实网络
 行为），那部分仍需实现方自己的测试。

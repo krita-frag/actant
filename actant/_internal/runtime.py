@@ -543,6 +543,7 @@ class _RuntimeTaskMixin(_RuntimeBase):
                 workflow_id,
                 handle.task_id,
                 state,
+                attempt=handle._attempt,
                 result=result,
                 error=error,
             )
@@ -586,6 +587,9 @@ class _RuntimeTaskMixin(_RuntimeBase):
             # （任务早已跑完，却等不到封口）。
             self._report_result_without_handle(completion)
             return
+        # 派发代数随每条事件带回：上报时原样交回，编排器据此丢弃被放弃那次
+        # 执行的迟到结果。
+        handle._attempt = getattr(completion, "attempt", 0)
         state = completion.state
         if state == TASK_STATE_RUNNING:
             # Worker 已开始执行任务，更新为 running（非终态，不从注册表移除）。
@@ -646,29 +650,46 @@ class _RuntimeTaskMixin(_RuntimeBase):
                         workflow_id,
                         task_id,
                         "Failed",
+                        attempt=getattr(completion, "attempt", 0),
                         error=f"undecodable result for task {task_id!r}: {e}",
                     )
                     return
                 if success:
                     self._report_task_result(
-                        workflow_id, task_id, "Completed", result=raw
+                        workflow_id,
+                        task_id,
+                        "Completed",
+                        attempt=getattr(completion, "attempt", 0),
+                        result=raw,
                     )
                 elif isinstance(payload_obj, _TCE):
-                    self._report_task_result(workflow_id, task_id, "Cancelled")
+                    self._report_task_result(
+                        workflow_id,
+                        task_id,
+                        "Cancelled",
+                        attempt=getattr(completion, "attempt", 0),
+                    )
                 else:
                     self._report_task_result(
                         workflow_id,
                         task_id,
                         "Failed",
+                        attempt=getattr(completion, "attempt", 0),
                         error=f"{type(payload_obj).__name__}: {payload_obj}",
                     )
             elif state == TASK_STATE_CANCELLED:
-                self._report_task_result(workflow_id, task_id, "Cancelled")
+                self._report_task_result(
+                    workflow_id,
+                    task_id,
+                    "Cancelled",
+                    attempt=getattr(completion, "attempt", 0),
+                )
             else:
                 self._report_task_result(
                     workflow_id,
                     task_id,
                     "Failed",
+                    attempt=getattr(completion, "attempt", 0),
                     error=completion.error or "task failed (no detail reported)",
                 )
         except Exception:
@@ -839,6 +860,7 @@ class _RuntimeTaskMixin(_RuntimeBase):
         task_id: str,
         state: str,
         *,
+        attempt: int,
         result: bytes | None = None,
         error: str | None = None,
     ) -> dict[str, Any]:
@@ -853,6 +875,8 @@ class _RuntimeTaskMixin(_RuntimeBase):
                 Rust 侧直接返回无裁决。
             task_id: 节点标识。
             state: ``"Completed"`` / ``"Failed"`` / ``"Cancelled"``。
+            attempt: 结果所属派发代数（来自结果事件，不得自行构造）。编排器
+                据此丢弃被放弃那次执行的迟到结果。
             result: ``Completed`` 时的结果字节。
             error: ``Failed`` 时的错误信息。
 
@@ -869,7 +893,7 @@ class _RuntimeTaskMixin(_RuntimeBase):
         core = self._require_core()
         return cast(
             "dict[str, Any]",
-            core.report_task_result(workflow_id, task_id, state, result, error),
+            core.report_task_result(workflow_id, task_id, state, attempt, result, error),
         )
 
     def _unregister_task(self, task_id: str) -> bool:

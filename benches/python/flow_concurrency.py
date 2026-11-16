@@ -8,9 +8,9 @@
 
 用法::
 
-    uv run --extra dev python benches/python/flow_concurrency.py --mode threads --flows 200
-    uv run --extra dev python benches/python/flow_concurrency.py --mode detached --flows 200
-    uv run --extra dev python benches/python/flow_concurrency.py --mode detached --flows 20 --replay
+    uv run python benches/python/flow_concurrency.py --mode threads --flows 200
+    uv run python benches/python/flow_concurrency.py --mode detached --flows 200
+    uv run python benches/python/flow_concurrency.py --mode detached --flows 20 --replay
 
 ``10,000`` 个线程通常会在 macOS/Linux 上触发线程创建上限；这正是基线的一部分，
 脚本会报告已成功 park 的数量而不是直接崩溃。

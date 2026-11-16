@@ -736,11 +736,11 @@ def suspend(*, timeout_ms: int = 0) -> None:
 
 
 def patched(change_id: str, *, enabled: bool = True) -> bool:
-    """声明一个向后兼容的代码分支，并返回该工作流**实际采用**的决策。
+    """声明一个确定性的代码演化分支，并返回该工作流**实际采用**的决策。
 
     用于在不打断在途工作流的前提下修改 flow 体：把新逻辑包进
-    ``if patched("change-id"):``，已存在的旧工作流仍走旧分支，新工作流走新
-    分支。
+    ``if patched("change-id"):``，已存在的在途工作流仍走旧分支，新工作流走新
+    分支。这是决策表机制（分支选择写入工作流历史），不是兼容层。
 
     决策是**首次执行时写入工作流历史**的确定性值（按 ``change_id`` 寻址，
     随 orchestration 快照跨重启存活）：

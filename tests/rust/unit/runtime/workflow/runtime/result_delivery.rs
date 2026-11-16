@@ -148,13 +148,8 @@ async fn pending_result_loop_delivers_and_stops_on_cancel() {
     transport.push_response(DirectResponse::TaskResultAck { accepted: true });
 
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-    let pending_tx = start_pending_result_loop(
-        transport.clone(),
-        cancel_rx,
-        3,
-        Duration::from_millis(1),
-        10,
-    );
+    let pending_tx =
+        start_pending_result_loop(transport.clone(), cancel_rx, Duration::from_millis(1), 10);
 
     pending_tx
         .send(PendingResult {
@@ -177,19 +172,14 @@ async fn pending_result_loop_delivers_and_stops_on_cancel() {
 #[tokio::test]
 async fn pending_result_loop_keeps_retrying_until_accepted() {
     let transport = Arc::new(RecordingTransport::new());
-    // 两次 rejected 后接受：超过 max_attempts 也不能丢弃远端结果。
+    // 两次 rejected 后接受：重试不设放弃阈值，远端结果不得因次数被丢弃。
     transport.push_response(DirectResponse::TaskResultAck { accepted: false });
     transport.push_response(DirectResponse::TaskResultAck { accepted: false });
     transport.push_response(DirectResponse::TaskResultAck { accepted: true });
 
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-    let pending_tx = start_pending_result_loop(
-        transport.clone(),
-        cancel_rx,
-        2,
-        Duration::from_millis(1),
-        10,
-    );
+    let pending_tx =
+        start_pending_result_loop(transport.clone(), cancel_rx, Duration::from_millis(1), 10);
 
     pending_tx
         .send(PendingResult {
@@ -214,18 +204,13 @@ async fn pending_result_loop_keeps_retrying_until_accepted() {
 }
 
 #[tokio::test]
-async fn pending_result_loop_retries_even_when_attempts_exceed_max() {
+async fn pending_result_loop_retries_regardless_of_attempt_count() {
     let transport = Arc::new(RecordingTransport::new());
     transport.push_response(DirectResponse::TaskResultAck { accepted: true });
 
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-    let pending_tx = start_pending_result_loop(
-        transport.clone(),
-        cancel_rx,
-        1,
-        Duration::from_millis(1),
-        10,
-    );
+    let pending_tx =
+        start_pending_result_loop(transport.clone(), cancel_rx, Duration::from_millis(1), 10);
 
     pending_tx
         .send(PendingResult {

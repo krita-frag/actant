@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::common::{ActantError, ActorId, TaskDefinition};
+use crate::common::{ActantError, ActorId, TaskDefinition, WorkflowId};
 use crate::runtime::actor::ActorSystem;
 use crate::runtime::workflow::actor::{scheduler_methods, InnerScheduler};
 use crate::runtime::workflow::messaging::{decode_result, encode, ok_or_error};
@@ -36,8 +36,17 @@ pub trait Scheduler: Send + Sync {
     async fn try_dequeue(&self) -> Option<TaskDefinition>;
     /// 至多出队 `limit` 个任务，按优先级排序返回。队列不足时返回数量少于 `limit`。
     async fn dequeue_batch(&self, limit: usize) -> Vec<TaskDefinition>;
-    async fn is_empty(&self) -> bool;
-    async fn len(&self) -> usize;
+    /// 移除该工作流所有**尚未出队**的任务，返回移除数量。
+    ///
+    /// 用于「让位」：本节点收到的 claim 表明另一节点已成为工作流的编排者时，
+    /// 本地排队但未开始执行的任务必须一并撤销。只摘编排状态（
+    /// `remove_active_workflow`）不够——执行层仍会把它们派发出去，副作用会在
+    /// 新旧两个主上各发生一次，而完成回灌时 slot 已删、结果被静默丢弃。
+    ///
+    /// 已经出队（在 `inflight` 或执行中）的任务不在此列，由派发前的
+    /// 租约所有权校验拦截。实现必须是无副作用的纯队列操作：不发终态事件、
+    /// 不重排、不重试——工作流已归对方，撤销的任务由对方重新派发。
+    async fn remove_workflow_tasks(&self, workflow_id: &WorkflowId) -> usize;
     /// 关闭调度器——拒绝新入队并唤醒等待者，使 `dequeue()` 在队列清空后返回 `None`。
     ///
     /// # 语义
@@ -58,8 +67,7 @@ pub trait Scheduler: Send + Sync {
     ///
     /// `close` 返回后 `is_closed` 立即返回 `true`（在 `ActorScheduler` 实现中
     /// 通过 `AtomicBool` 保证）。`ActorScheduler` 的 `close` 是 fire-and-forget：
-    /// 它仅标记本地状态并异步通知 Actor，调用方若需确保 Actor 完全停止应继续调用
-    /// [`ActorScheduler::join`]。
+    /// 它仅标记本地状态并异步通知 Actor 进入 drain 模式。
     fn close(&self) {}
     /// 调度器是否已被 [`close`](Self::close)。
     ///
@@ -71,10 +79,6 @@ pub trait Scheduler: Send + Sync {
     }
 }
 
-/// `name` 是否为内置调度器种类。
-///
-/// 供 [`crate::common::SchedulerKind::validate`] 在启动时拒绝未知调度器名，
-/// 而非静默回退到默认策略。
 /// 构造启用 enqueue fast-path 的 [`ActorScheduler`]（供 bench/test 使用）。
 ///
 /// 生产代码用 [`crate::runtime::builder::init_worker`] 装配；此函数仅供
@@ -251,21 +255,23 @@ impl Scheduler for ActorScheduler {
         }
     }
 
-    async fn is_empty(&self) -> bool {
-        match self.call(scheduler_methods::IS_EMPTY, vec![]).await {
-            Ok(result) => decode_result::<bool>(result).unwrap_or(true),
-            Err(e) => {
-                tracing::warn!("SchedulerActor is_empty call failed: {}", e);
-                true
-            }
+    async fn remove_workflow_tasks(&self, workflow_id: &WorkflowId) -> usize {
+        // 快路径：与 enqueue 同理，直接操作共享队列，避免一次 Actor 往返。
+        if let Some(ref inner) = self.fast_inner {
+            return inner.remove_workflow_tasks(workflow_id).await;
         }
-    }
-
-    async fn len(&self) -> usize {
-        match self.call(scheduler_methods::LEN, vec![]).await {
+        match self
+            .call(
+                scheduler_methods::REMOVE_WORKFLOW_TASKS,
+                encode(workflow_id).unwrap_or_default(),
+            )
+            .await
+        {
             Ok(result) => decode_result::<usize>(result).unwrap_or(0),
             Err(e) => {
-                tracing::warn!("SchedulerActor len call failed: {}", e);
+                // 撤队列失败时保守返回 0：调用方据此保留「已撤销」以外的日志口径，
+                // 未撤掉的任务由派发前的租约所有权校验兜住。
+                tracing::warn!("SchedulerActor remove_workflow_tasks call failed: {}", e);
                 0
             }
         }
@@ -287,15 +293,11 @@ impl Scheduler for ActorScheduler {
     /// 重复调用安全：`closed` 标志的 `store` 是幂等的；`CLOSE` 消息会被 Actor 侧
     /// 重复处理但无副作用。
     ///
-    /// # 与 [`ActorScheduler::join`] 的关系
+    /// # 与 Actor 生命周期的关系
     ///
-    /// 关闭流程分两步：
-    /// ```text
-    /// client.close();        // 1. 标记本地 + 异步通知 Actor
-    /// client.join().await?;  // 2. 等待 SchedulerActor 实际停止
-    /// ```
-    /// 若调用方需要确保 Actor 完全退出（例如 shutdown 序列），应在 `close` 之后
-    /// 调用 `join`。仅调用 `close` 不足以保证 Actor 已停止。
+    /// `close` 只负责「不再接单 + 唤醒消费者」。`SchedulerActor` 本身由
+    /// `ActorSystem` 的停机流程停止（`Runtime::shutdown` 的 actor 关闭顺序），
+    /// 调用方不需要、也没有接口等待它退出。
     ///
     /// # 错误处理
     ///
@@ -344,17 +346,6 @@ impl Scheduler for ActorScheduler {
             return inner.is_closed();
         }
         false
-    }
-}
-
-impl ActorScheduler {
-    /// 同步等待底层 `SchedulerActor` 实际停止。
-    ///
-    /// `close()` 是 fire-and-forget：它标记本地状态为 closed 并异步通知 Actor。
-    /// 调用方若需要确保 Actor 完全停止（例如 shutdown 流程），应在 `close()`
-    /// 之后调用 `join()`。
-    pub async fn join(&self) -> Result<(), ActantError> {
-        self.actor_system.stop(&self.actor_id).await
     }
 }
 

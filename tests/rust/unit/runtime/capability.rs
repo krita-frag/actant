@@ -62,9 +62,7 @@ async fn store_handler_roundtrip_via_actor() {
 
 #[test]
 fn effect_kind_variants_are_distinct() {
-    assert_ne!(EffectKind::Ask, EffectKind::Perform);
     assert_ne!(EffectKind::Perform, EffectKind::Emit);
-    assert_ne!(EffectKind::Ask, EffectKind::Emit);
 }
 
 #[tokio::test]
@@ -278,14 +276,6 @@ async fn runtime_chain_after_bind_returns_error() {
 }
 
 #[tokio::test]
-async fn ask_without_bound_actor_system_returns_error() {
-    let rt = CapabilityRuntime::new();
-    rt.register_codec::<Store>().unwrap();
-    let result = rt.ask::<Store>(StoreReq::Get { key: b"k".to_vec() }).await;
-    assert!(matches!(result, Err(ActantError::Internal(_))));
-}
-
-#[tokio::test]
 async fn perform_without_bound_actor_system_returns_error() {
     let rt = CapabilityRuntime::new();
     rt.register_codec::<Store>().unwrap();
@@ -306,42 +296,6 @@ async fn emit_without_bound_actor_system_returns_error() {
         })
         .await;
     assert!(matches!(result, Err(ActantError::Internal(_))));
-}
-
-#[tokio::test]
-async fn ask_without_codec_returns_error() {
-    let rt = CapabilityRuntime::new();
-    // 不调用 register_codec
-    let actor_system = Arc::new(crate::runtime::actor::ActorSystem::new());
-    let rt = Arc::new(rt);
-    Arc::clone(&rt)
-        .bind_actor_system(actor_system)
-        .await
-        .expect("bind actor system");
-
-    let result = rt.ask::<Store>(StoreReq::Get { key: b"k".to_vec() }).await;
-    assert!(matches!(result, Err(ActantError::Internal(_))));
-}
-
-#[test]
-fn builtin_capabilities_returns_all_wired() {
-    let caps = builtin_capabilities();
-    assert_eq!(caps.len(), 3);
-    let names: Vec<&str> = caps.iter().map(|c| c.name).collect();
-    assert!(names.contains(&"Store"));
-    assert!(names.contains(&"TaskLifecycle"));
-    assert!(names.contains(&"WorkflowLifecycle"));
-}
-
-#[test]
-fn register_defaults_registers_all_codecs() {
-    let rt = CapabilityRuntime::new();
-    register_defaults(&rt).unwrap();
-    // register_defaults 注册 codec 与空 layer（ensure_layer），
-    // 使所有内置 capability 都有 layer entry。
-    assert_eq!(rt.capability_count(), 3);
-    // handler_count 查 layer 中 handler 数量，应为 0（空 layer）
-    assert_eq!(rt.handler_count::<Store>(), 0);
 }
 
 #[tokio::test]
@@ -477,26 +431,6 @@ fn register_overwrites_existing_layer() {
 // =========================================================================
 
 #[tokio::test]
-async fn handler_adapter_ask_returns_none_on_type_mismatch() {
-    use crate::runtime::capability::HandlerAdapter;
-    use async_trait::async_trait;
-
-    struct DummyHandler;
-    #[async_trait]
-    impl Handler<Store> for DummyHandler {
-        async fn handle(&self, _req: StoreReq) -> Option<Result<Option<Vec<u8>>, String>> {
-            Some(Ok(None))
-        }
-    }
-
-    let adapter = HandlerAdapter::new(DummyHandler);
-    // 传入错误类型的 request
-    let wrong_req: Arc<dyn Any + Send + Sync> = Arc::new(42i32);
-    let result = adapter.ask(wrong_req).await;
-    assert!(result.is_none());
-}
-
-#[tokio::test]
 async fn handler_adapter_perform_returns_error_on_type_mismatch() {
     use crate::runtime::capability::HandlerAdapter;
     use async_trait::async_trait;
@@ -535,25 +469,6 @@ async fn handler_adapter_emit_returns_error_on_type_mismatch() {
 }
 
 #[tokio::test]
-async fn handler_adapter_ask_returns_none_when_handler_returns_none() {
-    use crate::runtime::capability::HandlerAdapter;
-    use async_trait::async_trait;
-
-    struct NoneHandler;
-    #[async_trait]
-    impl Handler<Store> for NoneHandler {
-        async fn handle(&self, _req: StoreReq) -> Option<Result<Option<Vec<u8>>, String>> {
-            None
-        }
-    }
-
-    let adapter = HandlerAdapter::new(NoneHandler);
-    let req: Arc<dyn Any + Send + Sync> = Arc::new(StoreReq::Get { key: b"k".to_vec() });
-    let result = adapter.ask(req).await;
-    assert!(result.is_none());
-}
-
-#[tokio::test]
 async fn handler_adapter_perform_returns_error_when_handler_returns_none() {
     use crate::runtime::capability::HandlerAdapter;
     use async_trait::async_trait;
@@ -573,91 +488,8 @@ async fn handler_adapter_perform_returns_error_when_handler_returns_none() {
 }
 
 // =========================================================================
-// ask / perform / emit 路径（绑定 ActorSystem）
+// perform / emit 路径（绑定 ActorSystem）
 // =========================================================================
-
-#[tokio::test]
-async fn ask_with_bound_actor_system_returns_response() {
-    let dir = tempdir().unwrap();
-    let store = StateStore::open(dir.path()).unwrap();
-    let rt = Arc::new(CapabilityRuntime::new());
-    register_defaults(&rt).unwrap();
-    register_store_handler(&rt, store).unwrap();
-    let actor_system = Arc::new(crate::runtime::actor::ActorSystem::new());
-    Arc::clone(&rt)
-        .bind_actor_system(actor_system)
-        .await
-        .expect("bind actor system");
-
-    // 先 Put 一个值
-    let _ = rt
-        .perform::<Store>(StoreReq::Put {
-            key: b"ask-k".to_vec(),
-            value: b"ask-v".to_vec(),
-        })
-        .await
-        .unwrap();
-
-    // ask 查询：StoreHandler 总是返回 Some，所以 ask 应返回 Some(Ok(Some(value)))
-    let result = rt
-        .ask::<Store>(StoreReq::Get {
-            key: b"ask-k".to_vec(),
-        })
-        .await
-        .unwrap();
-    assert!(result.is_some());
-    let resp = result.unwrap();
-    assert!(resp.is_ok());
-    assert_eq!(resp.unwrap(), Some(b"ask-v".to_vec()));
-}
-
-#[tokio::test]
-async fn ask_with_bound_actor_system_no_handler_returns_none() {
-    // 注册 codec + 空 layer（无 handler），ask 时无 handler 决策
-    // → actor 返回 payload=[0] → ask 返回 Ok(None)
-    let rt = Arc::new(CapabilityRuntime::new());
-    register_defaults(&rt).unwrap();
-    // 不注册任何 handler，仅 ensure_layer（register_defaults 已做）
-    let actor_system = Arc::new(crate::runtime::actor::ActorSystem::new());
-    Arc::clone(&rt)
-        .bind_actor_system(actor_system)
-        .await
-        .expect("bind actor system");
-
-    let result = rt
-        .ask::<Store>(StoreReq::Get {
-            key: b"no-handler".to_vec(),
-        })
-        .await;
-    assert!(matches!(result, Ok(None)));
-}
-
-#[tokio::test]
-async fn ask_with_bound_actor_system_returns_none_when_handler_returns_none() {
-    // 注册一个总返回 None 的 handler → ask 应返回 Ok(None)
-    use async_trait::async_trait;
-
-    struct NoneStoreHandler;
-    #[async_trait]
-    impl Handler<Store> for NoneStoreHandler {
-        async fn handle(&self, _req: StoreReq) -> Option<Result<Option<Vec<u8>>, String>> {
-            None
-        }
-    }
-
-    let rt = Arc::new(CapabilityRuntime::new());
-    register_defaults(&rt).unwrap();
-    rt.register(Layer::<Store>::new(Store::meta()).chain_erased(erase_handler(NoneStoreHandler)))
-        .unwrap();
-    let actor_system = Arc::new(crate::runtime::actor::ActorSystem::new());
-    Arc::clone(&rt)
-        .bind_actor_system(actor_system)
-        .await
-        .expect("bind actor system");
-
-    let result = rt.ask::<Store>(StoreReq::Get { key: b"k".to_vec() }).await;
-    assert!(matches!(result, Ok(None)));
-}
 
 #[tokio::test]
 async fn perform_with_no_local_handler_returns_error() {

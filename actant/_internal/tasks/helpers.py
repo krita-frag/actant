@@ -576,12 +576,10 @@ def _safe_serialize(
 
 
 def _ensure_picklable(exc: BaseException) -> BaseException:
-    """确保异常可序列化，不可序列化时退化为携带类型与消息的 RuntimeError。
+    """确保异常可序列化，不可序列化时退化为携带类型与消息的 ``RuntimeError``。
 
-    返回 bytes（用于
-    直接存入 _error_payload），``_ensure_picklable`` 返回对象（用于
-    ``_execute_with_retries`` 的 ``(False, exc_obj)`` 返回值，由调用方
-    统一序列化跨 Rust 边界）。
+    返回异常**对象**（不是字节）：``_execute_with_retries`` 以
+    ``(False, exc_obj)`` 返回，由调用方统一 ``cloudpickle.dumps`` 跨 Rust 边界。
     """
     try:
         cloudpickle.dumps(exc)

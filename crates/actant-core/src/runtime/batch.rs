@@ -153,7 +153,6 @@ impl BatchTracker {
         self.batches.remove(batch_id).is_some()
     }
 
-    /// 当前跟踪的 batch 数量。
     /// 是否没有任何 batch。
     pub fn is_empty(&self) -> bool {
         self.batches.is_empty()
@@ -175,8 +174,6 @@ fn progress_from(batch_id: &str, state: &BatchState) -> BatchProgress {
         pending: state.total.saturating_sub(settled),
     }
 }
-
-/// 成员集合类型别名，供调用方构造注册参数。
 
 #[cfg(test)]
 #[path = "../../../../tests/rust/unit/runtime/batch.rs"]

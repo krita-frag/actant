@@ -69,6 +69,21 @@ def to_bytes(self) -> bytes
 
 ### `_NetworkConfig`
 
+P2P 网络配置。
+
+``preset`` 是发现模式封闭白名单（``"none"`` / ``"local"`` / ``"dns"``）；
+环境变量 ``ACTANT_DISCOVERY`` 设置时覆盖 ``preset``（CI 用
+``ACTANT_DISCOVERY=none`` 强制离线）。跨机内网组网可配合
+``bootstrap_nodes``（自包含 NodeAddr，无 DNS/relay 依赖）。
+
+``max_message_size``（默认 16 MiB）只是**传输帧层**上限：所有远端输入
+随后还要过解码层 4 MiB 上限，4–16 MiB 的消息能过帧检查但必在解码处
+失败，调大本值不解除限制——超过 4 MiB 的载荷应走 blob 通道（独立
+ALPN，不受此约束）。
+
+``allowed_peer_ids`` 元素必须是 iroh endpoint id（z32）；写成完整
+``endpoint_addr`` 会在启动时报 Config 错误。
+
 **构造**
 
 ```python
@@ -126,17 +141,13 @@ Gossip 同步配置。所有字段的默认值取自 Rust ``GossipConfig::defaul
 **构造**
 
 ```python
-_GossipConfig(dedup_window_size: int | None = None, dedup_ttl_secs: int | None = None, retry_attempts: int | None = None, retry_base_delay_ms: int | None = None, heads_broadcast_interval_ms: int | None = None)
+_GossipConfig(heads_broadcast_interval_ms: int | None = None)
 ```
 
 **属性**
 
 | 属性 | 类型 | 说明 |
 | --- | --- | --- |
-| `dedup_window_size` | `int` |  |
-| `dedup_ttl_secs` | `int` |  |
-| `retry_attempts` | `int` |  |
-| `retry_base_delay_ms` | `int` |  |
 | `heads_broadcast_interval_ms` | `int` |  |
 
 ### `_StoreConfig`
@@ -230,6 +241,7 @@ Python 代码不应直接构造此对象——它仅作为 ``actant`` 模块中�
 | `result` | `bytes \| None` |  |
 | `error` | `str \| None` |  |
 | `target_node` | `str \| None` |  |
+| `attempt` | `int` | 产出该结果的派发代数；上报编排器时原样带回。 |
 
 ### `_DagNode`
 
@@ -595,13 +607,16 @@ def wait_wait_point_async(self, workflow_id: str, wait_key: str, timeout_ms: int
 不阻塞 event loop。
 
 ```python
-def report_task_result(self, workflow_id: str, task_id: str, state: str, result: bytes | None = None, error: str | None = None) -> dict[str, Any]
+def report_task_result(self, workflow_id: str, task_id: str, state: str, attempt: int, result: bytes | None = None, error: str | None = None) -> dict[str, Any]
 ```
 
 上报本地 flow 任务终态结果（Python 事件泵调用）。
 
 `workflow_id` 为空串表示独立 ``@task``（非编排任务），直接返回空裁决。
-`state` 为 ``"Completed"`` / ``"Failed"`` / ``"Cancelled"``；返回
+`state` 为 ``"Completed"`` / ``"Failed"`` / ``"Cancelled"``。
+`attempt` 是产出该结果的派发代数，必须原样取自 `_TaskCompletion.attempt`
+（不得自行构造）：编排器据此丢弃被放弃那次执行的迟到结果，代数为
+``0`` 而任务已重试过的结果会被当作过期结果拒绝；返回
 ``{"verdict": str, "delay_ms": int}``——``verdict`` 为 ``"retry"``
 （orchestrator 已排定重试并按 ``delay_ms`` 重新入队，提交方句柄应继续
 等待）、``"final"``（终局失败）或 ``"none"``（完成/取消入账、迟到重复

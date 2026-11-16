@@ -606,7 +606,9 @@ impl PyRuntimeCore {
     /// 将远端节点加入 gossip 网络（仅 peer_id，不建立直连）。
     ///
     /// 用于 dial() 之后对端尚未自动加入 gossip topic 时的补充。
-    /// ``peer_id`` 为对端 ``node_id()`` 返回的字符串。
+    /// ``peer_id`` 为对端 ``peer_id()`` 返回的 iroh 公钥 z32 字符串——
+    /// **不是** ``node_id()``：显式命名节点的 node_id（如 ``"alice"``）无法
+    /// 解析为 endpoint id，会得到 `invalid endpoint id` 错误。
     #[tracing::instrument(name = "py.add_gossip_peer", level = "info", skip(self, py))]
     fn add_gossip_peer(&self, py: Python<'_>, peer_id: String) -> PyResult<()> {
         let runtime = self.core()?;
@@ -873,11 +875,6 @@ impl PyRuntimeCore {
                 )
             }
         })?;
-        // 让出 GIL 一次给后台 tokio worker 处理 enqueue（协作式调度）。
-        // 不阻塞等待 enqueue 完成——后台 task 异步处理，Python 立即返回 handle。
-        py.detach(move || {
-            std::hint::spin_loop();
-        });
         Ok(())
     }
 
@@ -943,10 +940,6 @@ impl PyRuntimeCore {
                 )
             }
         })?;
-        // 让出 GIL 一次给后台 tokio worker 处理 enqueue_batch。
-        py.detach(move || {
-            std::hint::spin_loop();
-        });
         Ok(())
     }
 
@@ -1075,9 +1068,6 @@ impl PyRuntimeCore {
                         }
                     })?;
                     drop(tx_guard);
-                    py.detach(move || {
-                        std::hint::spin_loop();
-                    });
                 }
                 dict.set_item("created", true)?;
                 dict.set_item("state", Option::<String>::None)?;
@@ -1492,7 +1482,8 @@ impl PyRuntimeCore {
     /// Raises:
     ///     ValueError: ``state`` 不是已知终态（fail-fast，避免静默错分）。
     ///     RuntimeError: Runtime 未启动或 Worker 未初始化。
-    #[pyo3(signature = (workflow_id, task_id, state, result=None, error=None))]
+    #[pyo3(signature = (workflow_id, task_id, state, attempt, result=None, error=None))]
+    #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(
         name = "py.report_task_result",
         level = "debug",
@@ -1505,6 +1496,7 @@ impl PyRuntimeCore {
         workflow_id: String,
         task_id: String,
         state: String,
+        attempt: u32,
         result: Option<Vec<u8>>,
         error: Option<String>,
     ) -> PyResult<Py<PyAny>> {
@@ -1532,7 +1524,7 @@ impl PyRuntimeCore {
         // GIL 在 block_on 期间释放（与其它 actor 调用一致），避免 pyo3_log
         // 回调与持有 GIL 的调用方 block_on 互相等待。
         let verdict = py
-            .detach(move || tokio.block_on(worker.report_task_result(&wf, &tid, outcome)))
+            .detach(move || tokio.block_on(worker.report_task_result(&wf, &tid, outcome, attempt)))
             .map_err(actant_error_to_pyerr)?;
         let dict = pyo3::types::PyDict::new(py);
         let (verdict_str, delay_ms) = match verdict {
@@ -2048,7 +2040,6 @@ impl PyRuntimeCore {
         // fan-out 注册表：首次注册的回调由循环持有，后续注册经 mpsc 追加。
         let (add_tx, mut add_rx) = tokio::sync::mpsc::unbounded_channel::<Arc<Py<PyAny>>>();
         let mut callbacks: Vec<Arc<Py<PyAny>>> = vec![callback];
-        let blocking_permits = Arc::new(tokio::sync::Semaphore::new(PUMP_BLOCKING_PERMITS));
         // 泵对追加通道接收端的句柄在闭包内持有；发布端存入 pumps.active，
         // 后续注册经它追加（recv 唤醒即时生效，无需额外 notify）。
         *self.task_result_pumps.lock() = Some(add_tx.clone());
@@ -2064,6 +2055,7 @@ impl PyRuntimeCore {
                             TaskLifecycleEvent::TaskStarted {
                                 workflow_id,
                                 task_id,
+                                attempt,
                             } => PyTaskCompletion {
                                 workflow_id: workflow_id.as_str().to_string(),
                                 task_id: task_id.as_str().to_string(),
@@ -2072,6 +2064,7 @@ impl PyRuntimeCore {
                                 result: None,
                                 error: None,
                                 target_node: None,
+                                attempt,
                             },
                             TaskLifecycleEvent::TaskCompleted(c) => task_completion_to_py(&c),
                             TaskLifecycleEvent::TaskFailed(c) => task_completion_to_py(&c),
@@ -2080,20 +2073,14 @@ impl PyRuntimeCore {
                         for cb in &callbacks {
                             let cb = cb.clone();
                             let py_completion = py_completion.clone();
-                            // 把 Python 回调放到 spawn_blocking 执行，避免慢回调
-                            // 阻塞 feed 消费和 tokio worker 线程。并发上限 64：
-                            // 终态风暴 + 慢回调（GIL 被占）时无上限会堆积大量
-                            // 持结果字节的阻塞任务——纯内存放大（GIL 串行化后
-                            // 吞吐不变）；permits 在闭包 Drop 时归还，泵循环
-                            // 在 acquire 上等待，事件留在 feed 队列不丢。
-                            let Ok(permit) = blocking_permits.clone().acquire_owned().await
-                            else {
-                                // permits 永不 close；此分支仅剩 runtime drop 竞态，
-                                // 泵退出（事件无消费者）。
-                                break;
-                            };
-                            tokio::task::spawn_blocking(move || {
-                                let _permit = permit;
+                            // 串行交付：把回调移出 tokio worker 线程执行，但
+                            // **await 它**而不是 detached。correctness 通道的
+                            // FIFO 保证（同一任务的 Started 一定先于终态）只在
+                            // 逐条串行时成立；早先为每条事件起独立 blocking
+                            // 任务（并发 64），同一任务的 Started/终态会并发
+                            // 抢 GIL，顺序不确定。GIL 本就全局串行化，并发化
+                            // 不增吞吐，只放大持载荷的内存。
+                            let join = tokio::task::spawn_blocking(move || {
                                 Python::attach(|py| {
                                     let t0 = std::time::Instant::now();
                                     let cb_ref = cb.clone_ref(py);
@@ -2105,6 +2092,11 @@ impl PyRuntimeCore {
                                     );
                                 });
                             });
+                            if join.await.is_err() {
+                                tracing::warn!(
+                                    "task result callback panicked; event already delivered"
+                                );
+                            }
                         }
                     }
                     added = add_rx.recv() => {
@@ -2716,6 +2708,7 @@ fn task_completion_to_py(completion: &TaskCompletion) -> PyTaskCompletion {
             task_name,
             result,
             target_node,
+            attempt,
         } => PyTaskCompletion {
             workflow_id: workflow_id.as_str().to_string(),
             task_id: task_id.as_str().to_string(),
@@ -2724,6 +2717,7 @@ fn task_completion_to_py(completion: &TaskCompletion) -> PyTaskCompletion {
             result: Some(result.clone()),
             error: None,
             target_node: target_node.as_ref().map(|n| n.as_str().to_string()),
+            attempt: *attempt,
         },
         TaskCompletion::Failed {
             workflow_id,
@@ -2731,6 +2725,7 @@ fn task_completion_to_py(completion: &TaskCompletion) -> PyTaskCompletion {
             task_name,
             error,
             target_node,
+            attempt,
         } => PyTaskCompletion {
             workflow_id: workflow_id.as_str().to_string(),
             task_id: task_id.as_str().to_string(),
@@ -2739,12 +2734,14 @@ fn task_completion_to_py(completion: &TaskCompletion) -> PyTaskCompletion {
             result: None,
             error: Some(error.clone()),
             target_node: target_node.as_ref().map(|n| n.as_str().to_string()),
+            attempt: *attempt,
         },
         TaskCompletion::Cancelled {
             workflow_id,
             task_id,
             task_name,
             target_node,
+            attempt,
         } => PyTaskCompletion {
             workflow_id: workflow_id.as_str().to_string(),
             task_id: task_id.as_str().to_string(),
@@ -2753,6 +2750,7 @@ fn task_completion_to_py(completion: &TaskCompletion) -> PyTaskCompletion {
             result: None,
             error: None,
             target_node: target_node.as_ref().map(|n| n.as_str().to_string()),
+            attempt: *attempt,
         },
     }
 }

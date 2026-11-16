@@ -52,6 +52,10 @@ fn retry_delay_ms(policy: &RetryPolicy, retry_index: u32) -> u64 {
 /// 比对范围覆盖决定任务行为的全部字段（name / payload / timeout / priority /
 /// retry_policy / tags / quota）与依赖边集合：重放体的第 n 次提交必须与历史中同序位节点
 /// 完全一致，任何漂移（如上游结果差异、提交序列错位）都判为指纹不一致。
+///
+/// `metadata` **刻意不参与指纹**：它是纯标注字段，无放置/调度语义（消费方
+/// 仅 `queries` 透传给观测面），变化不构成提交序列漂移；纳入指纹会让纯
+/// 标注改动误判为重放冲突。
 fn flow_node_matches(existing: &DagNode, incoming: &DagNode, dag: &Dag, deps: &[TaskId]) -> bool {
     if existing.name != incoming.name
         || existing.payload != incoming.payload
@@ -474,7 +478,8 @@ impl Orchestrator {
 
         match terminal_snapshot {
             Some(exec_snapshot) => {
-                self.complete_terminal(workflow_id, None, &exec_snapshot)
+                // 封口触发终态 ⇒ 全部任务已终态，无在途对象需要取消传播。
+                self.complete_terminal(workflow_id, None, &exec_snapshot, Vec::new())
                     .await?;
             }
             None => {
@@ -511,6 +516,7 @@ impl Orchestrator {
         workflow_id: &WorkflowId,
         task_id: &TaskId,
         error: String,
+        result_attempt: Option<u32>,
     ) -> Result<FailureOutcome> {
         let (should_retry, delay_ms) = {
             let slot = self.state.slots.get(workflow_id).ok_or_else(|| {
@@ -608,8 +614,14 @@ impl Orchestrator {
                 }
             }
         }
-        self.fail_task(workflow_id, task_id, error, FailureScope::WorkflowLevel)
-            .await?;
+        self.fail_task(
+            workflow_id,
+            task_id,
+            error,
+            FailureScope::WorkflowLevel,
+            result_attempt,
+        )
+        .await?;
         Ok(FailureOutcome::Final)
     }
 
@@ -719,12 +731,12 @@ impl Orchestrator {
         &self,
         workflow_id: &WorkflowId,
         task_id: &TaskId,
-        result_attempt: Option<u32>,
+        result_attempt: u32,
     ) -> bool {
         match self.state.slots.get(workflow_id) {
             Some(slot) => slot
                 .execution
-                .attempt_fencing_passes(task_id, result_attempt),
+                .attempt_fencing_passes(task_id, Some(result_attempt)),
             None => true,
         }
     }
@@ -741,12 +753,10 @@ impl Orchestrator {
         workflow_id: &WorkflowId,
         task_id: &TaskId,
         result: Vec<u8>,
+        result_attempt: Option<u32>,
     ) -> Result<(Vec<TaskDefinition>, bool)> {
-        // 结果通路（WireTaskResult / WireDagStateUpdate / COMPLETE_TASK actor
-        // 载荷）尚未携带派发代数（wire.rs 本批次冻结），传 `None` 放行 attempt
-        // fencing；待协议扩展后由调用方传入结果的 attempt 即接入 fencing。
         let info = self
-            .complete_task(workflow_id, task_id, result, None)
+            .complete_task(workflow_id, task_id, result, result_attempt)
             .await?;
 
         // 出现终态时后继清单必然为空；且 `completed_retention_count == 0`
@@ -808,12 +818,11 @@ impl Orchestrator {
         };
 
         if let Some(exec_snapshot) = terminal_snapshot {
-            self.complete_terminal(workflow_id, None, &exec_snapshot)
+            // cancels_to_broadcast 即翻转临界区内采集的全部非终态任务
+            // （mark_cancelled 会擦除它们的状态）。即使持久化失败也要传播取消
+            // ——complete_terminal 内部对落盘失败只记日志不返回 Err，广播不跳过。
+            self.complete_terminal(workflow_id, None, &exec_snapshot, cancels_to_broadcast)
                 .await?;
-        }
-        // 即使持久化失败也要传播取消，否则在途/排队任务继续占用 Worker 槽位。
-        for task_id in cancels_to_broadcast {
-            self.broadcast_task_cancel(workflow_id, &task_id).await;
         }
         Ok(())
     }
@@ -889,7 +898,18 @@ impl Orchestrator {
     /// 节点被取消」），立即走 [`Self::complete_terminal`] 收尾——持久化终态
     /// 快照、追加终态事件、更新指标并唤醒等待者——取消必须触发收尾，否则
     /// 工作流会永久停留在 `Running`（flow 的终态轮询因此挂起）。
-    pub async fn cancel_task(&self, workflow_id: &WorkflowId, task_id: &TaskId) -> Result<bool> {
+    ///
+    /// `pub(crate)` 限定：本方法**不广播取消**，只做状态入账。唯一调用方
+    /// `WorkflowActor`（worker 上报 `Cancelled` 结果）到达时执行体已经停止，
+    /// 无需传播；用户级单任务取消的 P2P 双腿广播发生在更上层
+    /// （Python `_request_cancel` / `Worker::cancel_task`），广播完成后才
+    /// 落到本入账路径。若放开为 pub，Rust 嵌入方直调会得到「状态已取消、
+    /// 执行体仍在跑」的错位——这正是工作流级 `cancel()` 明令避免的行为。
+    pub(crate) async fn cancel_task(
+        &self,
+        workflow_id: &WorkflowId,
+        task_id: &TaskId,
+    ) -> Result<bool> {
         let (cancelled, terminal_snapshot) = {
             let mut slot = self.state.slots.get_mut(workflow_id).ok_or_else(|| {
                 crate::common::ActantError::NotFound(format!(
@@ -915,7 +935,8 @@ impl Orchestrator {
 
         match terminal_snapshot {
             Some(exec_snapshot) => {
-                self.complete_terminal(workflow_id, Some(task_id), &exec_snapshot)
+                // 本次取消导致终态 ⇒ 其余任务已全部终态，无在途对象需传播。
+                self.complete_terminal(workflow_id, Some(task_id), &exec_snapshot, Vec::new())
                     .await?;
             }
             None => {
@@ -1012,20 +1033,27 @@ impl Orchestrator {
     /// 终态吸收：工作流已终态或任务已终态时不推进——迟到的 `Running` 不得把
     /// `Cancelled` / `Failed` 任务"复活"，与 `mark_task_completed` 的守卫语义一致。
     pub fn mark_task_running(&self, workflow_id: &WorkflowId, task_id: &TaskId) -> Result<()> {
-        let mut slot = self.state.slots.get_mut(workflow_id).ok_or_else(|| {
-            crate::common::ActantError::NotFound(format!(
-                "workflow {} not found",
-                workflow_id.as_str()
-            ))
-        })?;
-        if !slot.execution.can_transition_task(task_id) {
-            return Ok(());
+        let transitioned = {
+            let mut slot = self.state.slots.get_mut(workflow_id).ok_or_else(|| {
+                crate::common::ActantError::NotFound(format!(
+                    "workflow {} not found",
+                    workflow_id.as_str()
+                ))
+            })?;
+            if !slot.execution.can_transition_task(task_id) {
+                return Ok(());
+            }
+            slot.execution.mark_task_running(task_id);
+            true
+        };
+        // 事件追加在写锁释放后执行：journal 同步写不入 DashMap 分片守卫，
+        // 避免慢盘期间同分片的其它工作流无法推进（与 `add_node` 同口径）。
+        if transitioned {
+            self.log_event(JournalEvent::TaskRunning {
+                workflow_id: workflow_id.clone(),
+                task_id: task_id.clone(),
+            });
         }
-        slot.execution.mark_task_running(task_id);
-        self.log_event(JournalEvent::TaskRunning {
-            workflow_id: workflow_id.clone(),
-            task_id: task_id.clone(),
-        });
         Ok(())
     }
 
@@ -1045,13 +1073,15 @@ impl Orchestrator {
         task_id: &TaskId,
         error: String,
         mode: FailureScope,
+        result_attempt: Option<u32>,
     ) -> Result<()> {
         let error_for_event = error.clone();
         // 终态守卫拒绝（workflow/task 已终态）时状态未变：不追加 TaskFailed
         // 事件、不重复终态收尾——同一失败的重复/迟到投递（本地通道 / 远端
         // 直连 / gossip 三路回灌）必须产生一致的状态与历史。attempt fencing
-        // 由 `WorkflowActor::on_task_result` 在进入本方法前统一裁决（当前
-        // 协议传 `None` 放行，DAG 层 `fail_task` 内部校验保留为最终防线）。
+        // 由 `WorkflowActor::on_task_result` 在进入本方法前统一裁决；
+        // `result_attempt` 在此再校验一次，兜住不经入口的直调（recover 重放
+        // 传 `None`，重放不参与 fencing）。
         let (accepted, is_terminal) = {
             let mut slot = self.state.slots.get_mut(workflow_id).ok_or_else(|| {
                 crate::common::ActantError::NotFound(format!(
@@ -1065,7 +1095,7 @@ impl Orchestrator {
                 dag, execution, ..
             } = &mut *slot;
             let accepted = execution.can_transition_task(task_id);
-            execution.fail_task(dag, task_id, error, mode, None);
+            execution.fail_task(dag, task_id, error, mode, result_attempt);
             (accepted, accepted && execution.is_terminal())
         };
 
@@ -1089,8 +1119,10 @@ impl Orchestrator {
             };
             // 与其它终态入口共用收尾：终态事件、指标、等待者释放、淘汰和
             // 落盘失败容错只有一处实现，落盘失败不得跳过内存侧结算。
+            // FailFast 兄弟任务未被翻转（set_failed 只置工作流相位），仍是
+            // 收尾点快照扫描可见的非终态对象，无需翻转前采集。
             return self
-                .complete_terminal(workflow_id, Some(task_id), &exec_snapshot)
+                .complete_terminal(workflow_id, Some(task_id), &exec_snapshot, Vec::new())
                 .await
                 .map(|_| ());
         }
@@ -1134,17 +1166,20 @@ impl Orchestrator {
             {
                 // 过期派发代数的迟到结果：丢弃，不推进状态、不发事件。
                 (true, false)
+            } else if !slot
+                .execution
+                .mark_task_completed(task_id, result.clone(), result_attempt)
+            {
+                // 入口预检与写入侧守卫同源，此分支当前不可达；一旦守卫口径
+                // 分叉（预检放行、写入拒绝），状态未变就不写事件——事件与
+                // 状态必须同进退，否则出现「事件写了、状态没变」的历史。
+                tracing::error!(
+                    workflow = %workflow_id.as_str(),
+                    task = %task_id.as_str(),
+                    "completion precheck passed but write-side guard rejected; no event written"
+                );
+                (true, false)
             } else {
-                slot.execution
-                    .mark_task_completed(task_id, result.clone(), result_attempt);
-                // 任务完成事件在终态判定之前追加：末任务完成使工作流进入
-                // 终态时，complete_terminal 早退路径不得吞掉 per-task 事件，
-                // 否则历史缺失 TaskCompleted（重放/审计无法重建任务终态）。
-                self.log_event(JournalEvent::TaskCompleted {
-                    workflow_id: workflow_id.clone(),
-                    task_id: task_id.clone(),
-                    result: result.clone(),
-                });
                 (false, slot.execution.is_terminal())
             }
         };
@@ -1156,6 +1191,16 @@ impl Orchestrator {
             });
         }
 
+        // 任务完成事件在终态判定之前落历史：末任务完成使工作流进入终态时，
+        // complete_terminal 的早退路径不得吞掉 per-task 事件，否则历史缺失
+        // TaskCompleted（重放/审计无法重建任务终态）。追加在写锁释放后执行：
+        // journal 同步写不入 DashMap 分片守卫（与 `add_node` 同口径）。
+        self.log_event(JournalEvent::TaskCompleted {
+            workflow_id: workflow_id.clone(),
+            task_id: task_id.clone(),
+            result: result.clone(),
+        });
+
         if is_terminal {
             let exec_snapshot = {
                 let slot = self.state.slots.get(workflow_id).ok_or_else(|| {
@@ -1166,8 +1211,9 @@ impl Orchestrator {
                 })?;
                 slot.execution.clone()
             };
+            // 完成驱动的终态 ⇒ 全部任务已终态，无在途对象需取消传播。
             return self
-                .complete_terminal(workflow_id, Some(task_id), &exec_snapshot)
+                .complete_terminal(workflow_id, Some(task_id), &exec_snapshot, Vec::new())
                 .await;
         }
 
@@ -1183,15 +1229,24 @@ impl Orchestrator {
     }
 
     /// 工作流终态收尾的唯一实现点：持久化终态快照（Completed 附带聚合结果）、
-    /// 追加终态事件（Completed / Cancelled / Failed 三选一）、更新指标并唤醒
-    /// 等待者。三条触发路径共用：末任务完成（`complete_task`）、
-    /// 封口时已全部终态（`seal_workflow`）、
-    /// 取消使最后在途节点终态（`cancel_task`）。
+    /// 追加终态事件（Completed / Cancelled / Failed 三选一）、更新指标、
+    /// 传播取消并唤醒等待者。全部终态入口共用。
+    ///
+    /// 取消传播的两个来源在收尾点汇合：
+    /// - `running_cancels`：**必填**。翻转函数会擦除 Running 状态的入口
+    ///   （`mark_workflow_failed` / `mark_cancelled`），必须在翻转临界区内
+    ///   采集后传入；终态系「全部任务已终态」的入口（完成驱动、封口、
+    ///   单任务取消入账）传空。漏传无法编译通过，消除「新增入口忘记补采集」
+    ///   的契约漂移。
+    /// - 快照中仍可见的非终态任务：FailFast（`set_failed` 只置工作流相位、
+    ///   不动兄弟任务）与 Pending 兄弟（`mark_workflow_failed` 只翻 Running）。
+    ///   两集合互斥，快照扫描是其唯一防线，不可删除。
     async fn complete_terminal(
         &self,
         workflow_id: &WorkflowId,
         completed_task_id: Option<&TaskId>,
         exec_snapshot: &crate::runtime::workflow::dag::WorkflowExecution,
+        running_cancels: Vec<TaskId>,
     ) -> Result<CompletionInfo> {
         if !exec_snapshot.state.is_terminal() {
             // 所有调用方都应在翻转到终态后再进入本方法。若这里收到非终态
@@ -1272,12 +1327,13 @@ impl Orchestrator {
 
         crate::metrics::dec_active_workflows();
 
-        // 终态收尾统一广播取消：fail-fast / fail_workflow / Continue 级联三类
-        // 入口翻转终态时，快照中的 Running 兄弟任务与已被级联取消的 Pending
-        // 下游可能仍在本节点或远端执行——与 `cancel()` 文档批判的行为一致
-        // （远端在途任务占满自身超时、结果再被终态守卫丢弃，纯浪费）。在
-        // 唯一收尾点单次收口，消除三类入口的行为漂移。快照携带终态前视图，
-        // 非终态任务即需要取消传播的对象。
+        // 终态收尾统一广播取消（双腿：gossip + 本地自投递）。两个来源见
+        // 本方法文档：翻转擦除态由调用方经 `running_cancels` 传入，快照可见
+        // 的非终态兄弟在此扫描补齐——远端在途任务占满自身超时、排队任务
+        // 继续派发而结果再被终态守卫丢弃，都是纯浪费的副作用执行。
+        for task_id in &running_cancels {
+            self.broadcast_task_cancel(workflow_id, task_id).await;
+        }
         for (task_id, ts) in &exec_snapshot.tasks {
             if !ts.state.is_terminal() {
                 self.broadcast_task_cancel(workflow_id, task_id).await;
@@ -1365,21 +1421,11 @@ impl Orchestrator {
     /// 本方法表示执行失败（Failed），错误串进入终态快照与 `Failed` 事件，
     /// 使 `FlowHandle.result()` 能区分失败与取消。
     pub async fn fail_workflow(&self, workflow_id: &WorkflowId, error: String) -> Result<()> {
-        // 状态翻转前采集 Running 任务：mark_workflow_failed 会把它们翻成
-        // Failed，complete_terminal 的快照收口（W3）看不到仍在本节点或远端
-        // 执行的对象——须由本入口显式广播取消。
-        let running_task_ids: Vec<TaskId> = match self.state.slots.get(workflow_id) {
-            Some(slot) if slot.state == SlotState::Ready => slot
-                .execution
-                .tasks
-                .iter()
-                .filter(|(_, ts)| ts.state == Phase::Running)
-                .map(|(id, _)| id.clone())
-                .collect(),
-            _ => Vec::new(),
-        };
-
-        let terminal_snapshot = {
+        // 采集与翻转在同一临界区：mark_workflow_failed 会把 Running 翻成
+        // Failed，complete_terminal 的快照收口看不到它们（Pending 兄弟不被
+        // 翻转、仍可见，由收尾点的快照扫描覆盖）——Running 集合必须由本入口
+        // 经 `running_cancels` 参数显式传入，漏传编译不过。
+        let (running_cancels, terminal_snapshot) = {
             let mut slot = self.state.slots.get_mut(workflow_id).ok_or_else(|| {
                 crate::common::ActantError::NotFound(format!(
                     "workflow {} not found",
@@ -1394,18 +1440,25 @@ impl Orchestrator {
                     workflow_id.as_str()
                 )));
             }
+            let running_cancels: Vec<TaskId> = slot
+                .execution
+                .tasks
+                .iter()
+                .filter(|(_, ts)| ts.state == Phase::Running)
+                .map(|(id, _)| id.clone())
+                .collect();
             let was_terminal = slot.execution.is_terminal();
             slot.execution.mark_workflow_failed(error);
-            (!was_terminal && slot.execution.is_terminal()).then(|| slot.execution.clone())
+            let snapshot =
+                (!was_terminal && slot.execution.is_terminal()).then(|| slot.execution.clone());
+            (running_cancels, snapshot)
         };
 
         if let Some(exec_snapshot) = terminal_snapshot {
-            self.complete_terminal(workflow_id, None, &exec_snapshot)
+            // 双腿广播（gossip + 本地自投递）在收尾点统一执行，与 `cancel`
+            // 同管线；此处不再自行补广播。
+            self.complete_terminal(workflow_id, None, &exec_snapshot, running_cancels)
                 .await?;
-            // 统一走双腿广播（gossip + 本地自投递），与 `cancel` 同管线。
-            for task_id in running_task_ids {
-                self.broadcast_task_cancel(workflow_id, &task_id).await;
-            }
         }
         Ok(())
     }

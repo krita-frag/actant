@@ -76,12 +76,12 @@ impl PyCapabilityRuntime {
 
     /// 返回所有内置 capability 的元数据列表。
     ///
-    /// 每个元素是 `(name: str, kind: str)` 元组，`kind` 为 `"ask"` / `"perform"` / `"emit"`。
+    /// 每个元素是 `(name: str, kind: str)` 元组，`kind` 为 `"perform"` / `"emit"`
+    /// （ask 型 capability 无 Rust 内置 handler，不经本桥）。
     fn builtin_capabilities<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let list = PyList::empty(py);
         for meta in builtin_capabilities() {
             let kind = match meta.default_kind {
-                EffectKind::Ask => "ask",
                 EffectKind::Perform => "perform",
                 EffectKind::Emit => "emit",
             };

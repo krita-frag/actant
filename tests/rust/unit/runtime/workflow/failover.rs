@@ -76,6 +76,32 @@ fn route_candidates_caches_per_version_and_tracks_peer_changes() {
     assert!(fm.route_candidates().is_empty());
 }
 
+/// 纯保活心跳（路由字段零变化）也必须使候选快照失效。
+///
+/// 判别力：`is_eligible` 以 `now - last_heartbeat_ms <= failure_timeout` 判活，
+/// 若保活心跳复用旧快照，`last_heartbeat_ms` 冻结在首次注册时刻——空闲期
+/// （无容量/成员变更）超过 ttl 后活 peer 被路由永久判死，新提交只能 defer
+/// 到饥饿失败。修复前该用例红：第二次保活心跳返回同一份 Arc 且时间戳不更新。
+#[test]
+fn heartbeat_keepalive_refreshes_route_candidate_freshness() {
+    let fm = make_fm("node-A");
+    fm.handle_heartbeat(&hb("node-B", 1_000));
+    let first = fm.route_candidates();
+    let first_ts = first[0].last_heartbeat_ms;
+
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    fm.handle_heartbeat(&hb("node-B", 2_000));
+    let refreshed = fm.route_candidates();
+    assert!(
+        !Arc::ptr_eq(&first, &refreshed),
+        "keepalive heartbeat must invalidate the cached route snapshot"
+    );
+    assert!(
+        refreshed[0].last_heartbeat_ms > first_ts,
+        "refreshed snapshot must carry the newer heartbeat timestamp"
+    );
+}
+
 #[test]
 fn getters_return_configured_values() {
     let fm = make_fm("node-A")
@@ -1122,17 +1148,24 @@ use std::sync::Mutex as StdMutex;
 
 struct RecordingScheduler {
     enqueued: Arc<StdMutex<Vec<crate::common::TaskDefinition>>>,
+    /// 被撤销的工作流（让位路径调 `remove_workflow_tasks`）。
+    removed: Arc<StdMutex<Vec<WorkflowId>>>,
 }
 
 impl RecordingScheduler {
     fn new() -> Self {
         Self {
             enqueued: Arc::new(StdMutex::new(Vec::new())),
+            removed: Arc::new(StdMutex::new(Vec::new())),
         }
     }
 
     fn take_enqueued(&self) -> Vec<crate::common::TaskDefinition> {
         std::mem::take(&mut *self.enqueued.lock().unwrap())
+    }
+
+    fn take_removed(&self) -> Vec<WorkflowId> {
+        std::mem::take(&mut *self.removed.lock().unwrap())
     }
 }
 
@@ -1162,11 +1195,8 @@ impl Scheduler for RecordingScheduler {
         Vec::new()
     }
 
-    async fn is_empty(&self) -> bool {
-        true
-    }
-
-    async fn len(&self) -> usize {
+    async fn remove_workflow_tasks(&self, workflow_id: &crate::common::WorkflowId) -> usize {
+        self.removed.lock().unwrap().push(workflow_id.clone());
         0
     }
 }
@@ -1573,13 +1603,16 @@ async fn expire_leases_removes_expired_leases_for_inactive_workflows() {
 
 #[tokio::test]
 async fn expire_leases_keeps_own_valid_lease() {
-    let fm = make_fm_with_short_lease("node-A").await;
+    // 判据是「仍有效的租约不被 expire_leases 移除」：有效性判定走真实墙钟，
+    // 若用短租约（10ms）+ 真实 sleep(5ms)，并行全量下调度延迟可越过租约
+    // 时长，把被测前提翻转成「租约已过期」。改用远超任何调度延迟的租约，
+    // sleep 仅承担「时间推进过至少一个检查点」的角色，前提不再依赖计时精度。
+    let fm = make_fm_with_lease("node-A", 60_000).await;
     let wf = WorkflowId("wf-renew".to_string());
 
     fm.claim_workflow(&wf).await.unwrap();
     let _ = fm.active_leases().pop().unwrap();
 
-    // 在租约过期前调用 expire_leases：租约仍有效，不应被移除。
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     fm.expire_leases().await;
 
@@ -2218,5 +2251,90 @@ async fn recover_discards_future_dated_lease_from_store() {
     assert!(
         leftovers.iter().all(|(k, _)| !k.contains("wf-poisoned")),
         "poisoned lease key must be deleted during recovery, residual: {leftovers:?}"
+    );
+}
+
+// ───────────────────────── 让位：执行层撤销（K05-02） ─────────────────────────
+
+/// 收到对端 claim 后，本地必须同时撤销**排队中的任务**。
+///
+/// 只摘编排状态（`remove_active_workflow`）不够：已入队但未出队的任务仍会被
+/// Worker 取出执行，副作用在新旧两个主上各发生一次，而完成回灌时 slot 已删、
+/// 结果被静默丢弃。
+#[tokio::test]
+async fn foreign_claim_purges_queued_tasks_of_that_workflow() {
+    let fm = make_fm("node-A");
+    let scheduler = Arc::new(RecordingScheduler::new());
+    fm.set_scheduler(scheduler.clone());
+
+    let claim = OrchestratorClaim {
+        node_id: NodeId::from("node-Z".to_string()),
+        workflow_id: WorkflowId("wf-relinquish".to_string()),
+        timestamp_ms: crate::common::epoch_millis(),
+    };
+    fm.handle_claim(&claim).await;
+
+    assert_eq!(
+        scheduler.take_removed(),
+        vec![WorkflowId("wf-relinquish".to_string())],
+        "让位时必须按工作流撤销本地排队任务"
+    );
+}
+
+/// 自己的 claim 不是让位：不得撤销自己的排队任务。
+///
+/// 取反用例——没有它，把撤销无条件放在 `handle_claim` 末尾也能通过上一条，
+/// 而那会让本节点每次续 claim 都丢掉自己的队列。
+#[tokio::test]
+async fn own_claim_keeps_queued_tasks() {
+    let fm = make_fm("node-A");
+    let scheduler = Arc::new(RecordingScheduler::new());
+    fm.set_scheduler(scheduler.clone());
+
+    let claim = OrchestratorClaim {
+        node_id: fm.node_id().clone(),
+        workflow_id: WorkflowId("wf-own".to_string()),
+        timestamp_ms: crate::common::epoch_millis(),
+    };
+    fm.handle_claim(&claim).await;
+
+    assert!(
+        scheduler.take_removed().is_empty(),
+        "自己持有租约时不得撤销自己的排队任务"
+    );
+}
+
+// ───────────────────────── 派发闸：租约所有权（K05-03） ─────────────────────────
+
+/// 派发前闸口的判据只有租约归属：无租约放行、自持放行、对端持有拒绝。
+#[tokio::test]
+async fn dispatch_permitted_follows_lease_ownership() {
+    let fm = make_fm("node-A");
+    let own_wf = WorkflowId("wf-own".to_string());
+    let foreign_wf = WorkflowId("wf-foreign".to_string());
+
+    assert!(
+        fm.dispatch_permitted(&own_wf),
+        "无租约条目（单机/未参与租约协调）必须放行"
+    );
+
+    let now = crate::common::epoch_millis();
+    fm.handle_claim(&OrchestratorClaim {
+        node_id: fm.node_id().clone(),
+        workflow_id: own_wf.clone(),
+        timestamp_ms: now,
+    })
+    .await;
+    assert!(fm.dispatch_permitted(&own_wf), "自己持有租约必须放行");
+
+    fm.handle_claim(&OrchestratorClaim {
+        node_id: NodeId::from("node-Z".to_string()),
+        workflow_id: foreign_wf.clone(),
+        timestamp_ms: now,
+    })
+    .await;
+    assert!(
+        !fm.dispatch_permitted(&foreign_wf),
+        "对端持有租约时必须拒绝——这是让位后拦住已出队任务的唯一闸口"
     );
 }

@@ -50,12 +50,8 @@
       "new"
     ],
     "PyGossipConfig": [
-      "dedup_ttl_secs",
-      "dedup_window_size",
       "heads_broadcast_interval_ms",
-      "new",
-      "retry_attempts",
-      "retry_base_delay_ms"
+      "new"
     ],
     "PyListenAddresses": [
       "direct_addrs",
@@ -196,6 +192,7 @@
       "workflow_id"
     ],
     "PyTaskCompletion": [
+      "attempt",
       "error",
       "result",
       "state",
@@ -409,11 +406,7 @@
       "lease_expiry_check_interval_secs"
     ],
     "_GossipConfig": [
-      "dedup_ttl_secs",
-      "dedup_window_size",
-      "heads_broadcast_interval_ms",
-      "retry_attempts",
-      "retry_base_delay_ms"
+      "heads_broadcast_interval_ms"
     ],
     "_ListenAddresses": [
       "direct_addrs",
@@ -515,6 +508,7 @@
       "utilization_ratio"
     ],
     "_TaskCompletion": [
+      "attempt",
       "error",
       "result",
       "state",

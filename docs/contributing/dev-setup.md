@@ -5,7 +5,7 @@
 ```bash
 git clone https://github.com/actant/actant.git
 cd actant
-uv sync --extra dev
+uv sync
 uv run maturin develop
 ```
 
@@ -28,6 +28,7 @@ mypy actant
 ## 文档
 
 ```bash
+uv sync --group docs         # 文档工具链不在 dev 组，构建站点前先安装
 uv run mkdocs serve          # 本地预览
 uv run mkdocs build --strict # 严格构建（CI 同款）
 

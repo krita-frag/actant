@@ -431,6 +431,10 @@ pub struct PyTaskCompletion {
     pub error: Option<String>,
     #[pyo3(get)]
     pub target_node: Option<String>,
+    /// 产出该结果的派发代数。结果上报（`report_task_result`）必须原样带回，
+    /// 编排器据此丢弃被放弃那次执行的迟到结果。
+    #[pyo3(get)]
+    pub attempt: u32,
 }
 
 /// 生成 Rust 内置 capability 的 PyO3 分发函数。
@@ -556,8 +560,6 @@ macro_rules! capability_registry {
             }
         }
 
-        /// 异步 ask 分发：返回 `asyncio.Future`，不阻塞 Python 主线程。
-        #[allow(unused_variables)]
         /// 批量 perform 异步分发：接收 `(name, request)` 列表，返回单个
         /// `asyncio.Future`，resolve 为结果列表（顺序与输入一致）。
         ///

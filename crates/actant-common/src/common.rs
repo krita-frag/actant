@@ -48,7 +48,7 @@ pub use config::{
 pub use error::{format_error_kind, ActantError, Result};
 pub use wire::TopicRoute;
 // 领域类型 — 公共 API
-pub use journal::{JournalEvent, JournalRecord, JOURNAL_SCHEMA_VERSION};
+pub use journal::{JournalEvent, JournalRecord};
 pub use model::{
     node_labels_within_limit, ActorErrorEnvelope, ActorErrorKind, ActorId, ActorMessage,
     ActorMessageResult, ActorStatus, BlobHash, DagNode, HlcTimestamp, HybridLogicalClock,
@@ -69,14 +69,12 @@ pub use payload::{
 pub use serialization::MAX_DECODE_SIZE;
 pub use serialization::{decode_postcard, deserialize_rkyv_value, encode_postcard, serialize_rkyv};
 pub use wire::register_wire_signing_key;
-pub use wire::set_wire_signing_key;
 pub use wire::WireTaskOutcome;
 pub use wire::{current_trace_scope, TraceContext, TraceScopeGuard};
 
 // 仅供测试使用的内部类型 — 不属于稳定公共 API
 #[doc(hidden)]
 pub use wire::{
-    HeadsExchange, NodeHeartbeat, SignedOrchestratorClaim, WireDagStateUpdate, WireEnvelope,
-    WireMessage, WireTaskState, WorkflowHead, WorkflowStateRequest, WorkflowStateResponse,
-    TOPIC_DAG_STATE, TOPIC_WORKFLOW_STATE_RESP, WIRE_PROTOCOL_VERSION,
+    HeadsExchange, NodeHeartbeat, SignedOrchestratorClaim, WireEnvelope, WireMessage, WorkflowHead,
+    WorkflowStateRequest, WorkflowStateResponse, TOPIC_WORKFLOW_STATE_RESP, WIRE_PROTOCOL_VERSION,
 };

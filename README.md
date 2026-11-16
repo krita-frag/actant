@@ -14,7 +14,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 
 git clone https://github.com/actant/actant.git
 cd actant
-uv sync --extra dev
+uv sync
 uv run maturin develop
 
 uv run python -c "import actant; print(actant.__version__)"

@@ -58,7 +58,7 @@ Actant 的身份 = **P2P 无中心 fabric + ERH 能力分发 + 进程级隔离 +
 | `runtime::builder` | 将上述子系统按依赖顺序装配成 `Runtime` |
 | `metrics` / `observability` | 指标与 tracing 初始化 |
 
-`runtime::workflow` 的子模块：`dag`（DAG 与执行状态）、`orchestrator`（状态机与事件溯源）、`scheduler`（调度策略，见[调度器](scheduler.md)）、`failover`（租约故障转移，见[故障转移](failover.md)）、`gossip`（DAG 状态复制）、`actor`（Actor 化封装）、`messaging`（消息编解码）、`runtime`（Worker 执行循环）。
+`runtime::workflow` 的子模块：`dag`（DAG 与执行状态）、`orchestrator`（状态机与事件溯源）、`scheduler`（调度策略，见[调度器](scheduler.md)）、`failover`（租约故障转移，见[故障转移](failover.md)）、`gossip`（工作流快照复制）、`actor`（Actor 化封装）、`messaging`（消息编解码）、`runtime`（Worker 执行循环）。
 
 ### Actor 运行时
 

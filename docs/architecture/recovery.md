@@ -42,7 +42,9 @@ recover = 快照 + 其后事件重放
 
 ## 版本兼容
 
-`JOURNAL_SCHEMA_VERSION` 是编译期契约标识，不写入记录、不参与运行时协商。**不做向后兼容**：schema 2 写入的 topic 才含 `NodesSealed` / `DeadlineSet` / `Evicted` / `StartedAt`，schema 1 的历史 journal 不被恢复语义支持——其 journal-only 恢复无法封口、跨重启硬超时从恢复时刻重新计时、旧版淘汰过的 topic 无墓碑可被误补建。存在 schema 1 数据时，必须在升级前重建这些工作流，或按 `workflow:{id}` topic 补齐对应事件后再启动。
+没有运行时版本协商，也没有迁移路径。事件集合即契约：`JournalEvent` 的变体与 `kind()` 字符串必须与当前构建对齐；尾部新增变体只需同步 `kind()`。
+
+不兼容的字段或语义变更要求重建 `data_dir`。store 打开时校验 `meta:fmt_version`：版本不符直接拒绝启动；**库非空但没有版本号**（版本化之前写入的布局）同样拒绝——把未知布局当作当前版本读，只会在恢复期以「工作流被当作 corrupt 整体清除」的形式丢数据，且现场已被删除。journal 侧同口径：重放遇到无法解码的事件时，整个工作流判为不可信并被丢弃（写墓碑 → 删快照 → 隐藏 topic），不会带着「快照已把 Running 重置为 Pending、历史却未重放」的状态继续运行。
 
 ## 相关页面
 

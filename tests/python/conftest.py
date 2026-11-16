@@ -212,16 +212,6 @@ def _isolate_runtime_between_tests():
             if t is not _threading.main_thread()
         )
 
-    # 诊断：记录测试后残留的后台线程（帮助定位资源泄漏）
-    _leaked = [
-        t.name for t in _threading.enumerate()
-        if t is not _threading.main_thread()
-        and ("tokio" in t.name or "iroh" in t.name or "actant" in t.name)
-    ]
-    if _leaked:
-        # 残留线程会在后续等待中退出；仅在等待超时时才警告。
-        pass
-
     # iroh endpoint close 与 tokio runtime drop 在独立线程完成。
     # Runtime.stop() 已通过 _RuntimeCore::shutdown 等待 network.shutdown()
     # 完成（15s 软超时），正常情况下 stop() 返回时 endpoint 已关闭。

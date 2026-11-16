@@ -52,7 +52,6 @@ async fn wait_until(mut condition: impl FnMut() -> bool) {
 struct TestWiring {
     router: NetworkEventRouter,
     failover: Arc<FailoverManager>,
-    gossip: DagGossip,
 }
 
 async fn make_wiring(node_id_str: &str) -> TestWiring {
@@ -80,10 +79,7 @@ async fn make_wiring(node_id_str: &str) -> TestWiring {
     );
     let dag_gossip_actor_id = ActorId::dag_gossip(&node_id);
     actor_system
-        .spawn(
-            dag_gossip_actor_id.clone(),
-            DagGossipActor::new(gossip.clone()),
-        )
+        .spawn(dag_gossip_actor_id.clone(), DagGossipActor::new(gossip))
         .await
         .unwrap();
 
@@ -100,11 +96,7 @@ async fn make_wiring(node_id_str: &str) -> TestWiring {
         cancelled_tasks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
     });
 
-    TestWiring {
-        router,
-        failover,
-        gossip,
-    }
+    TestWiring { router, failover }
 }
 
 #[tokio::test]
@@ -149,33 +141,6 @@ async fn inbound_heartbeat_creates_peer_with_capacity() {
 }
 
 #[tokio::test]
-async fn inbound_dag_update_registers_gossip_seen() {
-    let wiring = make_wiring("node-wire-C").await;
-
-    // 远端节点广播 t1 进入 Running 状态。
-    let update = crate::common::WireMessage::DagStateUpdate(crate::common::WireDagStateUpdate {
-        workflow_id: WorkflowId::from("wf-wire-1"),
-        task_id: crate::common::TaskId::from("t-1".to_string()),
-        task_state: crate::common::WireTaskState::Running,
-        hlc_timestamp: crate::runtime::state::HlcTimestamp::from_parts(10, 0),
-        origin_node: NodeId::from("node-wire-D".to_string()),
-    });
-    let envelope = crate::common::WireEnvelope::wrap(update).expect("wire envelope wrap");
-    let payload = crate::runtime::workflow::messaging::encode(&envelope).expect("encode");
-    wiring
-        .router
-        .handle_message(crate::common::Topic::dag_state().as_str(), &payload)
-        .await;
-
-    wait_until(|| wiring.gossip.seen_count() >= 1).await;
-    assert_eq!(
-        wiring.gossip.seen_count(),
-        1,
-        "remote update should be applied"
-    );
-}
-
-#[tokio::test]
 async fn inbound_claim_records_lease() {
     let wiring = make_wiring("node-wire-E").await;
 
@@ -203,7 +168,7 @@ async fn inbound_claim_records_lease() {
     );
 }
 
-/// wire topic 路由覆盖检查：四类控制面消息的 wire 分类入口保持存在
+/// wire topic 路由覆盖检查：控制面消息的 wire 分类入口保持存在
 /// （`TopicRoute` 由 wire 层保留，分发在 router 分支内直连完成）。
 #[test]
 fn wire_control_plane_topics_exist() {
@@ -211,7 +176,6 @@ fn wire_control_plane_topics_exist() {
     let _ = (
         crate::common::Topic::heartbeat().as_str().to_string(),
         crate::common::Topic::failover().as_str().to_string(),
-        crate::common::Topic::dag_state().as_str().to_string(),
         crate::common::Topic::heads().as_str().to_string(),
     );
 }

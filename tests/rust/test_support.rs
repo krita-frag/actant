@@ -209,14 +209,6 @@ impl crate::runtime::workflow::Scheduler for MockScheduler {
         Vec::new()
     }
 
-    async fn is_empty(&self) -> bool {
-        true
-    }
-
-    async fn len(&self) -> usize {
-        0
-    }
-
     fn close(&self) {
         self.closed
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -224,6 +216,10 @@ impl crate::runtime::workflow::Scheduler for MockScheduler {
 
     fn is_closed(&self) -> bool {
         self.closed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    async fn remove_workflow_tasks(&self, _workflow_id: &crate::common::WorkflowId) -> usize {
+        0
     }
 }
 
@@ -256,31 +252,28 @@ pub fn contract_task(name: &str, priority: i32) -> TaskDefinition {
 
 /// 断言调度器满足 `Scheduler` 的公共语义契约。
 ///
-/// 覆盖文档承诺的五件事：计数自洽、出队语义、批量出队、只 drain 未路由任务、
+/// 覆盖文档承诺的五件事：计数自洽、出队语义、批量出队、按工作流撤销、
 /// `close` 的幂等与 drain 行为。适用于生产实现（`ActorScheduler`）与第三方实现；
 /// `MockScheduler` 只是空桩，不满足本契约。
 ///
 /// 调用前调度器必须为空且未关闭。
 pub async fn assert_scheduler_contract<S: Scheduler + ?Sized>(scheduler: &S) {
     assert!(!scheduler.is_closed(), "scheduler must start open");
-    assert!(scheduler.is_empty().await, "scheduler must start empty");
-    assert_eq!(scheduler.len().await, 0, "empty scheduler len must be 0");
+    // 空队列语义以出队行为为准（`len`/`is_empty` 已随接口收缩删除）。
+    assert!(
+        scheduler.try_dequeue().await.is_none(),
+        "fresh scheduler must dequeue None"
+    );
 
     let Ok(()) = scheduler.enqueue(contract_task("contract-single", 0)).await else {
         panic!("open scheduler must accept enqueue");
     };
-    assert_eq!(scheduler.len().await, 1, "len must track enqueued tasks");
-    assert!(
-        !scheduler.is_empty().await,
-        "is_empty must track queue state"
-    );
-
     let Some(first) = scheduler.try_dequeue().await else {
         panic!("queued task must be dequeueable");
     };
     assert_eq!(first.name, "contract-single");
     assert!(
-        scheduler.is_empty().await,
+        scheduler.try_dequeue().await.is_none(),
         "queue must be empty after dequeue"
     );
 
@@ -293,13 +286,46 @@ pub async fn assert_scheduler_contract<S: Scheduler + ?Sized>(scheduler: &S) {
     else {
         panic!("open scheduler must accept enqueue_batch");
     };
-    assert_eq!(scheduler.len().await, 2);
     let batch = scheduler.dequeue_batch(10).await;
     assert_eq!(batch.len(), 2, "dequeue_batch must return all queued tasks");
-    assert!(scheduler.is_empty().await);
+    assert!(scheduler.try_dequeue().await.is_none());
 
-    // 原队列同时验证 drain_unrouted 的分流（该 API 已随路由内联移除）：
-    // 现仅保留「close 保留已排队任务」的单任务断言。
+    // 按工作流撤销：只移除目标工作流的任务，直提任务（`workflow_id` 为 `None`）保留。
+    let workflow = crate::common::WorkflowId::from("contract-wf");
+    let mut scoped_a = contract_task("contract-scoped-a", 0);
+    scoped_a.workflow_id = Some(workflow.clone());
+    let mut scoped_b = contract_task("contract-scoped-b", 0);
+    scoped_b.workflow_id = Some(workflow.clone());
+    let Ok(()) = scheduler
+        .enqueue_batch(vec![
+            scoped_a,
+            scoped_b,
+            contract_task("contract-standalone", 0),
+        ])
+        .await
+    else {
+        panic!("open scheduler must accept enqueue_batch");
+    };
+    assert_eq!(
+        scheduler.remove_workflow_tasks(&workflow).await,
+        2,
+        "remove_workflow_tasks must remove every queued task of the workflow"
+    );
+    let survivors = scheduler.dequeue_batch(10).await;
+    assert_eq!(
+        survivors.len(),
+        1,
+        "tasks of other workflows (and standalone tasks) must survive"
+    );
+    assert_eq!(survivors.len(), 1);
+    assert_eq!(survivors[0].name, "contract-standalone");
+    assert_eq!(
+        scheduler.remove_workflow_tasks(&workflow).await,
+        0,
+        "removing an absent workflow must report 0 and touch nothing"
+    );
+
+    // 关闭语义的最后一段：`close` 不得清空已排队任务。
     let Ok(()) = scheduler
         .enqueue(contract_task("contract-retained", 0))
         .await

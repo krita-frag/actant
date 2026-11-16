@@ -213,7 +213,10 @@ def _worker_config(config: SoakConfig) -> NodeConfig:
         discovery=config.discovery,
         heartbeat_interval_ms=300,
         failure_timeout_ms=1_500,
-        starvation_timeout_ms=4_000,
+        # kill+replace 的补位窗口（子进程拉起+发现+收敛）超过默认 4s：饥饿
+        # 超时必须容忍该窗口，让任务等补位 worker 就绪而不是被终态 Failed——
+        # soak 的目的正是验证「故障后任务仍收敛」。
+        starvation_timeout_ms=15_000,
         labels={"engine": "worker"},
         max_concurrent_tasks=2,
         crash_failover_max_attempts=5,
@@ -338,7 +341,7 @@ def run_soak(config: SoakConfig) -> SoakResult:
         discovery=config.discovery,
         heartbeat_interval_ms=300,
         failure_timeout_ms=1_500,
-        starvation_timeout_ms=4_000,
+        starvation_timeout_ms=15_000,
         seed=config.seed,
         keep_data=config.keep_data,
         strict_env=True,

@@ -28,22 +28,6 @@ dependencies = [
     "cloudpickle>=3.1.2",
 ]
 
-[project.optional-dependencies]
-dev = [
-    "pytest>=8.0",
-    "pytest-asyncio>=0.23",
-    "pytest-benchmark>=5.2.3",
-    "pytest-xdist>=3.5",
-    "maturin>=1.14.1",
-    "ruff>=0.15.18",
-    "mypy>=1.10",
-    "memory-profiler>=0.61.0",
-    "objgraph>=3.6.2",
-    "pytest-timeout>=2.3",
-    "pytest-cov>=4.1",
-    "coverage[toml]>=7.4",
-]
-
 [project.urls]
 Repository = "https://github.com/krita-frag/actant"
 Issues = "https://github.com/krita-frag/actant/issues"
@@ -55,6 +39,13 @@ actant = "actant.cli:main"
 manifest-path = "Cargo.toml"
 python-source = "."
 module-name = "actant.actant"
+
+# 锁定公共 PyPI：uv.lock 记录的是解析时的 registry URL，若按本机镜像解析，
+# 锁文件会把镜像域名写进去，CI（无法访问境内镜像）随即安装失败。
+# 需要镜像加速时用命令行覆盖：`uv sync --default-index <mirror>`。
+[[tool.uv.index]]
+url = "https://pypi.org/simple"
+default = true
 
 [tool.ruff]
 line-length = 100
@@ -169,11 +160,25 @@ ignore_missing_imports = true
 module = ["cloudpickle.*"]
 ignore_missing_imports = true
 
+# 开发依赖只在这里定义（PEP 735）。`dev` 是默认组，`uv sync` 自动安装；
+# 文档工具链单独成组，只有构建站点（CI 文档门禁、本地预览）才需要。
 [dependency-groups]
 dev = [
+    "pytest>=8.0",
     "pytest-asyncio>=0.23",
-    "pytest-timeout>=2.3",
+    "pytest-benchmark>=5.2.3",
+    "pytest-xdist>=3.5",
     "pytest-forked>=1.6.0",
+    "pytest-timeout>=2.3",
+    "pytest-cov>=4.1",
+    "coverage[toml]>=7.4",
+    "maturin>=1.14.1",
+    "ruff>=0.15.18",
+    "mypy>=1.10",
+    "memory-profiler>=0.61.0",
+    "objgraph>=3.6.2",
+]
+docs = [
     "mkdocs-material>=9.5",
     "mkdocstrings[python]>=0.25",
     "mike>=2.1",

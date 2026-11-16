@@ -7,6 +7,7 @@
 //!
 //! 底层基于 `LmdbStore`（LMDB），事件 ID 全局唯一且可排序。
 
+#[cfg(any(test, feature = "test-support"))]
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -27,13 +28,11 @@ const EVENT_PAGE_SIZE: usize = 256;
 const SEQ_KEY_PREFIX: &str = "meta:event_seq:";
 /// 隐藏 topic 的序号元数据前缀。
 ///
-/// `hide_topic` 把 seq 键**移入**该前缀而非删除：恢复期装载这些键，使
+/// `hide_topic` 把 seq 键**移入**该前缀而非删除：重启时装载这些键，使
 /// 同 id 重用时序号继续单调、时钟下界仍覆盖隐藏 topic 的历史事件（否则
 /// 回拨时钟会让新事件键排进旧代事件中间，破坏审计序与恢复期代际判定）。
 /// 该前缀不参与 `list_topics` 的 topic 扫描，隐藏语义不受影响。
 const HIDDEN_SEQ_KEY_PREFIX: &str = "meta:event_seq_hidden:";
-/// 存量序号迁移完成标记。故意不以 `SEQ_KEY_PREFIX` 开头，避免被当作 topic 元数据解析。
-const SEQ_MIGRATED_KEY: &str = "meta:event_seq_migrated";
 
 /// 事件唯一标识。
 ///
@@ -96,17 +95,10 @@ pub trait EventLog: Send + Sync {
     /// 原子追加一批事件到同一 topic。
     ///
     /// 用于 journal-first 提交：`Submitted` 与全部 `NodeAdded` 必须要么全部
-    /// 可见、要么全部不可见，恢复期才不会重放出半个 DAG。
-    ///
-    /// 默认实现逐条调用 [`Self::append`]（非原子，仅为外部实现保持编译兼容）；
-    /// 内置实现必须覆盖为单事务/单锁。
-    fn append_batch(&self, topic: &str, payloads: &[Vec<u8>]) -> Result<Vec<EventId>> {
-        let mut ids = Vec::with_capacity(payloads.len());
-        for payload in payloads {
-            ids.push(self.append(topic, payload)?);
-        }
-        Ok(ids)
-    }
+    /// 可见、要么全部不可见，恢复期才不会重放出半个 DAG。实现必须是
+    /// 单事务或单锁——逐条 `append` 的“分别可见”语义会让恢复重放出半个 DAG，
+    /// 故不提供默认实现。
+    fn append_batch(&self, topic: &str, payloads: &[Vec<u8>]) -> Result<Vec<EventId>>;
 
     /// 列出已有事件的 topic（按字典序）。
     ///
@@ -171,13 +163,10 @@ impl LmdbEventLog {
 
     /// 恢复序号元数据与已持久化的最大事件 ID。
     ///
-    /// 序号与事件条目同事务写入 `meta:event_seq:{topic}`，因此正常路径
-    /// 只需 O(topic 数) 次读取。存量库或部分迁移的库缺少某些 topic 的
-    /// 元数据时，退回一次全量事件扫描补齐——只补缺失 topic，不覆盖已有
-    /// 序号，也不降低任何 topic 的计数。
-    ///
-    /// 扫描完成后写入完成标记，后续启动走快路径；标记缺失时（旧版本写入
-    /// 过部分 topic 元数据）仍会扫一次，保证不会留下重复序号的 topic。
+    /// 序号与事件条目同事务写入 `meta:event_seq:{topic}`，因此启动成本是
+    /// O(topic 数) 次读取 + 每个 topic 一次反向扫描，不扫描全量事件。
+    /// 缺少元数据的 topic 不在启动期补齐：`append` 会为其从 1 重新取号，
+    /// 而键布局以 HLC 墙钟开头，序号不参与时间序，故不影响 `read_after`。
     fn recover_state(store: &LmdbStore) -> (DashMap<String, Arc<AtomicU64>>, Option<EventId>) {
         let sequences = DashMap::new();
         match store.scan_prefix(SEQ_KEY_PREFIX) {
@@ -243,20 +232,8 @@ impl LmdbEventLog {
             }
         }
 
-        if Self::migration_complete(store) {
-            let max_event = Self::max_recovered_event(store, &sequences);
-            return (sequences, max_event);
-        }
-
-        // 未标记完成：可能完全没有元数据，也可能只迁移了一部分 topic。
-        // 全量扫描一次，补齐缺失 topic（不覆盖已有值），然后写完成标记。
-        let max_event = Self::migrate_legacy_sequences(store, &sequences);
+        let max_event = Self::max_recovered_event(store, &sequences);
         (sequences, max_event)
-    }
-
-    /// 是否已完成存量序号迁移。
-    fn migration_complete(store: &LmdbStore) -> bool {
-        matches!(store.get(SEQ_MIGRATED_KEY), Ok(Some(_)))
     }
 
     /// 读取每个已知 topic 的最后一条事件，取全局最大 `EventId`。
@@ -295,76 +272,6 @@ impl LmdbEventLog {
                 }
             }
         }
-        max_event
-    }
-
-    /// 为没有序号元数据的 topic 做一次性迁移。
-    ///
-    /// 全量扫描事件日志，只为**缺失**元数据的 topic 补写序号（已有元数据
-    /// 不覆盖、不回退），并在同一批次写入完成标记。返回扫描过程中见到的
-    /// 最大事件 ID，供恢复 HLC 下界。
-    ///
-    /// 扫描或写入失败时不写完成标记，下次启动会重试；已补写的 topic 不会
-    /// 被重复覆盖。
-    fn migrate_legacy_sequences(
-        store: &LmdbStore,
-        sequences: &DashMap<String, Arc<AtomicU64>>,
-    ) -> Option<EventId> {
-        let entries = match store.scan_prefix("event:") {
-            Ok(entries) => entries,
-            Err(e) => {
-                tracing::warn!("failed to scan legacy event log: {e}, starting from 0");
-                return None;
-            }
-        };
-
-        let mut max_by_topic: HashMap<String, u64> = HashMap::new();
-        let mut max_event: Option<EventId> = None;
-        for (_, value) in entries {
-            match postcard::from_bytes::<LogEntry>(&value) {
-                Ok(entry) => {
-                    if max_event.map(|current| entry.id > current).unwrap_or(true) {
-                        max_event = Some(entry.id);
-                    }
-                    if sequences.contains_key(entry.topic.as_str()) {
-                        continue;
-                    }
-                    let seq = max_by_topic.entry(entry.topic).or_insert(0);
-                    if entry.id.sequence > *seq {
-                        *seq = entry.id.sequence;
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "ignoring corrupt legacy event entry");
-                }
-            }
-        }
-
-        let mut batch: Vec<(String, Vec<u8>)> = max_by_topic
-            .iter()
-            .map(|(topic, seq)| (Self::seq_key(topic), seq.to_le_bytes().to_vec()))
-            .collect();
-        // 完成标记与缺失序号同批提交：要么都写入，要么都不写入。
-        batch.push((SEQ_MIGRATED_KEY.to_string(), vec![1]));
-
-        if let Err(e) = store.put_batch(&batch) {
-            // 迁移失败不阻止启动：内存中的序号仍然正确，下次启动会重试。
-            tracing::warn!(error = %e, "failed to persist migrated event sequence metadata");
-            for (topic, seq) in max_by_topic {
-                sequences.insert(topic, Arc::new(AtomicU64::new(seq)));
-            }
-            return max_event;
-        }
-
-        let migrated = max_by_topic.len();
-        for (topic, seq) in max_by_topic {
-            sequences.insert(topic, Arc::new(AtomicU64::new(seq)));
-        }
-        tracing::info!(
-            topics = migrated,
-            total_topics = sequences.len(),
-            "migrated missing event sequence metadata from existing event log"
-        );
         max_event
     }
 

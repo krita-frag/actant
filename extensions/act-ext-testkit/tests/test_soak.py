@@ -28,6 +28,10 @@ def test_soak_smoke(tmp_path) -> None:
             fault_hold_s=0.5,
             max_failure_rate=0.05,
             seed=5,
+            # kill+补位轮保留在冒烟里：路由候选缓存随保活心跳刷新后
+            # （heartbeat_keepalive_refreshes_route_candidate_freshness），
+            # 补位窗口内 defer 的任务能在 15s 饥饿预算内等到新 worker 就绪。
+            kill_faults=True,
             report_path=report_path,
         )
     )

@@ -27,6 +27,7 @@
 use std::path::Path;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures::Stream;
@@ -118,15 +119,28 @@ impl BlobStore {
 /// 同时实现 [`Stream`]；[`Drop`] 与 [`close`](Self::close) 均显式关闭底层
 /// QUIC 连接（取消语义见模块文档）。传输中途数据损坏表现为 `Err` 块
 /// （hash mismatch），不会静默产出未校验数据。
+///
+/// ## 停滞防护
+///
+/// [`next_chunk`](Self::next_chunk) 的单次等待受 `start` 的 `idle_timeout`
+/// 约束：provider 在 size 头之后停滞不发也不 FIN 时，调用方拿到
+/// `Err(Timeout)` 而不是依赖 QUIC idle timeout 兜底（时长不可配置且远大于
+/// 请求超时，恢复流程的取值路径会被拖住）。`Stream` 实现是直通读
+/// （无界）——走 [`Stream`] 的消费者需自行处理停滞；本仓生产消费者
+/// （`value_fetch`）走 `next_chunk`。
 #[derive(Debug)]
 pub struct BlobFetch {
     rx: mpsc::Receiver<Result<Bytes>>,
     conn: Option<iroh::endpoint::Connection>,
     hash: BlobHash,
+    idle_timeout: Duration,
 }
 
 impl BlobFetch {
     /// 连接 provider 并发送请求；读到响应 size 头（拉取已就绪）后返回句柄。
+    ///
+    /// `idle_timeout` 是 `next_chunk` 单次等待的上限：provider 停滞该时长
+    /// 即产出 `Err(Timeout)` 块，不再依赖 QUIC idle timeout 兜底。
     ///
     /// hash 在 provider 上不存在时在**本调用**返回
     /// [`ActantError::NotFound`]；节点不可达返回 [`ActantError::Network`]。
@@ -134,7 +148,12 @@ impl BlobFetch {
     /// # Errors
     ///
     /// 连接失败、协议握手失败或 hash 不存在时返回错误。
-    pub async fn start(endpoint: &Endpoint, addr: EndpointAddr, hash: BlobHash) -> Result<Self> {
+    pub async fn start(
+        endpoint: &Endpoint,
+        addr: EndpointAddr,
+        hash: BlobHash,
+        idle_timeout: Duration,
+    ) -> Result<Self> {
         let conn = endpoint
             .connect(addr, iroh_blobs::ALPN)
             .await
@@ -183,6 +202,7 @@ impl BlobFetch {
             rx,
             conn: Some(conn),
             hash,
+            idle_timeout,
         })
     }
 
@@ -192,8 +212,19 @@ impl BlobFetch {
     }
 
     /// 接收下一个已校验数据块；流结束（传输完成或已出错）返回 `None`。
+    ///
+    /// 单次等待受 `idle_timeout` 约束（见结构体文档「停滞防护」）：provider
+    /// 停滞时产出 `Err(Timeout)`，调用方应 close/drop 句柄结束拉取。
     pub async fn next_chunk(&mut self) -> Option<Result<Bytes>> {
-        self.rx.recv().await
+        match tokio::time::timeout(self.idle_timeout, self.rx.recv()).await {
+            // 正常交付（数据块或错误块）。
+            Ok(item) => item,
+            // provider 停滞：发不出 Err 块，就在等待边界显式失败。
+            Err(_elapsed) => Some(Err(ActantError::Timeout(format!(
+                "blob fetch stalled: no chunk within {:?}",
+                self.idle_timeout
+            )))),
+        }
     }
 
     /// 显式取消拉取并立即关闭底层连接。
@@ -229,7 +260,9 @@ fn not_found_error(hash: &BlobHash) -> ActantError {
 /// fsm 内容循环：逐 leaf 转发到通道，读取侧拉式背压由有界通道承担。
 ///
 /// 消费方取消（通道关闭）或解码失败时任务退出；连接由 [`BlobFetch`] 的
-/// Drop/close 显式关闭。
+/// Drop/close 显式关闭。provider 停滞的防护在消费侧
+/// （[`BlobFetch::next_chunk`] 的 `idle_timeout`）——驱动任务本身无定时器，
+/// 停滞时阻塞在通道发送上，由句柄 Drop 收尾。
 async fn drive_content(mut content: fsm::AtBlobContent, tx: mpsc::Sender<Result<Bytes>>) {
     while let fsm::BlobContentNext::More((next, item)) = content.next().await {
         content = next;

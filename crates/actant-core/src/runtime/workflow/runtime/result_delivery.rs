@@ -11,6 +11,11 @@
 //! 不会阻塞队列中其他结果（消除队头阻塞）；并发上限防止目标节点长时间
 //! 不可达时重试任务无限堆积。
 //!
+//! **不保序是有意的**：跨结果的投递顺序无保证。乱序正确性不依赖本队列——
+//! 结果回灌的终态守卫（`can_transition_task`）与 attempt fencing（按派发
+//! 代数裁决）使迟到/重复结果无论先后到达都被一致拒绝；同工作流结算的
+//! 串行是结果泵上游的有意设计（见跨片裁定 X17）。
+//!
 //! ## 超限行为
 //!
 //! 重试次数达到上限后不做本地补偿（origin 在远端节点，收不到本地事件）：
@@ -23,6 +28,12 @@ use std::time::Duration;
 /// 同时在途的独立重试任务上限。达到上限后接收循环阻塞在信号量上，
 /// 形成对 retry queue 的背压。
 const MAX_CONCURRENT_RETRIES: usize = 16;
+
+/// 连续失败多少次后把日志级别提到 warn。
+///
+/// 这不是放弃阈值——结果重试不设放弃（放弃即丢结果，origin 永久等待）。
+/// 它只用来把「单位数重试」的 debug 噪声与「长期投不出去」的告警区分开。
+const RESULT_RETRY_WARN_AFTER: usize = 10;
 
 /// A task result that failed to deliver and is pending retry.
 pub(super) struct PendingResult {
@@ -100,7 +111,6 @@ pub(super) async fn try_enqueue_pending_result(
 pub(super) fn start_pending_result_loop(
     network: std::sync::Arc<dyn crate::runtime::network::Transport>,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
-    max_attempts: usize,
     base_delay: Duration,
     pending_result_channel_capacity: usize,
 ) -> tokio::sync::mpsc::Sender<PendingResult> {
@@ -122,13 +132,13 @@ pub(super) fn start_pending_result_loop(
                     break;
                 }
                 Some(pending) = pending_rx.recv() => {
-                    if pending.attempts >= max_attempts {
+                    if pending.attempts >= RESULT_RETRY_WARN_AFTER {
                         // 不做本地补偿（origin 在远端，收不到本地事件）；
                         // 继续按封顶退避重试，直到投递成功或节点停机。
                         tracing::warn!(
                             target = %pending.target,
                             attempts = pending.attempts,
-                            "result still undeliverable after max attempts; keeping for retry"
+                            "result still undeliverable; keeping for retry"
                         );
                     }
                     let delay = backoff.delay_for(pending.attempts as u32);

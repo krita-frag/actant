@@ -357,6 +357,12 @@ pub enum TaskCompletion {
         task_name: String,
         result: Vec<u8>,
         target_node: Option<NodeId>,
+        /// 产出该结果的派发代数（`TaskDefinition::attempt`）。
+        ///
+        /// 结果回灌编排器时按此做 attempt fencing：小于任务当前代数的结果
+        /// 属被放弃那次执行的迟到结果，必须丢弃。绑定层（Python 结果泵）
+        /// 上报结果时原样带回，不得自行构造。
+        attempt: u32,
     },
     Failed {
         workflow_id: WorkflowId,
@@ -364,12 +370,14 @@ pub enum TaskCompletion {
         task_name: String,
         error: String,
         target_node: Option<NodeId>,
+        attempt: u32,
     },
     Cancelled {
         workflow_id: WorkflowId,
         task_id: TaskId,
         task_name: String,
         target_node: Option<NodeId>,
+        attempt: u32,
     },
 }
 
@@ -412,6 +420,15 @@ impl TaskCompletion {
             TaskCompletion::Completed { target_node, .. }
             | TaskCompletion::Failed { target_node, .. }
             | TaskCompletion::Cancelled { target_node, .. } => target_node.as_ref(),
+        }
+    }
+
+    /// 产出该结果的派发代数，用于结果回灌时的 attempt fencing。
+    pub fn attempt(&self) -> u32 {
+        match self {
+            TaskCompletion::Completed { attempt, .. }
+            | TaskCompletion::Failed { attempt, .. }
+            | TaskCompletion::Cancelled { attempt, .. } => *attempt,
         }
     }
 
@@ -561,6 +578,10 @@ impl From<ActorErrorEnvelope> for crate::common::ActantError {
         match envelope.kind {
             ActorErrorKind::Storage => Self::Storage(envelope.message),
             ActorErrorKind::StorageIo => Self::StorageIo(std::io::Error::other(envelope.message)),
+            // heed::Error 为非序列化的源错误类型，跨 Actor 边界后无法重建原
+            // 变体——降级为 `Actor` 并保留 `heed: ` 前缀。正向映射
+            //（`ActantError::Heed` → `ActorErrorKind::Heed`）不受影响，错误
+            // kind 字符串仍为 `heed`，Python 侧据此映射存储后端异常。
             ActorErrorKind::Heed => Self::Actor(format!("heed: {}", envelope.message)),
             ActorErrorKind::Network => Self::Network(envelope.message),
             ActorErrorKind::Serialization => Self::Serialization(envelope.message),

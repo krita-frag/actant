@@ -138,5 +138,8 @@ cfg = (
 
 - `actant.ext` 是便利契约，不是新的核心扩展缝；真正的缝见[框架契约](../architecture/framework-contract.md)。
 - `EventEnvelope.schema_version` 用于消费端演进，未知字段应忽略。
-- 扩展应显式声明依赖的 `actant` 版本并做启动检查，不要依赖下划线模块。
+- 扩展应显式声明依赖的 `actant` 版本（如 ``actant-engine>=0.3.0``）并做启动检查。
+- 配置构造走 `actant.ext.config` 构建器；构建器未覆盖的高级字段（failover 间隔、
+  饥饿超时、进程数等）允许直接使用 `_ActantConfig` 族——这是官方认可的构造面，
+  字段与核心配置同步演进。除此之外不要依赖其它下划线符号。
 - 一致性测试建议复用 `act-ext-testkit`，覆盖装配顺序、事件可见性与多后端语义。

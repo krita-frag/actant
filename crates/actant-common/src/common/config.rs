@@ -161,7 +161,7 @@ pub struct ActantConfig {
     /// 强制要求 payload 签名。生产环境硬约束。
     ///
     /// - `false`（默认）：`payload_signing_key` 为空时仅 `warn` 日志，不阻止启动
-    ///   （向后兼容 0.2 行为，用于开发/测试）。
+    ///   （开发/测试的宽容语义；生产环境应显式置 `true`）。
     /// - `true`：`payload_signing_key` 为空时启动直接返回
     ///   [`crate::common::ActantError::Config`]，防止生产环境静默运行无签名模式。
     ///
@@ -300,8 +300,12 @@ pub struct WorkerConfig {
     /// 进程池后端的有效本地并发由 worker 子进程数决定；此值应等于
     /// `num_worker_processes`，保持信号量与进程池容量一致。
     pub max_concurrent_tasks: usize,
-    pub broadcast_retry_attempts: usize,
-    pub broadcast_retry_base_delay_ms: u64,
+    /// 远端任务结果直连投递失败后的重试退避基数（毫秒）。
+    ///
+    /// 只影响重试节奏、不影响是否重试：结果重试队列按封顶指数退避一直重试到
+    /// 投递成功或节点停机（放弃即丢结果，origin 会永久等待）。停机后由 origin
+    /// 的失联接管 / 租约重投兜底。
+    pub result_retry_base_delay_ms: u64,
     pub drain_timeout_secs: u64,
     /// 本地无法执行的任务（仅提交节点或远程转发失败）重新入队前的延迟（毫秒）。
     pub remote_fallback_delay_ms: u64,
@@ -387,8 +391,7 @@ impl Default for WorkerConfig {
             scheduler_kind: default_scheduler_kind(),
             default_task_timeout_ms: 30000,
             max_concurrent_tasks: proc_count,
-            broadcast_retry_attempts: 3,
-            broadcast_retry_base_delay_ms: 100,
+            result_retry_base_delay_ms: 100,
             drain_timeout_secs: 30,
             remote_fallback_delay_ms: 500,
             starvation_timeout_ms: default_starvation_timeout_ms(),
@@ -425,6 +428,11 @@ pub struct NetworkConfig {
     #[serde(default)]
     pub gossip_bootstrap_peers: Vec<String>,
     /// 单个直连请求消息帧的最大字节数。超过此值将被拒绝，防止畸形或恶意对端导致 OOM。默认 16 MiB。
+    ///
+    /// 注意这只是**传输帧层**上限；所有远端输入随后还要过解码层
+    /// `serialization::MAX_DECODE_SIZE`（4 MiB）——4 MiB 与本值之间的消息
+    /// 能通过帧检查，但必在解码处失败。调大本值**不解除** 4 MiB 限制：
+    /// 超过 4 MiB 的载荷应走 blob 通道（独立 ALPN，不受此约束）。
     #[serde(default = "default_max_message_size")]
     pub max_message_size: usize,
     /// P2P 节点认证白名单：允许建立直连请求-响应的 iroh EndpointId 字符串集合。
@@ -477,7 +485,8 @@ pub struct NetworkConfig {
     ///
     /// `true` 时 `FailoverManager` 拒绝缺签或验签失败的 gossip 心跳——
     /// 节点记录必须由其 iroh endpoint 私钥签名，防止伪造他人节点身份。
-    /// `false`（默认，向后兼容）跳过校验。`Runtime.production()` 默认开启。
+    /// `false`（默认，开发/单机模式）跳过校验；`Runtime.production()`
+    /// 默认开启。
     #[serde(default)]
     pub require_signed_records: bool,
 }
@@ -773,23 +782,16 @@ impl FailoverConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GossipConfig {
-    pub dedup_window_size: usize,
-    pub dedup_ttl_secs: u64,
-    /// 终态更新（Completed/Failed）的广播最大重试次数。非终态更新（Running）仅发送一次不重试。
-    pub retry_attempts: usize,
-    /// 重试间隔基数（毫秒）。实际延迟采用指数退避：`base * 2^attempt`，上限 30s。
-    pub retry_base_delay_ms: u64,
-    /// 周期性广播 DAG heads 的间隔（毫秒）。默认 30 秒。
+    /// 周期性广播工作流 heads 的间隔（毫秒）。默认 30 秒。
+    ///
+    /// heads 是快照复制的唯一触发源：对端发现本地缺失或计数落后时才拉取
+    /// 全量状态。间隔决定接管方拿到状态副本的最长延迟。
     pub heads_broadcast_interval_ms: u64,
 }
 
 impl Default for GossipConfig {
     fn default() -> Self {
         Self {
-            dedup_window_size: 1024,
-            dedup_ttl_secs: 300,
-            retry_attempts: 3,
-            retry_base_delay_ms: 100,
             heads_broadcast_interval_ms: 30_000,
         }
     }

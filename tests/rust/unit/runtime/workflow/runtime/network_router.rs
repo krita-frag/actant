@@ -156,20 +156,16 @@ impl Scheduler for MockScheduler {
         guard.drain(..count).collect()
     }
 
-    async fn is_empty(&self) -> bool {
-        self.enqueued.lock().unwrap().is_empty()
-    }
-
-    async fn len(&self) -> usize {
-        self.enqueued.lock().unwrap().len()
-    }
-
     fn close(&self) {
         self.closed.store(true, Ordering::Release);
     }
 
     fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
+    }
+
+    async fn remove_workflow_tasks(&self, _workflow_id: &crate::common::WorkflowId) -> usize {
+        0
     }
 }
 
@@ -535,73 +531,6 @@ async fn handle_peer_disconnected_publishes_event() {
         .expect("event should be published")
         .expect("event bus should not be closed");
     assert!(matches!(event, TapEvent::PeerDisconnected(ref s) if s.as_str() == "peer-B"));
-}
-
-#[tokio::test]
-async fn handle_dag_state_topic_dispatches_to_dag_gossip_actor() {
-    let transport = Arc::new(MockTransport::new("node-A", "peer-A"));
-    let scheduler: Arc<dyn Scheduler> = Arc::new(MockScheduler::new());
-    let actor_system = Arc::new(ActorSystem::new());
-    let node_id = NodeId::from("node-A".to_string());
-    let workflow_actor_id = ActorId::workflow(&node_id);
-    actor_system
-        .spawn(workflow_actor_id.clone(), EchoActor)
-        .await
-        .unwrap();
-    let gossip = crate::runtime::workflow::DagGossip::new(
-        transport.clone(),
-        actor_system.clone(),
-        workflow_actor_id,
-        crate::common::GossipConfig::default(),
-    );
-    let dag_gossip_id = ActorId::dag_gossip(&node_id);
-    actor_system
-        .spawn(
-            dag_gossip_id.clone(),
-            crate::runtime::workflow::DagGossipActor::new(gossip.clone()),
-        )
-        .await
-        .unwrap();
-
-    let router = NetworkEventRouter::new(NetworkEventRouterConfig {
-        network: transport,
-        tap: crate::runtime::events::EventTap::new(),
-        result_feed: crate::runtime::events::TaskResultFeed::new().0,
-        scheduler,
-        actor_system: Some(actor_system),
-        workflow_actor_id: None,
-        dag_gossip_actor_id: Some(dag_gossip_id),
-        failover: None,
-        cancel_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-        cancelled_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-    });
-
-    let update = crate::common::WireDagStateUpdate {
-        workflow_id: WorkflowId::from("wf-1".to_string()),
-        task_id: TaskId::from("t-1".to_string()),
-        task_state: crate::common::WireTaskState::Completed { result: vec![1] },
-        hlc_timestamp: crate::runtime::state::HlcTimestamp::from_parts(1, 2),
-        origin_node: NodeId::from("node-B".to_string()),
-    };
-    let envelope =
-        WireEnvelope::wrap(WireMessage::DagStateUpdate(update)).expect("wire envelope wrap");
-    let payload = postcard::to_allocvec(&envelope).unwrap();
-
-    router
-        .handle(NetworkEvent::Message(NetworkMessage {
-            topic: Topic::dag_state().as_str().to_string(),
-            data: payload,
-        }))
-        .await;
-
-    // 直连分发：DagGossipActor 应登记远端更新（gossip seen）。
-    for _ in 0..50 {
-        if gossip.seen_count() >= 1 {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    assert_eq!(gossip.seen_count(), 1, "remote update should be applied");
 }
 
 #[tokio::test]

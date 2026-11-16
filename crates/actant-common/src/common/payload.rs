@@ -47,7 +47,8 @@ pub fn pack_group(results: &[Vec<u8>]) -> crate::common::Result<Vec<u8>> {
 
 /// 解包由 `pack_group`（含单值/关键字位置标签）打包的负载。
 ///
-/// 仅用于 Rust 侧测试和内部校验，Python 侧有自己的解包逻辑。
+/// 生产路径：Rust orchestrator 查询结果的回包解包（`orchestrator/queries`）。
+/// Python 侧有自己的解包逻辑，不经本函数。
 pub fn unpack_payload(data: &[u8]) -> crate::common::Result<Vec<Vec<u8>>> {
     if data.is_empty() {
         return Err(crate::common::ActantError::Serialization(
@@ -222,10 +223,10 @@ pub const WIRE_MAC_LEN: usize = 32;
 /// 使用共享密钥为 wire message 字节计算 BLAKE3 keyed MAC。
 ///
 /// 流式计算 wire MAC：逐段 update，避免先组装与消息等大的
-/// 覆盖字节 `Vec`（一次额外全量 memcpy）。段序与 [`wire_mac`] 的单缓冲
-/// 输入完全一致——`version 字节 | message | traceparent | mac=None 字节`，
-/// 字节序不变红线：两函数对同一 (version, message, traceparent) 必产出
-/// 相同 MAC。
+/// 覆盖字节 `Vec`（一次额外全量 memcpy）。段序固定为
+/// `version 字节 | message | traceparent | mac=None 字节`——该序列与序列化
+/// 整个 `mac: None` 的 unsigned [`WireEnvelope`] 逐字节一致（字节序不变
+/// 红线），验证方据同一分段约定重组出相同 MAC。
 ///
 /// `segments` 按顺序喂给 keyed hasher。空密钥返回 `None`。
 pub fn wire_mac_incremental(key: &[u8], segments: &[&[u8]]) -> Option<[u8; WIRE_MAC_LEN]> {
@@ -242,34 +243,12 @@ pub fn wire_mac_incremental(key: &[u8], segments: &[&[u8]]) -> Option<[u8; WIRE_
     Some(out)
 }
 
-/// 返回固定 32 字节 MAC。空密钥返回 `None`（表示禁用 wire 签名）。
+/// 恒定时间校验分段形态的 wire message MAC：按顺序喂给同一个 keyed hasher。
 ///
-/// 与 [`sign`] 共享密钥派生逻辑，但语义独立：wire MAC 防止跨节点消息伪造，
-/// payload MAC 防止任务载荷篡改。两者可共用同一密钥（`payload_signing_key`）
-/// 也可分别配置。
-pub fn wire_mac(key: &[u8], bytes: &[u8]) -> Option<[u8; WIRE_MAC_LEN]> {
-    if key.is_empty() {
-        return None;
-    }
-    let derived = derive_key(key);
-    let mac = blake3::keyed_hash(&derived, bytes);
-    let mut out = [0u8; WIRE_MAC_LEN];
-    out.copy_from_slice(mac.as_bytes());
-    Some(out)
-}
-
-/// 恒定时间校验 wire message MAC。
-///
-/// `mac_bytes` 长度必须为 [`WIRE_MAC_LEN`]。空密钥返回 `Ok(())`（禁用签名时
-/// 一切通过，向后兼容）。MAC 不匹配返回 `Err`，调用方应丢弃该消息。
-pub fn verify_wire_mac(key: &[u8], bytes: &[u8], mac_bytes: &[u8]) -> Result<(), String> {
-    verify_wire_mac_incremental(key, &[bytes], mac_bytes)
-}
-
-/// 分段形态的 wire MAC 校验：按顺序喂给同一个 keyed hasher。
-///
-/// 与 [`verify_wire_mac`] 语义一致，但避免调用方为验证拼接与消息等大的
-/// 连续缓冲；段序必须与 [`wire_mac_incremental`] 完全一致。
+/// 空密钥返回 `Ok(())`——对应注册表为空的开发/单机模式，此时出站侧本就不
+/// 产生 MAC，调用方不应在配置了密钥的部署中使用空密钥走到此分支。
+/// MAC 不匹配返回 `Err`，调用方应丢弃该消息；段序必须与
+/// [`wire_mac_incremental`] 完全一致。
 pub fn verify_wire_mac_incremental(
     key: &[u8],
     segments: &[&[u8]],

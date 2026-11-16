@@ -11,7 +11,7 @@
 ```bash
 git clone https://github.com/actant/actant.git
 cd actant
-uv sync --extra dev
+uv sync
 uv run maturin develop
 ```
 
@@ -52,7 +52,7 @@ uv pip install --no-binary actant-engine actant-engine
 ## 文档站点
 
 ```bash
-uv sync --extra dev
+uv sync --group docs
 uv run mkdocs serve
 ```
 

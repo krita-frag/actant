@@ -350,7 +350,7 @@ stop/kill/freeze/thaw 等控制操作；负载与业务语义留在被测系统�
 ## 开发与测试
 
 ```bash
-uv sync --extra dev
+uv sync
 PYTHONPATH=extensions/act-ext-testkit uv run pytest extensions/act-ext-testkit/tests -q
 uv run ruff check extensions/act-ext-testkit
 ```

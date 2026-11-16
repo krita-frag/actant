@@ -14,6 +14,7 @@ fn completed(task: &str) -> TaskCompletion {
         task_name: "n".into(),
         result: Vec::new(),
         target_node: None,
+        attempt: 0,
     }
 }
 
@@ -133,6 +134,7 @@ fn completion_state_mapping() {
         task_name: "n".into(),
         error: "e".into(),
         target_node: None,
+        attempt: 0,
     };
     assert_eq!(
         BatchItemState::from_completion(&running_like),

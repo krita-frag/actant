@@ -3,6 +3,18 @@
 
 use super::*;
 
+/// 单段形态的 wire MAC：整块字节作为单一分段喂 keyed hasher。
+///
+/// 生产实现只有 incremental 形态；本包装保留"单缓冲等价"的测试表达
+/// （单段输入与分段拼接产出同一 MAC，即字节序不变红线）。
+fn wire_mac(key: &[u8], bytes: &[u8]) -> Option<[u8; WIRE_MAC_LEN]> {
+    wire_mac_incremental(key, &[bytes])
+}
+
+fn verify_wire_mac(key: &[u8], bytes: &[u8], mac_bytes: &[u8]) -> Result<(), String> {
+    verify_wire_mac_incremental(key, &[bytes], mac_bytes)
+}
+
 #[test]
 fn sign_and_verify_roundtrip() {
     let key = b"test-secret-key";
@@ -358,7 +370,7 @@ proptest! {
 // 包装，直接对二进制契约断言：帧布局（MAC_PREFIX | mac | payload）、空密钥
 // 降级语义、篡改/截断/伪造拒绝。
 
-use super::{sign, verify, wire_mac, wire_mac_incremental, MAC_LEN, MAC_PREFIX, WIRE_MAC_LEN};
+use super::{sign, verify, wire_mac_incremental, MAC_LEN, MAC_PREFIX, WIRE_MAC_LEN};
 
 const KEY: &[u8] = b"c5-direct-test-key";
 const PAYLOAD: &[u8] = b"cloudpickle-envelope-bytes";

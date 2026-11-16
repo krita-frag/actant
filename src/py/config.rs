@@ -301,14 +301,6 @@ impl From<PyFailoverConfig> for FailoverConfig {
 #[derive(Clone)]
 pub struct PyGossipConfig {
     #[pyo3(get)]
-    pub dedup_window_size: usize,
-    #[pyo3(get)]
-    pub dedup_ttl_secs: u64,
-    #[pyo3(get)]
-    pub retry_attempts: usize,
-    #[pyo3(get)]
-    pub retry_base_delay_ms: u64,
-    #[pyo3(get)]
     pub heads_broadcast_interval_ms: u64,
 }
 
@@ -317,20 +309,10 @@ impl PyGossipConfig {
     /// 所有字段的默认值取自 Rust [`GossipConfig::default()`]（单一来源），
     /// 此处不重复维护数值，避免 PyO3 与 Rust 侧默认值漂移。
     #[new]
-    #[pyo3(signature = (dedup_window_size=None, dedup_ttl_secs=None, retry_attempts=None, retry_base_delay_ms=None, heads_broadcast_interval_ms=None))]
-    fn new(
-        dedup_window_size: Option<usize>,
-        dedup_ttl_secs: Option<u64>,
-        retry_attempts: Option<usize>,
-        retry_base_delay_ms: Option<u64>,
-        heads_broadcast_interval_ms: Option<u64>,
-    ) -> Self {
+    #[pyo3(signature = (heads_broadcast_interval_ms=None))]
+    fn new(heads_broadcast_interval_ms: Option<u64>) -> Self {
         let default = GossipConfig::default();
         Self {
-            dedup_window_size: dedup_window_size.unwrap_or(default.dedup_window_size),
-            dedup_ttl_secs: dedup_ttl_secs.unwrap_or(default.dedup_ttl_secs),
-            retry_attempts: retry_attempts.unwrap_or(default.retry_attempts),
-            retry_base_delay_ms: retry_base_delay_ms.unwrap_or(default.retry_base_delay_ms),
             heads_broadcast_interval_ms: heads_broadcast_interval_ms
                 .unwrap_or(default.heads_broadcast_interval_ms),
         }
@@ -341,10 +323,6 @@ impl Default for PyGossipConfig {
     fn default() -> Self {
         let default = GossipConfig::default();
         Self {
-            dedup_window_size: default.dedup_window_size,
-            dedup_ttl_secs: default.dedup_ttl_secs,
-            retry_attempts: default.retry_attempts,
-            retry_base_delay_ms: default.retry_base_delay_ms,
             heads_broadcast_interval_ms: default.heads_broadcast_interval_ms,
         }
     }
@@ -353,10 +331,6 @@ impl Default for PyGossipConfig {
 impl From<PyGossipConfig> for GossipConfig {
     fn from(c: PyGossipConfig) -> Self {
         Self {
-            dedup_window_size: c.dedup_window_size,
-            dedup_ttl_secs: c.dedup_ttl_secs,
-            retry_attempts: c.retry_attempts,
-            retry_base_delay_ms: c.retry_base_delay_ms,
             heads_broadcast_interval_ms: c.heads_broadcast_interval_ms,
         }
     }
@@ -436,10 +410,11 @@ impl PyStoreConfig {
 
 /// 将用户提供的 scheduler kind 字符串解析为内部 `SchedulerKind`。
 ///
-/// 此处接受任何非空字符串；scheduler 注册表在启动时通过
-/// [`actant_core::common::SchedulerKind::validate`] 验证名称，
-/// 并以 `Config` 错误拒绝未知名称（无静默回退）。
-/// 这允许 Python 层在 runtime 启动前注册自定义调度策略。
+/// 此处接受任何非空字符串；启动时经
+/// [`actant_core::common::SchedulerKind::validate`] 验证名称（`priority` /
+/// `fifo` 封闭白名单），未知名称以 `Config` 错误拒绝（无静默回退）。
+/// 自定义调度策略只能经 Rust `Scheduler` trait 注入
+///（`RuntimeBuilder::with_scheduler`），Python 侧没有注册入口。
 fn scheduler_kind_from_str(kind: &str) -> PyResult<actant_core::common::SchedulerKind> {
     if kind.is_empty() {
         return Err(pyo3::exceptions::PyValueError::new_err(
@@ -480,7 +455,7 @@ pub struct PyActantConfig {
     #[pyo3(get)]
     pub payload_signing_key: String,
     /// 强制要求 payload 签名。`true` 时 `payload_signing_key` 为空启动直接报错。
-    /// 默认 `false`（向后兼容 0.2 行为，仅 warn 日志）。
+    /// 默认 `false`（开发/测试的宽容语义，仅 warn 日志；生产环境应显式置 `true`）。
     #[pyo3(get)]
     pub require_payload_signing: bool,
     /// worker 子进程数（进程池大小）。每个 worker 同一时刻执行一个任务，

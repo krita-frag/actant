@@ -14,6 +14,7 @@ fn completed(task: &str) -> TaskLifecycleEvent {
         task_name: "tn".to_string(),
         result: vec![1],
         target_node: None,
+        attempt: 0,
     })
 }
 
@@ -23,6 +24,7 @@ fn feed_fifo_preserves_order_across_event_kinds() {
     feed.send(TaskLifecycleEvent::TaskStarted {
         workflow_id: WorkflowId::from("wf-1"),
         task_id: crate::common::TaskId::from("t-1"),
+        attempt: 0,
     });
     feed.send(completed("t-1"));
 

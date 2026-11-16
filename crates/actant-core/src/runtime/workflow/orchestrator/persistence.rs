@@ -83,6 +83,76 @@ pub(crate) fn append_event(
     }
 }
 
+/// 移除一个数据损坏的工作流：墓碑 → 删快照 → 记录 `Recovered{corrupt}` → 隐藏 topic。
+///
+/// 墓碑必须先于任何删除落盘成功：否则会留下「快照已删、topic 可见、无墓碑」，
+/// 下次恢复补建空 slot 并重放旧事件，把已完成的任务重新派发（重复副作用）。
+/// 墓碑写失败时保留现场，不清理。
+///
+/// 三个调用点共用：快照槽位损坏、重放读取失败、重放解码失败。后两者若只
+/// 跳过而不清理，`recover` 已把 Running 重置为 Pending，随后的
+/// `recover_ready_tasks` 会重新派发这些任务。
+async fn discard_corrupt_workflow(
+    state: &OrchestratorState,
+    store: &Store,
+    event_log: Option<&Arc<dyn EventLog>>,
+    workflow_id: &WorkflowId,
+) {
+    if event_log.is_some()
+        && append_event(
+            event_log,
+            JournalEvent::Evicted {
+                workflow_id: workflow_id.clone(),
+            },
+        )
+        .is_none()
+    {
+        tracing::error!(
+            workflow = %workflow_id.as_str(),
+            "failed to persist eviction marker for corrupt workflow; keeping state intact"
+        );
+        return;
+    }
+    state.remove_workflow(workflow_id);
+    for key in [
+        dag_key(workflow_id),
+        exec_key(workflow_id),
+        pending_key(workflow_id),
+        result_key(workflow_id),
+        wait_key(workflow_id),
+        signal_buf_key(workflow_id),
+        context_key(workflow_id),
+        event_seq_key(workflow_id),
+    ] {
+        if let Err(e) = store.delete(&key).await {
+            tracing::warn!(
+                workflow = %workflow_id.as_str(),
+                key = %key,
+                error = %e,
+                "recover: failed to delete corrupt entry"
+            );
+        }
+    }
+    crate::metrics::inc_workflows_recovered_corrupt();
+    tracing::warn!(
+        workflow = %workflow_id.as_str(),
+        "workflow removed due to corrupt data"
+    );
+    // 记录损坏恢复事件（corrupt=true）供外部观测。必须在 hide_topic 之前写：
+    // append 的「再次追加即恢复可见」语义会把刚隐藏的 topic 重新暴露给扫描。
+    Orchestrator::log_recovered_event(event_log.map(|log| log.as_ref()), workflow_id, 0, true);
+    if let Some(log) = event_log {
+        let topic = format!("workflow:{}", workflow_id.as_str());
+        if let Err(e) = log.hide_topic(&topic) {
+            tracing::warn!(
+                workflow = %workflow_id.as_str(),
+                error = %e,
+                "failed to hide corrupt workflow topic from recovery scan"
+            );
+        }
+    }
+}
+
 /// 序列化单个持久化槽位；失败时记录日志并返回 `None`。
 fn encode_slot<E: std::fmt::Display>(
     slot_name: &str,
@@ -610,74 +680,15 @@ impl Orchestrator {
 
         // 任何条目损坏的 workflow：移除内存 slot，并删除 store 中的所有快照
         // 条目，避免"exec 数据悬空而 dag 缺失"等不一致状态在后续操作中触发
-        // workflow not found。
-        for wf_id in &corrupt {
-            // 与 evict_workflow 同口径：墓碑先行——它是该 topic 已淘汰的
-            // 唯一凭据，必须先于任何状态删除落盘成功。先删后写的话，两步
-            // 之间崩溃会留下「快照已删、topic 可见、无墓碑」，下次恢复补建
-            // 空 slot 并重放旧事件重新派发已完成的任务。墓碑写失败则放弃
-            // 清理，保留损坏现场。
-            if event_log.is_some()
-                && append_event(
-                    event_log.as_ref(),
-                    JournalEvent::Evicted {
-                        workflow_id: wf_id.clone(),
-                    },
-                )
-                .is_none()
-            {
-                tracing::error!(
-                    workflow = %wf_id.as_str(),
-                    "failed to persist eviction marker for corrupt workflow; keeping state intact"
-                );
-                continue;
-            }
-            state.remove_workflow(wf_id);
-            for key in [
-                dag_key(wf_id),
-                exec_key(wf_id),
-                pending_key(wf_id),
-                result_key(wf_id),
-                wait_key(wf_id),
-                signal_buf_key(wf_id),
-                context_key(wf_id),
-                event_seq_key(wf_id),
-            ] {
-                if let Err(e) = store.delete(&key).await {
-                    tracing::warn!(workflow = %wf_id.as_str(), key = %key, error = %e, "recover: failed to delete corrupt entry");
-                }
-            }
-            crate::metrics::inc_workflows_recovered_corrupt();
+        // workflow not found。清理语义（墓碑先行等）见 `discard_corrupt_workflow`。
+        if !corrupt.is_empty() {
             tracing::warn!(
-                workflow = %wf_id.as_str(),
-                "workflow removed due to corrupt data; total corrupt={}",
-                corrupt.len(),
+                corrupt = corrupt.len(),
+                "recovery will discard corrupt workflows"
             );
-            // 记录损坏恢复事件（corrupt=true）供外部观测。必须在 hide_topic
-            // 之前写：append 的「再次追加即恢复可见」语义会把刚隐藏的 topic
-            // 重新暴露给恢复期扫描。
-            Self::log_recovered_event(event_log.as_deref(), wf_id, 0, true);
-            if let Some(log) = event_log.as_deref() {
-                let topic = format!("workflow:{}", wf_id.as_str());
-                if let Err(e) = log.hide_topic(&topic) {
-                    tracing::warn!(
-                        workflow = %wf_id.as_str(),
-                        error = %e,
-                        "failed to hide corrupt workflow topic from recovery scan"
-                    );
-                }
+            for wf_id in &corrupt {
+                discard_corrupt_workflow(&state, &store, event_log.as_ref(), wf_id).await;
             }
-        }
-
-        // 为成功恢复的非损坏 workflow 记录恢复事件（corrupt=false）。
-        // 遍历 state.slots，跳过已标记为 corrupt 的 workflow。
-        for entry in state.slots.iter() {
-            let wf_id = entry.key();
-            if corrupt.contains(wf_id) {
-                continue;
-            }
-            let task_count = entry.execution.tasks.len();
-            Self::log_recovered_event(event_log.as_deref(), wf_id, task_count, false);
         }
 
         let orchestrator = Self {
@@ -693,9 +704,33 @@ impl Orchestrator {
         };
 
         // 快照加载完成后重放其后的事件，恢复语义唯一化（快照 + 事件重放）。
-        orchestrator
+        let unreplayable = orchestrator
             .replay_events_after_watermarks(event_log.as_deref(), &watermarks, &generation_starts)
             .await;
+        // 重放不可信的工作流与槽位损坏同口径：整份丢弃。不能带着「快照已把
+        // Running 重置为 Pending、历史却未重放」的状态继续运行，否则这些任务
+        // 会被 `recover_ready_tasks` 重新派发（重复副作用）。
+        if !unreplayable.is_empty() {
+            if let Some(store) = orchestrator.store.as_ref() {
+                for wf_id in &unreplayable {
+                    discard_corrupt_workflow(
+                        &orchestrator.state,
+                        store,
+                        orchestrator.event_log.as_ref(),
+                        wf_id,
+                    )
+                    .await;
+                }
+            }
+        }
+
+        // 为成功恢复的 workflow 记录恢复事件（corrupt=false）。放在重放与丢弃
+        // 之后：损坏 / 不可重放的工作流已不在 slots 中，无需再排除。
+        for entry in orchestrator.state.slots.iter() {
+            let wf_id = entry.key();
+            let task_count = entry.execution.tasks.len();
+            Self::log_recovered_event(event_log.as_deref(), wf_id, task_count, false);
+        }
 
         // 重启后重建淘汰顺序：若队列只由运行期的 complete_terminal 填充，
         // 从快照加载的历史终态工作流永远进不了队列，按 N 淘汰的契约在重启后
@@ -733,14 +768,19 @@ impl Orchestrator {
     /// 重放不追加新事件、不发网络消息、不触发等待者唤醒（恢复期尚无等待者）。
     /// 重放产生变更的工作流被标记脏，由后台 flush 把水位后的增量并入快照；
     /// 重放中进入终态的工作流立即同步落盘（对齐 `fail_task` 的终态崩溃安全）。
+    ///
+    /// 返回**重放不可信**的工作流：读取失败或任一条事件无法解码。调用方必须
+    /// 丢弃它们（`discard_corrupt_workflow`）——只跳过重放会让快照里被重置为
+    /// Pending 的已完成任务重新入队。
     async fn replay_events_after_watermarks(
         &self,
         event_log: Option<&dyn EventLog>,
         watermarks: &HashMap<WorkflowId, EventId>,
         generation_starts: &HashMap<WorkflowId, EventId>,
-    ) {
+    ) -> Vec<WorkflowId> {
+        let mut unreplayable: Vec<WorkflowId> = Vec::new();
         let Some(log) = event_log else {
-            return;
+            return unreplayable;
         };
         // 先收集再重放：iter() 持有 DashMap 分片读锁，而 apply_replayed_event
         // 会对同一 workflow 执行 get_mut（同分片写锁）——循环体内直接重放是
@@ -771,11 +811,12 @@ impl Orchestrator {
             let entries = match log.read_after(&topic, watermark.as_ref()) {
                 Ok(entries) => entries,
                 Err(e) => {
-                    tracing::warn!(
+                    tracing::error!(
                         workflow = %wf_id.as_str(),
                         error = %e,
-                        "recover: failed to read events after watermark, replay skipped"
+                        "recover: failed to read events after watermark; workflow marked corrupt"
                     );
+                    unreplayable.push(wf_id);
                     continue;
                 }
             };
@@ -783,6 +824,7 @@ impl Orchestrator {
                 continue;
             }
             let mut replayed = 0usize;
+            let mut decode_failed = false;
             for entry in &entries {
                 match postcard::from_bytes::<JournalEvent>(&entry.payload) {
                     Ok(payload) => {
@@ -790,15 +832,22 @@ impl Orchestrator {
                         replayed += 1;
                     }
                     Err(e) => {
-                        // 解码失败的事件跳过：旧枚举布局与新枚举布局不兼容
-                        // 时不阻断其余事件重放。
-                        tracing::warn!(
+                        // 跳过单条事件会让它的状态变更永久缺失；而 `recover` 已把
+                        // Running 重置为 Pending，后续 `recover_ready_tasks` 会把
+                        // 这些任务重新派发（重复副作用）。故整个工作流判为不可信。
+                        tracing::error!(
                             workflow = %wf_id.as_str(),
                             error = ?e,
-                            "recover: failed to decode replayed event, skipping"
+                            "recover: undecodable journal event; workflow marked corrupt"
                         );
+                        decode_failed = true;
+                        break;
                     }
                 }
+            }
+            if decode_failed {
+                unreplayable.push(wf_id);
+                continue;
             }
             tracing::info!(
                 workflow = %wf_id.as_str(),
@@ -806,6 +855,7 @@ impl Orchestrator {
                 "replayed workflow events after snapshot watermark"
             );
         }
+        unreplayable
     }
 
     /// 按事件语义幂等应用单条重放事件。
@@ -1201,6 +1251,9 @@ impl Orchestrator {
                 tokio::select! {
                     _ = cancel_rx.changed() => break,
                     _ = interval.tick() => {
+                        // 与 on_stop 的 flush_dirty 互斥：整段（drain → 写 → 裁剪）
+                        // 持锁，否则旧快照可能覆盖新快照并裁掉中间历史。
+                        let _flush_guard = state.flush_lock.lock().await;
                         let dirty_ids = state.drain_dirty();
                         if dirty_ids.is_empty() {
                             continue;
@@ -1237,6 +1290,8 @@ impl Orchestrator {
         let Some(ref store) = self.store else {
             return Ok(());
         };
+        // 与定期落盘循环互斥（见 `OrchestratorState::flush_lock`）。
+        let _flush_guard = self.state.flush_lock.lock().await;
         let dirty_ids = self.state.drain_dirty();
         if dirty_ids.is_empty() {
             return Ok(());

@@ -41,8 +41,8 @@ FRAME_SHUTDOWN = 0x03
 _FRAME_HEADER = struct.Struct("<IB")
 
 # 帧长度上限（帧头长度字段为 u32，理论最大 4GiB-1）。Rust 端
-# ``ProcessTaskDispatcher`` 对长度仅校验 >= 1、不设上界；此处选取 256MB 作为
-# worker 帧协议上限（提交侧 `_safe_serialize` 共用，见 `MAX_FRAME_BYTES`）。
+# ``ProcessTaskDispatcher::read_frame`` 与 ``write_frame`` 都以同一个 256MB 为界；
+# 此处与提交侧 `_safe_serialize` 共用 `MAX_FRAME_BYTES`，三处必须一致。
 
 
 # 预分配的头缓冲（worker 主线程串行使用，读写循环共用）。

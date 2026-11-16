@@ -114,8 +114,6 @@ fn all_counter_helpers_do_not_panic() {
     inc_workflows_failed();
     inc_workflow_timeouts();
     inc_retry_scheduled();
-    inc_gossip_updates_sent();
-    inc_gossip_updates_received();
     inc_gossip_updates_dropped();
     inc_heartbeats_sent();
     inc_failover_claims();

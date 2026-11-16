@@ -4,8 +4,8 @@
 1. 内置 capability 元数据可见（与 Rust `builtin_capabilities()` 一致）。
 2. `_CapabilityRuntime()` 无参构造时不注册任何 handler——`register_defaults`
    只注册 codec，具体 handler 由 `RuntimeBuilder` 在 `_RuntimeCore` 中注入。
-3. 不支持的 capability 会抛出清晰错误（自定义 ask capability 不在 Rust
-   `capability_registry!` 中）。
+3. Rust 桥不设 ask 分发入口（ask 是纯 Python 决策语义，见
+   `TestAskDispatch`）。
 
 它们不依赖 Python `Runtime` 的 handler 注册表，因此是 Rust-Python
 边界的端到端测试。
@@ -60,15 +60,24 @@ class TestCapabilityMetadata:
 
 
 class TestAskDispatch:
-    """Rust 不支持任何 ask capability（ask 注册表为空）。"""
+    """Rust 桥不设 ask 分发入口（设计决定，K12 确认）。
 
-    def test_custom_ask_not_supported_by_rust(self, cap_rt: _CapabilityRuntime) -> None:
-        with pytest.raises(ValueError, match="ask capability MyRouter not supported"):
-            cap_rt.ask("MyRouter", {"task_name": "task-1"})
+    ask 是纯 Python 决策语义：Python 侧 `_ask_chain` handler 链逆序决策，
+    Rust 无 ask 型内置 handler，`CapabilityRuntime` 的 Rust ask 执行链已随
+    K12 删除。此负向契约防止将来给桥加 ask 入口而不改 Python 侧——那会
+    造成同一 capability 两条决策路径漂移。
+    """
 
-    def test_unsupported_ask_raises(self, cap_rt: _CapabilityRuntime) -> None:
-        with pytest.raises(ValueError, match="ask capability Unknown not supported"):
-            cap_rt.ask("Unknown", {"task_name": "task-1"})
+    def test_bridge_has_no_ask_entry(self, cap_rt: _CapabilityRuntime) -> None:
+        assert not hasattr(cap_rt, "ask")
+
+    def test_python_ask_does_not_reach_rust_bridge(self, cap_rt: _CapabilityRuntime) -> None:
+        # Rust 桥只有 perform / emit 入口（与 capability_registry! 宏一致）。
+        assert hasattr(cap_rt, "perform")
+        assert hasattr(cap_rt, "perform_async")
+        assert hasattr(cap_rt, "perform_batch_async")
+        assert hasattr(cap_rt, "emit")
+        assert not hasattr(cap_rt, "ask")
 
 
 class TestPerformDispatch:

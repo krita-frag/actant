@@ -488,8 +488,10 @@ async fn failed_build_after_key_registration_does_not_leak_wire_key() {
         ..envelope
     };
     if let Some(mac) = mac {
+        // MAC 覆盖字节 = 序列化整个 `mac: None` 的 unsigned envelope（见
+        // `wire_mac_incremental` 的分段约定），单段输入与整信封字节一致。
         let bytes = crate::common::encode_postcard(&unsigned).unwrap();
-        let expected = crate::common::payload::wire_mac(&key, &bytes).unwrap();
+        let expected = crate::common::payload::wire_mac_incremental(&key, &[&bytes]).unwrap();
         assert_ne!(
             mac, expected,
             "failed build must not leave the node's wire key registered"
@@ -829,7 +831,12 @@ async fn build_redispatches_recovered_pending_tasks_only() {
     assert_eq!(roots.len(), 1);
     pre.mark_task_running(&wf, &roots[0].id).unwrap();
     let (ready, _) = pre
-        .on_task_completed(&wf, &crate::common::TaskId::from("t1"), b"r1".to_vec())
+        .on_task_completed(
+            &wf,
+            &crate::common::TaskId::from("t1"),
+            b"r1".to_vec(),
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(ready.len(), 1, "t2 should become ready after t1 completes");
@@ -902,16 +909,14 @@ impl crate::runtime::workflow::Scheduler for SentinelScheduler {
     async fn dequeue_batch(&self, _limit: usize) -> Vec<crate::common::TaskDefinition> {
         Vec::new()
     }
-    async fn is_empty(&self) -> bool {
-        false
-    }
-    async fn len(&self) -> usize {
-        7
+    async fn remove_workflow_tasks(&self, _workflow_id: &crate::common::WorkflowId) -> usize {
+        // 哨兵值：注入接管断言的观察点（纯队列操作、无副作用）。
+        42
     }
 }
 
 /// 注入缝 `with_scheduler` 的「真实接管」断言：注入后 `worker.scheduler()`
-/// 必须就是该实现——回退到内置 FIFO/priority 时 `len()` 为 0。
+/// 必须就是该实现——回退到内置 FIFO/priority 时哨兵值不会透传。
 #[tokio::test]
 async fn init_worker_uses_injected_scheduler() {
     let node_id = make_node("node-Sentinel");
@@ -946,13 +951,12 @@ async fn init_worker_uses_injected_scheduler() {
     .expect("init_worker with injected scheduler ok");
 
     assert_eq!(
-        worker.scheduler().len().await,
-        7,
-        "注入的调度器必须真实接管，而不是回退到内置 FIFO"
-    );
-    assert!(
-        !worker.scheduler().is_empty().await,
-        "哨兵调度器 is_empty() == false 必须被透传"
+        worker
+            .scheduler()
+            .remove_workflow_tasks(&crate::common::WorkflowId::from("sentinel-wf"))
+            .await,
+        42,
+        "哨兵调度器必须真实接管（remove_workflow_tasks 透传哨兵值），而不是回退到内置 FIFO"
     );
 }
 

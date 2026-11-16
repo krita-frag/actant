@@ -200,6 +200,7 @@ fn test_task_completion_accessors() {
         task_name: "tn".to_string(),
         result: vec![1],
         target_node: Some(node.clone()),
+        attempt: 0,
     };
     assert_eq!(tc.as_str(), "Completed");
     assert_eq!(tc.workflow_id(), &wf);
@@ -221,6 +222,7 @@ fn test_task_completion_to_wire_result_all_variants() {
         task_name: "tc".to_string(),
         result: vec![1, 2],
         target_node: None,
+        attempt: 0,
     };
     let wire = completed.to_wire_result(wf.clone());
     assert!(
@@ -233,6 +235,7 @@ fn test_task_completion_to_wire_result_all_variants() {
         task_name: "tf".to_string(),
         error: "boom".to_string(),
         target_node: None,
+        attempt: 0,
     };
     let wire = failed.to_wire_result(wf.clone());
     assert!(
@@ -244,6 +247,7 @@ fn test_task_completion_to_wire_result_all_variants() {
         task_id: task.clone(),
         task_name: "tcx".to_string(),
         target_node: None,
+        attempt: 0,
     };
     let wire = cancelled.to_wire_result(wf.clone());
     assert!(matches!(

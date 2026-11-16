@@ -146,43 +146,6 @@ fn lmdb_event_log_persists_sequence_metadata_atomically() {
 }
 
 #[test]
-fn lmdb_event_log_migrates_legacy_events_without_meta() {
-    let dir = tempdir().unwrap();
-    let store = LmdbStore::open(dir.path()).unwrap();
-
-    // 模拟旧版本写入：只有事件条目，没有 meta:event_seq。
-    for sequence in 1..=3u64 {
-        let entry = LogEntry {
-            id: EventId {
-                timestamp: crate::runtime::state::HlcTimestamp::zero(),
-                sequence,
-            },
-            topic: "legacy".into(),
-            payload: vec![sequence as u8],
-        };
-        let value = postcard::to_allocvec(&entry).unwrap();
-        store
-            .put(&LmdbEventLog::key("legacy", &entry.id), &value)
-            .unwrap();
-    }
-    assert!(store
-        .get(&LmdbEventLog::seq_key("legacy"))
-        .unwrap()
-        .is_none());
-
-    let log = LmdbEventLog::new(store.clone());
-    let next = log.append("legacy", b"next").unwrap();
-    assert_eq!(next.sequence, 4, "legacy events must be recovered by scan");
-    assert!(
-        store
-            .get(&LmdbEventLog::seq_key("legacy"))
-            .unwrap()
-            .is_some(),
-        "migration must persist sequence metadata for future starts"
-    );
-}
-
-#[test]
 fn lmdb_event_log_read_after_spans_pages() {
     let dir = tempdir().unwrap();
     let config = crate::common::StoreConfig {
